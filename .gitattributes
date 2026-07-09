@@ -1,0 +1,5 @@
+# This repo runs on Linux (Graviton). Force LF so shell scripts and Python
+# don't get CRLF line endings that break the bash shebang on the target box.
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf

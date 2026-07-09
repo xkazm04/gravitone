@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+logs/
+results/
+recordings/
+samples/
+voices/*.safetensors
+*.wav
+*.mp3
+service/loadtest_result.json
+.research-cache/
