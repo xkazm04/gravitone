@@ -19,6 +19,7 @@ import queue
 import subprocess
 import threading
 import time
+import wave
 from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass, field
@@ -46,6 +47,30 @@ def audio_to_wav_bytes(audio: torch.Tensor, sample_rate: int) -> bytes:
     buf = io.BytesIO()
     scipy.io.wavfile.write(buf, sample_rate, arr)
     return buf.getvalue()
+
+
+def concat_wavs(chunks: list[bytes]) -> bytes:
+    """Join same-format WAVs (24kHz mono 16-bit) end to end. No ffmpeg needed."""
+    chunks = [c for c in chunks if c]
+    if not chunks:
+        raise ValueError("no audio to concatenate")
+    if len(chunks) == 1:
+        return chunks[0]
+    nch = sw = fr = None
+    frames: list[bytes] = []
+    for c in chunks:
+        with wave.open(io.BytesIO(c), "rb") as w:
+            if nch is None:
+                nch, sw, fr = w.getnchannels(), w.getsampwidth(), w.getframerate()
+            frames.append(w.readframes(w.getnframes()))
+    out = io.BytesIO()
+    with wave.open(out, "wb") as w:
+        w.setnchannels(nch)  # type: ignore[arg-type]
+        w.setsampwidth(sw)   # type: ignore[arg-type]
+        w.setframerate(fr)   # type: ignore[arg-type]
+        for f in frames:
+            w.writeframes(f)
+    return out.getvalue()
 
 
 def wav_bytes_to_mp3(wav_bytes: bytes, bitrate: str = "128k") -> bytes:
@@ -152,9 +177,12 @@ class Metrics:
 class Job:
     voice_id: str
     text: str
-    temperature: Optional[float]
     max_tokens: int
     frames_after_eos: Optional[int]
+    # Per-request expression overrides applied to the worker's model instance
+    # (e.g. {"temp": 0.9, "noise_clamp": 1.2, "lsd_decode_steps": 3}). Safe
+    # because a worker owns its model and processes exactly one job at a time.
+    overrides: dict = field(default_factory=dict)
     future: Future = field(default_factory=Future)
     t_enqueue: float = field(default_factory=time.perf_counter)
 
@@ -210,8 +238,13 @@ class _Worker(threading.Thread):
                 break
             self.engine.metrics.on_start()
             t_start = time.perf_counter()
+            prev: dict = {}
             try:
                 state = self._voice_state(job.voice_id)
+                # apply expression overrides, remembering the originals
+                for k, v in job.overrides.items():
+                    prev[k] = getattr(self.model, k)
+                    setattr(self.model, k, v)
                 audio = self.model.generate_audio(
                     state, job.text,
                     max_tokens=job.max_tokens,
@@ -235,6 +268,8 @@ class _Worker(threading.Thread):
                 self.engine.metrics.on_error()
                 job.future.set_exception(exc)
             finally:
+                for k, v in prev.items():  # always restore model defaults
+                    setattr(self.model, k, v)
                 self.engine._admit.release()
                 self.engine._queue.task_done()
 
@@ -272,7 +307,7 @@ class TtsEngine:
     def ready(self) -> bool:
         return all(w.ready.is_set() for w in self._workers)
 
-    def submit(self, voice_id: str, text: str, temperature: Optional[float] = None,
+    def submit(self, voice_id: str, text: str, overrides: Optional[dict] = None,
                max_tokens: Optional[int] = None,
                frames_after_eos: Optional[int] = None) -> Job:
         """Admit a job or raise AdmissionRejected (429). Non-blocking admission."""
@@ -283,7 +318,7 @@ class TtsEngine:
                 f"queue full (max in-flight {self._max_inflight})"
             )
         job = Job(
-            voice_id=voice_id, text=text, temperature=temperature,
+            voice_id=voice_id, text=text, overrides=overrides or {},
             max_tokens=max_tokens or SETTINGS.max_tokens,
             frames_after_eos=frames_after_eos,
         )

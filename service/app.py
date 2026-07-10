@@ -22,8 +22,13 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
+import base64
+import json
+
 from service.config import SETTINGS
-from service.engine import AdmissionRejected, TtsEngine, wav_bytes_to_mp3
+from service.emotions import parse_segments, resolve
+from service.engine import AdmissionRejected, TtsEngine, concat_wavs, wav_bytes_to_mp3
+from service.voices import emotion_map, router as voices_router
 
 ENGINE: TtsEngine | None = None
 
@@ -42,11 +47,37 @@ app = FastAPI(title="Pocket TTS Service", version="1.0.0", lifespan=lifespan)
 
 
 class VoiceSettings(BaseModel):
+    """Expression controls.
+
+    Pocket TTS has no emotion/style/speed parameter — expression lives in the
+    reference audio. What IS tunable are the sampling knobs below, which the
+    engine applies to the worker's model instance per request.
+    """
+    # 0.5 (consistent) .. 1.0 (expressive). Model default 0.7.
     temperature: float | None = None
-    # accepted for ElevenLabs compatibility; not all map to pocket-tts
+    # 0 (off) .. 1 (tight). Mapped to the model's `noise_clamp`.
     stability: float | None = None
+    # 1 (fast) .. 5 (best). Mapped to `lsd_decode_steps`; costs realtime factor.
+    quality: int | None = None
+    # accepted for ElevenLabs compatibility; not honoured by pocket-tts
     similarity_boost: float | None = None
     style: float | None = None
+
+
+def _overrides(vs: VoiceSettings | None) -> dict:
+    """Map user-facing expression settings onto model attributes."""
+    o: dict = {}
+    if vs is None:
+        return o
+    if vs.temperature is not None:
+        o["temp"] = max(0.1, min(1.5, float(vs.temperature)))
+    if vs.stability is not None:
+        s = max(0.0, min(1.0, float(vs.stability)))
+        # 0 -> no clamp (wild); 1 -> tight clamp (stable)
+        o["noise_clamp"] = None if s < 0.01 else round(2.5 - 2.0 * s, 2)
+    if vs.quality is not None:
+        o["lsd_decode_steps"] = max(1, min(5, int(vs.quality)))
+    return o
 
 
 class TTSRequest(BaseModel):
@@ -81,11 +112,10 @@ async def text_to_speech(
     _check_auth(xi_api_key)
     assert ENGINE is not None
     kind, content_type = _parse_format(output_format)
-    temp = req.voice_settings.temperature if req.voice_settings else None
 
     try:
         job = ENGINE.submit(
-            voice_id=voice_id, text=req.text, temperature=temp,
+            voice_id=voice_id, text=req.text, overrides=_overrides(req.voice_settings),
             frames_after_eos=req.frames_after_eos,
         )
     except AdmissionRejected as exc:
@@ -127,20 +157,81 @@ async def text_to_speech(
     )
 
 
-@app.get("/v1/voices")
-async def list_voices():
-    vd = Path(SETTINGS.voices_dir)
-    exported = sorted(p.stem for p in vd.glob("*.safetensors")) if vd.is_dir() else []
-    builtins = [
-        "alba", "anna", "vera", "charles", "paul", "george", "mary", "jane",
-        "michael", "eve", "cosette", "marius", "javert", "jean", "fantine",
-        "eponine", "azelma", "bill_boerst", "peter_yearsley", "stuart_bell",
-        "caro_davy", "giovanni", "lola", "juergen", "rafael", "estelle",
-    ]
-    return {
-        "voices": [{"voice_id": v, "name": v, "category": "cloned"} for v in exported]
-        + [{"voice_id": v, "name": v, "category": "premade"} for v in builtins]
-    }
+# Voice + Character management lives in service/voices.py.
+app.include_router(voices_router)
+
+
+class SpeakRequest(BaseModel):
+    character_id: str
+    text: str = Field(..., min_length=1, max_length=8000)
+    voice_settings: VoiceSettings | None = None
+
+
+@app.post("/v1/speak")
+async def speak(
+    req: SpeakRequest,
+    xi_api_key: str | None = Header(default=None, alias="xi-api-key"),
+):
+    """Speak metatagged text with one Character, switching Voices per emotion.
+
+        "Hello. [excited]This is amazing![/excited] [sad]But now I'm sad."
+
+    Emotions the Character lacks fall back to its baseline Voice. The per-segment
+    report (what was requested vs what was used) is returned base64-JSON in the
+    `X-Segments` header so the UI can show the substitutions.
+    """
+    _check_auth(xi_api_key)
+    assert ENGINE is not None
+
+    emap = emotion_map(req.character_id)
+    if not emap:
+        raise HTTPException(status_code=404, detail=f"unknown character '{req.character_id}'")
+
+    segments = parse_segments(req.text)
+    overrides = _overrides(req.voice_settings)
+    loop = asyncio.get_event_loop()
+
+    wavs: list[bytes] = []
+    report: list[dict] = []
+    total_audio = 0.0
+    total_synth = 0.0
+
+    for seg in segments:
+        voice_id, used, fell_back = resolve(seg.emotion, emap)
+        try:
+            job = ENGINE.submit(voice_id=voice_id, text=seg.text, overrides=overrides)
+        except AdmissionRejected as exc:
+            return JSONResponse(status_code=429, content={"detail": str(exc)},
+                                headers={"Retry-After": "1"})
+        try:
+            result = await asyncio.wait_for(
+                loop.run_in_executor(None, job.future.result),
+                timeout=SETTINGS.request_timeout_s,
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail="synthesis timed out")
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=f"synthesis failed: {exc}")
+
+        wavs.append(result.wav_bytes)
+        total_audio += result.audio_seconds
+        total_synth += result.synth_seconds
+        report.append({
+            "text": seg.text, "requested": seg.emotion, "used": used,
+            "fallback": fell_back, "voice_id": voice_id, "seconds": result.audio_seconds,
+        })
+
+    body = concat_wavs(wavs)
+    rtf = round(total_audio / total_synth, 3) if total_synth else 0.0
+    return Response(
+        content=body, media_type="audio/wav",
+        headers={
+            "X-Audio-Seconds": str(round(total_audio, 2)),
+            "X-Synth-Seconds": str(round(total_synth, 3)),
+            "X-Realtime-Factor": str(rtf),
+            "X-Segments": base64.b64encode(json.dumps(report).encode()).decode(),
+        },
+    )
 
 
 @app.get("/health")
