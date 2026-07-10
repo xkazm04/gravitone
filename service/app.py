@@ -29,6 +29,7 @@ from service.config import SETTINGS
 from service.emotions import parse_segments, resolve
 from service.engine import AdmissionRejected, TtsEngine, concat_wavs, wav_bytes_to_mp3
 from service.voices import emotion_map, router as voices_router
+from service.keys import router as keys_router
 
 ENGINE: TtsEngine | None = None
 
@@ -159,6 +160,8 @@ async def text_to_speech(
 
 # Voice + Character management lives in service/voices.py.
 app.include_router(voices_router)
+# API key management (issue / rotate / revoke) lives in service/keys.py.
+app.include_router(keys_router)
 
 
 class SpeakRequest(BaseModel):
