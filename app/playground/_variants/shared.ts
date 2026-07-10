@@ -1,13 +1,12 @@
-// Shared model + mock generation for the Playground prototype variants.
-// (UI prototype — generation is simulated; wire to POST /v1/text-to-speech later.)
+// Model + waveform helpers for the Playground.
 
 export type Voice = {
   id: string;
   name: string;
   lang: string;
   source: "built-in" | "cloned";
-  sample?: string; // clone sample length, e.g. "16s"
-  rtf: number; // realtime factor on the reference box
+  sample?: string;
+  rtf: number;
   hue: number;
 };
 
@@ -24,37 +23,22 @@ export type Take = {
   text: string;
   voiceId: string;
   voiceName: string;
+  hue: number;
+  mode: "gravitone" | "browser";
+  url?: string; // object URL for the WAV (gravitone mode)
+  peaks: number[]; // 0..1 bar heights (real for gravitone, synthetic for browser)
   seconds: number;
-  rtf: number;
   kb: number;
-  seed: number;
+  rtf: number;
 };
 
-let takeSeq = 0;
-
-/** Simulate synthesis: latency ∝ audio length ÷ rtf. Resolves to a Take. */
-export function fakeGenerate(text: string, voice: Voice): Promise<Take> {
-  const seconds = Math.max(1.5, Math.round(text.trim().length * 0.055 * 10) / 10);
-  const kb = Math.round(seconds * 24000 * 2 / 1024);
-  const synthMs = Math.min(2600, (seconds / voice.rtf) * 1000);
-  takeSeq += 1;
-  const id = `take-${takeSeq}`;
-  const seed = (text.length * 31 + takeSeq * 7) % 997;
-  return new Promise((resolve) =>
-    setTimeout(
-      () => resolve({ id, text: text.trim(), voiceId: voice.id, voiceName: voice.name, seconds, rtf: voice.rtf, kb, seed }),
-      synthMs
-    )
-  );
-}
-
-/** Deterministic pseudo-waveform heights from a seed (static — no infinite motion). */
+/** Deterministic pseudo-waveform for browser-fallback takes. */
 export function waveHeights(seed: number, n = 48): number[] {
   const out: number[] = [];
   let s = seed || 1;
   for (let i = 0; i < n; i++) {
     s = (s * 1103515245 + 12345) & 0x7fffffff;
-    const env = Math.sin((i / n) * Math.PI); // fade in/out envelope
+    const env = Math.sin((i / n) * Math.PI);
     out.push(0.18 + ((s % 100) / 100) * 0.82 * (0.5 + env * 0.5));
   }
   return out;

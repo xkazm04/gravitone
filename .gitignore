@@ -9,3 +9,6 @@ npm-debug.log*
 next-env.d.ts
 .vercel
 tsconfig.tsbuildinfo
+
+# local audio artifacts
+*.wav
