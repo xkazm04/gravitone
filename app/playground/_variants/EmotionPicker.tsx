@@ -8,7 +8,7 @@
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { AnimatePresence, motion } from "framer-motion";
-import EmotionArt from "@/components/ui/EmotionArt";
+import EmotionGlyph from "@/components/ui/EmotionGlyph";
 import { EMOTIONS } from "@/lib/emotions";
 import { EASE } from "@/components/ui/tokens";
 
@@ -90,10 +90,10 @@ export default function EmotionPicker({
                     style={{ transform: `translate(${x}px, ${y}px)` }}
                   >
                     <span
-                      className="grid h-16 w-16 place-items-center overflow-hidden rounded-full border bg-black/50 transition group-hover:scale-110"
+                      className="grid h-16 w-16 place-items-center rounded-full border bg-black/50 transition group-hover:scale-110"
                       style={{ borderColor: has ? `hsl(${e.hue} 80% 55% / .5)` : "rgba(255,255,255,0.12)", boxShadow: has ? `0 0 22px hsl(${e.hue} 90% 60% / .3)` : "none" }}
                     >
-                      <EmotionArt emotion={e.id} size={58} dim={!has} />
+                      <EmotionGlyph emotion={e.id} size={46} dim={!has} animate={open} />
                     </span>
                     <span className="font-jetbrains mt-2 text-[11px] text-white/80">{e.label}</span>
                     <span className="font-jetbrains text-[9px] text-white/30">{has ? "available" : "→ baseline"}</span>

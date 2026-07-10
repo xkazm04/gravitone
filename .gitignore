@@ -16,3 +16,7 @@ tsconfig.tsbuildinfo
 
 # generated emotion art is committed (brand assets)
 !public/emotions/*.png
+
+# motionize skill working area + deps
+.claude/skills/motionize/out/
+.claude/skills/motionize/node_modules/
