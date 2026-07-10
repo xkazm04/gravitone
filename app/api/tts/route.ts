@@ -2,8 +2,7 @@
 // CORS issues and hides the endpoint. Set GRAVITONE_URL to point at a running
 // service (local :8080 by default, or your deployed Arm instance).
 import { NextRequest } from "next/server";
-
-const BASE = process.env.GRAVITONE_URL ?? "http://127.0.0.1:8080";
+import { backendFetch } from "@/lib/backend";
 
 // playground voice-id → backend voice-id (cloned demo voice lives as step4)
 const VOICE_MAP: Record<string, string> = { mine: "step4" };
@@ -20,8 +19,8 @@ export async function POST(req: NextRequest) {
   if (!text) return new Response("empty text", { status: 400 });
 
   try {
-    const upstream = await fetch(
-      `${BASE}/v1/text-to-speech/${encodeURIComponent(voiceId)}?output_format=wav_24000`,
+    const upstream = await backendFetch(
+      `/v1/text-to-speech/${encodeURIComponent(voiceId)}?output_format=wav_24000`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },

@@ -1,13 +1,13 @@
 // Retag / rename / delete a voice, proxied to the Gravitone backend.
 import { NextRequest } from "next/server";
 
-const BASE = process.env.GRAVITONE_URL ?? "http://127.0.0.1:8080";
+import { backendFetch } from "@/lib/backend";
 
 export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
   try {
     const body = await req.text();
-    const r = await fetch(`${BASE}/v1/voices/${encodeURIComponent(id)}`, {
+    const r = await backendFetch(`/v1/voices/${encodeURIComponent(id)}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body,
@@ -24,7 +24,7 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: strin
 export async function DELETE(_req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
   try {
-    const r = await fetch(`${BASE}/v1/voices/${encodeURIComponent(id)}`, { method: "DELETE" });
+    const r = await backendFetch(`/v1/voices/${encodeURIComponent(id)}`, { method: "DELETE" });
     return new Response(null, { status: r.status });
   } catch {
     return new Response("backend unreachable", { status: 503 });

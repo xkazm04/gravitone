@@ -2,11 +2,11 @@
 // fallback. Forwards the per-segment report so the UI can show substitutions.
 import { NextRequest } from "next/server";
 
-const BASE = process.env.GRAVITONE_URL ?? "http://127.0.0.1:8080";
+import { backendFetch } from "@/lib/backend";
 
 export async function POST(req: NextRequest) {
   try {
-    const upstream = await fetch(`${BASE}/v1/speak`, {
+    const upstream = await backendFetch(`/v1/speak`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: await req.text(),

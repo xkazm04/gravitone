@@ -1,10 +1,10 @@
 import { NextRequest } from "next/server";
-const BASE = process.env.GRAVITONE_URL ?? "http://127.0.0.1:8080";
+import { backendFetch } from "@/lib/backend";
 
 export async function POST(req: NextRequest, ctx: { params: Promise<{ job: string }> }) {
   const { job } = await ctx.params;
   try {
-    const r = await fetch(`${BASE}/v1/ingest/${encodeURIComponent(job)}/commit`, {
+    const r = await backendFetch(`/v1/ingest/${encodeURIComponent(job)}/commit`, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: await req.text(), signal: AbortSignal.timeout(300_000),
     });
