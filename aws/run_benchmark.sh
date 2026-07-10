@@ -18,6 +18,10 @@
 #   PROFILE (default gravitone)  REGION (default us-east-1)
 #   TYPE (default c8g.2xlarge)   REPO (default https://github.com/xkazm04/gravitone.git)
 set -uo pipefail
+# Git Bash / MSYS on Windows rewrites args that look like Unix paths
+# (e.g. /dev/sda1 -> C:/Program Files/Git/dev/sda1). Disable that mangling so
+# AWS CLI args (device names, JSON, remote paths) pass through verbatim.
+export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
 PROFILE="${PROFILE:-gravitone}"
 REGION="${REGION:-us-east-1}"
 TYPE="${TYPE:-c8g.2xlarge}"
