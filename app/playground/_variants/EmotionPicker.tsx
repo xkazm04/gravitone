@@ -5,6 +5,8 @@
 // into the composer. Each spoke is the emotion's generated art; emotions the
 // active Character lacks are dimmed and marked "→ baseline".
 
+import { useEffect, useState } from "react";
+import { createPortal } from "react-dom";
 import { AnimatePresence, motion } from "framer-motion";
 import EmotionArt from "@/components/ui/EmotionArt";
 import { EMOTIONS } from "@/lib/emotions";
@@ -25,12 +27,25 @@ export default function EmotionPicker({
   available: string[];
   characterName: string;
 }) {
-  return (
+  // Portal to <body> so the modal escapes AppFrame's overflow/stacking context
+  // (that was why it rendered below the page sections). Close on Escape.
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+
+  if (!mounted) return null;
+
+  return createPortal(
     <AnimatePresence>
       {open && (
         <motion.div
           initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-          className="fixed inset-0 z-[120] grid place-items-center bg-black/70 p-4 backdrop-blur-sm"
+          className="fixed inset-0 z-[9999] grid place-items-center bg-black/75 p-4 backdrop-blur-md"
           onClick={onClose}
           role="dialog" aria-modal="true" aria-label="Insert emotion"
         >
@@ -93,6 +108,7 @@ export default function EmotionPicker({
           </motion.div>
         </motion.div>
       )}
-    </AnimatePresence>
+    </AnimatePresence>,
+    document.body
   );
 }

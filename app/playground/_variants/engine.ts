@@ -67,9 +67,20 @@ export async function speak(text: string, characterId: string, expr: Expression)
     if (res.ok) {
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
-      const { peaks, duration } = await computePeaks(blob);
       const hdrSec = Number(res.headers.get("X-Audio-Seconds"));
       const hdrRtf = Number(res.headers.get("X-Realtime-Factor"));
+      // Waveform extraction is best-effort — a decode hiccup on the concatenated
+      // multi-segment WAV must NOT drop us to the browser fallback (that was the
+      // "composition produces no audio" bug). Keep the real audio; fake the bars.
+      let peaks = waveHeights(trimmed.length * 31 + 7, 56);
+      let duration = 0;
+      try {
+        const p = await computePeaks(blob);
+        peaks = p.peaks;
+        duration = p.duration;
+      } catch {
+        /* keep the synthetic peaks; audio still plays */
+      }
       return {
         mode: "gravitone", url, peaks,
         seconds: Math.round((hdrSec || duration) * 10) / 10,
