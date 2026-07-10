@@ -89,13 +89,25 @@ export default function EmotionPicker({
                       transition={{ duration: 0.35, ease: EASE, delay: i * 0.04 }}
                       onClick={() => { onPick(e.id); onClose(); }}
                       title={has ? `${e.label} — available` : `${e.label} — not recorded, falls back to baseline`}
-                      className="group flex w-24 flex-col items-center"
+                      className="group flex w-24 cursor-pointer flex-col items-center"
                     >
                       <span
-                        className="grid h-16 w-16 place-items-center overflow-hidden rounded-full border bg-black/60 transition duration-200 group-hover:scale-110 group-hover:brightness-125"
-                        style={{ borderColor: has ? `hsl(${e.hue} 85% 60%)` : "rgba(255,255,255,0.15)", boxShadow: has ? `0 0 22px hsl(${e.hue} 90% 60% / .35)` : "none" }}
+                        className="relative grid h-16 w-16 place-items-center overflow-hidden rounded-full border bg-black/60 transition-transform duration-300 group-hover:scale-110"
+                        style={{ borderColor: has ? `hsl(${e.hue} 85% 60%)` : "rgba(255,255,255,0.15)" }}
                       >
-                        <EmotionArt emotion={e.id} size={56} dim={!has} />
+                        {/* hue glow — fades in on hover, out on leave */}
+                        <span
+                          aria-hidden
+                          className="pointer-events-none absolute inset-0 rounded-full opacity-0 transition-opacity duration-300 group-hover:opacity-100"
+                          style={{ boxShadow: `0 0 26px hsl(${e.hue} 90% 60% / .65), inset 0 0 14px hsl(${e.hue} 90% 60% / .35)` }}
+                        />
+                        {/* image dimmed at rest, brightens + saturates toward the emotion colour on hover */}
+                        <EmotionArt
+                          emotion={e.id}
+                          size={56}
+                          dim={!has}
+                          className={has ? "transition duration-300 [filter:saturate(.7)_brightness(.9)] group-hover:[filter:saturate(1.5)_brightness(1.3)]" : ""}
+                        />
                       </span>
                       <span className="font-jetbrains mt-2 text-[12px] font-medium text-white transition group-hover:text-cyan-200">{e.label}</span>
                       <span className="font-jetbrains text-[11px]" style={{ color: has ? "hsl(160 60% 60%)" : "rgba(255,255,255,0.5)" }}>
