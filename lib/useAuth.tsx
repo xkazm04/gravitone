@@ -4,9 +4,30 @@
 // upsert a user profile in Firestore (users/{uid}) and keep it in sync.
 
 import { createContext, useCallback, useContext, useEffect, useState } from "react";
-import { onAuthStateChanged, signInWithPopup, signOut as fbSignOut, type User } from "firebase/auth";
+import {
+  browserLocalPersistence,
+  getRedirectResult,
+  onAuthStateChanged,
+  setPersistence,
+  signInWithPopup,
+  signInWithRedirect,
+  signOut as fbSignOut,
+  type AuthError,
+  type User,
+} from "firebase/auth";
 import { doc, getDoc, serverTimestamp, setDoc, updateDoc } from "firebase/firestore";
 import { auth, db, firebaseReady, googleProvider } from "./firebase";
+
+// Popup can fail (blocked, closed, COOP, internal-error) — fall back to a
+// full-page redirect, which always works. getRedirectResult (on mount) then
+// completes that path.
+const REDIRECT_FALLBACK = new Set([
+  "auth/popup-blocked",
+  "auth/popup-closed-by-user",
+  "auth/cancelled-popup-request",
+  "auth/internal-error",
+  "auth/operation-not-supported-in-this-environment",
+]);
 
 export type Profile = {
   uid: string;
@@ -39,6 +60,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     if (!firebaseReady) { setLoading(false); return; }
+    // Complete a redirect-based sign-in if we came back from one.
+    getRedirectResult(auth).catch((e) => setError(e instanceof Error ? e.message : "sign-in failed"));
     return onAuthStateChanged(auth, async (u) => {
       setUser(u);
       if (u) {
@@ -64,8 +87,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const signIn = useCallback(async () => {
     setError(null);
     if (!firebaseReady) { setError("Firebase not configured"); return; }
-    try { await signInWithPopup(auth, googleProvider); }
-    catch (e) { setError(e instanceof Error ? e.message : "sign-in failed"); }
+    await setPersistence(auth, browserLocalPersistence);
+    try {
+      await signInWithPopup(auth, googleProvider);
+    } catch (e) {
+      const code = (e as AuthError)?.code ?? "";
+      const coop = /Cross-Origin-Opener-Policy|window\.close/i.test(String(e));
+      if (REDIRECT_FALLBACK.has(code) || coop) {
+        try { await signInWithRedirect(auth, googleProvider); return; }
+        catch (e2) { setError(e2 instanceof Error ? e2.message : "sign-in failed"); return; }
+      }
+      setError(e instanceof Error ? e.message : "sign-in failed");
+    }
   }, []);
 
   const signOut = useCallback(async () => { await fbSignOut(auth); }, []);
