@@ -1,7 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import { Wordmark, Button } from "./Primitives";
+import { Wordmark } from "./Primitives";
+import UserMenu from "./UserMenu";
 
 const MODULES = [
   { label: "Playground", href: "/playground" },
@@ -25,7 +26,7 @@ export default function AppFrame({ children }: { children: React.ReactNode }) {
               </Link>
             ))}
           </div>
-          <Button variant="ghost" className="px-4 py-1.5">Sign in</Button>
+          <UserMenu />
         </nav>
         {children}
       </div>

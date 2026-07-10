@@ -8,6 +8,7 @@ import {
   Shantell_Sans,
 } from "next/font/google";
 import "./globals.css";
+import { AuthProvider } from "@/lib/useAuth";
 
 const instrument = Instrument_Serif({ weight: "400", subsets: ["latin"], variable: "--font-instrument", display: "swap" });
 const hanken = Hanken_Grotesk({ subsets: ["latin"], variable: "--font-hanken", display: "swap" });
@@ -31,7 +32,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           bricolage.variable, gabarito.variable, shantell.variable,
         ].join(" ")}
       >
-        {children}
+        <AuthProvider>{children}</AuthProvider>
       </body>
     </html>
   );
