@@ -37,10 +37,10 @@ cmd_up() {
   if [ -n "$existing" ] && [ "$existing" != "None" ]; then
     echo "instance exists: $existing (starting if stopped)"; "${AWS[@]}" ec2 start-instances --instance-ids "$existing" >/dev/null || true
   else
-    # Latest Ubuntu 24.04 arm64 AMI from Canonical's public SSM parameter.
-    local ami; ami="$("${AWS[@]}" ssm get-parameter \
-      --name /aws/service/canonical/ubuntu/server/24.04/stable/current/arm64/hvm/ebs-gp3/ami-id \
-      --query 'Parameter.Value' --output text)"
+    # Latest Ubuntu 24.04 (noble) arm64 AMI, resolved from Canonical's owner id.
+    local ami; ami="$("${AWS[@]}" ec2 describe-images --owners 099720109477 \
+      --filters "Name=name,Values=ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-*" "Name=state,Values=available" \
+      --query 'reverse(sort_by(Images,&CreationDate))[0].ImageId' --output text)"
     echo "launching $TYPE from $ami ..."
     local id; id="$("${AWS[@]}" ec2 run-instances \
       --image-id "$ami" --instance-type "$TYPE" \

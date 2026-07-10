@@ -18,7 +18,7 @@ SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
 # ---------- 1. setup ----------
 echo ">> installing system deps ..."
 $SUDO apt-get update -y >/dev/null
-$SUDO apt-get install -y python3 python3-venv python3-pip ffmpeg curl >/dev/null
+$SUDO apt-get install -y python3 python3-venv python3-pip ffmpeg curl psmisc >/dev/null
 [ -d .venv ] || python3 -m venv .venv
 # shellcheck disable=SC1091
 source .venv/bin/activate
