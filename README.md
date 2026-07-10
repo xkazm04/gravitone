@@ -159,8 +159,44 @@ paths, same auth header, same body shape. What maps where:
 | `voice_settings.similarity_boost`, `style` | ⚪ accepted, ignored | no equivalent knob in pocket-tts |
 | `GET /v1/voices` | ✅ same path | readable with a tts-scoped key, like ElevenLabs |
 | Voice cloning | ✅ `POST /v1/voices` (multipart) | 16 s sample → reusable voice |
+| Emotion addressing | ✅➕ Gravitone extension | `/v1/text-to-speech/{character}:{emotion}` (or `?emotion=`), baseline fallback reported in `X-Emotion-*` headers |
+| Multi-character scripts | ✅➕ `POST /v1/performance` | one call, many Characters, inline `[emotion]` metatags; needs the `performance` key scope |
+| Character capability manifest | ✅➕ `GET /v1/characters/{id}/manifest` | which emotions a Character performs natively vs falls back |
 | Streaming endpoint (`/stream`) | ❌ not yet | whole-utterance responses; ~realtime on Arm |
 | Usage accounting | ✅ `X-Audio-Seconds` header + `audio_seconds_total` in `/metrics` | feeds the studio's "you'd have paid $X at ElevenLabs" ticker |
+
+### Characters, not voices — the emotion-addressable API
+
+A **Character** groups cloned Voices of one speaker across the emotion scale
+(baseline, calm, happy, excited, sad, angry, whisper, confused). Three ways to
+direct one:
+
+```bash
+# 1. Emotion addressing on the compatible endpoint — voice_id is character:emotion
+curl -X POST "localhost:8080/v1/text-to-speech/sarah:excited" \
+  -H "xi-api-key: $KEY" -H "Content-Type: application/json" \
+  -d '{"text":"One character, many moods."}' --output line.wav
+# Missing emotions fall back to baseline — see X-Emotion-Used / X-Emotion-Fallback.
+
+# 2. Inline metatags: emotions switch mid-script (X-Segments has the report)
+curl -X POST "localhost:8080/v1/speak" \
+  -H "xi-api-key: $KEY" -H "Content-Type: application/json" \
+  -d '{"character_id":"sarah","text":"Hello. [excited]This is amazing![/excited] Back to calm."}' \
+  --output scene.wav
+
+# 3. Character Performance API: a multi-character script in one call
+#    (premium — requires a key with the "performance" scope)
+curl -X POST "localhost:8080/v1/performance" \
+  -H "xi-api-key: $KEY" -H "Content-Type: application/json" \
+  -d '{"lines":[
+        {"character_id":"sarah","text":"[excited]We open at dawn."},
+        {"character_id":"alba","text":"And the narrator sets the scene."}]}' \
+  --output act1.wav
+# Per-line/segment substitution report: X-Performance-Report (base64 JSON).
+
+# Check what a Character can perform before directing it:
+curl -s -H "xi-api-key: $KEY" localhost:8080/v1/characters/sarah/manifest
+```
 
 ## The full studio — two products
 
