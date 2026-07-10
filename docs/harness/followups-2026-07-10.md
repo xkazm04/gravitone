@@ -21,6 +21,19 @@ Each needs a product/pricing decision or a bigger engine than the wave scoped.
   the guided recorder, which clones from a fresh take — good enough until
   stem-level fidelity matters.
 
+## From character-packs (wave 5)
+
+- **Pack gallery / marketplace** (all three ideas' second half): publishing,
+  browsing, licensing and paid packs need hosting + payments + moderation —
+  a product decision. The portable format (.gravichar) and export/import
+  endpoints are done; a gallery is purely additive.
+- **Keypair signing**: packs currently carry per-file sha256 (integrity,
+  always verified) and optional HMAC via shared TTS_PACK_SECRET (team
+  authenticity). Public distribution needs Ed25519 creator keys + a trust
+  model.
+- **License/creator fields** exist in the manifest but nothing fills them —
+  add to the export UI when the gallery lands.
+
 ## From earlier waves
 
 - **Streaming synthesis** (compat matrix ❌ row): whole-utterance responses
