@@ -79,12 +79,16 @@ for i in $(seq 0 $((HALF-1))); do
     python -m service.app >"logs/proc_$port.log" 2>&1 &
 done
 for i in $(seq 0 $((HALF-1))); do wait_ready $((8080+i)) || echo "!! proc $((8080+i)) not ready"; done
+lt_pids=()
 for i in $(seq 0 $((HALF-1))); do
   port=$((8080+i))
   python -m service.loadtest --url "http://127.0.0.1:$port" --voice "$VOICE" \
     --levels 2 --requests 10 --out "results/proc_$port.json" >"logs/lt_proc_$port.log" 2>&1 &
+  lt_pids+=($!)
 done
-wait
+# Wait ONLY for the load-tests — a bare `wait` would also block on the
+# never-exiting service.app background processes started above.
+wait "${lt_pids[@]}"
 python - <<'PY'
 import json,glob
 tot=0; rows=[]
