@@ -3,28 +3,33 @@
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import AppFrame from "@/components/ui/AppFrame";
+import PrototypeTabs from "@/components/ui/PrototypeTabs";
 import { Button, Eyebrow } from "@/components/ui/Primitives";
 import EmotionArt from "@/components/ui/EmotionArt";
 import { emotionMeta } from "@/lib/emotions";
-import StepProgress, { type Step } from "./_components/StepProgress";
+import SignalFlow from "./_loaders/SignalFlow";
+import WaveformLab from "./_loaders/WaveformLab";
+import type { LoaderData, LoaderStep, Partial as PartialData } from "./_loaders/shared";
 
+type Speaker = { id: string; utterances: number; seconds: number; sample_text: string };
 type Stem = { emotion: string; seconds: number; segments: number; eligible: boolean; cues: string[] };
-type ScanResult = { duration: number; speakers: string[]; target: string; utterances: number; min_stem: number; stems: Stem[] };
+type Result = { duration: number; speakers: string[]; target: string; utterances: number; stems: Stem[] };
 type Character = { character_id: string; name: string };
+type Job = { status: string; step: string | null; steps: LoaderStep[]; partial: PartialData;
+  speakers: Speaker[] | null; duration: number; result: Result | null; error: string | null };
 
-type Phase = "upload" | "scanning" | "review" | "committing" | "done";
+type Phase = "upload" | "processing" | "speaker" | "review" | "committing" | "complete";
 
 export default function NewCharacterPage() {
   const [phase, setPhase] = useState<Phase>("upload");
   const [file, setFile] = useState<File | null>(null);
   const [dragging, setDragging] = useState(false);
   const [jobId, setJobId] = useState<string | null>(null);
-  const [steps, setSteps] = useState<Step[]>([]);
-  const [result, setResult] = useState<ScanResult | null>(null);
+  const [job, setJob] = useState<Job | null>(null);
+  const [result, setResult] = useState<Result | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
 
-  // assignment
   const [mode, setMode] = useState<"new" | "extend">("new");
   const [charName, setCharName] = useState("");
   const [extendCid, setExtendCid] = useState("");
@@ -42,28 +47,22 @@ export default function NewCharacterPage() {
       .catch(() => {});
   }, [phase]);
 
-  // poll the scan job
+  // poll the job while processing or awaiting a speaker
   useEffect(() => {
-    if (phase !== "scanning" || !jobId) return;
+    if (!jobId || !(phase === "processing" || phase === "speaker")) return;
     const iv = setInterval(async () => {
       try {
         const r = await fetch(`/api/ingest/${jobId}`, { cache: "no-store" });
-        const j = await r.json();
-        setSteps(j.steps ?? []);
-        if (j.status === "done") {
-          clearInterval(iv);
-          setResult(j.result);
-          setSelected(new Set((j.result.stems as Stem[]).filter((s) => s.eligible).map((s) => s.emotion)));
-          setPhase("review");
-        } else if (j.status === "error") {
-          clearInterval(iv); setError(j.error ?? "scan failed"); setPhase("upload");
-        }
+        const j: Job = await r.json();
+        setJob(j);
+        if (j.status === "awaiting_speaker") setPhase("speaker");
+        else if (j.status === "running") setPhase("processing");
+        else if (j.status === "done" && j.result) { setResult(j.result); setSelected(new Set(j.result.stems.filter((s) => s.eligible).map((s) => s.emotion))); setPhase("review"); clearInterval(iv); }
+        else if (j.status === "error") { setError(j.error ?? "failed"); setPhase("upload"); clearInterval(iv); }
       } catch { /* keep polling */ }
-    }, 1800);
+    }, 1500);
     return () => clearInterval(iv);
-  }, [phase, jobId]);
-
-  function pickFile(f: File) { setFile(f); setError(null); }
+  }, [jobId, phase]);
 
   async function startScan() {
     if (!file) return;
@@ -75,24 +74,28 @@ export default function NewCharacterPage() {
       const j = await r.json();
       if (!r.ok) throw new Error(j?.detail ?? "scan failed to start");
       setJobId(j.job_id);
-      setSteps([
+      setJob({ status: "running", step: "transcribe", steps: [
         { key: "transcribe", label: "Transcribe & diarize", state: "active" },
         { key: "isolate", label: "Isolate voice", state: "pending" },
         { key: "label", label: "Detect emotions", state: "pending" },
-        { key: "stem", label: "Build emotion stems", state: "pending" },
-      ]);
-      setPhase("scanning");
+        { key: "stem", label: "Build emotion stems", state: "pending" }],
+        partial: {}, speakers: null, duration: 0, result: null, error: null });
+      setPhase("processing");
     } catch (e) { setError(e instanceof Error ? e.message : "scan failed"); }
   }
 
-  function preview(emotion: string) {
-    if (!jobId) return;
-    if (playing === emotion) { audioRef.current?.pause(); setPlaying(null); return; }
+  async function chooseSpeaker(sid: string) {
+    audioRef.current?.pause(); setPlaying(null);
+    await fetch(`/api/ingest/${jobId}/speaker`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ speaker_id: sid }) });
+    setPhase("processing");
+  }
+
+  function playClip(url: string, id: string) {
+    if (playing === id) { audioRef.current?.pause(); setPlaying(null); return; }
     audioRef.current?.pause();
     const a = audioRef.current ?? (audioRef.current = new Audio());
-    a.src = `/api/ingest/${jobId}/preview/${emotion}`;
-    a.onended = () => setPlaying(null);
-    void a.play(); setPlaying(emotion);
+    a.src = url; a.onended = () => setPlaying(null);
+    void a.play(); setPlaying(id);
   }
 
   function toggle(emotion: string) {
@@ -107,23 +110,19 @@ export default function NewCharacterPage() {
     if (mode === "extend" && !extendCid) { setError("Pick a character to extend"); return; }
     setPhase("committing"); setError(null);
     try {
-      const r = await fetch(`/api/ingest/${jobId}/commit`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ character, emotions: [...selected], character_id }),
-      });
+      const r = await fetch(`/api/ingest/${jobId}/commit`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ character, emotions: [...selected], character_id }) });
       const j = await r.json();
       if (!r.ok) throw new Error(j?.detail ?? "commit failed");
-      setCreated(j.created ?? []);
-      setCommittedCid(character_id ?? slug(character));
-      setPhase("done");
+      setCreated(j.created ?? []); setCommittedCid(character_id ?? slug(character)); setPhase("complete");
     } catch (e) { setError(e instanceof Error ? e.message : "commit failed"); setPhase("review"); }
   }
 
   function scanAnother() {
-    // keep extending the just-created character
     setMode("extend"); setExtendCid(committedCid ?? extendCid);
-    setFile(null); setResult(null); setJobId(null); setSteps([]); setCreated([]); setPhase("upload");
+    setFile(null); setResult(null); setJobId(null); setJob(null); setCreated([]); setPhase("upload");
   }
+
+  const loaderData: LoaderData = { steps: job?.steps ?? [], partial: job?.partial ?? {}, duration: job?.duration };
 
   return (
     <AppFrame>
@@ -132,8 +131,8 @@ export default function NewCharacterPage() {
         <Eyebrow>new character</Eyebrow>
         <h1 className="font-instrument mt-3 text-4xl text-white">Build from a recording.</h1>
         <p className="mt-2 max-w-2xl text-base text-white/70">
-          Drop a recording — we transcribe &amp; diarize it, isolate one speaker, detect emotions,
-          and propose a set of emotion Voices you assign into a Character.
+          Drop a recording — we transcribe &amp; diarize it, you pick the speaker, we isolate them,
+          detect emotions, and propose a set of emotion Voices to assign into a Character.
         </p>
 
         {error && <p className="font-jetbrains mt-4 rounded-lg border border-rose-400/25 bg-rose-400/5 px-4 py-2 text-[12px] text-rose-200">{error}</p>}
@@ -144,83 +143,126 @@ export default function NewCharacterPage() {
             <div
               onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
               onDragLeave={() => setDragging(false)}
-              onDrop={(e) => { e.preventDefault(); setDragging(false); const f = e.dataTransfer.files?.[0]; if (f) pickFile(f); }}
+              onDrop={(e) => { e.preventDefault(); setDragging(false); const f = e.dataTransfer.files?.[0]; if (f) { setFile(f); setError(null); } }}
               onClick={() => fileRef.current?.click()}
               className={`grid cursor-pointer place-items-center rounded-2xl border-2 border-dashed px-6 py-14 text-center transition ${dragging ? "border-cyan-400/60 bg-cyan-400/5" : "border-white/12 hover:border-white/30"}`}
             >
-              <input ref={fileRef} type="file" accept="audio/*,video/mp4" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) pickFile(f); }} />
+              <input ref={fileRef} type="file" accept="audio/*,video/mp4" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) { setFile(f); setError(null); } }} />
               <div>
                 <div className="text-lg text-white">{file ? file.name : "Drop an mp3 / recording, or click to choose"}</div>
                 <div className="font-jetbrains mt-1 text-[12px] text-white/55">
-                  {file ? `${(file.size / 1024 / 1024).toFixed(2)} MB` : "a minute+ of one person speaking, with emotional range, works best"}
+                  {file ? `${(file.size / 1024 / 1024).toFixed(2)} MB` : "a minute+ of speech with emotional range works best"}
                 </div>
               </div>
             </div>
-            {committedCid && (
-              <p className="font-jetbrains mt-3 text-[12px] text-cyan-300/80">Extending an existing character with more emotions.</p>
-            )}
+            {committedCid && <p className="font-jetbrains mt-3 text-[12px] text-cyan-300/80">Extending an existing character with more emotions.</p>}
             <Button onClick={startScan} disabled={!file} className="mt-5 cursor-pointer">Scan recording →</Button>
           </div>
         )}
 
-        {/* SCANNING */}
-        {phase === "scanning" && (
-          <div className="mt-12 max-w-3xl">
-            <StepProgress steps={steps} />
-            <p className="font-jetbrains mt-8 text-center text-[12px] text-white/55">Analysing… this takes a minute for a short clip.</p>
+        {/* PROCESSING — loader (A/B) */}
+        {phase === "processing" && (
+          <div className="mt-10 max-w-3xl">
+            <PrototypeTabs storageKey="proto-ingest-loader" variants={[
+              { id: "flow", label: "Signal Flow", sub: "pipeline", node: <SignalFlow data={loaderData} /> },
+              { id: "lab", label: "Waveform Lab", sub: "living waveform", node: <WaveformLab data={loaderData} /> },
+            ]} />
           </div>
         )}
 
-        {/* REVIEW */}
+        {/* SPEAKER PICK */}
+        {phase === "speaker" && job?.speakers && (
+          <div className="mt-8 max-w-3xl">
+            <h2 className="font-instrument text-2xl text-white">Which voice is your character?</h2>
+            <p className="mt-1 text-sm text-white/60">{job.speakers.length} speakers detected. Play a sample, then pick the one to build from.</p>
+            <div className="mt-5 space-y-2">
+              {job.speakers.map((s, i) => (
+                <div key={s.id} className="glass-panel flex items-center gap-3 rounded-xl px-4 py-3">
+                  <span className="grid h-9 w-9 shrink-0 place-items-center rounded-full text-sm font-semibold text-slate-950" style={{ background: `hsl(${(i * 67) % 360} 85% 65%)` }}>{i + 1}</span>
+                  <button onClick={() => playClip(`/api/ingest/${jobId}/speaker-preview/${s.id}`, s.id)} aria-label="Play sample"
+                    className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-cyan-300 text-[12px] text-slate-950 transition hover:brightness-110">
+                    {playing === s.id ? "⏸" : "▶"}
+                  </button>
+                  <div className="min-w-0 flex-1">
+                    <div className="font-jetbrains text-[12px] text-white/80">{s.id} · <span className="text-white">{s.seconds}s</span> · {s.utterances} utterances</div>
+                    <div className="line-clamp-1 text-sm italic text-white/50">“{s.sample_text}”</div>
+                  </div>
+                  <Button onClick={() => chooseSpeaker(s.id)} className="shrink-0 cursor-pointer px-4 py-2 text-[13px]">Use this →</Button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* REVIEW — ledger */}
         {phase === "review" && result && (
           <div className="mt-8">
-            <StepProgress steps={steps.map((s) => ({ ...s, state: "done" }))} />
-
-            <div className="font-jetbrains mt-8 flex flex-wrap gap-4 text-[12px] text-white/60">
+            <div className="font-jetbrains flex flex-wrap gap-4 text-[12px] text-white/60">
               <span>{result.duration}s audio</span>
-              <span>{result.speakers.length} speaker(s) · target <span className="text-white">{result.target}</span></span>
+              <span>{result.speakers.length} speakers · target <span className="text-white">{result.target}</span></span>
               <span>{result.utterances} utterances</span>
             </div>
 
-            <h2 className="font-instrument mt-6 text-2xl text-white">Proposed voices</h2>
-            <p className="mt-1 text-sm text-white/60">Toggle which emotions to keep. Ineligible ones are too short — descope or extend later.</p>
-
-            <div className="mt-5 grid gap-3 sm:grid-cols-2">
-              {result.stems.map((st) => {
-                const on = selected.has(st.emotion);
-                const m = emotionMeta(st.emotion);
-                return (
-                  <div key={st.emotion} className={`glass-panel rounded-2xl p-4 transition ${on ? "" : "opacity-60"}`}
-                    style={on ? { borderColor: `hsl(${m.hue} 70% 55% / .4)` } : undefined}>
-                    <div className="flex items-center gap-3">
-                      <span className="grid h-11 w-11 shrink-0 place-items-center overflow-hidden rounded-lg border border-white/8 bg-black/40">
-                        <EmotionArt emotion={st.emotion} size={38} dim={!st.eligible && !on} />
-                      </span>
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-2">
-                          <span className="text-base font-medium text-white">{m.label}</span>
-                          {!st.eligible && <span className="font-jetbrains rounded bg-amber-400/10 px-1.5 py-0.5 text-[10px] text-amber-200">short</span>}
-                        </div>
-                        <div className="font-jetbrains text-[11px] text-white/55">{st.seconds}s · {st.segments} seg</div>
-                      </div>
-                      <button onClick={() => preview(st.emotion)} aria-label="Preview"
-                        className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-cyan-300 text-[12px] text-slate-950 transition hover:brightness-110">
-                        {playing === st.emotion ? "⏸" : "▶"}
-                      </button>
-                      <button onClick={() => toggle(st.emotion)} aria-pressed={on}
-                        className={`font-jetbrains shrink-0 rounded-lg border px-2.5 py-1 text-[11px] transition ${on ? "border-cyan-400/40 bg-cyan-400/10 text-cyan-200" : "border-white/12 text-white/55 hover:text-white"}`}>
-                        {on ? "✓ keep" : "descope"}
-                      </button>
-                    </div>
-                    {st.cues.length > 0 && (
-                      <p className="mt-2 line-clamp-1 pl-14 text-[11px] italic text-white/45">“{st.cues[0]}”</p>
-                    )}
-                  </div>
-                );
-              })}
+            <div className="mt-6 flex items-end justify-between">
+              <div>
+                <h2 className="font-instrument text-2xl text-white">Proposed voices</h2>
+                <p className="mt-1 text-sm text-white/60">Keep or descope each emotion. “Short” stems are below the clone threshold.</p>
+              </div>
+              <span className="font-jetbrains text-[12px] text-white/60">{selected.size} selected</span>
             </div>
 
-            {/* assign */}
+            <div className="glass-panel mt-4 overflow-x-auto rounded-xl">
+              <table className="w-full min-w-[680px] border-collapse text-sm">
+                <thead className="border-b border-white/8">
+                  <tr className="font-jetbrains text-[11px] uppercase tracking-widest text-white/60">
+                    <th className="w-12 px-3 py-2" />
+                    <th className="px-3 py-2 text-left font-normal">emotion</th>
+                    <th className="px-3 py-2 text-left font-normal">length</th>
+                    <th className="px-3 py-2 text-left font-normal">segments</th>
+                    <th className="px-3 py-2 text-left font-normal">vocal cue</th>
+                    <th className="w-24 px-3 py-2" />
+                    <th className="w-28 px-3 py-2" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {result.stems.map((st) => {
+                    const on = selected.has(st.emotion);
+                    const m = emotionMeta(st.emotion);
+                    return (
+                      <tr key={st.emotion} className={`border-b border-white/5 transition hover:bg-white/[0.03] ${on ? "" : "opacity-55"}`}>
+                        <td className="px-3 py-2">
+                          <span className="grid h-9 w-9 place-items-center overflow-hidden rounded-lg border border-white/8 bg-black/40">
+                            <EmotionArt emotion={st.emotion} size={30} dim={!on} />
+                          </span>
+                        </td>
+                        <td className="px-3 py-2">
+                          <span className="flex items-center gap-2 text-sm font-medium text-white">
+                            <span className="h-2 w-2 rounded-full" style={{ background: `hsl(${m.hue} 85% 62%)` }} />{m.label}
+                            {!st.eligible && <span className="font-jetbrains rounded bg-amber-400/10 px-1.5 py-0.5 text-[10px] text-amber-200">short</span>}
+                          </span>
+                        </td>
+                        <td className="font-jetbrains px-3 py-2 text-[12px] text-white/70">{st.seconds}s</td>
+                        <td className="font-jetbrains px-3 py-2 text-[12px] text-white/60">{st.segments}</td>
+                        <td className="px-3 py-2 text-[12px] italic text-white/50">{st.cues[0] ? `“${st.cues[0]}”` : "—"}</td>
+                        <td className="px-3 py-2">
+                          <button onClick={() => playClip(`/api/ingest/${jobId}/preview/${st.emotion}`, `stem-${st.emotion}`)}
+                            className="grid h-8 w-8 place-items-center rounded-full bg-cyan-300 text-[12px] text-slate-950 transition hover:brightness-110">
+                            {playing === `stem-${st.emotion}` ? "⏸" : "▶"}
+                          </button>
+                        </td>
+                        <td className="px-3 py-2 text-right">
+                          <button onClick={() => toggle(st.emotion)} aria-pressed={on}
+                            className={`font-jetbrains rounded-lg border px-2.5 py-1 text-[11px] transition ${on ? "border-cyan-400/40 bg-cyan-400/10 text-cyan-200" : "border-white/12 text-white/55 hover:text-white"}`}>
+                            {on ? "✓ keep" : "descope"}
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+
             <div className="glass-panel mt-6 max-w-2xl rounded-2xl p-5">
               <div className="flex gap-2">
                 <button onClick={() => setMode("new")} className={`font-jetbrains cursor-pointer rounded-full border px-3 py-1.5 text-[12px] ${mode === "new" ? "border-cyan-400/40 bg-cyan-400/10 text-cyan-200" : "border-white/12 text-white/60"}`}>New character</button>
@@ -249,12 +291,12 @@ export default function NewCharacterPage() {
         {phase === "committing" && (
           <div className="mt-16 text-center">
             <div className="font-jetbrains text-[12px] uppercase tracking-widest text-cyan-300">cloning {selected.size} voice(s)…</div>
-            <p className="mt-2 text-sm text-white/60">Each emotion is being cloned on the CPU engine (~15s each).</p>
+            <p className="mt-2 text-sm text-white/60">Each emotion is cloned on the CPU engine (~15s each).</p>
           </div>
         )}
 
-        {/* DONE */}
-        {phase === "done" && (
+        {/* COMPLETE */}
+        {phase === "complete" && (
           <div className="mt-10 max-w-2xl">
             <div className="glass-panel rounded-2xl p-6">
               <div className="font-jetbrains text-[11px] uppercase tracking-widest text-emerald-300">character ready</div>
