@@ -23,7 +23,12 @@ $SUDO apt-get install -y python3 python3-venv python3-pip ffmpeg curl psmisc >/d
 # shellcheck disable=SC1091
 source .venv/bin/activate
 pip install -q -U pip
-echo ">> installing python deps (pulls Arm-optimized torch) ..."
+# IMPORTANT: on aarch64, plain PyPI torch is a CUDA (GH200) build that bypasses
+# the oneDNN + Arm Compute Library CPU path. Install the CPU wheel explicitly
+# FIRST so pocket-tts sees torch already satisfied and we get ACL/KleidiAI.
+echo ">> installing CPU-optimized Arm torch (oneDNN+ACL) from the CPU index ..."
+pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+echo ">> installing remaining deps ..."
 pip install -q -r requirements.txt
 
 # ---------- 2. env / sizing ----------
