@@ -187,6 +187,37 @@ def get_voices() -> list[Voice]:
     return [v for c in list_characters() for v in c.voices]
 
 
+@router.get("/v1/characters/{character_id}/manifest")
+def character_manifest(character_id: str) -> dict:
+    """Validated performance manifest: exactly which emotions this Character
+    can perform natively, and what every other request will fall back to.
+    Clients check this before directing a script (/v1/performance)."""
+    for c in list_characters():
+        if c.character_id != character_id:
+            continue
+        native = {
+            v.emotion: {"voice_id": v.voice_id, "sample_seconds": v.sample_seconds}
+            for v in c.voices
+        }
+        fallback = BASELINE if BASELINE in native else next(iter(native), None)
+        return {
+            "character_id": c.character_id,
+            "name": c.name,
+            "category": c.category,
+            "emotion_scale": EMOTION_SCALE,
+            "performable": native,
+            "missing": [e for e in EMOTION_SCALE if e not in native],
+            "fallback": fallback,
+            "coverage": f"{c.coverage}/{c.total}",
+            "addressing": {
+                "tts": f"POST /v1/text-to-speech/{c.character_id}:{{emotion}}",
+                "speak": "POST /v1/speak with [emotion]...[/emotion] metatags",
+                "performance": "POST /v1/performance with lines[].character_id",
+            },
+        }
+    raise HTTPException(404, "character not found")
+
+
 @router.post("/v1/voices", response_model=Voice, status_code=201)
 async def create_voice(
     file: UploadFile = File(...),

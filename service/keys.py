@@ -22,7 +22,9 @@ from service.config import SETTINGS
 router = APIRouter(prefix="/v1/keys", tags=["keys"])
 
 KEYS_PATH = Path(SETTINGS.voices_dir).parent / "api_keys.json"
-SCOPES = ["tts", "voices", "clone"]  # tts=synthesize, voices=manage, clone=upload
+# tts=synthesize, voices=manage, clone=upload,
+# performance=multi-character scripts (/v1/performance — the premium tier)
+SCOPES = ["tts", "voices", "clone", "performance"]
 
 
 class ApiKey(BaseModel):
