@@ -11,6 +11,10 @@ Usage:
       --url http://127.0.0.1:8080 --voice step4 \
       --levels 1,2,3,4,6,8 --requests 12
 
+  # Sizing advisor: turn an existing result JSON into the exact env vars
+  # (also printed automatically at the end of every run):
+  python -m service.loadtest --plan [--out service/loadtest_result.json]
+
 Degradation is flagged when ANY of these trip vs the level-1 baseline:
   * p95 latency > --degrade-factor x baseline p95   (default 2.0)
   * any HTTP 429 (queue overflow) or errors
@@ -121,6 +125,46 @@ async def run_level(url, voice, text, fmt, concurrency, n_requests):
     }
 
 
+def print_plan(result: dict) -> None:
+    """Sizing advisor: translate measured knee data into the exact deployment
+    env vars (mirrors the /benchmarks capacity planner in the web studio).
+
+    Grounded in the benchmark finding that throughput scales by
+    process/replica, not in-process workers (the model is GIL-bound): the
+    safe cap becomes the number of single-worker processes to run.
+    """
+    import os
+
+    rows = result.get("levels") or []
+    if not rows:
+        print("no levels in result -- run the load test first")
+        return
+    knee = result.get("knee")
+    cap = result.get("recommended_cap") or rows[-1]["concurrency"]
+    at_cap = next((r for r in rows if r["concurrency"] == cap), rows[-1])
+    cores = os.cpu_count() or cap
+    threads = max(1, cores // cap)
+    queue_max = max(8, 4 * cap)
+
+    print("\n" + "-" * 60)
+    print("Deployment plan (from measured knee)")
+    print("-" * 60)
+    if knee:
+        print(f"Safe concurrency cap: {cap}  (degradation first at {knee})")
+    else:
+        print(f"Safe concurrency cap: >= {cap}  (no degradation seen -- true cap is higher)")
+    if at_cap.get("audio_s_per_wall_s"):
+        aud = at_cap["audio_s_per_wall_s"]
+        print(f"Throughput at cap: {aud} audio-s/s ~= {round(aud * 60)} audio-min/hour")
+    print(f"\nRun {cap} single-worker processes behind a load balancer:")
+    print(f"  TTS_WORKERS=1")
+    print(f"  TTS_TORCH_THREADS={threads}        # {cores} cores / {cap} processes")
+    print(f"  TTS_QUEUE_MAX={queue_max}          # ~4x cap of waiting requests")
+    print("\nScale by adding processes/replicas, not in-process workers (GIL-bound).")
+    print("Full calculator + $/audio-hour comparison: the studio's /benchmarks page.")
+    print("-" * 60)
+
+
 async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://127.0.0.1:8080")
@@ -134,7 +178,17 @@ async def main():
     ap.add_argument("--degrade-factor", type=float, default=2.0)
     ap.add_argument("--cpu-ceiling", type=float, default=95.0)
     ap.add_argument("--out", default="service/loadtest_result.json")
+    ap.add_argument("--plan", action="store_true",
+                    help="print the sizing advisor for an existing --out result and exit (no load run)")
     args = ap.parse_args()
+
+    if args.plan:
+        try:
+            with open(args.out) as f:
+                print_plan(json.load(f))
+        except FileNotFoundError:
+            print(f"{args.out} not found — run the load test first")
+        return
 
     # readiness check
     async with httpx.AsyncClient() as c:
@@ -189,10 +243,12 @@ async def main():
               f"Push higher with --levels to find the ceiling.")
     print("=" * 60)
 
+    result = {"levels": rows, "knee": knee, "recommended_cap": recommended,
+              "args": vars(args)}
     with open(args.out, "w") as f:
-        json.dump({"levels": rows, "knee": knee, "recommended_cap": recommended,
-                   "args": vars(args)}, f, indent=2)
+        json.dump(result, f, indent=2)
     print(f"wrote {args.out}")
+    print_plan(result)
 
 
 if __name__ == "__main__":
