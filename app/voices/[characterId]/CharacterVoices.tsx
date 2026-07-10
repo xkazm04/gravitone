@@ -4,6 +4,7 @@ import Link from "next/link";
 import { Eyebrow } from "@/components/ui/Primitives";
 import { useCharacterVoices } from "./_variants/useCharacterVoices";
 import EmotionRack from "./_variants/EmotionRack";
+import ApiPanel from "./_variants/ApiPanel";
 
 // Rack won the voice-overview round — rendered directly, no switcher.
 export default function CharacterVoices({ characterId }: { characterId: string }) {
@@ -53,6 +54,8 @@ export default function CharacterVoices({ characterId }: { characterId: string }
           busySlot={busySlot} addVoice={addVoice} removeVoice={removeVoice}
         />
       </div>
+
+      <ApiPanel characterId={character.character_id} filledEmotions={character.emotions} />
     </div>
   );
 }

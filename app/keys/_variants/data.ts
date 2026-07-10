@@ -17,6 +17,7 @@ export const SCOPES: { id: string; label: string; hint: string }[] = [
   { id: "tts", label: "Synthesize", hint: "generate speech" },
   { id: "voices", label: "Manage voices", hint: "rename / retag / delete" },
   { id: "clone", label: "Clone", hint: "upload & create voices" },
+  { id: "performance", label: "Performance", hint: "multi-character scripts (/v1/performance) — the premium tier" },
 ];
 
 export function relTime(iso?: string | null): string {
