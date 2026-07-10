@@ -18,7 +18,7 @@ export default function AppFrame({ children }: { children: React.ReactNode }) {
       <div className="relative mx-auto max-w-6xl px-6">
         <nav className="flex items-center justify-between py-6">
           <Link href="/"><Wordmark /></Link>
-          <div className="font-jetbrains hidden items-center gap-7 text-[13px] text-white/55 md:flex">
+          <div className="font-jetbrains hidden items-center gap-7 text-[13px] text-white/70 md:flex">
             {MODULES.map((m) => (
               <Link key={m.href} href={m.href} className="transition hover:text-white">
                 {m.label}

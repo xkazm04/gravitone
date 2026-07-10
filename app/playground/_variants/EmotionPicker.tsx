@@ -8,7 +8,7 @@
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { AnimatePresence, motion } from "framer-motion";
-import EmotionGlyph from "@/components/ui/EmotionGlyph";
+import EmotionArt from "@/components/ui/EmotionArt";
 import { EMOTIONS } from "@/lib/emotions";
 import { EASE } from "@/components/ui/tokens";
 
@@ -67,10 +67,10 @@ export default function EmotionPicker({
               </svg>
 
               {/* centre */}
-              <div className="z-10 grid h-28 w-28 place-items-center rounded-full border border-white/10 bg-[#0b0e15]/90 text-center">
+              <div className="z-10 grid h-28 w-28 place-items-center rounded-full border border-white/15 bg-[#0b0e15]/90 text-center">
                 <div>
                   <div className="font-instrument text-lg leading-tight text-white">{characterName}</div>
-                  <div className="font-jetbrains mt-1 text-[10px] uppercase tracking-widest text-white/40">pick a mood</div>
+                  <div className="font-jetbrains mt-1 text-[11px] uppercase tracking-widest text-white/60">pick a mood</div>
                 </div>
               </div>
 
@@ -79,30 +79,35 @@ export default function EmotionPicker({
                 const x = Math.cos(a) * R;
                 const y = Math.sin(a) * R;
                 const has = available.includes(e.id);
+                // Positioning transform lives on a plain wrapper; the animated
+                // button only touches opacity/scale (so framer's transform can't
+                // clobber the translate — that was the "all nodes stacked" bug).
                 return (
-                  <motion.button
-                    key={e.id}
-                    initial={{ opacity: 0, scale: 0.8 }} animate={{ opacity: 1, scale: 1 }}
-                    transition={{ duration: 0.35, ease: EASE, delay: i * 0.04 }}
-                    onClick={() => { onPick(e.id); onClose(); }}
-                    title={has ? `${e.label} — available` : `${e.label} — not recorded, falls back to baseline`}
-                    className="group absolute flex w-24 flex-col items-center"
-                    style={{ transform: `translate(${x}px, ${y}px)` }}
-                  >
-                    <span
-                      className="grid h-16 w-16 place-items-center rounded-full border bg-black/50 transition group-hover:scale-110"
-                      style={{ borderColor: has ? `hsl(${e.hue} 80% 55% / .5)` : "rgba(255,255,255,0.12)", boxShadow: has ? `0 0 22px hsl(${e.hue} 90% 60% / .3)` : "none" }}
+                  <div key={e.id} className="absolute" style={{ transform: `translate(${x}px, ${y}px)` }}>
+                    <motion.button
+                      initial={{ opacity: 0, scale: 0.8 }} animate={{ opacity: 1, scale: 1 }}
+                      transition={{ duration: 0.35, ease: EASE, delay: i * 0.04 }}
+                      onClick={() => { onPick(e.id); onClose(); }}
+                      title={has ? `${e.label} — available` : `${e.label} — not recorded, falls back to baseline`}
+                      className="group flex w-24 flex-col items-center"
                     >
-                      <EmotionGlyph emotion={e.id} size={46} dim={!has} animate={open} />
-                    </span>
-                    <span className="font-jetbrains mt-2 text-[11px] text-white/80">{e.label}</span>
-                    <span className="font-jetbrains text-[9px] text-white/30">{has ? "available" : "→ baseline"}</span>
-                  </motion.button>
+                      <span
+                        className="grid h-16 w-16 place-items-center overflow-hidden rounded-full border bg-black/60 transition duration-200 group-hover:scale-110 group-hover:brightness-125"
+                        style={{ borderColor: has ? `hsl(${e.hue} 85% 60%)` : "rgba(255,255,255,0.15)", boxShadow: has ? `0 0 22px hsl(${e.hue} 90% 60% / .35)` : "none" }}
+                      >
+                        <EmotionArt emotion={e.id} size={56} dim={!has} />
+                      </span>
+                      <span className="font-jetbrains mt-2 text-[12px] font-medium text-white transition group-hover:text-cyan-200">{e.label}</span>
+                      <span className="font-jetbrains text-[11px]" style={{ color: has ? "hsl(160 60% 60%)" : "rgba(255,255,255,0.5)" }}>
+                        {has ? "available" : "→ baseline"}
+                      </span>
+                    </motion.button>
+                  </div>
                 );
               })}
             </div>
 
-            <p className="font-jetbrains mt-2 text-center text-[11px] text-white/35">
+            <p className="font-jetbrains mt-3 text-center text-[12px] text-white/60">
               Wraps your selected text in <span className="text-cyan-300">[emotion]…[/emotion]</span>
             </p>
           </motion.div>

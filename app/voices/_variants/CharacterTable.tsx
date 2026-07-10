@@ -29,7 +29,7 @@ function CoverageBar({ c }: { c: Character }) {
           );
         })}
       </div>
-      <span className="font-jetbrains text-[11px] text-white/45">{c.coverage}/{c.total}</span>
+      <span className="font-jetbrains text-[11px] text-white/65">{c.coverage}/{c.total}</span>
     </div>
   );
 }
@@ -99,7 +99,7 @@ export default function CharacterTable() {
 
   const Th = ({ k, children }: { k: SortKey; children: React.ReactNode }) => (
     <th className="px-3 py-2 text-left font-normal">
-      <button onClick={() => toggleSort(k)} className="font-jetbrains inline-flex items-center gap-1 text-[11px] uppercase tracking-widest text-white/40 transition hover:text-white">
+      <button onClick={() => toggleSort(k)} className="font-jetbrains inline-flex items-center gap-1 text-[11px] uppercase tracking-widest text-white/60 transition hover:text-white">
         {children}<span className={sort.key === k ? "text-cyan-300" : "opacity-0"}>{sort.dir === 1 ? "↑" : "↓"}</span>
       </button>
     </th>
@@ -109,7 +109,7 @@ export default function CharacterTable() {
     <div className="pb-24">
       <Eyebrow>character roster</Eyebrow>
       <h1 className="font-instrument mt-4 text-4xl text-white">Characters.</h1>
-      <p className="mt-2 max-w-2xl text-base text-white/55">
+      <p className="mt-2 max-w-2xl text-base text-white/70">
         A <span className="text-white">Character</span> is a speaker; each of its{" "}
         <span className="text-white">Voices</span> is one emotion. Missing emotions fall back to baseline.
       </p>
@@ -123,7 +123,7 @@ export default function CharacterTable() {
       {/* toolbar */}
       <div className="mt-8 flex flex-wrap items-center gap-3">
         <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search characters, tags…"
-          className="font-hanken w-72 rounded-lg border border-white/12 bg-white/[0.03] px-3 py-2 text-sm text-white placeholder:text-white/30 focus:border-cyan-400/40 focus:outline-none" />
+          className="font-hanken w-72 rounded-lg border border-white/12 bg-white/[0.03] px-3 py-2 text-sm text-white placeholder:text-white/55 focus:border-cyan-400/40 focus:outline-none" />
         <select value={tagFilter ?? ""} onChange={(e) => setTagFilter(e.target.value || null)}
           className="font-jetbrains rounded-lg border border-white/12 bg-[#0d1017] px-3 py-2 text-[12px] text-white/80 focus:outline-none">
           <option value="">all tags</option>
@@ -134,7 +134,7 @@ export default function CharacterTable() {
         <Button onClick={() => fileRef.current?.click()} disabled={cloning} className="px-4 py-2 text-[13px]">
           {cloning ? "Cloning…" : "+ New character"}
         </Button>
-        <span className="font-jetbrains ml-auto text-[11px] text-white/40">{rows.length} of {characters.length}</span>
+        <span className="font-jetbrains ml-auto text-[11px] text-white/60">{rows.length} of {characters.length}</span>
       </div>
 
       {selected.size > 0 && (
@@ -142,13 +142,13 @@ export default function CharacterTable() {
           <span className="font-jetbrains text-[11px] text-cyan-200">{selected.size} selected</span>
           <input value={bulkTag} onChange={(e) => setBulkTag(e.target.value)} onKeyDown={(e) => e.key === "Enter" && applyBulkTag()}
             placeholder="add tag to all…"
-            className="font-jetbrains rounded border border-white/15 bg-transparent px-2 py-1 text-[11px] text-white placeholder:text-white/30 focus:outline-none" />
+            className="font-jetbrains rounded border border-white/15 bg-transparent px-2 py-1 text-[11px] text-white placeholder:text-white/55 focus:outline-none" />
           <button onClick={applyBulkTag} className="font-jetbrains rounded border border-white/15 px-2 py-1 text-[11px] text-white/80 hover:bg-white/5">apply tag</button>
           <button onClick={bulkDelete} disabled={clonedSelected.length === 0}
             className="font-jetbrains rounded border border-rose-400/30 px-2 py-1 text-[11px] text-rose-300 disabled:opacity-30 hover:bg-rose-400/10">
             delete {clonedSelected.length} cloned
           </button>
-          <button onClick={() => setSelected(new Set())} className="font-jetbrains ml-auto text-[11px] text-white/40 hover:text-white">clear</button>
+          <button onClick={() => setSelected(new Set())} className="font-jetbrains ml-auto text-[11px] text-white/60 hover:text-white">clear</button>
         </div>
       )}
 
@@ -164,14 +164,14 @@ export default function CharacterTable() {
               <Th k="category">source</Th>
               <Th k="lang">lang</Th>
               <Th k="coverage">emotion coverage</Th>
-              <th className="px-3 py-2 text-left"><span className="font-jetbrains text-[11px] uppercase tracking-widest text-white/40">tags</span></th>
+              <th className="px-3 py-2 text-left"><span className="font-jetbrains text-[11px] uppercase tracking-widest text-white/60">tags</span></th>
               <Th k="created">added</Th>
               <th className="w-28 px-3 py-2" />
             </tr>
           </thead>
           <tbody>
-            {loading && <tr><td colSpan={9} className="px-3 py-8 text-center text-sm text-white/40">Loading characters…</td></tr>}
-            {!loading && rows.length === 0 && <tr><td colSpan={9} className="px-3 py-8 text-center text-sm text-white/40">No characters match.</td></tr>}
+            {loading && <tr><td colSpan={9} className="px-3 py-8 text-center text-sm text-white/60">Loading characters…</td></tr>}
+            {!loading && rows.length === 0 && <tr><td colSpan={9} className="px-3 py-8 text-center text-sm text-white/60">No characters match.</td></tr>}
             {rows.map((c) => {
               const baseline = c.voices.find((v) => v.emotion === "baseline") ?? c.voices[0];
               return (
@@ -199,16 +199,16 @@ export default function CharacterTable() {
                     </div>
                   </td>
                   <td className="px-3 py-2">
-                    <span className={`font-jetbrains rounded px-1.5 py-0.5 text-[10px] ${c.category === "cloned" ? "bg-cyan-400/10 text-cyan-300" : "bg-white/5 text-white/50"}`}>{c.category}</span>
+                    <span className={`font-jetbrains rounded px-1.5 py-0.5 text-[11px] ${c.category === "cloned" ? "bg-cyan-400/10 text-cyan-300" : "bg-white/5 text-white/65"}`}>{c.category}</span>
                   </td>
                   <td className="font-jetbrains px-3 py-2 text-[12px] text-white/60">{c.lang}</td>
                   <td className="px-3 py-2"><CoverageBar c={c} /></td>
                   <td className="px-3 py-2"><TagEditor compact max={3} tags={c.tags} onChange={(tags) => patchCharacter(c.character_id, { tags })} /></td>
-                  <td className="font-jetbrains px-3 py-2 text-[12px] text-white/50">{relTime(c.created)}</td>
+                  <td className="font-jetbrains px-3 py-2 text-[12px] text-white/65">{relTime(c.created)}</td>
                   <td className="px-3 py-2 text-right">
                     <Link href={`/voices/${c.character_id}`} className="font-jetbrains text-[11px] text-cyan-300/80 transition hover:text-cyan-200">open →</Link>
                     {c.category === "cloned" && (
-                      <button onClick={() => deleteCharacter(c.character_id)} className="font-jetbrains ml-3 text-[11px] text-white/30 transition hover:text-rose-300">delete</button>
+                      <button onClick={() => deleteCharacter(c.character_id)} className="font-jetbrains ml-3 text-[11px] text-white/55 transition hover:text-rose-300">delete</button>
                     )}
                   </td>
                 </tr>

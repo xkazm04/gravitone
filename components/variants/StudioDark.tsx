@@ -39,7 +39,7 @@ export default function StudioDark() {
             </span>
             <span className="font-instrument text-2xl tracking-tight text-white">{BRAND}</span>
           </div>
-          <div className="font-jetbrains hidden items-center gap-7 text-[13px] text-white/55 md:flex">
+          <div className="font-jetbrains hidden items-center gap-7 text-[13px] text-white/70 md:flex">
             {NAV.map((n) => (
               <a key={n.label} href={n.href} className="transition hover:text-white">{n.label}</a>
             ))}
@@ -88,7 +88,7 @@ export default function StudioDark() {
               {STATS.map((s) => (
                 <div key={s.label}>
                   <div className="font-instrument text-2xl text-white">{s.value}</div>
-                  <div className="font-jetbrains mt-1 text-[11px] uppercase tracking-wider text-white/45">{s.label}</div>
+                  <div className="font-jetbrains mt-1 text-[11px] uppercase tracking-wider text-white/65">{s.label}</div>
                 </div>
               ))}
             </motion.div>
@@ -103,7 +103,7 @@ export default function StudioDark() {
           >
             <div className="flex items-center justify-between">
               <span className="font-jetbrains text-[11px] uppercase tracking-widest text-cyan-300/80">● now generating</span>
-              <span className="font-jetbrains text-[11px] text-white/40">24kHz · cpu</span>
+              <span className="font-jetbrains text-[11px] text-white/60">24kHz · cpu</span>
             </div>
             <p className="font-instrument mt-5 text-xl italic leading-snug text-white/90">“{SAMPLE_TEXT}”</p>
             <div className="mt-6 rounded-2xl border border-white/8 bg-black/30 p-5">
@@ -113,7 +113,7 @@ export default function StudioDark() {
                   <span className="grid h-9 w-9 place-items-center rounded-full bg-cyan-300 text-slate-950">▶</span>
                   <div>
                     <div className="text-sm text-white">Your voice</div>
-                    <div className="font-jetbrains text-[11px] text-white/40">cloned · 16s sample</div>
+                    <div className="font-jetbrains text-[11px] text-white/60">cloned · 16s sample</div>
                   </div>
                 </div>
                 <span className="font-jetbrains text-[11px] text-cyan-300">1.9× realtime</span>
@@ -126,7 +126,7 @@ export default function StudioDark() {
         <section id="voices" className="border-t border-white/5 py-14">
           <div className="mb-6 flex items-end justify-between">
             <h2 className="font-instrument text-3xl text-white">A voice for every line.</h2>
-            <span className="font-jetbrains text-[11px] uppercase tracking-widest text-white/40">27 built-in · ∞ cloned</span>
+            <span className="font-jetbrains text-[11px] uppercase tracking-widest text-white/60">27 built-in · ∞ cloned</span>
           </div>
           <div className="flex flex-wrap gap-3">
             {VOICES.map((v) => (
@@ -134,7 +134,7 @@ export default function StudioDark() {
                 <span className="h-8 w-8 rounded-full" style={{ background: `radial-gradient(circle at 30% 30%, hsl(${v.hue} 90% 70%), hsl(${v.hue} 80% 45%))`, boxShadow: `0 0 18px hsl(${v.hue} 90% 60% / .4)` }} />
                 <div>
                   <div className="text-sm text-white">{v.name}</div>
-                  <div className="font-jetbrains text-[11px] text-white/45">{v.tag}</div>
+                  <div className="font-jetbrains text-[11px] text-white/65">{v.tag}</div>
                 </div>
               </div>
             ))}
@@ -179,7 +179,7 @@ export default function StudioDark() {
         </section>
 
         {/* footer */}
-        <footer className="flex flex-col items-center justify-between gap-4 border-t border-white/5 py-10 text-sm text-white/40 sm:flex-row">
+        <footer className="flex flex-col items-center justify-between gap-4 border-t border-white/5 py-10 text-sm text-white/60 sm:flex-row">
           <span className="font-instrument text-lg text-white/70">{BRAND}</span>
           <span className="font-jetbrains text-[11px] uppercase tracking-widest">runs on arm · self-hostable · mit</span>
         </footer>

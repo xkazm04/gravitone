@@ -33,21 +33,21 @@ export default function TagEditor({
         <span
           key={t}
           className={`font-jetbrains group inline-flex items-center gap-1 rounded-full border border-white/12 bg-white/5 text-white/75 ${
-            compact ? "px-2 py-0.5 text-[10px]" : "px-2.5 py-1 text-[11px]"
+            compact ? "px-2 py-0.5 text-[11px]" : "px-2.5 py-1 text-[11px]"
           }`}
         >
           {t}
           <button
             onClick={() => onChange(tags.filter((x) => x !== t))}
             aria-label={`Remove tag ${t}`}
-            className="text-white/35 transition hover:text-white"
+            className="text-white/60 transition hover:text-white"
           >
             ×
           </button>
         </span>
       ))}
       {overflow > 0 && (
-        <span className="font-jetbrains rounded-full border border-white/10 px-2 py-0.5 text-[10px] text-white/40">
+        <span className="font-jetbrains rounded-full border border-white/10 px-2 py-0.5 text-[11px] text-white/60">
           +{overflow}
         </span>
       )}
@@ -63,15 +63,15 @@ export default function TagEditor({
             if (e.key === "Escape") { setDraft(""); setAdding(false); }
           }}
           placeholder="tag…"
-          className={`font-jetbrains w-20 rounded-full border border-cyan-400/40 bg-transparent px-2 text-cyan-200 placeholder:text-white/25 focus:outline-none ${
-            compact ? "py-0.5 text-[10px]" : "py-1 text-[11px]"
+          className={`font-jetbrains w-20 rounded-full border border-cyan-400/40 bg-transparent px-2 text-cyan-200 placeholder:text-white/50 focus:outline-none ${
+            compact ? "py-0.5 text-[11px]" : "py-1 text-[11px]"
           }`}
         />
       ) : (
         <button
           onClick={() => setAdding(true)}
-          className={`font-jetbrains rounded-full border border-dashed border-white/15 text-white/40 transition hover:border-cyan-400/40 hover:text-cyan-300 ${
-            compact ? "px-2 py-0.5 text-[10px]" : "px-2.5 py-1 text-[11px]"
+          className={`font-jetbrains rounded-full border border-dashed border-white/15 text-white/60 transition hover:border-cyan-400/40 hover:text-cyan-300 ${
+            compact ? "px-2 py-0.5 text-[11px]" : "px-2.5 py-1 text-[11px]"
           }`}
         >
           + tag

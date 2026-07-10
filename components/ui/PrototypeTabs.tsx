@@ -34,7 +34,7 @@ export default function PrototypeTabs({
   return (
     <div>
       <div className="mb-8 flex flex-wrap items-center gap-2">
-        <span className="font-jetbrains mr-1 text-[11px] uppercase tracking-[0.2em] text-white/35">
+        <span className="font-jetbrains mr-1 text-[11px] uppercase tracking-[0.2em] text-white/60">
           prototype ·
         </span>
         {variants.map((v) => (
@@ -45,7 +45,7 @@ export default function PrototypeTabs({
             className={`font-jetbrains rounded-full border px-4 py-2 text-left text-[12px] transition ${
               active === v.id
                 ? "border-cyan-400/40 bg-cyan-400/10 text-cyan-200"
-                : "border-white/10 text-white/55 hover:border-white/20 hover:text-white"
+                : "border-white/10 text-white/70 hover:border-white/20 hover:text-white"
             }`}
           >
             <span className="font-semibold">{v.label}</span>

@@ -10,12 +10,12 @@ export default function CharacterVoices({ characterId }: { characterId: string }
   const { character, slots, coverage, total, loading, error, busySlot, addVoice, removeVoice } =
     useCharacterVoices(characterId);
 
-  if (loading) return <p className="py-20 text-sm text-white/40">Loading character…</p>;
+  if (loading) return <p className="py-20 text-sm text-white/60">Loading character…</p>;
 
   if (!character) {
     return (
       <div className="py-20">
-        <p className="text-sm text-white/50">{error ?? `No character “${characterId}”.`}</p>
+        <p className="text-sm text-white/65">{error ?? `No character “${characterId}”.`}</p>
         <Link href="/voices" className="font-jetbrains mt-4 inline-block text-[12px] text-cyan-300/80 hover:text-cyan-200">
           ← back to characters
         </Link>
@@ -25,13 +25,13 @@ export default function CharacterVoices({ characterId }: { characterId: string }
 
   return (
     <div className="py-10">
-      <Link href="/voices" className="font-jetbrains text-[12px] text-white/40 transition hover:text-white">← characters</Link>
+      <Link href="/voices" className="font-jetbrains text-[12px] text-white/60 transition hover:text-white">← characters</Link>
 
       <div className="mt-4 flex flex-wrap items-end justify-between gap-4">
         <div>
           <Eyebrow>voice overview</Eyebrow>
           <h1 className="font-instrument mt-3 text-4xl text-white">{character.name}</h1>
-          <p className="mt-2 max-w-xl text-base text-white/55">
+          <p className="mt-2 max-w-xl text-base text-white/70">
             Each <span className="text-white">Voice</span> is one emotion of this{" "}
             <span className="text-white">Character</span>. Empty slots fall back to baseline.
           </p>

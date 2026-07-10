@@ -20,7 +20,7 @@ export default function EmotionRack({
 
   return (
     <div className="py-4">
-      <div className="font-jetbrains mb-3 flex items-center justify-between text-[11px] uppercase tracking-widest text-white/40">
+      <div className="font-jetbrains mb-3 flex items-center justify-between text-[11px] uppercase tracking-widest text-white/60">
         <span>emotion rack</span>
         <span>
           {coverage}/{total} recorded{missing > 0 && <span className="ml-2 text-amber-300/70">· {missing} fall back to baseline</span>}
@@ -30,7 +30,7 @@ export default function EmotionRack({
       <div className="glass-panel overflow-x-auto rounded-xl">
         <table className="w-full min-w-[760px] border-collapse text-sm">
           <thead className="border-b border-white/8">
-            <tr className="font-jetbrains text-[11px] uppercase tracking-widest text-white/40">
+            <tr className="font-jetbrains text-[11px] uppercase tracking-widest text-white/60">
               <th className="w-10 px-2 py-2" />
               <th className="px-3 py-2 text-left font-normal">emotion</th>
               <th className="px-3 py-2 text-left font-normal">status</th>
@@ -54,7 +54,7 @@ export default function EmotionRack({
                       disabled={isBusy}
                       aria-label={filled ? `Play ${s.label}` : `Record ${s.label}`}
                       className={`grid h-7 w-7 place-items-center rounded-full text-[11px] transition disabled:opacity-50 ${
-                        filled ? "text-slate-950 hover:brightness-110" : "border border-dashed border-white/20 text-white/45 hover:border-cyan-400/50 hover:text-cyan-300"
+                        filled ? "text-slate-950 hover:brightness-110" : "border border-dashed border-white/20 text-white/65 hover:border-cyan-400/50 hover:text-cyan-300"
                       }`}
                       style={filled ? { background: `hsl(${s.hue} 85% 64%)` } : undefined}
                     >
@@ -73,15 +73,15 @@ export default function EmotionRack({
 
                   <td className="px-3 py-2">
                     {filled ? (
-                      <span className="font-jetbrains rounded bg-cyan-400/10 px-1.5 py-0.5 text-[10px] text-cyan-300">recorded</span>
+                      <span className="font-jetbrains rounded bg-cyan-400/10 px-1.5 py-0.5 text-[11px] text-cyan-300">recorded</span>
                     ) : (
-                      <span className="font-jetbrains rounded bg-white/5 px-1.5 py-0.5 text-[10px] text-white/45">→ baseline</span>
+                      <span className="font-jetbrains rounded bg-white/5 px-1.5 py-0.5 text-[11px] text-white/65">→ baseline</span>
                     )}
                   </td>
 
                   <td className="font-jetbrains px-3 py-2 text-[12px] text-white/60">{filled ? `${s.voice!.sample_seconds ?? "?"}s` : "—"}</td>
-                  <td className="font-jetbrains px-3 py-2 text-[12px] text-white/35">{filled ? s.voice!.voice_id : "—"}</td>
-                  <td className="font-jetbrains px-3 py-2 text-[12px] text-white/50">{filled ? relTime(s.voice!.created) : "—"}</td>
+                  <td className="font-jetbrains px-3 py-2 text-[12px] text-white/60">{filled ? s.voice!.voice_id : "—"}</td>
+                  <td className="font-jetbrains px-3 py-2 text-[12px] text-white/65">{filled ? relTime(s.voice!.created) : "—"}</td>
 
                   <td className="px-3 py-2 text-right">
                     {filled ? (
@@ -90,7 +90,7 @@ export default function EmotionRack({
                           title="Remove first, then re-record this slot"
                           className="font-jetbrains text-[11px] text-white/15">replace</button>
                         <button onClick={() => removeVoice(s.voice!.voice_id)}
-                          className="font-jetbrains ml-3 text-[11px] text-white/30 transition hover:text-rose-300">remove</button>
+                          className="font-jetbrains ml-3 text-[11px] text-white/55 transition hover:text-rose-300">remove</button>
                       </>
                     ) : (
                       <button onClick={() => pickAudio((f) => addVoice(s.emotion, f))} disabled={isBusy}

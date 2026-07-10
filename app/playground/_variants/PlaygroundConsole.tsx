@@ -41,13 +41,13 @@ function Slider({ label, hint, value, min, max, step, onChange, format }: {
   return (
     <div>
       <div className="flex items-baseline justify-between">
-        <span className="font-jetbrains text-[11px] uppercase tracking-widest text-white/45">{label}</span>
+        <span className="font-jetbrains text-[11px] uppercase tracking-widest text-white/65">{label}</span>
         <span className="font-jetbrains text-[12px] text-cyan-300">{format(value)}</span>
       </div>
       <input type="range" min={min} max={max} step={step} value={value}
         onChange={(e) => onChange(Number(e.target.value))}
         className="mt-2 w-full accent-cyan-300" />
-      <p className="font-jetbrains mt-1 text-[10px] text-white/30">{hint}</p>
+      <p className="font-jetbrains mt-1 text-[11px] text-white/55">{hint}</p>
     </div>
   );
 }
@@ -112,7 +112,7 @@ export default function PlaygroundConsole() {
       />
       <Eyebrow>free playground</Eyebrow>
       <h1 className="font-instrument mt-4 text-4xl text-white">Compose a take.</h1>
-      <p className="mt-2 max-w-2xl text-base text-white/55">
+      <p className="mt-2 max-w-2xl text-base text-white/70">
         Pick a <span className="text-white">Character</span>, then use{" "}
         <span className="font-jetbrains text-cyan-300">[emotion]…[/emotion]</span> to switch its{" "}
         <span className="text-white">Voices</span> mid-sentence. Missing emotions fall back to baseline.
@@ -126,7 +126,7 @@ export default function PlaygroundConsole() {
 
       {/* character rail */}
       <div className="mt-8">
-        <div className="font-jetbrains mb-2 text-[11px] uppercase tracking-widest text-white/40">character</div>
+        <div className="font-jetbrains mb-2 text-[11px] uppercase tracking-widest text-white/60">character</div>
         <div className="flex flex-wrap gap-2">
           {characters.slice(0, 10).map((c) => {
             const on = c.character_id === charId;
@@ -136,7 +136,7 @@ export default function PlaygroundConsole() {
                 <span className="h-6 w-6 rounded-full" style={{ background: `radial-gradient(circle at 30% 30%, hsl(${(c.character_id.length * 47) % 360} 90% 70%), hsl(${(c.character_id.length * 47) % 360} 80% 45%))` }} />
                 <span>
                   <span className="block text-sm text-white">{c.name}</span>
-                  <span className="font-jetbrains text-[10px] text-white/40">{c.category} · {c.coverage}/{c.total} emotions</span>
+                  <span className="font-jetbrains text-[11px] text-white/60">{c.category} · {c.coverage}/{c.total} emotions</span>
                 </span>
               </button>
             );
@@ -147,19 +147,19 @@ export default function PlaygroundConsole() {
       <div className="mt-6 grid gap-5 lg:grid-cols-[1.35fr_0.65fr]">
         {/* compose bay */}
         <div className="glass-panel rounded-2xl">
-          <div className="font-jetbrains flex items-center justify-between border-b border-white/8 px-5 py-2.5 text-[11px] uppercase tracking-widest text-white/40">
+          <div className="font-jetbrains flex items-center justify-between border-b border-white/8 px-5 py-2.5 text-[11px] uppercase tracking-widest text-white/60">
             <span>compose</span><span>{plain.length} chars · ~{estSec}s audio</span>
           </div>
 
           <textarea ref={areaRef} value={text} onChange={(e) => setText(e.target.value)}
             onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") generate(); }}
             rows={5} placeholder="Type something. Select words, then click an emotion to tag them…"
-            className="font-hanken w-full resize-none bg-transparent px-5 py-4 text-base leading-relaxed text-white placeholder:text-white/30 focus:outline-none" />
+            className="font-hanken w-full resize-none bg-transparent px-5 py-4 text-base leading-relaxed text-white placeholder:text-white/55 focus:outline-none" />
 
           {/* emotion chips + wheel */}
           <div className="border-t border-white/8 px-5 py-4">
             <div className="mb-2 flex items-center justify-between">
-              <span className="font-jetbrains text-[11px] uppercase tracking-widest text-white/40">tag selection with an emotion</span>
+              <span className="font-jetbrains text-[11px] uppercase tracking-widest text-white/60">tag selection with an emotion</span>
               <button
                 onClick={() => setPickerOpen(true)}
                 className="font-jetbrains inline-flex items-center gap-1.5 rounded-full border border-cyan-400/30 bg-cyan-400/5 px-3 py-1 text-[11px] text-cyan-200 transition hover:bg-cyan-400/10"
@@ -175,7 +175,7 @@ export default function PlaygroundConsole() {
                     title={has ? `${e.label} — available` : `${e.label} — not recorded, falls back to baseline`}
                     className={`font-jetbrains inline-flex items-center gap-1.5 rounded-full py-1 pl-1 pr-2.5 text-[11px] transition ${
                       has ? "border border-white/15 bg-white/5 text-white/85 hover:border-cyan-400/40"
-                          : "border border-dashed border-white/12 text-white/35 hover:text-white/60"}`}>
+                          : "border border-dashed border-white/12 text-white/60 hover:text-white/60"}`}>
                     <span className="grid h-5 w-5 place-items-center overflow-hidden rounded-full bg-black/50">
                       <EmotionArt emotion={e.id} size={20} dim={!has} />
                     </span>
@@ -187,16 +187,16 @@ export default function PlaygroundConsole() {
           </div>
 
           <div className="flex items-center justify-between border-t border-white/8 px-5 py-3">
-            <span className="font-jetbrains text-[11px] text-white/40">⌘↵ to generate · exports 24kHz wav</span>
+            <span className="font-jetbrains text-[11px] text-white/60">⌘↵ to generate · exports 24kHz wav</span>
             <Button onClick={generate} disabled={busy || !plain || !character}>{busy ? "Rendering…" : "Generate ▶"}</Button>
           </div>
         </div>
 
         {/* expression */}
         <div className="glass-panel rounded-2xl p-5">
-          <div className="font-jetbrains mb-4 flex items-center justify-between text-[11px] uppercase tracking-widest text-white/40">
+          <div className="font-jetbrains mb-4 flex items-center justify-between text-[11px] uppercase tracking-widest text-white/60">
             <span>expression</span>
-            <button onClick={() => setExpr(DEFAULT_EXPRESSION)} className="text-white/35 transition hover:text-white">reset</button>
+            <button onClick={() => setExpr(DEFAULT_EXPRESSION)} className="text-white/60 transition hover:text-white">reset</button>
           </div>
           <div className="space-y-5">
             <Slider label="temperature" hint="consistent ⟷ expressive" value={expr.temperature} min={0.5} max={1.0} step={0.05}
@@ -206,7 +206,7 @@ export default function PlaygroundConsole() {
             <Slider label="quality" hint="decode steps — higher is slower" value={expr.quality} min={1} max={5} step={1}
               onChange={(v) => setExpr({ ...expr, quality: v })} format={(v) => `${v} step${v > 1 ? "s" : ""}`} />
           </div>
-          <p className="font-jetbrains mt-5 border-t border-white/8 pt-3 text-[10px] leading-relaxed text-white/30">
+          <p className="font-jetbrains mt-5 border-t border-white/8 pt-3 text-[11px] leading-relaxed text-white/55">
             Pocket TTS exposes no emotion or speed parameter — expression comes from the reference
             audio. That is why emotions are separate Voices, and these are the model&apos;s real knobs.
           </p>
@@ -215,12 +215,12 @@ export default function PlaygroundConsole() {
 
       {/* takes log */}
       <div className="mt-8">
-        <div className="font-jetbrains mb-3 flex items-center justify-between text-[11px] uppercase tracking-widest text-white/40">
+        <div className="font-jetbrains mb-3 flex items-center justify-between text-[11px] uppercase tracking-widest text-white/60">
           <span>takes</span><span>{takes.length}</span>
         </div>
 
         {takes.length === 0 && !busy && (
-          <div className="rounded-2xl border border-dashed border-white/10 px-5 py-10 text-center text-sm text-white/40">
+          <div className="rounded-2xl border border-dashed border-white/10 px-5 py-10 text-center text-sm text-white/60">
             No takes yet — compose above and hit Generate.
           </div>
         )}
@@ -253,7 +253,7 @@ export default function PlaygroundConsole() {
 
                   <Bars peaks={t.peaks} progress={isCurrent ? progress : 0} active={isCurrent} className="h-9 min-w-0 flex-1" />
 
-                  <div className="font-jetbrains hidden shrink-0 items-center gap-4 text-[11px] text-white/50 sm:flex">
+                  <div className="font-jetbrains hidden shrink-0 items-center gap-4 text-[11px] text-white/65 sm:flex">
                     <span className="text-white/80">{t.characterName}</span>
                     <span>{t.seconds}s</span>
                     {t.rtf > 0 && <span className="text-cyan-300">{t.rtf}× rt</span>}
@@ -265,7 +265,7 @@ export default function PlaygroundConsole() {
                       className="font-jetbrains shrink-0 rounded-lg border border-white/15 px-3 py-1.5 text-[11px] text-white/80 transition hover:bg-white/5">↓ wav</a>
                   ) : (
                     <span title="Connect a Gravitone endpoint to export WAV"
-                      className="font-jetbrains shrink-0 cursor-not-allowed rounded-lg border border-white/10 px-3 py-1.5 text-[11px] text-white/25">↓ wav</span>
+                      className="font-jetbrains shrink-0 cursor-not-allowed rounded-lg border border-white/10 px-3 py-1.5 text-[11px] text-white/50">↓ wav</span>
                   )}
                 </div>
 
@@ -276,21 +276,21 @@ export default function PlaygroundConsole() {
                       const m = emotionMeta(s.used);
                       return (
                         <span key={i} title={s.text}
-                          className="font-jetbrains inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/[0.04] px-2 py-0.5 text-[10px] text-white/70">
+                          className="font-jetbrains inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/[0.04] px-2 py-0.5 text-[11px] text-white/70">
                           <span className="h-1.5 w-1.5 rounded-full" style={{ background: `hsl(${m.hue} 80% 62%)` }} />
                           {s.fallback ? (
-                            <><span className="text-amber-300/80 line-through">{s.requested}</span><span className="text-white/30">→</span><span>{s.used}</span></>
+                            <><span className="text-amber-300/80 line-through">{s.requested}</span><span className="text-white/55">→</span><span>{s.used}</span></>
                           ) : (
                             <span>{s.used}</span>
                           )}
-                          <span className="text-white/30">{s.seconds}s</span>
+                          <span className="text-white/55">{s.seconds}s</span>
                         </span>
                       );
                     })}
                   </div>
                 )}
 
-                <p className="mt-2 line-clamp-1 text-sm text-white/45">{t.text}</p>
+                <p className="mt-2 line-clamp-1 text-sm text-white/65">{t.text}</p>
               </motion.div>
             );
           })}
