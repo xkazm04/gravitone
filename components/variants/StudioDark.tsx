@@ -196,6 +196,9 @@ export default function StudioDark() {
         {/* footer */}
         <footer className="flex flex-col items-center justify-between gap-4 border-t border-white/5 py-10 text-sm text-white/60 sm:flex-row">
           <span className="font-instrument text-lg text-white/70">{BRAND}</span>
+          <Link href="/benchmarks" className="font-jetbrains text-[11px] uppercase tracking-widest text-cyan-300/70 transition hover:text-cyan-200">
+            benchmarks — the receipts
+          </Link>
           <span className="font-jetbrains text-[11px] uppercase tracking-widest">runs on arm · self-hostable · mit</span>
         </footer>
       </div>

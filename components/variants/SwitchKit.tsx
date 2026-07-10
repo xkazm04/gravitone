@@ -5,6 +5,7 @@
 // running 24/7, and copy the base-URL diff that is the whole migration.
 
 import { useMemo, useState } from "react";
+import Link from "next/link";
 import { motion } from "framer-motion";
 import {
   ARM_BOXES,
@@ -95,7 +96,10 @@ export default function SwitchKit() {
             </div>
             <p className="font-jetbrains mt-3 text-[11px] leading-relaxed text-white/45">
               Arm box priced 24/7 on-demand; it serves up to {Math.round(est.boxCapacityMinutes).toLocaleString("en-US")} audio-min/mo.
-              ElevenLabs list prices, ~{CHARS_PER_AUDIO_MINUTE.toLocaleString("en-US")} chars per audio minute.
+              ElevenLabs list prices, ~{CHARS_PER_AUDIO_MINUTE.toLocaleString("en-US")} chars per audio minute.{" "}
+              <Link href="/benchmarks" className="text-cyan-300/80 underline-offset-2 transition hover:text-cyan-200 hover:underline">
+                See the measured benchmarks →
+              </Link>
             </p>
           </div>
 
