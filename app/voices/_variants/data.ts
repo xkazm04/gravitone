@@ -26,6 +26,8 @@ export type Character = {
   coverage: number;
   total: number;
   created?: string | null;
+  // Fallback telemetry: unmet requests per still-missing emotion.
+  demand?: Record<string, number>;
 };
 
 export function hueOf(id: string): number {

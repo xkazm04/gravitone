@@ -5,7 +5,7 @@ import Link from "next/link";
 import AppFrame from "@/components/ui/AppFrame";
 import { Button, Eyebrow } from "@/components/ui/Primitives";
 import EmotionArt from "@/components/ui/EmotionArt";
-import { emotionMeta } from "@/lib/emotions";
+import { EMOTION_IDS, emotionMeta } from "@/lib/emotions";
 import WaveformLab from "./_loaders/WaveformLab";
 import type { LoaderData, LoaderStep, Partial as PartialData } from "./_loaders/shared";
 
@@ -306,6 +306,40 @@ export default function NewCharacterPage() {
                   );
                 })}
               </div>
+              {/* Coverage Coach — the recording produced an incomplete rack;
+                  give every remaining slot a direct path to done. Stems that
+                  were detected but too short to clone are called out. */}
+              {committedCid && (() => {
+                const done = new Set(created.map((c) => c.emotion));
+                const missing = EMOTION_IDS.filter((e) => !done.has(e));
+                if (missing.length === 0) return null;
+                const shortStems = new Set(
+                  (result?.stems ?? []).filter((s) => !s.eligible).map((s) => s.emotion),
+                );
+                return (
+                  <div className="mt-6 rounded-2xl border border-amber-400/15 bg-amber-400/[0.04] p-4">
+                    <div className="font-jetbrains text-[11px] uppercase tracking-widest text-amber-200/80">
+                      coverage coach · {done.size}/{EMOTION_IDS.length} recorded
+                    </div>
+                    <p className="mt-1 text-sm text-white/65">
+                      Finish the rack with a guided 30-second read per emotion — no new recording to hunt for:
+                    </p>
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {missing.map((e) => (
+                        <Link
+                          key={e}
+                          href={`/voices/${committedCid}?record=${e}`}
+                          className="font-jetbrains inline-flex items-center gap-1.5 rounded-full border border-amber-400/25 bg-black/30 px-2.5 py-1 text-[11px] text-amber-200/90 transition hover:border-amber-300/50 hover:text-amber-100"
+                        >
+                          ● {emotionMeta(e).label}
+                          {shortStems.has(e) && <span className="text-white/45">(detected, too short)</span>}
+                        </Link>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })()}
+
               <div className="mt-6 flex flex-wrap gap-3">
                 {committedCid && <Link href={`/voices/${committedCid}`} className="rounded-full bg-cyan-300 px-5 py-2.5 text-sm font-semibold text-slate-950 transition hover:brightness-110">Open character →</Link>}
                 <button onClick={scanAnother} className="font-jetbrains cursor-pointer rounded-full border border-white/15 px-5 py-2.5 text-sm text-white/85 transition hover:bg-white/5">Scan another recording (extend palette)</button>

@@ -75,6 +75,13 @@ export default function EmotionRack({
                   <td className="px-3 py-2">
                     {filled ? (
                       <span className="font-jetbrains rounded bg-cyan-400/10 px-1.5 py-0.5 text-[11px] text-cyan-300">recorded</span>
+                    ) : s.demand > 0 ? (
+                      <span
+                        className="font-jetbrains rounded bg-amber-400/10 px-1.5 py-0.5 text-[11px] text-amber-300"
+                        title={`API callers requested ${s.label} ${s.demand}× and got baseline — record it to meet the demand`}
+                      >
+                        requested {s.demand}× → baseline
+                      </span>
                     ) : (
                       <span className="font-jetbrains rounded bg-white/5 px-1.5 py-0.5 text-[11px] text-white/65">→ baseline</span>
                     )}

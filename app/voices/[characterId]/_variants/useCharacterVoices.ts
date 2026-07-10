@@ -9,6 +9,7 @@ export type Slot = {
   label: string;
   hue: number;
   voice: Voice | null; // null = empty slot (falls back to baseline)
+  demand: number; // unmet requests for this emotion (fallback telemetry)
 };
 
 /** One Character's emotion scale: which slots are filled, and how to fill them. */
@@ -41,6 +42,7 @@ export function useCharacterVoices(characterId: string) {
         label: e.label,
         hue: e.hue,
         voice: character?.voices.find((v) => v.emotion === e.id) ?? null,
+        demand: character?.demand?.[e.id] ?? 0,
       })),
     [character]
   );
