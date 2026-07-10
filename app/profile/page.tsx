@@ -1,17 +1,41 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import AppFrame from "@/components/ui/AppFrame";
 import { Button, Eyebrow } from "@/components/ui/Primitives";
 import { useAuth } from "@/lib/useAuth";
+import { getStoredKey, mintDefaultKey, type StoredKey } from "@/lib/mintKey";
+import { migrationSnippet, SNIPPET_LANGS, type SnippetLang } from "@/lib/switchkit";
 
 export default function ProfilePage() {
   const { user, profile, loading, ready, signIn, updateProfile } = useAuth();
   const [name, setName] = useState("");
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [storedKey, setStoredKey] = useState<StoredKey | null>(null);
+  const [minting, setMinting] = useState(false);
+  const [lang, setLang] = useState<SnippetLang>("curl");
+  const [copied, setCopied] = useState<"key" | "snippet" | null>(null);
 
   useEffect(() => { if (profile?.displayName) setName(profile.displayName); }, [profile?.displayName]);
+  useEffect(() => { if (user) setStoredKey(getStoredKey(user.uid)); }, [user]);
+
+  async function mint() {
+    if (!user || minting) return;
+    setMinting(true);
+    const k = await mintDefaultKey(user.uid, user.email);
+    if (k) setStoredKey({ secret: k.secret, prefix: k.prefix });
+    setMinting(false);
+  }
+
+  async function copyText(what: "key" | "snippet", text: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(what);
+      setTimeout(() => setCopied(null), 1500);
+    } catch { /* selectable anyway */ }
+  }
 
   async function save() {
     setSaving(true); setSaved(false);
@@ -65,6 +89,61 @@ export default function ProfilePage() {
                 <Button onClick={save} disabled={saving} className="cursor-pointer">{saving ? "Saving…" : "Save"}</Button>
                 {saved && <span className="font-jetbrains text-[12px] text-emerald-300">✓ saved to Firestore</span>}
               </div>
+            </div>
+
+            {/* your API key — the 60-second ElevenLabs migration */}
+            <div className="glass-panel rounded-2xl p-5">
+              <div className="flex items-center justify-between">
+                <span className="font-jetbrains text-[11px] uppercase tracking-widest text-white/60">your api key</span>
+                {storedKey && (
+                  <div className="flex gap-1.5">
+                    {SNIPPET_LANGS.map((l) => (
+                      <button key={l} onClick={() => setLang(l)}
+                        className={`font-jetbrains cursor-pointer rounded-full border px-2 py-0.5 text-[10px] transition ${
+                          l === lang ? "border-cyan-400/40 bg-cyan-400/10 text-cyan-200" : "border-white/12 text-white/60 hover:text-white"
+                        }`}>
+                        {l}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {storedKey ? (
+                <>
+                  <div className="mt-3 flex items-center gap-2 rounded-xl border border-cyan-400/25 bg-black/40 p-3">
+                    <code className="font-jetbrains flex-1 truncate text-sm text-cyan-200">{storedKey.secret}</code>
+                    <button onClick={() => void copyText("key", storedKey.secret)}
+                      className="font-jetbrains shrink-0 rounded-lg border border-white/15 px-3 py-1.5 text-[12px] text-white/85 transition hover:bg-white/5">
+                      {copied === "key" ? "✓ copied" : "copy"}
+                    </button>
+                  </div>
+                  <p className="mt-3 text-sm text-white/65">
+                    Point any ElevenLabs client at your Gravitone box — the whole migration is the base URL:
+                  </p>
+                  <pre className="font-jetbrains mt-2 max-h-44 overflow-auto rounded-xl border border-white/8 bg-black/40 p-3 text-[11px] leading-relaxed text-cyan-100/90">
+                    {migrationSnippet(lang, { apiKey: storedKey.secret })}
+                  </pre>
+                  <div className="mt-3 flex items-center gap-3">
+                    <button onClick={() => void copyText("snippet", migrationSnippet(lang, { apiKey: storedKey.secret }))}
+                      className="font-jetbrains cursor-pointer rounded-lg border border-white/15 px-3 py-1.5 text-[11px] text-white/85 transition hover:bg-white/5">
+                      {copied === "snippet" ? "✓ copied" : "copy snippet"}
+                    </button>
+                    <Link href="/keys" className="font-jetbrains text-[11px] text-cyan-300/80 transition hover:text-cyan-200">
+                      manage all keys →
+                    </Link>
+                  </div>
+                </>
+              ) : (
+                <div className="mt-3">
+                  <p className="text-sm text-white/65">
+                    Mint a tts-scoped key and migrate any ElevenLabs client in 60 seconds — change one base URL, keep your code.
+                  </p>
+                  <Button onClick={() => void mint()} disabled={minting} className="mt-3 cursor-pointer">
+                    {minting ? "Minting…" : "Mint my API key"}
+                  </Button>
+                </div>
+              )}
             </div>
 
             <p className="font-jetbrains text-[11px] text-white/50">

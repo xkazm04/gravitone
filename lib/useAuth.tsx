@@ -17,6 +17,7 @@ import {
 } from "firebase/auth";
 import { doc, getDoc, serverTimestamp, setDoc, updateDoc } from "firebase/firestore";
 import { auth, db, firebaseReady, googleProvider } from "./firebase";
+import { mintDefaultKey } from "./mintKey";
 
 // Popup can fail (blocked, closed, COOP, internal-error) — fall back to a
 // full-page redirect, which always works. getRedirectResult (on mount) then
@@ -76,6 +77,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         } else {
           await setDoc(ref, { ...base, plan: "free", createdAt: serverTimestamp(), lastLogin: serverTimestamp() });
           setProfile({ ...base, plan: "free" });
+          // First sign-in: auto-provision a tts-scoped API key and land the
+          // user on the profile panel with a ready-to-run migration snippet.
+          // Best-effort — a down backend must never break sign-in.
+          void mintDefaultKey(u.uid, u.email).then((k) => {
+            if (!k) return;
+            void updateDoc(ref, { keyId: k.id, keyPrefix: k.prefix }).catch(() => {});
+            if (window.location.pathname !== "/profile") window.location.assign("/profile");
+          });
         }
       } else {
         setProfile(null);

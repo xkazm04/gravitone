@@ -4,12 +4,26 @@ import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { AnimatePresence, motion } from "framer-motion";
 import { useAuth } from "@/lib/useAuth";
+import { getStoredKey } from "@/lib/mintKey";
 import { Button } from "./Primitives";
 
 export default function UserMenu() {
   const { user, profile, loading, ready, signIn, signOut } = useAuth();
   const [open, setOpen] = useState(false);
+  const [keyCopied, setKeyCopied] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+
+  // The credential is one click away from any page (localStorage, this browser).
+  const copyKey = async () => {
+    if (!user) return;
+    const k = getStoredKey(user.uid);
+    if (!k) return;
+    try {
+      await navigator.clipboard.writeText(k.secret);
+      setKeyCopied(true);
+      setTimeout(() => setKeyCopied(false), 1500);
+    } catch { /* ignore */ }
+  };
 
   useEffect(() => {
     const onDoc = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false); };
@@ -61,6 +75,11 @@ export default function UserMenu() {
             </div>
             <div className="my-1 h-px bg-white/8" />
             <Link href="/profile" onClick={() => setOpen(false)} className="block rounded-lg px-3 py-2 text-sm text-white/80 transition hover:bg-white/5">Profile</Link>
+            {user && getStoredKey(user.uid) && (
+              <button onClick={() => void copyKey()} className="w-full cursor-pointer rounded-lg px-3 py-2 text-left text-sm text-white/80 transition hover:bg-white/5">
+                {keyCopied ? "✓ key copied" : "Copy API key"}
+              </button>
+            )}
             <button onClick={() => void signOut()} className="w-full cursor-pointer rounded-lg px-3 py-2 text-left text-sm text-white/80 transition hover:bg-white/5">Sign out</button>
           </motion.div>
         )}
