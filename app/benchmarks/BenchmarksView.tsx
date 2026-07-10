@@ -244,7 +244,10 @@ export default function BenchmarksView() {
 {`# any Arm64 Linux box — Graviton, Axion, Ampere, or your laptop
 git clone <repo> && cd gravitone
 bash benchmark_arm.sh          # ramps concurrency, finds the knee
-# → service/loadtest_result.json (open a PR to add your row)`}
+# → service/loadtest_result.json (open a PR to add your row)
+
+# liked the numbers? deploy your own Private ElevenLabs in one command:
+deploy/aws-oneclick.sh up      # → base URL + xi-api-key (see deploy/README.md)`}
             </pre>
             <p className="font-jetbrains mt-3 text-[11px] text-white/45">
               Community rows welcome — every submitted result JSON grows the sizing corpus behind the planner above.
