@@ -35,7 +35,7 @@ function CoverageBar({ c }: { c: Character }) {
 }
 
 export default function CharacterTable() {
-  const { characters, loading, error, createVoice, patchCharacter, deleteCharacter } = useCharacters();
+  const { characters, loading, error, createVoice, patchCharacter, deleteCharacter, refresh } = useCharacters();
   const { preview, playingId, busyId } = useVoicePreview();
 
   const [query, setQuery] = useState("");
@@ -46,7 +46,9 @@ export default function CharacterTable() {
   const [bulkTag, setBulkTag] = useState("");
   const [cloning, setCloning] = useState(false);
   const [cloneErr, setCloneErr] = useState<string | null>(null);
+  const [importing, setImporting] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
+  const packRef = useRef<HTMLInputElement>(null);
 
   const allTags = useMemo(() => Array.from(new Set(characters.flatMap((c) => c.tags))).sort(), [characters]);
 
@@ -97,6 +99,27 @@ export default function CharacterTable() {
     } finally { setCloning(false); }
   }
 
+  /** Import a .gravichar Character Pack; on an id collision, offer a rename. */
+  async function onPack(f: File, rename = "") {
+    setImporting(true); setCloneErr(null);
+    try {
+      const fd = new FormData();
+      fd.append("file", f, f.name);
+      if (rename) fd.append("rename", rename);
+      const r = await fetch("/api/characters/import", { method: "POST", body: fd });
+      const body = await r.json().catch(() => ({}));
+      if (r.status === 409) {
+        const name = window.prompt("A character with this id already exists. Import under a new name:");
+        if (name?.trim()) { setImporting(false); return onPack(f, name.trim()); }
+        throw new Error(body?.detail ?? "character already exists");
+      }
+      if (!r.ok) throw new Error(body?.detail ?? `import failed (${r.status})`);
+      await refresh();
+    } catch (e) {
+      setCloneErr(e instanceof Error ? e.message : "import failed");
+    } finally { setImporting(false); }
+  }
+
   const Th = ({ k, children }: { k: SortKey; children: React.ReactNode }) => (
     <th className="px-3 py-2 text-left font-normal">
       <button onClick={() => toggleSort(k)} className="font-jetbrains inline-flex items-center gap-1 text-[11px] uppercase tracking-widest text-white/60 transition hover:text-white">
@@ -133,6 +156,13 @@ export default function CharacterTable() {
           className="rounded-full bg-gradient-to-r from-cyan-300 to-cyan-200 px-4 py-2 text-[13px] font-semibold text-slate-950 transition hover:brightness-110">
           + New character
         </Link>
+        <input ref={packRef} type="file" accept=".gravichar,application/zip" hidden
+          onChange={(e) => { const f = e.target.files?.[0]; if (f) void onPack(f); e.target.value = ""; }} />
+        <button onClick={() => packRef.current?.click()} disabled={importing}
+          title="Import a portable .gravichar Character Pack exported from any Gravitone instance"
+          className="font-jetbrains rounded-full border border-white/12 px-3 py-2 text-[12px] text-white/70 transition hover:text-white disabled:opacity-50">
+          {importing ? "importing…" : "⇪ import pack"}
+        </button>
         <input ref={fileRef} type="file" accept="audio/*,video/mp4" hidden
           onChange={(e) => { const f = e.target.files?.[0]; if (f) void onFile(f); }} />
         <button onClick={() => fileRef.current?.click()} disabled={cloning}

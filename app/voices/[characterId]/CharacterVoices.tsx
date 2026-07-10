@@ -54,8 +54,20 @@ export default function CharacterVoices({ characterId }: { characterId: string }
             <span className="text-white">Character</span>. Empty slots fall back to baseline.
           </p>
         </div>
-        <span className="font-jetbrains rounded-full border border-white/12 px-3 py-1 text-[11px] text-white/60">
-          {character.category} · {character.lang} · {coverage}/{total} emotions
+        <span className="flex items-center gap-2">
+          <span className="font-jetbrains rounded-full border border-white/12 px-3 py-1 text-[11px] text-white/60">
+            {character.category} · {character.lang} · {coverage}/{total} emotions
+          </span>
+          {character.category === "cloned" && (
+            <a
+              href={`/api/characters/${encodeURIComponent(character.character_id)}/pack`}
+              download
+              title="Download this Character as a portable .gravichar pack — import it on any Gravitone instance"
+              className="font-jetbrains rounded-full border border-cyan-400/30 bg-cyan-400/5 px-3 py-1 text-[11px] text-cyan-200 transition hover:bg-cyan-400/10"
+            >
+              ⇓ export pack
+            </a>
+          )}
         </span>
       </div>
 
