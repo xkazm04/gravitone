@@ -7,6 +7,7 @@
 
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
+import Link from "next/link";
 import { AnimatePresence, motion } from "framer-motion";
 import EmotionArt from "@/components/ui/EmotionArt";
 import { EMOTIONS } from "@/lib/emotions";
@@ -20,12 +21,14 @@ export default function EmotionPicker({
   onPick,
   available,
   characterName,
+  characterId,
 }: {
   open: boolean;
   onClose: () => void;
   onPick: (emotion: string) => void;
   available: string[];
   characterName: string;
+  characterId: string;
 }) {
   // Portal to <body> so the modal escapes AppFrame's overflow/stacking context
   // (that was why it rendered below the page sections). Close on Escape.
@@ -110,10 +113,23 @@ export default function EmotionPicker({
                         />
                       </span>
                       <span className="font-jetbrains mt-2 text-[12px] font-medium text-white transition group-hover:text-cyan-200">{e.label}</span>
-                      <span className="font-jetbrains text-[11px]" style={{ color: has ? "hsl(160 60% 60%)" : "rgba(255,255,255,0.5)" }}>
-                        {has ? "available" : "→ baseline"}
-                      </span>
                     </motion.button>
+                    {/* status line lives OUTSIDE the button so a missing
+                        emotion can deep-link into the guided recorder */}
+                    {has ? (
+                      <span className="font-jetbrains block w-24 text-center text-[11px]" style={{ color: "hsl(160 60% 60%)" }}>
+                        available
+                      </span>
+                    ) : (
+                      <Link
+                        href={`/voices/${encodeURIComponent(characterId)}?record=${e.id}`}
+                        onClick={onClose}
+                        title={`${characterName} has no ${e.label} voice yet — record it now`}
+                        className="font-jetbrains block w-24 text-center text-[11px] text-amber-300/80 underline-offset-2 transition hover:text-amber-200 hover:underline"
+                      >
+                        record →
+                      </Link>
+                    )}
                   </div>
                 );
               })}

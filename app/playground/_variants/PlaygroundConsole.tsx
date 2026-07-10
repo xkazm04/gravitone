@@ -8,10 +8,11 @@
 //   * Missing emotions fall back to baseline; the take shows what actually ran.
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
 import { AnimatePresence, motion } from "framer-motion";
 import { Button, Eyebrow } from "@/components/ui/Primitives";
 import { EASE } from "@/components/ui/tokens";
-import { EMOTIONS, emotionMeta, wrapWithTag } from "@/lib/emotions";
+import { EMOTION_IDS, EMOTIONS, emotionMeta, wrapWithTag } from "@/lib/emotions";
 import EmotionArt from "@/components/ui/EmotionArt";
 import { DEFAULT_EXPRESSION, DEFAULT_TEXT, stripTags, type Expression, type Take } from "./shared";
 import { speak } from "./engine";
@@ -109,6 +110,7 @@ export default function PlaygroundConsole() {
         onPick={insertEmotion}
         available={character?.emotions ?? ["baseline"]}
         characterName={character?.name ?? "Character"}
+        characterId={character?.character_id ?? ""}
       />
       <Eyebrow>free playground</Eyebrow>
       <h1 className="font-instrument mt-4 text-4xl text-white">Compose a take.</h1>
@@ -284,6 +286,16 @@ export default function PlaygroundConsole() {
                             <span>{s.used}</span>
                           )}
                           <span className="text-white/55">{s.seconds}s</span>
+                          {/* fallback chips upsell the guided recorder */}
+                          {s.fallback && EMOTION_IDS.includes(s.requested) && (
+                            <Link
+                              href={`/voices/${encodeURIComponent(t.characterId)}?record=${s.requested}`}
+                              title={`${t.characterName} has no ${s.requested} voice — record it and re-render this take`}
+                              className="text-amber-300/90 underline-offset-2 transition hover:text-amber-200 hover:underline"
+                            >
+                              record →
+                            </Link>
+                          )}
                         </span>
                       );
                     })}
