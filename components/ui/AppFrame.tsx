@@ -4,6 +4,7 @@ import { useEffect } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Wordmark } from "./Primitives";
+import SavingsTicker from "./SavingsTicker";
 import UserMenu from "./UserMenu";
 import { useAuth } from "@/lib/useAuth";
 
@@ -42,7 +43,10 @@ export default function AppFrame({ children }: { children: React.ReactNode }) {
                 </Link>
               ))}
           </div>
-          <UserMenu />
+          <div className="flex items-center gap-3">
+            <SavingsTicker />
+            <UserMenu />
+          </div>
         </nav>
 
         {resolving ? (
