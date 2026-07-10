@@ -8,6 +8,7 @@ import { createPortal } from "react-dom";
 import { AnimatePresence, motion } from "framer-motion";
 import { Button } from "@/components/ui/Primitives";
 import { EASE } from "@/components/ui/tokens";
+import MigrationKit from "./MigrationKit";
 import type { ApiKeyWithSecret } from "./data";
 
 export default function SecretReveal({ keyData, onClose }: { keyData: ApiKeyWithSecret | null; onClose: () => void }) {
@@ -34,7 +35,7 @@ export default function SecretReveal({ keyData, onClose }: { keyData: ApiKeyWith
           <motion.div
             initial={{ opacity: 0, scale: 0.94 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.96 }}
             transition={{ duration: 0.26, ease: EASE }} onClick={(e) => e.stopPropagation()}
-            className="glass-panel w-full max-w-lg rounded-3xl p-8"
+            className="glass-panel max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-3xl p-8"
           >
             <div className="font-jetbrains text-[11px] uppercase tracking-widest text-cyan-300/80">save this key now</div>
             <h2 className="font-instrument mt-2 text-2xl text-white">{keyData.name}</h2>
@@ -55,6 +56,9 @@ export default function SecretReveal({ keyData, onClose }: { keyData: ApiKeyWith
                 <span key={s} className="font-jetbrains rounded-full border border-white/12 bg-white/5 px-2.5 py-1 text-[11px] text-white/70">{s}</span>
               ))}
             </div>
+
+            {/* the key-in-hand moment IS the switching moment */}
+            <MigrationKit apiKey={keyData.secret} />
 
             <div className="mt-6 flex justify-end">
               <Button onClick={onClose}>I&apos;ve saved it</Button>

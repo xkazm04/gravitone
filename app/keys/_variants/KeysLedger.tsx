@@ -35,7 +35,8 @@ export default function KeysLedger() {
       <h1 className="font-instrument mt-4 text-4xl text-white">API keys.</h1>
       <p className="mt-2 max-w-2xl text-base text-white/70">
         Issue keys for other apps to call your Gravitone API. Send them as{" "}
-        <span className="font-jetbrains text-cyan-300">xi-api-key</span>. Secrets are shown once.
+        <span className="font-jetbrains text-cyan-300">xi-api-key</span> — the same header ElevenLabs
+        clients already send, so a new key plus a base-URL swap is a complete migration. Secrets are shown once.
       </p>
 
       {(error || err) && (
