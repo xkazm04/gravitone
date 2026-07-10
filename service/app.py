@@ -34,6 +34,7 @@ from service.engine import AdmissionRejected, TtsEngine, concat_wavs, wav_bytes_
 from service.voices import emotion_map, router as voices_router
 from service.keys import router as keys_router
 from service.ingest_api import router as ingest_router
+from service.packs import router as packs_router
 
 ENGINE: TtsEngine | None = None
 
@@ -210,6 +211,9 @@ app.include_router(voices_router, dependencies=[Depends(require_read_write("tts"
 app.include_router(keys_router, dependencies=[Depends(require_scope("admin"))])
 # Character ingestion (scan a recording → review → commit) — "clone" scope.
 app.include_router(ingest_router, dependencies=[Depends(require_scope("clone"))])
+# Character Packs (export/import portable bundles) — exporting hands out the
+# raw voice embeddings, so both directions need the "voices" scope.
+app.include_router(packs_router, dependencies=[Depends(require_scope("voices"))])
 
 
 class SpeakRequest(BaseModel):
