@@ -34,6 +34,22 @@ Each needs a product/pricing decision or a bigger engine than the wave scoped.
 - **License/creator fields** exist in the manifest but nothing fills them —
   add to the export UI when the gallery lands.
 
+## From cloud-marketplace (wave 6)
+
+- **Actual marketplace publication**: the CFN template + bootstrap are the
+  deployable; listing on AWS Marketplace needs an AMI baked from a booted
+  instance (or Packer), seller registration, and the listing process — a
+  business/account workflow, not code. GCP (Axion) / Azure (Cobalt) launch
+  wrappers reuse deploy/bootstrap.sh unchanged.
+- **Multi-replica fleet on big boxes**: the one-click runs one container
+  (WORKERS=1, THREADS=min(4,cores)); full utilization of c8g.2xlarge needs
+  N replicas + LB — that's the production-fleet-tier wave (Helm/autoscaler).
+- **cfn-lint validated; not launched**: no AWS profile on this machine, so
+  the stack/script haven't been exercised against a live account. First real
+  run: `deploy/aws-oneclick.sh up` with the gravitone profile (needs
+  ec2:CreateSecurityGroup + AuthorizeSecurityGroupIngress added to
+  aws/iam-policy.json, or SG=).
+
 ## From earlier waves
 
 - **Streaming synthesis** (compat matrix ❌ row): whole-utterance responses
