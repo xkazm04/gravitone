@@ -3,11 +3,9 @@
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import AppFrame from "@/components/ui/AppFrame";
-import PrototypeTabs from "@/components/ui/PrototypeTabs";
 import { Button, Eyebrow } from "@/components/ui/Primitives";
 import EmotionArt from "@/components/ui/EmotionArt";
 import { emotionMeta } from "@/lib/emotions";
-import SignalFlow from "./_loaders/SignalFlow";
 import WaveformLab from "./_loaders/WaveformLab";
 import type { LoaderData, LoaderStep, Partial as PartialData } from "./_loaders/shared";
 
@@ -160,13 +158,10 @@ export default function NewCharacterPage() {
           </div>
         )}
 
-        {/* PROCESSING — loader (A/B) */}
+        {/* PROCESSING — Waveform Lab won the loader round */}
         {phase === "processing" && (
           <div className="mt-10 max-w-3xl">
-            <PrototypeTabs storageKey="proto-ingest-loader" variants={[
-              { id: "flow", label: "Signal Flow", sub: "pipeline", node: <SignalFlow data={loaderData} /> },
-              { id: "lab", label: "Waveform Lab", sub: "living waveform", node: <WaveformLab data={loaderData} /> },
-            ]} />
+            <WaveformLab data={loaderData} />
           </div>
         )}
 
