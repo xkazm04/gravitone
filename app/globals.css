@@ -1,0 +1,99 @@
+@import "tailwindcss";
+
+/* Font families are injected as CSS vars by next/font in layout.tsx.
+   Expose them as utility classes so each variant can pick its own voice. */
+.font-instrument { font-family: var(--font-instrument), Georgia, serif; }
+.font-hanken     { font-family: var(--font-hanken), system-ui, sans-serif; }
+.font-jetbrains  { font-family: var(--font-jetbrains), ui-monospace, monospace; }
+.font-bricolage  { font-family: var(--font-bricolage), system-ui, sans-serif; }
+.font-gabarito   { font-family: var(--font-gabarito), system-ui, sans-serif; }
+.font-shantell   { font-family: var(--font-shantell), "Comic Sans MS", cursive; }
+
+* { -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
+html { scroll-behavior: smooth; }
+body { margin: 0; }
+
+/* ---------------------------------------------------------------------------
+   A · OBSIDIAN STUDIO — dark cinematic
+--------------------------------------------------------------------------- */
+.aurora {
+  background:
+    radial-gradient(60% 50% at 20% 10%, rgba(34,211,238,0.18), transparent 60%),
+    radial-gradient(50% 45% at 85% 20%, rgba(139,92,246,0.16), transparent 60%),
+    radial-gradient(70% 60% at 60% 100%, rgba(16,185,129,0.10), transparent 60%);
+  animation: aurora-drift 22s ease-in-out infinite alternate;
+}
+@keyframes aurora-drift {
+  0%   { transform: translate3d(-2%, -1%, 0) scale(1.02); }
+  100% { transform: translate3d(3%, 2%, 0) scale(1.08); }
+}
+.grain::before {
+  content: ""; position: absolute; inset: 0; pointer-events: none; opacity: 0.05;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+.glass-panel {
+  background: linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0.015));
+  border: 1px solid rgba(255,255,255,0.08);
+  backdrop-filter: blur(14px);
+}
+.text-aurora {
+  background: linear-gradient(92deg, #67e8f9, #a78bfa 55%, #6ee7b7);
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.cta-glow { box-shadow: 0 0 0 1px rgba(103,232,249,0.3), 0 8px 40px -8px rgba(103,232,249,0.45); }
+
+/* live equalizer bars (used in A + C) */
+@keyframes eq {
+  0%,100% { transform: scaleY(0.25); } 50% { transform: scaleY(1); }
+}
+.eq-bar { transform-origin: bottom; animation: eq 1.1s ease-in-out infinite; }
+
+/* ---------------------------------------------------------------------------
+   B · STICKER STUDIO — warm-cream neo-brutalist
+--------------------------------------------------------------------------- */
+.sticker {
+  border: 3px solid #17202a; background: #fff;
+  box-shadow: 6px 6px 0 #17202a; border-radius: 1rem;
+  transition: transform .18s cubic-bezier(.16,1,.3,1), box-shadow .18s;
+}
+.sticker-hover:hover { transform: translate(-3px,-3px) rotate(0deg); box-shadow: 9px 9px 0 #17202a; }
+.btn-pop {
+  border: 3px solid #17202a; box-shadow: 5px 5px 0 #17202a;
+  transition: transform .12s, box-shadow .12s;
+}
+.btn-pop:hover { transform: translate(2px,2px); box-shadow: 3px 3px 0 #17202a; }
+.btn-pop:active { transform: translate(5px,5px); box-shadow: 0 0 0 #17202a; }
+@keyframes marquee { from { transform: translateX(0); } to { transform: translateX(-50%); } }
+.marquee { animation: marquee 22s linear infinite; }
+.underline-draw {
+  background-image: linear-gradient(#caa54c,#caa54c);
+  background-position: 0 92%; background-repeat: no-repeat; background-size: 100% 0.28em;
+}
+
+/* ---------------------------------------------------------------------------
+   C · SIGNAL / SILICON — oscilloscope editorial
+--------------------------------------------------------------------------- */
+.grid-paper {
+  background-image:
+    linear-gradient(rgba(16,185,129,0.09) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(16,185,129,0.09) 1px, transparent 1px);
+  background-size: 28px 28px;
+}
+.scanlines::after {
+  content: ""; position: absolute; inset: 0; pointer-events: none; opacity: .35;
+  background: repeating-linear-gradient(0deg, rgba(0,0,0,0.14) 0 1px, transparent 1px 3px);
+}
+@keyframes trace {
+  from { stroke-dashoffset: 1400; } to { stroke-dashoffset: 0; }
+}
+.scope-trace { stroke-dasharray: 1400; animation: trace 3.2s ease-out forwards; }
+@keyframes blink { 50% { opacity: 0; } }
+.cursor-blink { animation: blink 1.1s steps(1) infinite; }
+.chip-tech {
+  border: 1px solid rgba(16,185,129,0.35); background: rgba(16,185,129,0.06);
+  color: #34d399; letter-spacing: 0.12em;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}
