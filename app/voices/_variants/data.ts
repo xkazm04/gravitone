@@ -2,17 +2,32 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
+/** One speaker in ONE emotion. */
 export type Voice = {
   voice_id: string;
+  character_id: string;
+  emotion: string;
   name: string;
   category: "cloned" | "premade";
-  tags: string[];
   lang: string;
   created?: string | null;
   sample_seconds?: number | null;
 };
 
-/** Stable hue per voice id, so a voice looks the same across every variant. */
+/** A group of Voices across the emotion scale. */
+export type Character = {
+  character_id: string;
+  name: string;
+  category: "cloned" | "premade";
+  tags: string[];
+  lang: string;
+  voices: Voice[];
+  emotions: string[];
+  coverage: number;
+  total: number;
+  created?: string | null;
+};
+
 export function hueOf(id: string): number {
   let h = 0;
   for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) % 360;
@@ -31,19 +46,19 @@ export function relTime(iso?: string | null): string {
   return `${Math.floor(h / 24)}d ago`;
 }
 
-export function useVoices() {
-  const [voices, setVoices] = useState<Voice[]>([]);
+export function useCharacters() {
+  const [characters, setCharacters] = useState<Character[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
-      const r = await fetch("/api/voices", { cache: "no-store" });
+      const r = await fetch("/api/characters", { cache: "no-store" });
       if (!r.ok) throw new Error(r.status === 503 ? "Gravitone backend unreachable" : `error ${r.status}`);
-      setVoices((await r.json()) as Voice[]);
+      setCharacters((await r.json()) as Character[]);
       setError(null);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "failed to load voices");
+      setError(e instanceof Error ? e.message : "failed to load characters");
     } finally {
       setLoading(false);
     }
@@ -51,11 +66,13 @@ export function useVoices() {
 
   useEffect(() => { void refresh(); }, [refresh]);
 
+  /** Clone one Voice (character + emotion) from a recording. */
   const createVoice = useCallback(
-    async (file: Blob, name: string, tags: string[], filename = "recording.wav") => {
+    async (file: Blob, character: string, emotion: string, tags: string[] = [], filename = "recording.wav") => {
       const fd = new FormData();
       fd.append("file", file, filename);
-      fd.append("name", name);
+      fd.append("character", character);
+      fd.append("emotion", emotion);
       fd.append("tags", tags.join(","));
       const r = await fetch("/api/voices", { method: "POST", body: fd });
       const body = await r.json().catch(() => ({}));
@@ -66,26 +83,30 @@ export function useVoices() {
     [refresh]
   );
 
-  const patchVoice = useCallback(async (id: string, patch: { name?: string; tags?: string[] }) => {
-    setVoices((vs) => vs.map((v) => (v.voice_id === id ? { ...v, ...patch } : v))); // optimistic
-    const r = await fetch(`/api/voices/${encodeURIComponent(id)}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(patch),
+  const patchCharacter = useCallback(async (id: string, patch: { name?: string; tags?: string[] }) => {
+    setCharacters((cs) => cs.map((c) => (c.character_id === id ? { ...c, ...patch } : c)));
+    const r = await fetch(`/api/characters/${encodeURIComponent(id)}`, {
+      method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(patch),
     });
     if (!r.ok) await refresh();
   }, [refresh]);
 
-  const removeVoice = useCallback(async (id: string) => {
-    setVoices((vs) => vs.filter((v) => v.voice_id !== id)); // optimistic
-    const r = await fetch(`/api/voices/${encodeURIComponent(id)}`, { method: "DELETE" });
+  const deleteCharacter = useCallback(async (id: string) => {
+    setCharacters((cs) => cs.filter((c) => c.character_id !== id));
+    const r = await fetch(`/api/characters/${encodeURIComponent(id)}`, { method: "DELETE" });
     if (!r.ok) await refresh();
   }, [refresh]);
 
-  return { voices, loading, error, refresh, createVoice, patchVoice, removeVoice };
+  const deleteVoice = useCallback(async (voiceId: string) => {
+    const r = await fetch(`/api/voices/${encodeURIComponent(voiceId)}`, { method: "DELETE" });
+    await refresh();
+    if (!r.ok) throw new Error("delete failed");
+  }, [refresh]);
+
+  return { characters, loading, error, refresh, createVoice, patchCharacter, deleteCharacter, deleteVoice };
 }
 
-/** Synthesize a short line with a voice and play it. One preview at a time. */
+/** Synthesize a short line with one Voice and play it. One preview at a time. */
 export function useVoicePreview() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const [playingId, setPlayingId] = useState<string | null>(null);
@@ -97,16 +118,15 @@ export function useVoicePreview() {
   }, []);
 
   const preview = useCallback(
-    async (voice: Voice, line?: string) => {
-      if (playingId === voice.voice_id) return stop();
+    async (voiceId: string, label: string, line?: string) => {
+      if (playingId === voiceId) return stop();
       stop();
-      setBusyId(voice.voice_id);
+      setBusyId(voiceId);
       try {
-        const text = line ?? `Hi, this is ${voice.name}. This is how I sound.`;
+        const text = line ?? `Hi, this is ${label}. This is how I sound.`;
         const r = await fetch("/api/tts", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text, voiceId: voice.voice_id }),
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text, voiceId }),
         });
         if (!r.ok) throw new Error("preview failed");
         const url = URL.createObjectURL(await r.blob());
@@ -115,7 +135,7 @@ export function useVoicePreview() {
         a.src = url;
         a.onended = () => setPlayingId(null);
         await a.play();
-        setPlayingId(voice.voice_id);
+        setPlayingId(voiceId);
       } catch {
         setPlayingId(null);
       } finally {

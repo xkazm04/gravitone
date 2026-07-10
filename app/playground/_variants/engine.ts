@@ -1,9 +1,9 @@
 "use client";
 
-import { waveHeights, type Voice } from "./shared";
+import { stripTags, waveHeights, type Expression, type Segment } from "./shared";
 
 /** Decode a WAV blob and reduce it to N peak bars + true duration. */
-export async function computePeaks(blob: Blob, n = 48): Promise<{ peaks: number[]; duration: number }> {
+export async function computePeaks(blob: Blob, n = 56): Promise<{ peaks: number[]; duration: number }> {
   const AC: typeof AudioContext =
     window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
   const ctx = new AC();
@@ -28,27 +28,41 @@ export async function computePeaks(blob: Blob, n = 48): Promise<{ peaks: number[
   }
 }
 
-export type SynthResult = {
+export type SpeakResult = {
   mode: "gravitone" | "browser";
   url?: string;
   peaks: number[];
   seconds: number;
   kb: number;
   rtf: number;
+  segments: Segment[];
 };
 
+function decodeSegments(header: string | null): Segment[] {
+  if (!header) return [];
+  try {
+    return JSON.parse(atob(header)) as Segment[];
+  } catch {
+    return [];
+  }
+}
+
 /**
- * Synthesize `text` with `voice`. Prefers the real Gravitone backend (via the
- * /api/tts server proxy); if it's unreachable, falls back to the browser's
- * speech engine so the playground still speaks.
+ * Speak metatagged text with one Character. Emotions the Character lacks fall
+ * back to baseline; the per-segment report says what actually happened.
+ * Falls back to browser speech (tags stripped) when the backend is unreachable.
  */
-export async function synthesize(text: string, voice: Voice): Promise<SynthResult> {
+export async function speak(text: string, characterId: string, expr: Expression): Promise<SpeakResult> {
   const trimmed = text.trim();
   try {
-    const res = await fetch("/api/tts", {
+    const res = await fetch("/api/speak", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: trimmed, voiceId: voice.id }),
+      body: JSON.stringify({
+        character_id: characterId,
+        text: trimmed,
+        voice_settings: { temperature: expr.temperature, stability: expr.stability, quality: expr.quality },
+      }),
     });
     if (res.ok) {
       const blob = await res.blob();
@@ -57,23 +71,20 @@ export async function synthesize(text: string, voice: Voice): Promise<SynthResul
       const hdrSec = Number(res.headers.get("X-Audio-Seconds"));
       const hdrRtf = Number(res.headers.get("X-Realtime-Factor"));
       return {
-        mode: "gravitone",
-        url,
-        peaks,
+        mode: "gravitone", url, peaks,
         seconds: Math.round((hdrSec || duration) * 10) / 10,
         kb: Math.round(blob.size / 1024),
-        rtf: hdrRtf || voice.rtf,
+        rtf: hdrRtf || 0,
+        segments: decodeSegments(res.headers.get("X-Segments")),
       };
     }
   } catch {
-    /* fall through to browser speech */
+    /* fall through */
   }
-  const seconds = Math.max(1.5, Math.round(trimmed.length * 0.055 * 10) / 10);
+  const plain = stripTags(trimmed);
+  const seconds = Math.max(1.5, Math.round(plain.length * 0.055 * 10) / 10);
   return {
-    mode: "browser",
-    peaks: waveHeights(trimmed.length * 31 + 7, 48),
-    seconds,
-    kb: 0,
-    rtf: voice.rtf,
+    mode: "browser", peaks: waveHeights(plain.length * 31 + 7, 56),
+    seconds, kb: 0, rtf: 0, segments: [],
   };
 }

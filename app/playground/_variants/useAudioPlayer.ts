@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { Take } from "./shared";
+import { stripTags, type Take } from "./shared";
 
 /**
  * Unified transport for takes.
@@ -80,7 +80,7 @@ export function useAudioPlayer() {
         try { await a.play(); } catch { /* autoplay blocked */ }
       } else {
         const synth = window.speechSynthesis;
-        const u = new SpeechSynthesisUtterance(take.text);
+        const u = new SpeechSynthesisUtterance(stripTags(take.text));
         u.onend = () => {
           clearTimer();
           elapsedRef.current = 0;
