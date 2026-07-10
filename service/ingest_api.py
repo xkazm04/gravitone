@@ -1,12 +1,14 @@
-"""HTTP surface for the Character-ingestion flow.
+"""HTTP surface for the Character-ingestion flow (with speaker selection).
 
-  POST /v1/ingest/scan            (multipart file) → { job_id }   [starts async scan]
-  GET  /v1/ingest/{job}           → { status, steps[], result }   [poll]
-  GET  /v1/ingest/{job}/preview/{emotion}  → stem wav             [listen before accept]
-  POST /v1/ingest/{job}/commit    { character, emotions[], character_id? } → created voices
+  POST /v1/ingest/scan                      (file) → { job_id }  [analyze: transcribe+isolate]
+  GET  /v1/ingest/{job}                     → { status, step, steps[], partial, speakers, result }
+  GET  /v1/ingest/{job}/speaker-preview/{id}→ per-speaker sample wav
+  POST /v1/ingest/{job}/speaker             { speaker_id }  [start label+stem for that speaker]
+  GET  /v1/ingest/{job}/preview/{emotion}   → stem wav
+  POST /v1/ingest/{job}/commit              { character, emotions[], character_id? } → voices
 
-Scan runs on a background thread; stem wavs live in a per-job temp dir until the
-job is committed or expires. In-memory job store — fine for a single-node POC.
+Status flow: running → awaiting_speaker → running → done. `partial` streams live
+intermediate data (word count, speakers, per-emotion tally) for a data-rich loader.
 """
 from __future__ import annotations
 
@@ -17,7 +19,7 @@ import time
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -33,7 +35,7 @@ STEPS = [
 ]
 
 JOBS: dict[str, dict] = {}
-_TTL = 60 * 30  # 30 min
+_TTL = 60 * 30
 
 
 def _gc() -> None:
@@ -43,24 +45,41 @@ def _gc() -> None:
         JOBS.pop(jid, None)
 
 
-def _run(job_id: str, audio: Path) -> None:
+def _mk_step(job: dict, key: str, state: str) -> None:
+    for s in job["steps"]:
+        if s["key"] == key:
+            s["state"] = state
+    job["step"] = key
+
+
+def _analyze(job_id: str, audio: Path) -> None:
     job = JOBS[job_id]
-
-    def progress(key: str, state: str) -> None:
-        for s in job["steps"]:
-            if s["key"] == key:
-                s["state"] = state
-        job["step"] = key
-
     try:
-        res = ingest.scan(audio, Path(job["work_dir"]), progress=progress)
-        job["result"] = res
-        job["status"] = "done"
+        res = ingest.analyze(
+            audio, Path(job["work_dir"]),
+            progress=lambda k, s: _mk_step(job, k, s),
+            partial=lambda d: job["partial"].update(d))
+        job["speakers"] = res["speakers"]
+        job["duration"] = res["duration"]
+        job["status"] = "awaiting_speaker"
     except Exception as exc:  # noqa: BLE001
-        job["status"] = "error"
-        job["error"] = str(exc)[:400]
+        job["status"] = "error"; job["error"] = str(exc)[:400]
     finally:
         audio.unlink(missing_ok=True)
+
+
+def _label(job_id: str, target: str) -> None:
+    job = JOBS[job_id]
+    try:
+        res = ingest.label_and_stem(
+            Path(job["work_dir"]), target,
+            progress=lambda k, s: _mk_step(job, k, s),
+            partial=lambda d: job["partial"].update(d))
+        job["result"] = {"duration": job.get("duration", 0),
+                         "speakers": [s["id"] for s in job.get("speakers", [])], **res}
+        job["status"] = "done"
+    except Exception as exc:  # noqa: BLE001
+        job["status"] = "error"; job["error"] = str(exc)[:400]
 
 
 @router.post("/scan")
@@ -73,9 +92,9 @@ async def start_scan(file: UploadFile = File(...)) -> dict:
     JOBS[job_id] = {
         "id": job_id, "status": "running", "step": None,
         "steps": [{**s, "state": "pending"} for s in STEPS],
-        "result": None, "error": None, "work_dir": str(work_dir), "created": time.time(),
-    }
-    threading.Thread(target=_run, args=(job_id, src), daemon=True).start()
+        "partial": {}, "speakers": None, "duration": 0, "result": None, "error": None,
+        "work_dir": str(work_dir), "created": time.time()}
+    threading.Thread(target=_analyze, args=(job_id, src), daemon=True).start()
     return {"job_id": job_id}
 
 
@@ -84,8 +103,36 @@ def get_job(job_id: str) -> dict:
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(404, "job not found or expired")
-    return {"id": job["id"], "status": job["status"], "step": job["step"],
-            "steps": job["steps"], "result": job["result"], "error": job["error"]}
+    return {k: job[k] for k in ("id", "status", "step", "steps", "partial",
+                                "speakers", "duration", "result", "error")}
+
+
+@router.get("/{job_id}/speaker-preview/{sid}")
+def speaker_preview(job_id: str, sid: str) -> FileResponse:
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    p = Path(job["work_dir"]) / f"speaker_{sid}.wav"
+    if not p.is_file():
+        raise HTTPException(404, "preview not found")
+    return FileResponse(str(p), media_type="audio/wav")
+
+
+class SpeakerReq(BaseModel):
+    speaker_id: str
+
+
+@router.post("/{job_id}/speaker")
+def choose_speaker(job_id: str, req: SpeakerReq) -> dict:
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "job not found or expired")
+    if job["status"] != "awaiting_speaker":
+        raise HTTPException(409, "not awaiting speaker")
+    job["status"] = "running"
+    job["partial"] = {}
+    threading.Thread(target=_label, args=(job_id, req.speaker_id), daemon=True).start()
+    return {"status": "running"}
 
 
 @router.get("/{job_id}/preview/{emotion}")
@@ -102,7 +149,7 @@ def preview(job_id: str, emotion: str) -> FileResponse:
 class CommitReq(BaseModel):
     character: str
     emotions: list[str]
-    character_id: str | None = None  # set to EXTEND an existing character
+    character_id: str | None = None
 
 
 @router.post("/{job_id}/commit")
@@ -119,5 +166,4 @@ def commit(job_id: str, req: CommitReq) -> dict:
                                 req.emotions, req.character_id)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(500, f"commit failed: {exc}")
-    # keep the job around (user may commit more emotions / extend), gc handles TTL
     return {"created": created}

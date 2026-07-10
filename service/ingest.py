@@ -173,11 +173,12 @@ def pick_speaker(segs: list[dict]) -> str:
     return max(totals, key=totals.get) if totals else "speaker_0"
 
 
-# ── SCAN (analysis only) ──────────────────────────────────────────────────────
-def scan(audio: Path, work_dir: Path, speaker: str = "auto", min_stem: float = 4.0,
-         limit: int = 40, progress: Callable[[str, str], None] | None = None) -> dict:
-    """Run steps 1-5. Saves stem_<emotion>.wav into work_dir. Returns a review dict.
-    `progress(step_key, state)` is called with state in {active, done}."""
+# ── ANALYZE (transcribe + isolate; stop for speaker pick) ─────────────────────
+def analyze(audio: Path, work_dir: Path,
+            progress: Callable[[str, str], None] | None = None,
+            partial: Callable[[dict], None] | None = None) -> dict:
+    """Steps 1-2 + per-speaker stats. Saves clean.wav, segments.json, and a
+    preview clip per speaker. Returns { duration, transcript, speakers:[...] }."""
     assert ELEVEN_KEY and GEMINI_KEY, "ELEVEN_LABS_API_KEY / GEMINI_API_KEY missing"
     work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -189,10 +190,12 @@ def scan(audio: Path, work_dir: Path, speaker: str = "auto", min_stem: float = 4
     tr = scribe(audio)
     words = tr.get("words", [])
     duration = tr.get("audio_duration_secs", 0)
+    transcript = (tr.get("text") or "")[:600]
     all_segs = build_segments(words)
-    speakers = sorted({s["speaker"] for s in all_segs})
-    target = pick_speaker(all_segs) if speaker == "auto" else speaker
-    tsegs = [s for s in all_segs if s["speaker"] == target]
+    if partial:
+        partial({"words": sum(1 for w in words if w.get("type") == "word"),
+                 "speakers": sorted({s["speaker"] for s in all_segs}),
+                 "transcript": transcript})
     prog("transcribe", "done")
 
     prog("isolate", "active")
@@ -202,14 +205,46 @@ def scan(audio: Path, work_dir: Path, speaker: str = "auto", min_stem: float = 4
     to_wav(iso, clean)
     prog("isolate", "done")
 
+    # per-speaker stats + a preview clip (their longest utterance, capped)
+    (work_dir / "segments.json").write_text(json.dumps(all_segs), "utf-8")
+    speakers: list[dict] = []
+    for sid in sorted({s["speaker"] for s in all_segs}):
+        ss = [s for s in all_segs if s["speaker"] == sid]
+        secs = round(sum(s["end"] - s["start"] for s in ss), 1)
+        longest = max(ss, key=lambda s: s["end"] - s["start"])
+        pv = work_dir / f"speaker_{sid}.wav"
+        to_wav(clean, pv, longest["start"], min(longest["end"], longest["start"] + 6))
+        speakers.append({"id": sid, "utterances": len(ss), "seconds": secs,
+                         "sample_text": longest["text"][:80]})
+    speakers.sort(key=lambda s: -s["seconds"])
+    return {"duration": duration, "transcript": transcript, "speakers": speakers}
+
+
+# ── LABEL + STEM for a chosen speaker ─────────────────────────────────────────
+def label_and_stem(work_dir: Path, target: str, min_stem: float = 4.0, limit: int = 40,
+                   progress: Callable[[str, str], None] | None = None,
+                   partial: Callable[[dict], None] | None = None) -> dict:
+    def prog(k: str, s: str) -> None:
+        if progress:
+            progress(k, s)
+
+    all_segs = json.loads((work_dir / "segments.json").read_text("utf-8"))
+    tsegs = [s for s in all_segs if s["speaker"] == target]
+    clean = work_dir / "clean.wav"
+
     prog("label", "active")
     labelled: list[dict] = []
-    for i, s in enumerate(tsegs[:limit]):
+    counts: dict[str, int] = {}
+    todo = tsegs[:limit]
+    for i, s in enumerate(todo):
         seg_wav = work_dir / f"seg_{i:03d}.wav"
         to_wav(clean, seg_wav, s["start"], s["end"])
         lab = label_emotion(seg_wav)
         lab.update({"i": i, "dur": round(s["end"] - s["start"], 2), "text": s["text"][:60], "wav": str(seg_wav)})
         labelled.append(lab)
+        counts[lab["emotion"]] = counts.get(lab["emotion"], 0) + 1
+        if partial:
+            partial({"segments_total": len(todo), "segments_done": i + 1, "emotion_counts": dict(counts)})
     prog("label", "done")
 
     prog("stem", "active")
@@ -217,7 +252,6 @@ def scan(audio: Path, work_dir: Path, speaker: str = "auto", min_stem: float = 4
     for lab in labelled:
         by_emotion.setdefault(lab["emotion"], []).append(lab)
     stems: list[dict] = []
-    # baseline always available from the whole target track
     base_wav = work_dir / "stem_baseline.wav"
     base_dur = concat_wavs([Path(l["wav"]) for l in labelled], base_wav)
     stems.append({"emotion": BASELINE, "seconds": base_dur, "segments": len(labelled),
@@ -234,11 +268,18 @@ def scan(audio: Path, work_dir: Path, speaker: str = "auto", min_stem: float = 4
     stems.sort(key=lambda s: order.get(s["emotion"], 99))
     prog("stem", "done")
 
-    return {"duration": duration, "speakers": speakers, "target": target,
-            "utterances": len(tsegs), "min_stem": min_stem, "stems": stems,
-            "segments": [{"emotion": l["emotion"], "confidence": l["confidence"],
-                          "cue": l["cue"], "dur": l["dur"], "text": l["text"],
-                          "model": l["model"]} for l in labelled]}
+    return {"target": target, "utterances": len(tsegs), "min_stem": min_stem, "stems": stems,
+            "segments": [{"emotion": l["emotion"], "confidence": l["confidence"], "cue": l["cue"],
+                          "dur": l["dur"], "text": l["text"], "model": l["model"]} for l in labelled]}
+
+
+# ── one-shot scan (CLI convenience: analyze → auto speaker → label) ────────────
+def scan(audio: Path, work_dir: Path, speaker: str = "auto", min_stem: float = 4.0,
+         limit: int = 40, progress: Callable[[str, str], None] | None = None) -> dict:
+    a = analyze(audio, work_dir, progress)
+    target = a["speakers"][0]["id"] if speaker == "auto" else speaker
+    r = label_and_stem(work_dir, target, min_stem, limit, progress)
+    return {"duration": a["duration"], "speakers": [s["id"] for s in a["speakers"]], **r}
 
 
 # ── COMMIT (clone selected stems) ─────────────────────────────────────────────
