@@ -103,6 +103,9 @@ class Metrics:
         self._latencies: deque[float] = deque(maxlen=window)   # end-to-end seconds
         self._proc: deque[float] = deque(maxlen=window)        # pure synth seconds
         self._audio: deque[float] = deque(maxlen=window)       # audio seconds produced
+        # Lifetime counter (not windowed) — feeds the "you'd have paid $X at
+        # ElevenLabs" savings ticker in the web studio.
+        self.audio_seconds_total = 0.0
 
     def on_received(self):
         with self._lock:
@@ -128,6 +131,7 @@ class Metrics:
             self._latencies.append(latency_s)
             self._proc.append(proc_s)
             self._audio.append(audio_s)
+            self.audio_seconds_total += audio_s
 
     def on_error(self):
         with self._lock:
@@ -154,6 +158,7 @@ class Metrics:
                 "errored": self.errored,
                 "in_flight": self.in_flight,
                 "queued": self.queued,
+                "audio_seconds_total": round(self.audio_seconds_total, 2),
             }
         rtf = None
         if proc and audio and sum(audio) > 0:

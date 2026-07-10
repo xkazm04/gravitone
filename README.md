@@ -145,6 +145,23 @@ python -m service.loadtest \
   --voice alba --levels 1,2,3,4,6,8 --requests 8
 ```
 
+### ElevenLabs compatibility matrix (drop-in switch kit)
+
+Migrating an existing ElevenLabs integration is a **base-URL change** — same
+paths, same auth header, same body shape. What maps where:
+
+| ElevenLabs surface | Gravitone | Notes |
+|---|---|---|
+| `POST /v1/text-to-speech/{voice_id}` | ✅ same path | body `{text, model_id, voice_settings}` |
+| `xi-api-key` header | ✅ same header | root key or a `/v1/keys`-issued scoped key; `Authorization: Bearer` also accepted |
+| `output_format=` query param | ✅ `wav_24000`, `mp3_24000_128`, `pcm_24000` | |
+| `voice_settings.stability` | ✅ mapped | → noise clamp |
+| `voice_settings.similarity_boost`, `style` | ⚪ accepted, ignored | no equivalent knob in pocket-tts |
+| `GET /v1/voices` | ✅ same path | readable with a tts-scoped key, like ElevenLabs |
+| Voice cloning | ✅ `POST /v1/voices` (multipart) | 16 s sample → reusable voice |
+| Streaming endpoint (`/stream`) | ❌ not yet | whole-utterance responses; ~realtime on Arm |
+| Usage accounting | ✅ `X-Audio-Seconds` header + `audio_seconds_total` in `/metrics` | feeds the studio's "you'd have paid $X at ElevenLabs" ticker |
+
 ## The full studio — two products
 
 Gravitone is **two products** that together form the studio:
