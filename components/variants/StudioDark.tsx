@@ -1,7 +1,16 @@
 "use client";
 
+import Link from "next/link";
 import { motion } from "framer-motion";
-import { BRAND, HERO, STATS, FEATURES, VOICES, SAMPLE_TEXT, NAV } from "@/lib/content";
+import { BRAND, HERO, STATS, FEATURES, VOICES, SAMPLE_TEXT } from "@/lib/content";
+import { useAuth } from "@/lib/useAuth";
+import UserMenu from "@/components/ui/UserMenu";
+
+const APP_ROUTES = [
+  { label: "Playground", href: "/playground" },
+  { label: "Voices", href: "/voices" },
+  { label: "API keys", href: "/keys" },
+];
 
 const ease = [0.22, 1, 0.36, 1] as const;
 const rise = {
@@ -24,6 +33,7 @@ function Equalizer({ bars = 28, className = "" }: { bars?: number; className?: s
 }
 
 export default function StudioDark() {
+  const { user } = useAuth();
   return (
     <div className="font-hanken relative min-h-screen overflow-hidden bg-[#080a10] text-slate-200 grain">
       {/* atmosphere */}
@@ -33,20 +43,21 @@ export default function StudioDark() {
       <div className="relative mx-auto max-w-6xl px-6">
         {/* nav */}
         <nav className="flex items-center justify-between py-6">
-          <div className="flex items-center gap-2">
+          <Link href="/" aria-label="Gravitone home" className="flex items-center gap-2">
             <span className="grid h-8 w-8 place-items-center rounded-lg border border-white/10 bg-white/5">
               <Equalizer bars={4} className="h-4 scale-[0.7]" />
             </span>
             <span className="font-instrument text-2xl tracking-tight text-white">{BRAND}</span>
-          </div>
+          </Link>
+          {/* Signed-in users get route navigation; signed-out visitors get none
+              (the marketing section anchors are removed for them). */}
           <div className="font-jetbrains hidden items-center gap-7 text-[13px] text-white/70 md:flex">
-            {NAV.map((n) => (
-              <a key={n.label} href={n.href} className="transition hover:text-white">{n.label}</a>
-            ))}
+            {user &&
+              APP_ROUTES.map((r) => (
+                <Link key={r.href} href={r.href} className="transition hover:text-white">{r.label}</Link>
+              ))}
           </div>
-          <button className="rounded-full border border-white/15 bg-white/5 px-4 py-1.5 text-sm text-white/90 transition hover:bg-white/10">
-            Sign in
-          </button>
+          <UserMenu />
         </nav>
 
         {/* hero */}
