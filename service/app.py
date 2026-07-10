@@ -30,6 +30,7 @@ from service.emotions import parse_segments, resolve
 from service.engine import AdmissionRejected, TtsEngine, concat_wavs, wav_bytes_to_mp3
 from service.voices import emotion_map, router as voices_router
 from service.keys import router as keys_router
+from service.ingest_api import router as ingest_router
 
 ENGINE: TtsEngine | None = None
 
@@ -162,6 +163,8 @@ async def text_to_speech(
 app.include_router(voices_router)
 # API key management (issue / rotate / revoke) lives in service/keys.py.
 app.include_router(keys_router)
+# Character ingestion (scan a recording → review → commit) lives in ingest_api.py.
+app.include_router(ingest_router)
 
 
 class SpeakRequest(BaseModel):
