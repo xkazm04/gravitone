@@ -1,15 +1,32 @@
 "use client";
 
+import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { Eyebrow } from "@/components/ui/Primitives";
+import { EMOTION_IDS } from "@/lib/emotions";
 import { useCharacterVoices } from "./_variants/useCharacterVoices";
 import EmotionRack from "./_variants/EmotionRack";
+import GuidedRecorder from "./_variants/GuidedRecorder";
 import ApiPanel from "./_variants/ApiPanel";
 
 // Rack won the voice-overview round — rendered directly, no switcher.
 export default function CharacterVoices({ characterId }: { characterId: string }) {
   const { character, slots, coverage, total, loading, error, busySlot, addVoice, removeVoice } =
     useCharacterVoices(characterId);
+  const [recording, setRecording] = useState<string | null>(null);
+
+  // Deep link from playground fallbacks: /voices/{id}?record=angry opens the
+  // guided recorder. Read via window.location so no Suspense boundary needed.
+  useEffect(() => {
+    const wanted = new URLSearchParams(window.location.search).get("record");
+    if (wanted && EMOTION_IDS.includes(wanted)) setRecording(wanted);
+  }, []);
+
+  // GuidedRecorder needs a throwing clone (it drives its own state machine),
+  // while the rack's file-upload path keeps the hook's stateful error flow.
+  const cloneForRecorder = useCallback(async (emotion: string, file: File) => {
+    await addVoice(emotion, file, { rethrow: true });
+  }, [addVoice]);
 
   if (loading) return <p className="py-20 text-sm text-white/60">Loading character…</p>;
 
@@ -52,8 +69,18 @@ export default function CharacterVoices({ characterId }: { characterId: string }
         <EmotionRack
           name={character.name} slots={slots} coverage={coverage} total={total}
           busySlot={busySlot} addVoice={addVoice} removeVoice={removeVoice}
+          onRecord={setRecording}
         />
       </div>
+
+      <GuidedRecorder
+        emotion={recording}
+        characterName={character.name}
+        filledEmotions={slots.filter((s) => s.voice).map((s) => s.emotion)}
+        onClone={cloneForRecorder}
+        onClose={() => setRecording(null)}
+        onSwitch={setRecording}
+      />
 
       <ApiPanel characterId={character.character_id} filledEmotions={character.emotions} />
     </div>

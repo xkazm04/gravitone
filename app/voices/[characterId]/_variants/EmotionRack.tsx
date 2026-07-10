@@ -10,10 +10,11 @@ import EmotionArt from "@/components/ui/EmotionArt";
 import { pickAudio, type Slot } from "./useCharacterVoices";
 
 export default function EmotionRack({
-  name, slots, coverage, total, busySlot, addVoice, removeVoice,
+  name, slots, coverage, total, busySlot, addVoice, removeVoice, onRecord,
 }: {
   name: string; slots: Slot[]; coverage: number; total: number; busySlot: string | null;
   addVoice: (emotion: string, f: File) => void; removeVoice: (id: string) => void;
+  onRecord: (emotion: string) => void; // open the guided capture session
 }) {
   const { preview, playingId, busyId } = useVoicePreview();
   const missing = total - coverage;
@@ -50,7 +51,7 @@ export default function EmotionRack({
                 <tr key={s.emotion} className={`border-b border-white/5 transition hover:bg-white/[0.03] ${!filled ? "opacity-70" : ""}`}>
                   <td className="px-2 py-2">
                     <button
-                      onClick={() => (filled ? preview(s.voice!.voice_id, `${name} ${s.emotion}`) : pickAudio((f) => addVoice(s.emotion, f)))}
+                      onClick={() => (filled ? preview(s.voice!.voice_id, `${name} ${s.emotion}`) : onRecord(s.emotion))}
                       disabled={isBusy}
                       aria-label={filled ? `Play ${s.label}` : `Record ${s.label}`}
                       className={`grid h-7 w-7 place-items-center rounded-full text-[11px] transition disabled:opacity-50 ${
@@ -93,10 +94,16 @@ export default function EmotionRack({
                           className="font-jetbrains ml-3 text-[11px] text-white/55 transition hover:text-rose-300">remove</button>
                       </>
                     ) : (
-                      <button onClick={() => pickAudio((f) => addVoice(s.emotion, f))} disabled={isBusy}
-                        className="font-jetbrains text-[11px] text-cyan-300/80 transition hover:text-cyan-200 disabled:opacity-50">
-                        {isBusy ? "cloning…" : "+ record this"}
-                      </button>
+                      <>
+                        <button onClick={() => onRecord(s.emotion)} disabled={isBusy}
+                          className="font-jetbrains text-[11px] text-cyan-300/80 transition hover:text-cyan-200 disabled:opacity-50">
+                          {isBusy ? "cloning…" : "● record this"}
+                        </button>
+                        <button onClick={() => pickAudio((f) => addVoice(s.emotion, f))} disabled={isBusy}
+                          className="font-jetbrains ml-3 text-[11px] text-white/45 transition hover:text-white/80 disabled:opacity-50">
+                          upload
+                        </button>
+                      </>
                     )}
                   </td>
                 </tr>

@@ -45,9 +45,11 @@ export function useCharacterVoices(characterId: string) {
     [character]
   );
 
-  /** Clone a new Voice into an empty emotion slot. */
+  /** Clone a new Voice into an empty emotion slot.
+   *  `rethrow` lets callers with their own error UI (GuidedRecorder) get the
+   *  failure instead of the hook's shared error banner. */
   const addVoice = useCallback(
-    async (emotion: string, file: File) => {
+    async (emotion: string, file: File, opts: { rethrow?: boolean } = {}) => {
       if (!character) return;
       setBusySlot(emotion);
       setError(null);
@@ -61,6 +63,7 @@ export function useCharacterVoices(characterId: string) {
         if (!r.ok) throw new Error(body?.detail ?? `clone failed (${r.status})`);
         await refresh();
       } catch (e) {
+        if (opts.rethrow) throw e;
         setError(e instanceof Error ? e.message : "clone failed");
       } finally {
         setBusySlot(null);
