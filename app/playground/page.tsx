@@ -1,15 +1,21 @@
+"use client";
+
 import AppFrame from "@/components/ui/AppFrame";
-import { Eyebrow } from "@/components/ui/Primitives";
+import PrototypeTabs from "@/components/ui/PrototypeTabs";
+import PlaygroundConsole from "./_variants/PlaygroundConsole";
+import PlaygroundStage from "./_variants/PlaygroundStage";
 
 export default function PlaygroundPage() {
   return (
     <AppFrame>
-      <div className="py-20">
-        <Eyebrow>free playground</Eyebrow>
-        <h1 className="font-instrument mt-5 text-4xl text-white">Playground</h1>
-        <p className="mt-3 max-w-md text-white/55">
-          Prototype pending — two directional variants incoming via the /prototype workflow.
-        </p>
+      <div className="py-10">
+        <PrototypeTabs
+          storageKey="proto-playground"
+          variants={[
+            { id: "console", label: "Console", sub: "operator / terminal", node: <PlaygroundConsole /> },
+            { id: "stage", label: "Stage", sub: "performer / cinematic", node: <PlaygroundStage /> },
+          ]}
+        />
       </div>
     </AppFrame>
   );
