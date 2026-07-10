@@ -50,6 +50,15 @@ export const VOICES = [
   { name: "Your voice", tag: "cloned · 16s", hue: 340 },
 ];
 
+// ElevenLabs switch-kit section (landing). Pricing math lives in
+// lib/switchkit.ts — this is copy only.
+export const SWITCH = {
+  eyebrow: "switch kit",
+  headline: "Your ElevenLabs bill, next to one Arm box.",
+  sub: "The API is ElevenLabs-compatible, so migrating is a base-URL change. Slide to your monthly volume and see what stays in your pocket when the same requests hit your own CPU.",
+  note: "Same request shape · xi-api-key · wav/mp3/pcm",
+};
+
 export const NAV = [
   { label: "Playground", href: "#playground" },
   { label: "Voices", href: "#voices" },

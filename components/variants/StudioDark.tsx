@@ -5,6 +5,7 @@ import { motion } from "framer-motion";
 import { BRAND, HERO, STATS, FEATURES, VOICES, SAMPLE_TEXT } from "@/lib/content";
 import { useAuth } from "@/lib/useAuth";
 import UserMenu from "@/components/ui/UserMenu";
+import SwitchKit from "./SwitchKit";
 
 const APP_ROUTES = [
   { label: "Playground", href: "/playground" },
@@ -166,6 +167,9 @@ export default function StudioDark() {
             </motion.div>
           ))}
         </section>
+
+        {/* ElevenLabs switch kit: bill calculator + one-line switcher */}
+        <SwitchKit />
 
         {/* playground teaser */}
         <section id="playground" className="py-14">
