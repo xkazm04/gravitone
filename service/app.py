@@ -28,6 +28,7 @@ import json
 
 from service.auth import require_read_write, require_scope
 from service.config import SETTINGS
+from service.demand import record_fallback
 from service.emotions import parse_segments, resolve
 from service.engine import AdmissionRejected, TtsEngine, concat_wavs, wav_bytes_to_mp3
 from service.voices import emotion_map, router as voices_router
@@ -141,6 +142,8 @@ def _resolve_emotion_address(voice_id: str, emotion: str | None) -> tuple[str, d
     if not emap:
         raise HTTPException(status_code=404, detail=f"unknown character '{character_id}'")
     resolved_id, used, fell_back = resolve(requested, emap)
+    if fell_back:
+        record_fallback(character_id, requested)
     return resolved_id, {
         "X-Character": character_id,
         "X-Emotion-Requested": requested,
@@ -243,6 +246,8 @@ async def speak(
 
     for seg in segments:
         voice_id, used, fell_back = resolve(seg.emotion, emap)
+        if fell_back:
+            record_fallback(req.character_id, seg.emotion)
         try:
             result = await _submit_and_wait(voice_id, seg.text, overrides)
         except _Backpressure as exc:
@@ -313,6 +318,8 @@ async def performance(req: PerformanceRequest):
         overrides = _overrides(line.voice_settings)
         for seg in parse_segments(line.text):
             voice_id, used, fell_back = resolve(seg.emotion, emap)
+            if fell_back:
+                record_fallback(line.character_id, seg.emotion)
             try:
                 result = await _submit_and_wait(voice_id, seg.text, overrides)
             except _Backpressure as exc:

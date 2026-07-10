@@ -12,3 +12,4 @@ service/loadtest_result.json
 .research-cache/
 .env
 api_keys.json
+emotion_demand.json

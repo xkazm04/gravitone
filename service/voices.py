@@ -23,6 +23,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from service.config import SETTINGS
+from service.demand import all_demand, demand_for
 from service.emotions import BASELINE, EMOTION_SCALE
 
 router = APIRouter(tags=["voices"])
@@ -62,6 +63,8 @@ class Character(BaseModel):
     coverage: int = 0
     total: int = len(EMOTION_SCALE)
     created: str | None = None
+    # Unmet requests per emotion (fallback telemetry) — "record this next" heat.
+    demand: dict[str, int] = {}
 
 
 class VoicePatch(BaseModel):
@@ -155,11 +158,15 @@ def list_characters() -> list[Character]:
                           name=vid.replace("_", " ").title(), category="premade", lang=lang)],
         )
 
+    demand = all_demand()
     for c in chars.values():
         order = {e: i for i, e in enumerate(EMOTION_SCALE)}
         c.voices.sort(key=lambda v: order.get(v.emotion, 99))
         c.emotions = [v.emotion for v in c.voices]
         c.coverage = len(set(c.emotions))
+        # only slots still missing carry heat — recording one clears it
+        c.demand = {e: n for e, n in demand_for(c.character_id, demand).items()
+                    if e not in c.emotions}
     return sorted(chars.values(), key=lambda c: (c.category != "cloned", c.name.lower()))
 
 
@@ -209,6 +216,7 @@ def character_manifest(character_id: str) -> dict:
             "missing": [e for e in EMOTION_SCALE if e not in native],
             "fallback": fallback,
             "coverage": f"{c.coverage}/{c.total}",
+            "demand": c.demand,  # unmet requests per missing emotion
             "addressing": {
                 "tts": f"POST /v1/text-to-speech/{c.character_id}:{{emotion}}",
                 "speak": "POST /v1/speak with [emotion]...[/emotion] metatags",
