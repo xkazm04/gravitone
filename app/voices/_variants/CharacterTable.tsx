@@ -129,11 +129,16 @@ export default function CharacterTable() {
           <option value="">all tags</option>
           {allTags.map((t) => <option key={t} value={t}>{t}</option>)}
         </select>
+        <Link href="/voices/new"
+          className="rounded-full bg-gradient-to-r from-cyan-300 to-cyan-200 px-4 py-2 text-[13px] font-semibold text-slate-950 transition hover:brightness-110">
+          + New character
+        </Link>
         <input ref={fileRef} type="file" accept="audio/*,video/mp4" hidden
           onChange={(e) => { const f = e.target.files?.[0]; if (f) void onFile(f); }} />
-        <Button onClick={() => fileRef.current?.click()} disabled={cloning} className="px-4 py-2 text-[13px]">
-          {cloning ? "Cloning…" : "+ New character"}
-        </Button>
+        <button onClick={() => fileRef.current?.click()} disabled={cloning}
+          className="font-jetbrains rounded-full border border-white/12 px-3 py-2 text-[12px] text-white/70 transition hover:text-white disabled:opacity-50">
+          {cloning ? "cloning…" : "quick clone"}
+        </button>
         <span className="font-jetbrains ml-auto text-[11px] text-white/60">{rows.length} of {characters.length}</span>
       </div>
 
