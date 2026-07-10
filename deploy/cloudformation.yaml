@@ -1,0 +1,82 @@
+# One-click "Private ElevenLabs" — Gravitone TTS on a Graviton instance.
+# This template is the deployable a cloud-marketplace listing wraps: pick an
+# instance size (presets from the measured benchmarks), get back an
+# ElevenLabs-compatible base URL protected by your API key.
+#
+#   aws cloudformation deploy \
+#     --template-file deploy/cloudformation.yaml \
+#     --stack-name gravitone \
+#     --parameter-overrides ApiKey=gvt_root_$(openssl rand -hex 24) AllowedCidr=$(curl -s https://checkip.amazonaws.com)/32
+#
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Gravitone - Private ElevenLabs: CPU-only Arm TTS with voice cloning,
+  ElevenLabs-compatible API. One Graviton box, no GPU, no per-character bill.
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t4g.small
+    AllowedValues: [t4g.small, t4g.medium, c7g.xlarge, c8g.xlarge, c8g.2xlarge]
+    Description: >-
+      t4g.small = free-tier-eligible demo (1.33x realtime). c8g.2xlarge =
+      production (4.26x realtime single stream, ~650 audio-min/hour).
+  ApiKey:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+    Description: Root TTS_API_KEY every request must present (xi-api-key header).
+  AllowedCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: '^\d+\.\d+\.\d+\.\d+/\d+$'
+    Description: CIDR allowed to reach the API on port 8080. Narrow this to your IP.
+  UbuntuArm64Ami:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/arm64/hvm/ebs-gp3/ami-id
+    Description: Resolved automatically - latest Ubuntu 24.04 Arm64 AMI.
+
+Resources:
+  ApiSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Gravitone TTS API (8080) + no inbound SSH (use SSM)
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: !Ref AllowedCidr
+      Tags: [{ Key: Name, Value: gravitone-tts }]
+
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref UbuntuArm64Ami
+      InstanceType: !Ref InstanceType
+      SecurityGroupIds: [!GetAtt ApiSecurityGroup.GroupId]
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs: { VolumeSize: 20, VolumeType: gp3 }
+      Tags: [{ Key: Name, Value: gravitone-tts }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          export TTS_API_KEY='${ApiKey}'
+          curl -sL https://raw.githubusercontent.com/xkazm04/gravitone/main/deploy/bootstrap.sh | bash
+          # Bootstrap logs: /var/log/cloud-init-output.log. The stack completes
+          # when the instance launches; the model finishes loading ~1-3 min
+          # later - poll the HealthCheck output until it returns "ready".
+
+Outputs:
+  BaseUrl:
+    Description: Point ElevenLabs clients here (base URL swap = the migration)
+    Value: !Sub "http://${Instance.PublicIp}:8080"
+  HealthCheck:
+    Value: !Sub "curl http://${Instance.PublicIp}:8080/health"
+  TryIt:
+    Description: First synthesis (uses the ApiKey you provided)
+    Value: !Sub >-
+      curl -X POST "http://${Instance.PublicIp}:8080/v1/text-to-speech/alba"
+      -H "xi-api-key: <your ApiKey>" -H "Content-Type: application/json"
+      -d '{"text":"My own voice cloud."}' --output hello.wav

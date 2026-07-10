@@ -123,6 +123,17 @@ ONEDNN_DEFAULT_FPMATH_MODE=bf16 TTS_WORKERS=1 TTS_TORCH_THREADS=4 \
   python -m service.app                          # → http://0.0.0.0:8080
 ```
 
+### Option C — one-click cloud deploy ("Private ElevenLabs")
+
+```bash
+# One Graviton box, bootstrapped end-to-end, key-protected, ready in minutes:
+deploy/aws-oneclick.sh up                  # or the CloudFormation template
+# → Base URL + xi-api-key printed; ElevenLabs clients migrate with one env change.
+```
+
+See `deploy/README.md` — includes the CloudFormation template a cloud-
+marketplace listing wraps, and a curl-pipe bootstrap for any Arm box.
+
 ### Validate
 
 ```bash
