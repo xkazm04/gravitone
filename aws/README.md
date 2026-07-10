@@ -45,6 +45,29 @@ Everything is tagged `Name=gravitone-bench`. Nothing else in your account is
 touched. Cost: `c8g.2xlarge` ≈ $0.29/hr while running; **stop** drops compute to
 $0 (only ~$0.64/mo for the 20 GB disk). A full benchmark run is ~15-25 min.
 
+## Free tier vs paid — which instance, when
+
+- **Demo site → `t4g.small` (Neoverse N1), free-tier eligible, DEFAULT.** A hosted
+  demo runs for months with little/no traffic, so t4g's burstable ceiling never
+  bites. Launch it with `TYPE=t4g.small`. Works on a **free** account plan.
+- **Performance / production → `c8g.2xlarge` (Graviton4/Neoverse V2).** ~2.3× the
+  dev box, ~3.2× the t4g. **Requires a PAID account plan** — the new AWS Free Tier
+  refuses non-free-tier types with `"not eligible for Free Tier"`.
+
+### Switching FREE → PAID (unlocks Graviton c8g)
+
+Check the plan: `aws freetier get-account-plan-state` → `accountPlanType` is
+`FREE` or `PAID`. To upgrade (console-only — it's a billing commitment, so it is
+**not** doable via the agent's CLI policy):
+
+1. AWS Console → **Billing and Cost Management** → left nav **"Free tier"**.
+2. **"Upgrade" / "Move to a paid plan"**; add a payment method under *Payment
+   preferences* if prompted.
+3. Confirm. Any free-plan **credits carry over** and apply to paid usage, so a
+   ~20-min c8g benchmark (~$0.15) typically costs $0 out of pocket.
+
+To go back to the cheap demo, just launch `t4g.small` again — no downgrade needed.
+
 ## Blast radius / what these permissions allow
 
 The `gravitone-agent` policy (`aws/iam-policy.json`) can only: run/start/stop/

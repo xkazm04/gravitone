@@ -52,24 +52,38 @@ study**:
    latency percentiles / throughput / server RTF / CPU / RAM, and the
    recommended safe cap. Emits `loadtest_result.json`.
 
-**Measured output (dev box: Windows-on-Arm64, 12 threads, unoptimized).**
-In-process throughput ceiling **≈ 2.2 audio-seconds per wall-second**; best
-single request **2.0× real-time**. CPU peaks at only ~70% at that ceiling → the
-model is **GIL/serialization-bound, not core-bound**. We proved the fix: **4
-independent single-worker processes reached 4.14 aud/s — 1.88× the in-process
-ceiling — on the same box**, lifting CPU to ~75%. So throughput scales by
-running **independent processes/replicas** (separate GILs), not more in-process
-workers. These are a **floor**: a Linux Neoverse instance with BF16 + KleidiAI
-is expected to be materially faster (see optimizations below).
+### Measured performance — three Arm variants (all bf16, CPU-index ARM torch)
 
-**Measured on AWS Graviton (t4g.small, Neoverse N1, free tier, bf16):**
-single-worker single-stream **1.33× real-time**, CPU-saturated on 2 vCPU.
-Finding: on aarch64, PyPI's default `torch` is a **CUDA (GH200) build** whose
-CPU fallback bypasses the oneDNN + Arm Compute Library path — installing the
-**CPU-index wheel** instead lifted single-stream **1.23× → 1.33× (~8%)** and
-removed concurrency degradation, on the same box. Graviton4 (c8g / Neoverse V2
-with BF16/I8MM + KleidiAI) is expected to be materially higher; it was
-unavailable here only because the test account was in AWS Free-Tier mode.
+| Platform | Single-stream RTF | In-process peak | 4-process scaling | Notes |
+|---|---|---|---|---|
+| Windows-ARM64 dev box | ~1.9× | ~2.2 aud/s | 4.14 aud/s | 12 threads, unoptimized reference |
+| Graviton2 · `t4g.small` (Neoverse N1) | 1.33× | — | — | 2 vCPU, free-tier, burstable |
+| **Graviton4 · `c8g.2xlarge` (Neoverse V2)** | **4.26×** | **~6.0 aud/s** | **~10.9 aud/s** | 8 vCPU, ~46% CPU at in-process ceiling |
+
+**Graviton4 is ~2.3× faster single-stream than the dev box and ~3.2× the N1** — a
+3-second sentence renders in ~0.7s. One `c8g.2xlarge` (~$0.29/hr) sustains
+**~10.9 audio-seconds/second ≈ ~650 audio-minutes/hour ≈ ~98 two-sentence
+requests/minute**, at **~$0.0004 per audio-minute** of compute (1000×+ under
+hosted TTS).
+
+**Two findings that generalise:**
+1. **Scale by process/replica, not in-process workers.** On *every* box CPU tops
+   out well before throughput (c8g: ~46% at its in-process ceiling) — the model
+   is **GIL/serialization-bound**. Running N single-worker processes (separate
+   GILs) ≈ doubles throughput vs one N-worker process. `WORKERS ≈ vCPU / THREADS`,
+   pinned per replica.
+2. **Install torch from the CPU index.** On aarch64, PyPI's default `torch` is a
+   **CUDA (GH200) build** whose CPU fallback bypasses the oneDNN + Arm Compute
+   Library path; the CPU-index wheel (`--index-url .../whl/cpu`) restores ACL and
+   lifted single-stream ~8% on N1.
+
+### Which instance to run
+
+- **Demo site → free tier `t4g.small` by default.** A hosted demo runs for months
+  with little/no real traffic, so t4g's burstable limit never bites — and it stays
+  free-tier eligible. This is the default deployment target.
+- **Production / benchmarking → `c8g` (Graviton4).** Non-burstable Neoverse V2 for
+  real throughput. Needs a **paid** AWS account plan (see `aws/README.md`).
 
 ## Setup Instructions (Arm64 / Arm-powered device)
 
@@ -130,6 +144,51 @@ curl -X POST "localhost:8080/v1/text-to-speech/myvoice" \
 python -m service.loadtest \
   --voice alba --levels 1,2,3,4,6,8 --requests 8
 ```
+
+## The full studio — two products
+
+Gravitone is **two products** that together form the studio:
+
+```
+┌──────────────────────┐   GRAVITONE_URL    ┌───────────────────────────┐
+│  gravitone-web        │ ─────────────────▶ │  TTS backend (this repo)   │
+│  Next.js studio UI    │   /v1/* over HTTP  │  python -m service.app     │
+│  (auth, playground,   │                    │  :8080  · runs on Arm CPU  │
+│   voices, keys,       │                    │  pocket-tts clone + serve  │
+│   ingestion)          │                    └───────────────────────────┘
+└──────────────────────┘
+```
+
+**Product 1 — TTS backend (this repo).** Run it per *Setup Instructions* above.
+For the **ingestion** feature (build a Character from a recording) the backend
+also needs, in its env:
+
+```bash
+ELEVEN_LABS_API_KEY=…   # Scribe diarization + Voice Isolator
+GEMINI_API_KEY=…        # emotion classification (gemini-3.5-flash → 3.1-pro escalate)
+HF_TOKEN=…              # first-run only: gated pocket-tts voice-cloning weights
+```
+
+**Product 2 — web studio (`gravitone-web`).** Next.js 15 app (playground, voice &
+Character management, API keys, Firebase Google-auth + Firestore profiles, and the
+recording-ingestion flow). It talks to the backend via **`GRAVITONE_URL`**:
+
+```bash
+# gravitone-web/.env.local
+GRAVITONE_URL=http://127.0.0.1:8080          # or https://tts.<your-domain> in prod
+NEXT_PUBLIC_FIREBASE_API_KEY=…               # web config (public by design)
+NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=…
+NEXT_PUBLIC_FIREBASE_PROJECT_ID=…
+# … (see gravitone-web/.env.example for the full set)
+
+npm install && npm run dev                    # → http://localhost:3001
+```
+
+**Local dev:** start the backend on `:8080`, then the web app on `:3001` with
+`GRAVITONE_URL` pointing at it. **Deploy:** put the backend on an Arm instance
+(**`t4g.small` free-tier for the demo**, `c8g` for production) and host the web app
+(e.g. Vercel) with `GRAVITONE_URL` set to the instance's URL. The web app is
+stateless per request, so it can also sit behind the same box.
 
 ### Arm optimizations applied (Track 2 relevance)
 
