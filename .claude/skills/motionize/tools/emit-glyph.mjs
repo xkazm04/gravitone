@@ -1,0 +1,106 @@
+#!/usr/bin/env node
+/**
+ * SVG → animatable data module for motionize. Parses a traced SVG's <path>s and
+ * emits a TS array of `{ d, fill, delay }` the component maps over — so a
+ * many-path trace becomes an orchestrated, per-element reveal without
+ * hand-classifying paths.
+ *
+ * Handles the trace gotchas automatically:
+ *  - drops the full-canvas background path,
+ *  - recolors interior near-white "negative space" paths to `var(--background)`
+ *    (so links/holes read as thin lines, not solid),
+ *  - assigns each path a `delay` (0..1) from its distance to the canvas centre —
+ *    the reveal radiates center-out (hub → links → figures → outer accents).
+ *
+ * Usage:
+ *   node emit-glyph.mjs --input traced.svg --output data.ts --name NETWORK_GLYPH [--order radial|angular]
+ */
+import { readFileSync, writeFileSync, mkdirSync } from "fs";
+import { dirname, resolve } from "path";
+
+function parseArgs(argv) {
+  const a = {};
+  for (let i = 2; i < argv.length; i++) {
+    if (argv[i].startsWith("--")) { const k = argv[i].slice(2), n = argv[i + 1]; if (n && !n.startsWith("--")) { a[k] = n; i++; } else a[k] = true; }
+  }
+  return a;
+}
+const rgb = (hex) => { const m = /^#([0-9a-f]{6})$/i.exec(hex); if (!m) return null; const n = parseInt(m[1], 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; };
+// "Light" = high luminance (catches white AND light lavender/panel highlights)
+// without touching saturated neon accents (amber/cyan/violet sit well below 0.82).
+const nearWhite = (hex) => { const c = rgb(hex); return c ? (0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]) / 255 > 0.82 : false; };
+// "Near-black" = all channels very dark. STRICT (< 26) so a black BACKGROUND is
+// caught but dark line-work like navy (#0D1F51, blue channel 0x51) is NOT.
+const nearBlack = (hex) => { const c = rgb(hex); return c ? Math.max(c[0], c[1], c[2]) < 26 : false; };
+// Either extreme reads as surface (white-bg or black-bg source art).
+const isSurface = (hex) => nearWhite(hex) || nearBlack(hex);
+// rough bbox from all numbers in a path (exact enough to spot the full-canvas rect)
+function roughBox(d) {
+  const nums = (d.match(/-?\d*\.?\d+/g) || []).map(Number);
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (let i = 0; i + 1 < nums.length; i += 2) {
+    minX = Math.min(minX, nums[i]); maxX = Math.max(maxX, nums[i]);
+    minY = Math.min(minY, nums[i + 1]); maxY = Math.max(maxY, nums[i + 1]);
+  }
+  return { minX, maxX, minY, maxY };
+}
+// accurate-ish anchor: the first absolute M coordinate (element position)
+function anchor(d) {
+  const m = /M\s*(-?\d*\.?\d+)[ ,]+(-?\d*\.?\d+)/.exec(d);
+  return m ? { x: +m[1], y: +m[2] } : { x: 512, y: 512 };
+}
+
+/**
+ * Core: SVG string → { ts, elements, dropped }. Exported so trace.mjs can emit
+ * the component data in one pass (--emit) as well as this standalone CLI.
+ */
+export function svgToGlyphData(svg, { name, order = "radial", whiteKeep = 0.1 } = {}) {
+  const vb = /viewBox="([^"]+)"/.exec(svg);
+  const wh = /width="(\d+)"\s+height="(\d+)"/.exec(svg);
+  const [W, H] = vb ? vb[1].split(/\s+/).slice(2).map(Number) : wh ? [+wh[1], +wh[2]] : [1024, 1024];
+  const cx = W / 2, cy = H / 2, maxR = Math.hypot(cx, cy), canvasArea = W * H;
+
+  const paths = [...svg.matchAll(/<path\s+fill="(#[0-9A-Fa-f]+)"\s+d="([^"]+)"\s*\/>/g)].map((m) => ({ fill: m[1], d: m[2] }));
+
+  // Paint order (z-order) is PRESERVED — VTracer stacks fills over outlines, so
+  // reordering hides colored fills behind navy. `delay` drives timing only.
+  const out = [];
+  for (const p of paths) {
+    const raw = roughBox(p.d);
+    // Clamp to the canvas — spline control points can sit far outside it and
+    // otherwise inflate the bbox, corrupting the coversCanvas / areaFrac tests.
+    const box = { minX: Math.max(0, raw.minX), minY: Math.max(0, raw.minY), maxX: Math.min(W, raw.maxX), maxY: Math.min(H, raw.maxY) };
+    const coversCanvas = box.minX <= 4 && box.minY <= 4 && box.maxX >= W - 4 && box.maxY >= H - 4;
+    // Surface-coloured regions (white OR black) that are the bg / large negative-
+    // space are RECOLORED to `var(--background)` — NOT dropped: VTracer's stacked
+    // output relies on them painting over accents to carve line gaps (linework art),
+    // and they follow the theme for free. Small surface paths (sparks, highlights,
+    // thin holes) stay as-is. Lower `whiteKeep` (e.g. 0.02) for wireframe/lattice.
+    const areaFrac = ((box.maxX - box.minX) * (box.maxY - box.minY)) / canvasArea;
+    const fill = isSurface(p.fill) && (coversCanvas || areaFrac > whiteKeep) ? "var(--background)" : p.fill;
+    const a = anchor(p.d);
+    const dist = Math.hypot(a.x - cx, a.y - cy) / maxR; // 0 (center) .. 1 (corner)
+    const ang = (Math.atan2(a.y - cy, a.x - cx) + Math.PI) / (2 * Math.PI); // 0..1 clockwise
+    out.push({ d: p.d, fill, delay: Number((order === "angular" ? ang : dist).toFixed(3)) });
+  }
+
+  const ts = `// AUTO-GENERATED by .claude/skills/motionize (trace.mjs --emit / emit-glyph.mjs) — do not edit by hand.
+export const ${name}_VIEWBOX = "0 0 ${W} ${H}";
+export const ${name}: { d: string; fill: string; delay: number }[] = ${JSON.stringify(out, null, 0)};
+`;
+  return { ts, elements: out.length, dropped: paths.length - out.length };
+}
+
+function main() {
+  const args = parseArgs(process.argv);
+  if (!args.input || !args.output || !args.name) { console.error("Usage: --input svg --output data.ts --name NAME"); process.exit(1); }
+  const svg = readFileSync(args.input, "utf8");
+  const { ts, elements, dropped } = svgToGlyphData(svg, { name: args.name, order: args.order, whiteKeep: args["white-keep"] ? Number(args["white-keep"]) : undefined });
+  const abs = resolve(args.output);
+  mkdirSync(dirname(abs), { recursive: true });
+  writeFileSync(abs, ts);
+  console.log(JSON.stringify({ success: true, output: abs, elements, dropped }, null, 2));
+}
+
+// Run as CLI only when invoked directly (not when imported by trace.mjs).
+if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith("emit-glyph.mjs")) main();

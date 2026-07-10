@@ -5,17 +5,20 @@
 //   Character = a group of Voices across the scale. `baseline` is mandatory.
 // Requests for an emotion a Character lacks fall back to its baseline Voice.
 
-export type EmotionMeta = { id: string; label: string; hue: number };
+export type EmotionMeta = { id: string; label: string; hue: number; art: string };
 
+// art = glowing line-art emblem on pure black (generated via /leonardo → Gemini
+// image). Render it with mix-blend-mode:screen so the black drops out on the
+// dark UI. Trace-friendly for a future /motionize pass.
 export const EMOTIONS: EmotionMeta[] = [
-  { id: "baseline", label: "Baseline", hue: 200 },
-  { id: "calm", label: "Calm", hue: 170 },
-  { id: "happy", label: "Happy", hue: 48 },
-  { id: "excited", label: "Excited", hue: 20 },
-  { id: "sad", label: "Sad", hue: 225 },
-  { id: "angry", label: "Angry", hue: 355 },
-  { id: "whisper", label: "Whisper", hue: 275 },
-  { id: "confused", label: "Confused", hue: 305 },
+  { id: "baseline", label: "Baseline", hue: 200, art: "/emotions/baseline.png" },
+  { id: "calm", label: "Calm", hue: 170, art: "/emotions/calm.png" },
+  { id: "happy", label: "Happy", hue: 48, art: "/emotions/happy.png" },
+  { id: "excited", label: "Excited", hue: 20, art: "/emotions/excited.png" },
+  { id: "sad", label: "Sad", hue: 225, art: "/emotions/sad.png" },
+  { id: "angry", label: "Angry", hue: 355, art: "/emotions/angry.png" },
+  { id: "whisper", label: "Whisper", hue: 275, art: "/emotions/whisper.png" },
+  { id: "confused", label: "Confused", hue: 305, art: "/emotions/confused.png" },
 ];
 
 export const BASELINE = "baseline";

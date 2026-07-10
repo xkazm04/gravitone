@@ -6,6 +6,7 @@
 
 import { useVoicePreview } from "@/app/voices/_variants/data";
 import { relTime } from "@/app/voices/_variants/data";
+import EmotionArt from "@/components/ui/EmotionArt";
 import { pickAudio, type Slot } from "./useCharacterVoices";
 
 export default function EmotionRack({
@@ -62,8 +63,10 @@ export default function EmotionRack({
                   </td>
 
                   <td className="px-3 py-2">
-                    <div className="flex items-center gap-2">
-                      <span className="h-4 w-1.5 rounded-sm" style={{ background: filled ? `hsl(${s.hue} 80% 60%)` : "rgba(255,255,255,0.10)" }} />
+                    <div className="flex items-center gap-2.5">
+                      <span className="grid h-9 w-9 shrink-0 place-items-center overflow-hidden rounded-lg border border-white/8 bg-black/40">
+                        <EmotionArt emotion={s.emotion} size={34} dim={!filled} />
+                      </span>
                       <span className="text-sm font-medium text-white">{s.label}</span>
                     </div>
                   </td>

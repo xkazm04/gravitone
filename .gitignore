@@ -13,3 +13,6 @@ tsconfig.tsbuildinfo
 # local audio artifacts
 *.wav
 !.env.example
+
+# generated emotion art is committed (brand assets)
+!public/emotions/*.png

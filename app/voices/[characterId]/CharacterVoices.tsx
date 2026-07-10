@@ -1,13 +1,11 @@
 "use client";
 
 import Link from "next/link";
-import PrototypeTabs from "@/components/ui/PrototypeTabs";
 import { Eyebrow } from "@/components/ui/Primitives";
 import { useCharacterVoices } from "./_variants/useCharacterVoices";
-import EmotionWheel from "./_variants/EmotionWheel";
-import EmotionFilmstrip from "./_variants/EmotionFilmstrip";
 import EmotionRack from "./_variants/EmotionRack";
 
+// Rack won the voice-overview round — rendered directly, no switcher.
 export default function CharacterVoices({ characterId }: { characterId: string }) {
   const { character, slots, coverage, total, loading, error, busySlot, addVoice, removeVoice } =
     useCharacterVoices(characterId);
@@ -24,8 +22,6 @@ export default function CharacterVoices({ characterId }: { characterId: string }
       </div>
     );
   }
-
-  const shared = { name: character.name, slots, coverage, total, busySlot, addVoice, removeVoice };
 
   return (
     <div className="py-10">
@@ -52,13 +48,9 @@ export default function CharacterVoices({ characterId }: { characterId: string }
       )}
 
       <div className="mt-8">
-        <PrototypeTabs
-          storageKey="proto-character-voices"
-          variants={[
-            { id: "wheel", label: "Wheel", sub: "radial / spatial", node: <EmotionWheel {...shared} /> },
-            { id: "filmstrip", label: "Filmstrip", sub: "reel / sequence", node: <EmotionFilmstrip {...shared} /> },
-            { id: "rack", label: "Rack", sub: "dense / practical", node: <EmotionRack {...shared} /> },
-          ]}
+        <EmotionRack
+          name={character.name} slots={slots} coverage={coverage} total={total}
+          busySlot={busySlot} addVoice={addVoice} removeVoice={removeVoice}
         />
       </div>
     </div>

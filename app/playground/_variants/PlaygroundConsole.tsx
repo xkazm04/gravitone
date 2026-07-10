@@ -12,9 +12,11 @@ import { AnimatePresence, motion } from "framer-motion";
 import { Button, Eyebrow } from "@/components/ui/Primitives";
 import { EASE } from "@/components/ui/tokens";
 import { EMOTIONS, emotionMeta, wrapWithTag } from "@/lib/emotions";
+import EmotionArt from "@/components/ui/EmotionArt";
 import { DEFAULT_EXPRESSION, DEFAULT_TEXT, stripTags, type Expression, type Take } from "./shared";
 import { speak } from "./engine";
 import { useAudioPlayer } from "./useAudioPlayer";
+import EmotionPicker from "./EmotionPicker";
 
 type Character = {
   character_id: string; name: string; category: "cloned" | "premade";
@@ -57,6 +59,7 @@ export default function PlaygroundConsole() {
   const [expr, setExpr] = useState<Expression>(DEFAULT_EXPRESSION);
   const [busy, setBusy] = useState(false);
   const [takes, setTakes] = useState<Take[]>([]);
+  const [pickerOpen, setPickerOpen] = useState(false);
   const seq = useRef(0);
   const areaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -100,6 +103,13 @@ export default function PlaygroundConsole() {
 
   return (
     <div className="pb-24">
+      <EmotionPicker
+        open={pickerOpen}
+        onClose={() => setPickerOpen(false)}
+        onPick={insertEmotion}
+        available={character?.emotions ?? ["baseline"]}
+        characterName={character?.name ?? "Character"}
+      />
       <Eyebrow>free playground</Eyebrow>
       <h1 className="font-instrument mt-4 text-4xl text-white">Compose a take.</h1>
       <p className="mt-2 max-w-2xl text-base text-white/55">
@@ -146,10 +156,16 @@ export default function PlaygroundConsole() {
             rows={5} placeholder="Type something. Select words, then click an emotion to tag them…"
             className="font-hanken w-full resize-none bg-transparent px-5 py-4 text-base leading-relaxed text-white placeholder:text-white/30 focus:outline-none" />
 
-          {/* emotion chips */}
+          {/* emotion chips + wheel */}
           <div className="border-t border-white/8 px-5 py-4">
-            <div className="font-jetbrains mb-2 text-[11px] uppercase tracking-widest text-white/40">
-              tag selection with an emotion
+            <div className="mb-2 flex items-center justify-between">
+              <span className="font-jetbrains text-[11px] uppercase tracking-widest text-white/40">tag selection with an emotion</span>
+              <button
+                onClick={() => setPickerOpen(true)}
+                className="font-jetbrains inline-flex items-center gap-1.5 rounded-full border border-cyan-400/30 bg-cyan-400/5 px-3 py-1 text-[11px] text-cyan-200 transition hover:bg-cyan-400/10"
+              >
+                ◎ emotion wheel
+              </button>
             </div>
             <div className="flex flex-wrap gap-1.5">
               {EMOTIONS.map((e) => {
@@ -157,10 +173,12 @@ export default function PlaygroundConsole() {
                 return (
                   <button key={e.id} onClick={() => insertEmotion(e.id)}
                     title={has ? `${e.label} — available` : `${e.label} — not recorded, falls back to baseline`}
-                    className={`font-jetbrains inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] transition ${
+                    className={`font-jetbrains inline-flex items-center gap-1.5 rounded-full py-1 pl-1 pr-2.5 text-[11px] transition ${
                       has ? "border border-white/15 bg-white/5 text-white/85 hover:border-cyan-400/40"
                           : "border border-dashed border-white/12 text-white/35 hover:text-white/60"}`}>
-                    <span className="h-1.5 w-1.5 rounded-full" style={{ background: has ? `hsl(${e.hue} 80% 62%)` : "rgba(255,255,255,0.2)" }} />
+                    <span className="grid h-5 w-5 place-items-center overflow-hidden rounded-full bg-black/50">
+                      <EmotionArt emotion={e.id} size={20} dim={!has} />
+                    </span>
                     {e.label}
                   </button>
                 );
