@@ -1,15 +1,21 @@
+"use client";
+
 import AppFrame from "@/components/ui/AppFrame";
-import { Eyebrow } from "@/components/ui/Primitives";
+import PrototypeTabs from "@/components/ui/PrototypeTabs";
+import KeysLedger from "./_variants/KeysLedger";
+import KeysVault from "./_variants/KeysVault";
 
 export default function KeysPage() {
   return (
     <AppFrame>
-      <div className="py-20">
-        <Eyebrow>security</Eyebrow>
-        <h1 className="font-instrument mt-5 text-4xl text-white">API keys</h1>
-        <p className="mt-3 max-w-md text-white/70">
-          Prototype pending — API-key exchange &amp; secret handling coming via /prototype.
-        </p>
+      <div className="py-10">
+        <PrototypeTabs
+          storageKey="proto-keys"
+          variants={[
+            { id: "ledger", label: "Ledger", sub: "dense / practical", node: <KeysLedger /> },
+            { id: "vault", label: "Vault", sub: "ceremonial / cards", node: <KeysVault /> },
+          ]}
+        />
       </div>
     </AppFrame>
   );
