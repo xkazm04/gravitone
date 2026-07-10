@@ -62,6 +62,15 @@ running **independent processes/replicas** (separate GILs), not more in-process
 workers. These are a **floor**: a Linux Neoverse instance with BF16 + KleidiAI
 is expected to be materially faster (see optimizations below).
 
+**Measured on AWS Graviton (t4g.small, Neoverse N1, free tier, bf16):**
+single-worker single-stream **1.33× real-time**, CPU-saturated on 2 vCPU.
+Finding: on aarch64, PyPI's default `torch` is a **CUDA (GH200) build** whose
+CPU fallback bypasses the oneDNN + Arm Compute Library path — installing the
+**CPU-index wheel** instead lifted single-stream **1.23× → 1.33× (~8%)** and
+removed concurrency degradation, on the same box. Graviton4 (c8g / Neoverse V2
+with BF16/I8MM + KleidiAI) is expected to be materially higher; it was
+unavailable here only because the test account was in AWS Free-Tier mode.
+
 ## Setup Instructions (Arm64 / Arm-powered device)
 
 **Prerequisites:** an Arm64 Linux instance (AWS Graviton, GCP Axion, Azure
@@ -126,7 +135,8 @@ python -m service.loadtest \
 
 | Lever | How | Effect |
 |---|---|---|
-| **oneDNN + Arm Compute Library** | default in aarch64 PyTorch / `armswdev/pytorch-arm-neoverse` | ACL GEMM kernels for fp32/bf16 |
+| **CPU-index torch** | `pip install torch --index-url https://download.pytorch.org/whl/cpu` | avoids PyPI's aarch64 CUDA (GH200) wheel whose CPU fallback bypasses ACL; **+8%** single-stream on N1 |
+| **oneDNN + Arm Compute Library** | default in the CPU-index aarch64 wheel / `armswdev/pytorch-arm-neoverse` | ACL GEMM kernels for fp32/bf16 |
 | **BF16 fast-math** | `ONEDNN_DEFAULT_FPMATH_MODE=bf16` | fp32 matmuls dispatched to BF16 kernels on Neoverse (BF16/I8MM HW) |
 | **KleidiAI** | Kleidi-enabled aarch64 PyTorch wheel | automatic inference uplift, no code change |
 | **int8 quantization** | `TTS_QUANTIZE=true` | ~27% faster / ~48% less memory (validate quality on Arm qengine) |
