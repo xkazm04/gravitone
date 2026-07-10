@@ -1,15 +1,23 @@
+"use client";
+
 import AppFrame from "@/components/ui/AppFrame";
-import { Eyebrow } from "@/components/ui/Primitives";
+import PrototypeTabs from "@/components/ui/PrototypeTabs";
+import VoicesGallery from "./_variants/VoicesGallery";
+import VoicesTable from "./_variants/VoicesTable";
+import VoicesLab from "./_variants/VoicesLab";
 
 export default function VoicesPage() {
   return (
     <AppFrame>
-      <div className="py-20">
-        <Eyebrow>voice library</Eyebrow>
-        <h1 className="font-instrument mt-5 text-4xl text-white">Voices</h1>
-        <p className="mt-3 max-w-md text-white/55">
-          Prototype pending — voice management (clone, browse, manage) coming via /prototype.
-        </p>
+      <div className="py-10">
+        <PrototypeTabs
+          storageKey="proto-voices"
+          variants={[
+            { id: "gallery", label: "Gallery", sub: "browse / cards", node: <VoicesGallery /> },
+            { id: "table", label: "Table", sub: "scale / operations", node: <VoicesTable /> },
+            { id: "lab", label: "Lab", sub: "wildcard / capture+grade", node: <VoicesLab /> },
+          ]}
+        />
       </div>
     </AppFrame>
   );
