@@ -12,3 +12,4 @@ tsconfig.tsbuildinfo
 
 # local audio artifacts
 *.wav
+!.env.example
