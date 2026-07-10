@@ -10,3 +10,5 @@ voices/*.safetensors
 *.mp3
 service/loadtest_result.json
 .research-cache/
+.env
+api_keys.json

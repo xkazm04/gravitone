@@ -10,7 +10,8 @@ Request body mirrors ElevenLabs:
   { "text": "...", "model_id": "pocket_tts",
     "voice_settings": { "temperature": 0.7 } }
 `output_format` is a query param (elevenlabs-style): wav_24000 | mp3_24000_128 | pcm_24000.
-Auth: optional `xi-api-key` header, enabled by setting TTS_API_KEY.
+Auth: enforced when TTS_API_KEY is set (see service/auth.py) — the root key or
+a managed `/v1/keys` key via `xi-api-key` / `Authorization: Bearer`.
 """
 from __future__ import annotations
 
@@ -18,13 +19,14 @@ import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 import base64
 import json
 
+from service.auth import require_read_write, require_scope
 from service.config import SETTINGS
 from service.emotions import parse_segments, resolve
 from service.engine import AdmissionRejected, TtsEngine, concat_wavs, wav_bytes_to_mp3
@@ -89,11 +91,6 @@ class TTSRequest(BaseModel):
     frames_after_eos: int | None = None
 
 
-def _check_auth(xi_api_key: str | None):
-    if SETTINGS.api_key and xi_api_key != SETTINGS.api_key:
-        raise HTTPException(status_code=401, detail="invalid or missing xi-api-key")
-
-
 def _parse_format(output_format: str) -> tuple[str, str]:
     """Return (kind, content_type). kind in {wav, mp3, pcm}."""
     fmt = (output_format or "wav").lower()
@@ -104,14 +101,12 @@ def _parse_format(output_format: str) -> tuple[str, str]:
     return "wav", "audio/wav"
 
 
-@app.post("/v1/text-to-speech/{voice_id}")
+@app.post("/v1/text-to-speech/{voice_id}", dependencies=[Depends(require_scope("tts"))])
 async def text_to_speech(
     voice_id: str,
     req: TTSRequest,
     output_format: str = Query("wav_24000"),
-    xi_api_key: str | None = Header(default=None, alias="xi-api-key"),
 ):
-    _check_auth(xi_api_key)
     assert ENGINE is not None
     kind, content_type = _parse_format(output_format)
 
@@ -159,12 +154,14 @@ async def text_to_speech(
     )
 
 
-# Voice + Character management lives in service/voices.py.
-app.include_router(voices_router)
-# API key management (issue / rotate / revoke) lives in service/keys.py.
-app.include_router(keys_router)
-# Character ingestion (scan a recording → review → commit) lives in ingest_api.py.
-app.include_router(ingest_router)
+# Voice + Character management lives in service/voices.py. Read endpoints
+# (list voices/characters/emotions) accept a tts-scoped key so ElevenLabs
+# drop-in clients work; mutations need the "voices" scope.
+app.include_router(voices_router, dependencies=[Depends(require_read_write("tts", "voices"))])
+# API key management (issue / rotate / revoke) — root TTS_API_KEY only.
+app.include_router(keys_router, dependencies=[Depends(require_scope("admin"))])
+# Character ingestion (scan a recording → review → commit) — "clone" scope.
+app.include_router(ingest_router, dependencies=[Depends(require_scope("clone"))])
 
 
 class SpeakRequest(BaseModel):
@@ -173,10 +170,9 @@ class SpeakRequest(BaseModel):
     voice_settings: VoiceSettings | None = None
 
 
-@app.post("/v1/speak")
+@app.post("/v1/speak", dependencies=[Depends(require_scope("tts"))])
 async def speak(
     req: SpeakRequest,
-    xi_api_key: str | None = Header(default=None, alias="xi-api-key"),
 ):
     """Speak metatagged text with one Character, switching Voices per emotion.
 
@@ -186,7 +182,6 @@ async def speak(
     report (what was requested vs what was used) is returned base64-JSON in the
     `X-Segments` header so the UI can show the substitutions.
     """
-    _check_auth(xi_api_key)
     assert ENGINE is not None
 
     emap = emotion_map(req.character_id)
