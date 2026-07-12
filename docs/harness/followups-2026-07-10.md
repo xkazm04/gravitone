@@ -50,6 +50,14 @@ Each needs a product/pricing decision or a bigger engine than the wave scoped.
   ec2:CreateSecurityGroup + AuthorizeSecurityGroupIngress added to
   aws/iam-policy.json, or SG=).
 
+## From landing-activation (wave 7)
+
+- **Hero demo hardening for public deploys** (idea a5d8f311 called for both):
+  per-IP rate limiting on the clone path (each demo run costs ~20s of CPU —
+  trivially abusable on a public instance) and audio watermarking of demo
+  output. Fine for local/demo use as shipped; required before a public
+  marketing site points real traffic at it.
+
 ## From earlier waves
 
 - **Streaming synthesis** (compat matrix ❌ row): whole-utterance responses
