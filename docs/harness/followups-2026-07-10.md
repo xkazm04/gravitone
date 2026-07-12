@@ -58,6 +58,23 @@ Each needs a product/pricing decision or a bigger engine than the wave scoped.
   output. Fine for local/demo use as shipped; required before a public
   marketing site points real traffic at it.
 
+## From privacy-trust-tier (wave 8)
+
+- **Server-side ownership enforcement** (idea 7fe9dfbf: "the TTS API
+  resolves voice IDs only through this ownership layer"): the vault is a
+  client-written Firestore provenance ledger; the Python service has no
+  Firebase identity and serves any voice to any valid key. Enforcement
+  needs firebase-admin (or a token-verifying proxy) + per-user key binding
+  — a multi-tenant architecture decision.
+- **Firestore security rules** must allow `users/{uid}/voices/**` for the
+  owner only — verify the deployed rules cover the new subcollection.
+- **Sovereign mode quality upgrades**: optional local ASR (faster-whisper)
+  for transcripts/cues and local diarization (pyannote) for multi-speaker
+  recordings, as opt-in extras — the shipped ffmpeg path deliberately
+  assumes single-speaker and labels everything baseline.
+- **Verification-phrase audio** (7fe9dfbf): the vault stores attestations
+  but not a spoken consent phrase recording; add when consent UX matures.
+
 ## From earlier waves
 
 - **Streaming synthesis** (compat matrix ❌ row): whole-utterance responses
