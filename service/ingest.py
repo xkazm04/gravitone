@@ -1,17 +1,30 @@
 """Character-from-recording pipeline (scan → review → commit).
 
+Two ingest modes:
+
+CLOUD ("quality" — richest results, audio leaves the machine):
   1. INGEST   ffmpeg extracts audio.
   2. MAP      ElevenLabs Scribe → diarized words + timestamps → pick target speaker.
   3. ISOLATE  ElevenLabs Voice Isolator → clean studio track (timing preserved).
   4. LABEL    Gemini 3.5-flash classifies each segment into our emotion scale;
               low-confidence segments escalate to gemini-3.1-pro-preview.
   5. STEM     group segments by emotion → concatenate → one clean sample/emotion.
+
+SOVEREIGN (audio NEVER leaves the machine — ffmpeg only, no API keys):
+  1. CLEAN    ffmpeg highpass + afftdn denoise + loudnorm → clean.wav.
+  2. DETECT   ffmpeg silencedetect → speech spans (single-speaker assumption —
+              the normal case when cloning your own recording; no diarization).
+  3. LABEL    everything is baseline (no cloud classifier); emotions are added
+              afterwards via the studio's guided per-emotion recorder.
+  4. STEM     one baseline stem, same review/commit flow as cloud mode.
+
   --- user reviews the proposed stems here (assign / descope / extend) ---
   6. COMMIT   pocket-tts export-voice on each accepted stem → the Character's
               emotion Voices (into the shared voices/ + _meta.json store).
 
-`scan()` does 1-5 (no cloning) and leaves the stem wavs in a work dir; `commit()`
-clones the chosen stems. Keys from env: ELEVEN_LABS_API_KEY, GEMINI_API_KEY.
+`scan()` does the pre-commit steps and leaves stem wavs in a work dir;
+`commit()` clones the chosen stems. Cloud keys from env: ELEVEN_LABS_API_KEY,
+GEMINI_API_KEY (absent keys auto-select sovereign mode).
 CLI (one-shot): python -m service.ingest <audio> --character NAME [--dry-run]
 """
 from __future__ import annotations
@@ -145,6 +158,93 @@ def label_emotion(wav: Path, escalate_below: float = 0.7) -> dict:
     return res
 
 
+# ── sovereign mode (local-only, ffmpeg — audio never leaves the machine) ─────
+def clean_local(src: Path, dst: Path) -> None:
+    """Local stand-in for the Voice Isolator: rumble filter + spectral denoise
+    + loudness normalization. Not studio isolation, but honest local cleanup."""
+    r = subprocess.run(
+        ["ffmpeg", "-y", "-i", str(src),
+         "-af", "highpass=f=80,afftdn=nf=-25,loudnorm",
+         "-ac", "1", "-ar", "24000", str(dst)],
+        capture_output=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"local cleanup failed: {r.stderr.decode(errors='ignore')[-200:]}")
+
+
+def detect_speech(wav: Path, noise_db: float = -35.0, min_silence: float = 0.5,
+                  min_dur: float = 1.2, max_dur: float = 15.0) -> list[dict]:
+    """Speech spans via ffmpeg silencedetect (inverted), single speaker.
+    Long spans are split at max_dur so stem concatenation stays balanced."""
+    import re
+
+    with wave.open(str(wav), "rb") as w:
+        total = w.getnframes() / w.getframerate()
+    r = subprocess.run(
+        ["ffmpeg", "-i", str(wav),
+         "-af", f"silencedetect=noise={noise_db}dB:d={min_silence}", "-f", "null", "-"],
+        capture_output=True)
+    text = r.stderr.decode(errors="ignore")
+    starts = [float(x) for x in re.findall(r"silence_start:\s*([0-9.]+)", text)]
+    ends = [float(x) for x in re.findall(r"silence_end:\s*([0-9.]+)", text)]
+
+    spans: list[tuple[float, float]] = []
+    pos = 0.0
+    for i, st in enumerate(starts):
+        if st - pos >= min_dur:
+            spans.append((pos, st))
+        pos = ends[i] if i < len(ends) else total
+    if total - pos >= min_dur:
+        spans.append((pos, total))
+    if not spans and total >= min_dur:  # no silence found at all — one big span
+        spans = [(0.0, total)]
+
+    segs: list[dict] = []
+    for a, b in spans:
+        cur = a
+        while b - cur >= min_dur:
+            chunk_end = min(cur + max_dur, b)
+            segs.append({"speaker": "speaker_0", "start": round(cur, 3),
+                         "end": round(chunk_end, 3), "text": ""})
+            cur = chunk_end
+    return segs
+
+
+def sovereign_analyze(audio: Path, work_dir: Path,
+                      progress: Callable[[str, str], None] | None = None,
+                      partial: Callable[[dict], None] | None = None) -> dict:
+    """Local-only analyze: same outputs/shape as analyze(), no network I/O."""
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    def prog(k: str, s: str) -> None:
+        if progress:
+            progress(k, s)
+
+    prog("isolate", "active")
+    clean = work_dir / "clean.wav"
+    clean_local(audio, clean)
+    prog("isolate", "done")
+
+    prog("transcribe", "active")
+    segs = detect_speech(clean)
+    with wave.open(str(clean), "rb") as w:
+        duration = round(w.getnframes() / w.getframerate(), 2)
+    if partial:
+        partial({"words": 0, "speakers": ["speaker_0"],
+                 "transcript": "(sovereign mode — no transcription, audio stayed on this machine)"})
+    prog("transcribe", "done")
+
+    (work_dir / "segments.json").write_text(json.dumps(segs), "utf-8")
+    speakers: list[dict] = []
+    if segs:
+        secs = round(sum(s["end"] - s["start"] for s in segs), 1)
+        longest = max(segs, key=lambda s: s["end"] - s["start"])
+        pv = work_dir / "speaker_speaker_0.wav"
+        to_wav(clean, pv, longest["start"], min(longest["end"], longest["start"] + 6))
+        speakers.append({"id": "speaker_0", "utterances": len(segs), "seconds": secs,
+                         "sample_text": "(local mode — no transcript)"})
+    return {"duration": duration, "transcript": "", "speakers": speakers}
+
+
 # ── segmentation ──────────────────────────────────────────────────────────────
 def build_segments(words: list[dict], min_gap: float = 0.6, min_dur: float = 1.2) -> list[dict]:
     segs: list[dict] = []
@@ -223,7 +323,8 @@ def analyze(audio: Path, work_dir: Path,
 # ── LABEL + STEM for a chosen speaker ─────────────────────────────────────────
 def label_and_stem(work_dir: Path, target: str, min_stem: float = 4.0, limit: int = 40,
                    progress: Callable[[str, str], None] | None = None,
-                   partial: Callable[[dict], None] | None = None) -> dict:
+                   partial: Callable[[dict], None] | None = None,
+                   mode: str = "cloud") -> dict:
     def prog(k: str, s: str) -> None:
         if progress:
             progress(k, s)
@@ -239,7 +340,12 @@ def label_and_stem(work_dir: Path, target: str, min_stem: float = 4.0, limit: in
     for i, s in enumerate(todo):
         seg_wav = work_dir / f"seg_{i:03d}.wav"
         to_wav(clean, seg_wav, s["start"], s["end"])
-        lab = label_emotion(seg_wav)
+        if mode == "sovereign":
+            # No cloud classifier: everything is baseline. Emotions get added
+            # afterwards via the studio's guided per-emotion recorder.
+            lab = {"emotion": BASELINE, "confidence": 1.0, "cue": "", "model": "local"}
+        else:
+            lab = label_emotion(seg_wav)
         lab.update({"i": i, "dur": round(s["end"] - s["start"], 2), "text": s["text"][:60], "wav": str(seg_wav)})
         labelled.append(lab)
         counts[lab["emotion"]] = counts.get(lab["emotion"], 0) + 1
@@ -273,13 +379,23 @@ def label_and_stem(work_dir: Path, target: str, min_stem: float = 4.0, limit: in
                           "dur": l["dur"], "text": l["text"], "model": l["model"]} for l in labelled]}
 
 
+def resolve_mode(mode: str = "auto") -> str:
+    """auto → cloud when both API keys exist, else sovereign (local-only)."""
+    if mode in ("cloud", "sovereign"):
+        return mode
+    return "cloud" if (ELEVEN_KEY and GEMINI_KEY) else "sovereign"
+
+
 # ── one-shot scan (CLI convenience: analyze → auto speaker → label) ────────────
 def scan(audio: Path, work_dir: Path, speaker: str = "auto", min_stem: float = 4.0,
-         limit: int = 40, progress: Callable[[str, str], None] | None = None) -> dict:
-    a = analyze(audio, work_dir, progress)
+         limit: int = 40, progress: Callable[[str, str], None] | None = None,
+         mode: str = "auto") -> dict:
+    mode = resolve_mode(mode)
+    a = (sovereign_analyze if mode == "sovereign" else analyze)(audio, work_dir, progress)
     target = a["speakers"][0]["id"] if speaker == "auto" else speaker
-    r = label_and_stem(work_dir, target, min_stem, limit, progress)
-    return {"duration": a["duration"], "speakers": [s["id"] for s in a["speakers"]], **r}
+    r = label_and_stem(work_dir, target, min_stem, limit, progress, mode=mode)
+    return {"duration": a["duration"], "speakers": [s["id"] for s in a["speakers"]],
+            "mode": mode, **r}
 
 
 # ── COMMIT (clone selected stems) ─────────────────────────────────────────────
@@ -324,13 +440,15 @@ def main() -> None:
     ap.add_argument("--speaker", default="auto")
     ap.add_argument("--min-stem", type=float, default=4.0)
     ap.add_argument("--limit", type=int, default=40)
+    ap.add_argument("--mode", default="auto", choices=["auto", "cloud", "sovereign"],
+                    help="sovereign = local-only (ffmpeg), audio never leaves the machine")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
     import tempfile
     with tempfile.TemporaryDirectory(prefix="gvt-ingest-") as td:
         wd = Path(td)
         res = scan(Path(a.audio), wd, a.speaker, a.min_stem, a.limit,
-                   progress=lambda k, s: _log(f"  {k}: {s}"))
+                   progress=lambda k, s: _log(f"  {k}: {s}"), mode=a.mode)
         _log(json.dumps({k: v for k, v in res.items() if k != "segments"}, indent=2))
         if a.dry_run:
             return
