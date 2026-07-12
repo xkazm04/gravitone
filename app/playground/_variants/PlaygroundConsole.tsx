@@ -18,6 +18,7 @@ import { DEFAULT_EXPRESSION, DEFAULT_TEXT, stripTags, type Expression, type Take
 import { speak } from "./engine";
 import { useAudioPlayer } from "./useAudioPlayer";
 import EmotionPicker from "./EmotionPicker";
+import TakeCode from "./TakeCode";
 
 type Character = {
   character_id: string; name: string; category: "cloned" | "premade";
@@ -61,6 +62,7 @@ export default function PlaygroundConsole() {
   const [busy, setBusy] = useState(false);
   const [takes, setTakes] = useState<Take[]>([]);
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [codeFor, setCodeFor] = useState<string | null>(null); // take id with the code panel open
   const seq = useRef(0);
   const areaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -97,7 +99,7 @@ export default function PlaygroundConsole() {
         id: `take-${seq.current}`, text: text.trim(),
         characterId: character.character_id, characterName: character.name,
         mode: r.mode, url: r.url, peaks: r.peaks, seconds: r.seconds, kb: r.kb, rtf: r.rtf,
-        segments: r.segments,
+        segments: r.segments, expr: { ...expr },
       }, ...t]);
     } finally { setBusy(false); }
   }
@@ -262,6 +264,19 @@ export default function PlaygroundConsole() {
                     {t.kb > 0 && <span>{t.kb} kb</span>}
                   </div>
 
+                  <button
+                    onClick={() => setCodeFor((c) => (c === t.id ? null : t.id))}
+                    disabled={t.mode === "browser"}
+                    title={t.mode === "browser" ? "Browser-speech fallback take — no API request to export" : "Get this exact take as an API call"}
+                    aria-expanded={codeFor === t.id}
+                    className={`font-jetbrains shrink-0 rounded-lg border px-3 py-1.5 text-[11px] transition ${
+                      codeFor === t.id
+                        ? "border-cyan-400/40 bg-cyan-400/10 text-cyan-200"
+                        : "border-white/15 text-white/80 hover:bg-white/5 disabled:cursor-not-allowed disabled:border-white/10 disabled:text-white/50"
+                    }`}
+                  >
+                    {"</>"} code
+                  </button>
                   {t.url ? (
                     <a href={t.url} download={`gravitone-${t.characterId}-${t.id}.wav`}
                       className="font-jetbrains shrink-0 rounded-lg border border-white/15 px-3 py-1.5 text-[11px] text-white/80 transition hover:bg-white/5">↓ wav</a>
@@ -270,6 +285,8 @@ export default function PlaygroundConsole() {
                       className="font-jetbrains shrink-0 cursor-not-allowed rounded-lg border border-white/10 px-3 py-1.5 text-[11px] text-white/50">↓ wav</span>
                   )}
                 </div>
+
+                {codeFor === t.id && t.mode === "gravitone" && <TakeCode take={t} />}
 
                 {/* segment ribbon — what actually ran */}
                 {t.segments.length > 0 && (

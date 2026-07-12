@@ -22,6 +22,9 @@ export type Take = {
   kb: number;
   rtf: number;
   segments: Segment[];
+  // The expression knobs this take was rendered with — together with text +
+  // characterId this is the exact reproduction recipe for the code export.
+  expr: Expression;
 };
 
 /** Expression controls. Pocket TTS has no emotion/speed parameter — these are
