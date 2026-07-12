@@ -88,6 +88,20 @@ Each needs a product/pricing decision or a bigger engine than the wave scoped.
 - **Share moderation/abuse**: shared takes are public and unauthenticated
   by design; a public deployment needs rate limits and a takedown path.
 
+## From production-fleet-tier (wave 10)
+
+- **Chart not cluster-tested**: helm lint clean + all three autoscaling
+  modes template-render to valid manifests, but nothing was deployed to a
+  real cluster (none available here). First real run: kind/k3s on an Arm
+  box, then KEDA mode against live queue depth.
+- **Multi-replica voice-embedding sync** (the paid fleet-tier feature):
+  the chart offers a RWX PVC as the shared store; active sync/replication
+  (clone on one replica → instantly serveable on all, without shared
+  storage) is unbuilt.
+- **License gating on certificates**: certify.py emits/verifies signed
+  certs (exit-code friendly), but no enforcement point consumes them yet —
+  wire into the enterprise install flow when a licensing decision lands.
+
 ## From earlier waves
 
 - **Streaming synthesis** (compat matrix ❌ row): whole-utterance responses
