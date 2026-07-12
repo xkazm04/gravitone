@@ -14,7 +14,8 @@ type Stem = { emotion: string; seconds: number; segments: number; eligible: bool
 type Result = { duration: number; speakers: string[]; target: string; utterances: number; stems: Stem[] };
 type Character = { character_id: string; name: string };
 type Job = { status: string; step: string | null; steps: LoaderStep[]; partial: PartialData;
-  speakers: Speaker[] | null; duration: number; result: Result | null; error: string | null };
+  speakers: Speaker[] | null; duration: number; result: Result | null; error: string | null;
+  mode?: "cloud" | "sovereign" };
 
 type Phase = "upload" | "processing" | "speaker" | "review" | "committing" | "complete";
 
@@ -29,6 +30,9 @@ export default function NewCharacterPage() {
   const [error, setError] = useState<string | null>(null);
 
   const [mode, setMode] = useState<"new" | "extend">("new");
+  // auto = cloud quality when the backend has API keys, else local.
+  // sovereign = force local-only: the recording never leaves the machine.
+  const [ingestMode, setIngestMode] = useState<"auto" | "sovereign">("auto");
   const [charName, setCharName] = useState("");
   const [extendCid, setExtendCid] = useState("");
   const [characters, setCharacters] = useState<Character[]>([]);
@@ -67,6 +71,7 @@ export default function NewCharacterPage() {
     setError(null);
     const fd = new FormData();
     fd.append("file", file, file.name);
+    fd.append("mode", ingestMode);
     try {
       const r = await fetch("/api/ingest/scan", { method: "POST", body: fd });
       const j = await r.json();
@@ -154,6 +159,26 @@ export default function NewCharacterPage() {
               </div>
             </div>
             {committedCid && <p className="font-jetbrains mt-3 text-[12px] text-cyan-300/80">Extending an existing character with more emotions.</p>}
+
+            {/* privacy mode */}
+            <div className="glass-panel mt-4 rounded-2xl p-4">
+              <div className="flex flex-wrap gap-2">
+                <button onClick={() => setIngestMode("auto")} aria-pressed={ingestMode === "auto"}
+                  className={`font-jetbrains cursor-pointer rounded-full border px-3 py-1.5 text-[12px] transition ${ingestMode === "auto" ? "border-cyan-400/40 bg-cyan-400/10 text-cyan-200" : "border-white/12 text-white/60 hover:text-white"}`}>
+                  Cloud quality
+                </button>
+                <button onClick={() => setIngestMode("sovereign")} aria-pressed={ingestMode === "sovereign"}
+                  className={`font-jetbrains cursor-pointer rounded-full border px-3 py-1.5 text-[12px] transition ${ingestMode === "sovereign" ? "border-emerald-400/40 bg-emerald-400/10 text-emerald-200" : "border-white/12 text-white/60 hover:text-white"}`}>
+                  🔒 Sovereign — audio never leaves this machine
+                </button>
+              </div>
+              <p className="font-jetbrains mt-2 text-[11px] leading-relaxed text-white/50">
+                {ingestMode === "sovereign"
+                  ? "Local ffmpeg pipeline only: cleanup + speech detection on this box, no transcription, no third-party APIs. Emotions are recorded afterwards with the guided per-emotion capture."
+                  : "Uses ElevenLabs (diarize + isolate) and Gemini (emotion labels) when the backend has keys; falls back to local processing when it doesn't."}
+              </p>
+            </div>
+
             <Button onClick={startScan} disabled={!file} className="mt-5 cursor-pointer">Scan recording →</Button>
           </div>
         )}
@@ -161,6 +186,11 @@ export default function NewCharacterPage() {
         {/* PROCESSING — Waveform Lab won the loader round */}
         {phase === "processing" && (
           <div className="mt-10 max-w-3xl">
+            {job?.mode === "sovereign" && (
+              <p className="font-jetbrains mb-3 inline-flex items-center gap-2 rounded-full border border-emerald-400/25 bg-emerald-400/5 px-3 py-1 text-[11px] text-emerald-200">
+                🔒 sovereign mode — processing locally, audio stays on this machine
+              </p>
+            )}
             <WaveformLab data={loaderData} />
           </div>
         )}
