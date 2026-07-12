@@ -75,6 +75,19 @@ Each needs a product/pricing decision or a bigger engine than the wave scoped.
 - **Verification-phrase audio** (7fe9dfbf): the vault stores attestations
   but not a spoken consent phrase recording; add when consent UX matures.
 
+## From viral-share (wave 9)
+
+- **Dynamic OG image / MP4 export** (d4018d03): share pages use a static
+  emotion-glyph PNG as og:image; a rendered card image (@vercel/og or
+  satori) and an MP4 export of the animated card are bigger lifts.
+- **`<gravitone-player>` web component** (37b1fa41): the iframe embed
+  shipped instead; a script-tag web component would remove the iframe
+  height/width friction for customer sites.
+- **oEmbed endpoint** (cdbb5529): rich unfurls in Slack/Notion need an
+  /api/oembed discovery route on top of the existing share pages.
+- **Share moderation/abuse**: shared takes are public and unauthenticated
+  by design; a public deployment needs rate limits and a takedown path.
+
 ## From earlier waves
 
 - **Streaming synthesis** (compat matrix ❌ row): whole-utterance responses
