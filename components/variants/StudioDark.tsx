@@ -6,6 +6,7 @@ import { BRAND, HERO, STATS, FEATURES, VOICES, SAMPLE_TEXT } from "@/lib/content
 import { useAuth } from "@/lib/useAuth";
 import UserMenu from "@/components/ui/UserMenu";
 import SwitchKit from "./SwitchKit";
+import HeroMicDemo from "./HeroMicDemo";
 
 const APP_ROUTES = [
   { label: "Playground", href: "/playground" },
@@ -106,32 +107,8 @@ export default function StudioDark() {
             </motion.div>
           </div>
 
-          {/* now-playing glass panel */}
-          <motion.div
-            initial={{ opacity: 0, scale: 0.96, y: 20 }}
-            animate={{ opacity: 1, scale: 1, y: 0 }}
-            transition={{ duration: 0.9, ease, delay: 0.2 }}
-            className="glass-panel relative rounded-3xl p-6 shadow-2xl"
-          >
-            <div className="flex items-center justify-between">
-              <span className="font-jetbrains text-[11px] uppercase tracking-widest text-cyan-300/80">● now generating</span>
-              <span className="font-jetbrains text-[11px] text-white/60">24kHz · cpu</span>
-            </div>
-            <p className="font-instrument mt-5 text-xl italic leading-snug text-white/90">“{SAMPLE_TEXT}”</p>
-            <div className="mt-6 rounded-2xl border border-white/8 bg-black/30 p-5">
-              <Equalizer bars={40} className="h-16" />
-              <div className="mt-4 flex items-center justify-between">
-                <div className="flex items-center gap-3">
-                  <span className="grid h-9 w-9 place-items-center rounded-full bg-cyan-300 text-slate-950">▶</span>
-                  <div>
-                    <div className="text-sm text-white">Your voice</div>
-                    <div className="font-jetbrains text-[11px] text-white/60">cloned · 16s sample</div>
-                  </div>
-                </div>
-                <span className="font-jetbrains text-[11px] text-cyan-300">1.9× realtime</span>
-              </div>
-            </div>
-          </motion.div>
+          {/* hero panel = live mic demo: record ~16s, hear your cloned voice */}
+          <HeroMicDemo />
         </section>
 
         {/* voices */}

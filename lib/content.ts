@@ -68,3 +68,17 @@ export const NAV = [
 
 export const SAMPLE_TEXT =
   "Hi — this is my cloned voice, generated locally on an Arm CPU. If this sounds like me, the studio works.";
+
+// Hero mic demo: what the visitor READS (16-20s, phonetically varied,
+// conversational) vs what their clone then SAYS (SAMPLE_TEXT — deliberately
+// different words, so the playback proves synthesis, not parroting).
+export const HERO_DEMO = {
+  cta: "hear YOUR voice",
+  readScript:
+    "Here's a quick test of my own voice. I'm reading a few easy lines — " +
+    "nothing fancy, just the way I actually talk. Some days start slow, with " +
+    "coffee and a bit of quiet; others jump straight into the deep end. " +
+    "Either way, this should be enough for the machine to catch how I sound.",
+  note: "~16 seconds · cloned on the CPU · demo voice is deleted right after playback",
+  keepCta: "Sign in to clone voices you keep",
+};
