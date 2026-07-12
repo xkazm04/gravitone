@@ -63,6 +63,8 @@ export default function PlaygroundConsole() {
   const [takes, setTakes] = useState<Take[]>([]);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [codeFor, setCodeFor] = useState<string | null>(null); // take id with the code panel open
+  // take id → shared state: publishing / share id / failed
+  const [shares, setShares] = useState<Record<string, string | "pending" | "error">>({});
   const seq = useRef(0);
   const areaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -87,6 +89,35 @@ export default function PlaygroundConsole() {
     const { next, caret } = wrapWithTag(text, start, end, emotion);
     setText(next);
     requestAnimationFrame(() => { el?.focus(); el?.setSelectionRange(caret, caret); });
+  }
+
+  /** Persist a take server-side, mint its /t/{id} page, copy the link. */
+  async function share(t: Take) {
+    if (!t.url || shares[t.id]) {
+      const existing = shares[t.id];
+      if (existing && existing !== "pending" && existing !== "error") {
+        await navigator.clipboard.writeText(`${window.location.origin}/t/${existing}`).catch(() => {});
+      }
+      return;
+    }
+    setShares((s) => ({ ...s, [t.id]: "pending" }));
+    try {
+      const blob = await (await fetch(t.url)).blob();
+      const fd = new FormData();
+      fd.append("file", blob, "take.wav");
+      fd.append("meta", JSON.stringify({
+        character_id: t.characterId, character_name: t.characterName,
+        text: t.text, seconds: t.seconds, rtf: t.rtf, segments: t.segments,
+      }));
+      const r = await fetch("/api/takes", { method: "POST", body: fd });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j?.detail ?? "share failed");
+      setShares((s) => ({ ...s, [t.id]: j.take_id as string }));
+      await navigator.clipboard.writeText(`${window.location.origin}/t/${j.take_id}`).catch(() => {});
+    } catch {
+      setShares((s) => ({ ...s, [t.id]: "error" }));
+      setTimeout(() => setShares((s) => { const { [t.id]: _, ...rest } = s; return rest; }), 2000);
+    }
   }
 
   async function generate() {
@@ -264,6 +295,17 @@ export default function PlaygroundConsole() {
                     {t.kb > 0 && <span>{t.kb} kb</span>}
                   </div>
 
+                  <button
+                    onClick={() => void share(t)}
+                    disabled={t.mode === "browser" || shares[t.id] === "pending"}
+                    title={t.mode === "browser" ? "Browser-speech fallback — nothing to share" : "Publish this take at a public /t/… link (copies the URL)"}
+                    className="font-jetbrains shrink-0 rounded-lg border border-white/15 px-3 py-1.5 text-[11px] text-white/80 transition hover:bg-white/5 disabled:cursor-not-allowed disabled:border-white/10 disabled:text-white/50"
+                  >
+                    {shares[t.id] === "pending" ? "sharing…"
+                      : shares[t.id] === "error" ? "✗ failed"
+                      : shares[t.id] ? "✓ link copied"
+                      : "↗ share"}
+                  </button>
                   <button
                     onClick={() => setCodeFor((c) => (c === t.id ? null : t.id))}
                     disabled={t.mode === "browser"}
