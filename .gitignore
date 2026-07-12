@@ -13,3 +13,4 @@ service/loadtest_result.json
 .env
 api_keys.json
 emotion_demand.json
+takes/

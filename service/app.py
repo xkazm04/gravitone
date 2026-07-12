@@ -35,6 +35,7 @@ from service.voices import emotion_map, router as voices_router
 from service.keys import router as keys_router
 from service.ingest_api import router as ingest_router
 from service.packs import router as packs_router
+from service.takes import router as takes_router
 
 ENGINE: TtsEngine | None = None
 
@@ -214,6 +215,9 @@ app.include_router(ingest_router, dependencies=[Depends(require_scope("clone"))]
 # Character Packs (export/import portable bundles) — exporting hands out the
 # raw voice embeddings, so both directions need the "voices" scope.
 app.include_router(packs_router, dependencies=[Depends(require_scope("voices"))])
+# Shared takes (public Voice Cards) — reads/writes ride the web proxy's key;
+# direct API access needs a tts-scoped key.
+app.include_router(takes_router, dependencies=[Depends(require_scope("tts"))])
 
 
 class SpeakRequest(BaseModel):
