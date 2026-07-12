@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gravitone.fullname" . }}
+  labels:
+    {{- include "gravitone.labels" . | nindent 4 }}
+spec:
+  {{- if eq .Values.autoscaling.mode "off" }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "gravitone.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gravitone.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: gravitone
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: 8080
+          env:
+            # The scaling law: capacity comes from replicas, never from
+            # in-process workers (the model is GIL-bound). Do not raise this.
+            - name: TTS_WORKERS
+              value: "1"
+            - name: TTS_TORCH_THREADS
+              value: {{ .Values.tts.torchThreads | quote }}
+            - name: OMP_NUM_THREADS
+              value: {{ .Values.tts.torchThreads | quote }}
+            - name: TTS_QUEUE_MAX
+              value: {{ .Values.tts.queueMax | quote }}
+            - name: TTS_LANGUAGE
+              value: {{ .Values.tts.language | quote }}
+            - name: TTS_HOST
+              value: "0.0.0.0"
+          envFrom:
+            - secretRef:
+                name: {{ include "gravitone.secretName" . }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          # /health returns 503 until the model is loaded — exactly what
+          # readiness wants. Liveness stays TCP so a long model (re)load
+          # never gets the pod killed.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 30
+          livenessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 20
+          volumeMounts:
+            - name: voices
+              mountPath: /app/voices
+      volumes:
+        - name: voices
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "gravitone.fullname" . }}-voices
+          {{- else }}
+          emptyDir: {}
+          {{- end }}

@@ -1,0 +1,23 @@
+{{- if eq .Values.autoscaling.mode "keda" }}
+# 429-driven autoscaling: the engine's admission queue depth (the signal that
+# precedes every 429) is polled straight from the JSON /metrics endpoint —
+# no Prometheus required. Needs KEDA installed: https://keda.sh
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "gravitone.fullname" . }}
+  labels:
+    {{- include "gravitone.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    name: {{ include "gravitone.fullname" . }}
+  minReplicaCount: {{ .Values.autoscaling.minReplicas }}
+  maxReplicaCount: {{ .Values.autoscaling.maxReplicas }}
+  pollingInterval: {{ .Values.autoscaling.keda.pollingInterval }}
+  triggers:
+    - type: metrics-api
+      metadata:
+        url: "http://{{ include "gravitone.fullname" . }}:{{ .Values.service.port }}/metrics"
+        valueLocation: "metrics.queued"
+        targetValue: {{ .Values.autoscaling.keda.queuedTarget | quote }}
+{{- end }}

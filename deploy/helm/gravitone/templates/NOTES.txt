@@ -1,0 +1,20 @@
+Gravitone fleet deployed.
+
+  Replicas : {{ if eq .Values.autoscaling.mode "off" }}{{ .Values.replicaCount }} (static){{ else }}{{ .Values.autoscaling.minReplicas }}-{{ .Values.autoscaling.maxReplicas }} ({{ .Values.autoscaling.mode }}){{ end }}
+  Threads  : {{ .Values.tts.torchThreads }} per replica (TTS_WORKERS pinned to 1 — scale by replica)
+
+Endpoint (once the LoadBalancer is up):
+  export GVT=$(kubectl get svc {{ include "gravitone.fullname" . }} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}{.status.loadBalancer.ingress[0].ip}')
+  curl http://$GVT:{{ .Values.service.port }}/health
+
+First synthesis:
+  curl -X POST "http://$GVT:{{ .Values.service.port }}/v1/text-to-speech/alba" \
+    -H "xi-api-key: <your key>" -H "Content-Type: application/json" \
+    -d '{"text":"A fleet of Arm replicas, no GPU."}' --output hello.wav
+
+{{- if not .Values.persistence.enabled }}
+
+NOTE: persistence is OFF — cloned voices live per-replica and vanish on
+restart. Enable persistence with a ReadWriteMany storage class for a shared
+voice store across the fleet.
+{{- end }}

@@ -1,0 +1,10 @@
+apiVersion: v2
+name: gravitone
+description: >-
+  Gravitone TTS fleet — CPU-only Arm voice cloning with an
+  ElevenLabs-compatible API, scaled by the measured law: N single-worker
+  replicas, queue-depth as the autoscaling signal.
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords: [tts, voice-cloning, arm, graviton, elevenlabs-compatible]

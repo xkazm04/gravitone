@@ -1,0 +1,61 @@
+# Gravitone fleet values. The defaults encode the measured scaling law from
+# the benchmark study (README "Two findings that generalise"):
+#   * TTS_WORKERS is pinned to 1 — the model is GIL-bound; capacity comes
+#     from REPLICAS, never from in-process workers.
+#   * Each replica gets torchThreads CPUs; replicas × torchThreads ≈ node vCPU.
+#   * queue depth (the pre-429 signal) is the autoscaling metric.
+
+image:
+  repository: gravitone   # build from the repo Dockerfile and push to your registry
+  tag: latest
+  pullPolicy: IfNotPresent
+
+replicaCount: 4            # c8g.2xlarge preset: 4 replicas × 2 threads = 8 vCPU
+
+# Root API key (xi-api-key). Leave value empty and set existingSecret to use
+# a pre-created secret with key TTS_API_KEY.
+apiKey:
+  value: ""
+  existingSecret: ""
+
+tts:
+  torchThreads: 2
+  queueMax: 32
+  language: english
+
+resources:
+  requests:
+    cpu: "2"               # keep equal to tts.torchThreads — per-replica CPU pinning
+    memory: 3Gi
+  limits:
+    cpu: "2"
+    memory: 4Gi
+
+nodeSelector:
+  kubernetes.io/arch: arm64   # Graviton / Axion / Ampere node pools
+
+service:
+  type: LoadBalancer
+  port: 8080
+
+# Shared voices store. Multi-replica writes (cloning on one replica, serving
+# on another) need a ReadWriteMany storage class (EFS/Filestore); with
+# persistence off each replica keeps its own built-in voices only.
+persistence:
+  enabled: false
+  storageClassName: ""
+  accessModes: [ReadWriteMany]
+  size: 10Gi
+
+autoscaling:
+  # off | cpu | keda
+  #   cpu  — standard HPA on CPU utilization (works everywhere)
+  #   keda — scale on the engine's live queue depth via KEDA's metrics-api
+  #          scaler polling /metrics (requires KEDA installed in the cluster)
+  mode: "off"
+  minReplicas: 2
+  maxReplicas: 12
+  cpuTargetPercent: 70
+  keda:
+    queuedTarget: "4"      # scale out when avg queued requests per replica exceeds this
+    pollingInterval: 15
