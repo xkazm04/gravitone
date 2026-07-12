@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { EMOTIONS } from "@/lib/emotions";
+import { useAuth } from "@/lib/useAuth";
+import { recordVoiceOwnership, type ConsentMethod } from "@/lib/voiceVault";
 import type { Character, Voice } from "@/app/voices/_variants/data";
 
 export type Slot = {
@@ -14,6 +16,7 @@ export type Slot = {
 
 /** One Character's emotion scale: which slots are filled, and how to fill them. */
 export function useCharacterVoices(characterId: string) {
+  const { user } = useAuth();
   const [character, setCharacter] = useState<Character | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -49,9 +52,10 @@ export function useCharacterVoices(characterId: string) {
 
   /** Clone a new Voice into an empty emotion slot.
    *  `rethrow` lets callers with their own error UI (GuidedRecorder) get the
-   *  failure instead of the hook's shared error banner. */
+   *  failure instead of the hook's shared error banner. `consent` names how
+   *  the audio was obtained — it becomes the Voice Vault attestation. */
   const addVoice = useCallback(
-    async (emotion: string, file: File, opts: { rethrow?: boolean } = {}) => {
+    async (emotion: string, file: File, opts: { rethrow?: boolean; consent?: ConsentMethod } = {}) => {
       if (!character) return;
       setBusySlot(emotion);
       setError(null);
@@ -63,6 +67,13 @@ export function useCharacterVoices(characterId: string) {
         const r = await fetch("/api/voices", { method: "POST", body: fd });
         const body = await r.json().catch(() => ({}));
         if (!r.ok) throw new Error(body?.detail ?? `clone failed (${r.status})`);
+        if (user) {
+          const v = body as Voice;
+          void recordVoiceOwnership(user, [{
+            voice_id: v.voice_id, character_id: v.character_id,
+            character_name: character.name, emotion: v.emotion,
+          }], opts.consent ?? "uploaded");
+        }
         await refresh();
       } catch (e) {
         if (opts.rethrow) throw e;
@@ -71,7 +82,7 @@ export function useCharacterVoices(characterId: string) {
         setBusySlot(null);
       }
     },
-    [character, refresh]
+    [character, refresh, user]
   );
 
   const removeVoice = useCallback(

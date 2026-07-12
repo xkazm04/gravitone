@@ -6,6 +6,8 @@ import AppFrame from "@/components/ui/AppFrame";
 import { Button, Eyebrow } from "@/components/ui/Primitives";
 import EmotionArt from "@/components/ui/EmotionArt";
 import { EMOTION_IDS, emotionMeta } from "@/lib/emotions";
+import { useAuth } from "@/lib/useAuth";
+import { recordVoiceOwnership } from "@/lib/voiceVault";
 import WaveformLab from "./_loaders/WaveformLab";
 import type { LoaderData, LoaderStep, Partial as PartialData } from "./_loaders/shared";
 
@@ -20,7 +22,9 @@ type Job = { status: string; step: string | null; steps: LoaderStep[]; partial: 
 type Phase = "upload" | "processing" | "speaker" | "review" | "committing" | "complete";
 
 export default function NewCharacterPage() {
+  const { user } = useAuth();
   const [phase, setPhase] = useState<Phase>("upload");
+  const [consented, setConsented] = useState(false); // Voice Vault attestation
   const [file, setFile] = useState<File | null>(null);
   const [dragging, setDragging] = useState(false);
   const [jobId, setJobId] = useState<string | null>(null);
@@ -116,7 +120,13 @@ export default function NewCharacterPage() {
       const r = await fetch(`/api/ingest/${jobId}/commit`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ character, emotions: [...selected], character_id }) });
       const j = await r.json();
       if (!r.ok) throw new Error(j?.detail ?? "commit failed");
-      setCreated(j.created ?? []); setCommittedCid(character_id ?? slug(character)); setPhase("complete");
+      const cid = character_id ?? slug(character);
+      if (user && Array.isArray(j.created)) {
+        void recordVoiceOwnership(user, (j.created as { voice_id: string; emotion: string }[]).map((v) => ({
+          voice_id: v.voice_id, character_id: cid, character_name: character, emotion: v.emotion,
+        })), "ingested");
+      }
+      setCreated(j.created ?? []); setCommittedCid(cid); setPhase("complete");
     } catch (e) { setError(e instanceof Error ? e.message : "commit failed"); setPhase("review"); }
   }
 
@@ -304,10 +314,20 @@ export default function NewCharacterPage() {
                     {characters.map((c) => <option key={c.character_id} value={c.character_id}>{c.name}</option>)}
                   </select>
                 )}
-                <Button onClick={commit} disabled={selected.size === 0} className="ml-auto cursor-pointer">
+                <Button onClick={commit} disabled={selected.size === 0 || !consented} className="ml-auto cursor-pointer">
                   {mode === "new" ? "Create character" : "Add to character"} ({selected.size})
                 </Button>
               </div>
+              <label className="mt-4 flex cursor-pointer items-start gap-2 text-[13px] text-white/70">
+                <input type="checkbox" checked={consented} onChange={(e) => setConsented(e.target.checked)}
+                  className="mt-0.5 accent-cyan-300" />
+                <span>
+                  I own this voice or have the speaker&apos;s explicit consent to clone it.{" "}
+                  <span className="font-jetbrains text-[11px] text-white/45">
+                    (attestation stored with the voices — Voice Vault)
+                  </span>
+                </span>
+              </label>
             </div>
           </div>
         )}

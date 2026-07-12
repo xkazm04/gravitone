@@ -7,6 +7,7 @@ import { Button, Eyebrow } from "@/components/ui/Primitives";
 import { useAuth } from "@/lib/useAuth";
 import { getStoredKey, mintDefaultKey, type StoredKey } from "@/lib/mintKey";
 import { migrationSnippet, SNIPPET_LANGS, type SnippetLang } from "@/lib/switchkit";
+import MyVoices from "./MyVoices";
 
 export default function ProfilePage() {
   const { user, profile, loading, ready, signIn, updateProfile } = useAuth();
@@ -145,6 +146,9 @@ export default function ProfilePage() {
                 </div>
               )}
             </div>
+
+            {/* Personal Voice Vault */}
+            <MyVoices uid={user.uid} />
 
             <p className="font-jetbrains text-[11px] text-white/50">
               Stored in Firestore <span className="text-white/70">users/{user.uid}</span>

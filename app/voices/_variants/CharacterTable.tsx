@@ -10,6 +10,8 @@ import { Button, Eyebrow } from "@/components/ui/Primitives";
 import { EMOTIONS } from "@/lib/emotions";
 import TagEditor from "./TagEditor";
 import { hueOf, relTime, useCharacters, useVoicePreview, type Character } from "./data";
+import { useAuth } from "@/lib/useAuth";
+import { CONSENT_PROMPT, recordVoiceOwnership } from "@/lib/voiceVault";
 
 type SortKey = "name" | "category" | "lang" | "coverage" | "created";
 
@@ -37,6 +39,7 @@ function CoverageBar({ c }: { c: Character }) {
 export default function CharacterTable() {
   const { characters, loading, error, createVoice, patchCharacter, deleteCharacter, refresh } = useCharacters();
   const { preview, playingId, busyId } = useVoicePreview();
+  const { user } = useAuth();
 
   const [query, setQuery] = useState("");
   const [tagFilter, setTagFilter] = useState<string | null>(null);
@@ -91,9 +94,17 @@ export default function CharacterTable() {
     setSelected(new Set());
   }
   async function onFile(f: File) {
+    if (!window.confirm(CONSENT_PROMPT)) return; // Voice Vault attestation gate
     setCloning(true); setCloneErr(null);
     try {
-      await createVoice(f, f.name.replace(/\.[^.]+$/, ""), "baseline", [], f.name);
+      const name = f.name.replace(/\.[^.]+$/, "");
+      const v = await createVoice(f, name, "baseline", [], f.name);
+      if (user) {
+        void recordVoiceOwnership(user, [{
+          voice_id: v.voice_id, character_id: v.character_id,
+          character_name: name, emotion: v.emotion,
+        }], "uploaded");
+      }
     } catch (e) {
       setCloneErr(e instanceof Error ? e.message : "clone failed");
     } finally { setCloning(false); }

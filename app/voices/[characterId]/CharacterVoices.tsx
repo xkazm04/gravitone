@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { Eyebrow } from "@/components/ui/Primitives";
 import { EMOTION_IDS } from "@/lib/emotions";
+import { CONSENT_PROMPT } from "@/lib/voiceVault";
 import { useCharacterVoices } from "./_variants/useCharacterVoices";
 import EmotionRack from "./_variants/EmotionRack";
 import GuidedRecorder from "./_variants/GuidedRecorder";
@@ -22,10 +23,16 @@ export default function CharacterVoices({ characterId }: { characterId: string }
     if (wanted && EMOTION_IDS.includes(wanted)) setRecording(wanted);
   }, []);
 
-  // GuidedRecorder needs a throwing clone (it drives its own state machine),
-  // while the rack's file-upload path keeps the hook's stateful error flow.
+  // GuidedRecorder needs a throwing clone (it drives its own state machine).
+  // Self-recorded here = the speaker IS the attester (Voice Vault consent).
   const cloneForRecorder = useCallback(async (emotion: string, file: File) => {
-    await addVoice(emotion, file, { rethrow: true });
+    await addVoice(emotion, file, { rethrow: true, consent: "self-recorded" });
+  }, [addVoice]);
+
+  // Uploaded files need an explicit consent attestation before cloning.
+  const addVoiceWithConsent = useCallback((emotion: string, file: File) => {
+    if (!window.confirm(CONSENT_PROMPT)) return;
+    void addVoice(emotion, file, { consent: "uploaded" });
   }, [addVoice]);
 
   if (loading) return <p className="py-20 text-sm text-white/60">Loading character…</p>;
@@ -80,7 +87,7 @@ export default function CharacterVoices({ characterId }: { characterId: string }
       <div className="mt-8">
         <EmotionRack
           name={character.name} slots={slots} coverage={coverage} total={total}
-          busySlot={busySlot} addVoice={addVoice} removeVoice={removeVoice}
+          busySlot={busySlot} addVoice={addVoiceWithConsent} removeVoice={removeVoice}
           onRecord={setRecording}
         />
       </div>
