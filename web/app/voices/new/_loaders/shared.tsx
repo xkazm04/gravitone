@@ -10,6 +10,8 @@ export type Partial = {
   segments_total?: number;
   segments_done?: number;
   emotion_counts?: Record<string, number>;
+  // segments whose classification failed and fell back to the baseline stem
+  label_errors?: number;
   // commit phase: live per-emotion cloning progress
   emotions_done?: number;
   emotions_total?: number;

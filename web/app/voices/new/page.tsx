@@ -71,6 +71,14 @@ export default function NewCharacterPage() {
     }
   }, [phase, user, created, state.pendingCommit]);
 
+  // Validate before we accept a file — no upload round-trip for a bad pick.
+  async function acceptFile(f: File | undefined | null) {
+    if (!f) return;
+    const err = await validateUpload(f);
+    if (err) { setFile(null); dispatch({ type: "SET_ERROR", error: err }); return; }
+    setFile(f); dispatch({ type: "SET_ERROR", error: null });
+  }
+
   async function startScan() {
     if (!file) return;
     const fd = new FormData();
@@ -155,13 +163,15 @@ export default function NewCharacterPage() {
         {phase === "upload" && (
           <div className="mt-8 max-w-2xl">
             <div
+              role="button" tabIndex={0} aria-label="Choose or drop an audio recording"
               onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
               onDragLeave={() => setDragging(false)}
-              onDrop={(e) => { e.preventDefault(); setDragging(false); const f = e.dataTransfer.files?.[0]; if (f) { setFile(f); dispatch({ type: "SET_ERROR", error: null }); } }}
+              onDrop={(e) => { e.preventDefault(); setDragging(false); void acceptFile(e.dataTransfer.files?.[0]); }}
               onClick={() => fileRef.current?.click()}
-              className={`grid cursor-pointer place-items-center rounded-2xl border-2 border-dashed px-6 py-14 text-center transition ${dragging ? "border-cyan-400/60 bg-cyan-400/5" : "border-white/12 hover:border-white/30"}`}
+              onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fileRef.current?.click(); } }}
+              className={`grid cursor-pointer place-items-center rounded-2xl border-2 border-dashed px-6 py-14 text-center transition focus:outline-none focus-visible:border-cyan-400/60 focus-visible:bg-cyan-400/5 ${dragging ? "border-cyan-400/60 bg-cyan-400/5" : "border-white/12 hover:border-white/30"}`}
             >
-              <input ref={fileRef} type="file" accept="audio/*,video/mp4" hidden onChange={(e) => { const f = e.target.files?.[0]; if (f) { setFile(f); dispatch({ type: "SET_ERROR", error: null }); } }} />
+              <input ref={fileRef} type="file" accept={ACCEPT_ATTR} hidden onChange={(e) => { void acceptFile(e.target.files?.[0]); }} />
               <div>
                 <div className="text-lg text-white">{file ? file.name : "Drop an mp3 / recording, or click to choose"}</div>
                 <div className="font-jetbrains mt-1 text-[12px] text-white/55">
@@ -238,6 +248,11 @@ export default function NewCharacterPage() {
               <span>{result.speakers.length} speakers · target <span className="text-white">{result.target}</span></span>
               <span>{result.utterances} utterances</span>
             </div>
+            {(job?.partial?.label_errors ?? 0) > 0 && (
+              <p className="font-jetbrains mt-3 rounded-lg border border-amber-400/20 bg-amber-400/5 px-3 py-2 text-[12px] text-amber-200/85">
+                {job!.partial!.label_errors} segment{job!.partial!.label_errors === 1 ? "" : "s"} couldn’t be classified — they fell back to the baseline stem.
+              </p>
+            )}
 
             <div className="mt-6 flex items-end justify-between">
               <div>
@@ -282,6 +297,7 @@ export default function NewCharacterPage() {
                         <td className="px-3 py-2 text-[12px] italic text-white/50">{st.cues[0] ? `“${st.cues[0]}”` : "—"}</td>
                         <td className="px-3 py-2">
                           <button onClick={() => playClip(`/api/ingest/${jobId}/preview/${st.emotion}`, `stem-${st.emotion}`)}
+                            aria-label={`${playing === `stem-${st.emotion}` ? "Pause" : "Play"} ${m.label} stem`}
                             className="grid h-8 w-8 place-items-center rounded-full bg-cyan-300 text-[12px] text-slate-950 transition hover:brightness-110">
                             {playing === `stem-${st.emotion}` ? "⏸" : "▶"}
                           </button>
@@ -347,7 +363,9 @@ export default function NewCharacterPage() {
               <p className="mt-2 text-sm text-white/60">
                 {current ? <>Cloning <span className="text-white">{emotionMeta(current).label}</span> on the CPU engine…</> : "Cloning on the CPU engine…"}
               </p>
-              <div className="mx-auto mt-5 h-1.5 w-64 overflow-hidden rounded-full bg-white/10">
+              <div className="mx-auto mt-5 h-1.5 w-64 overflow-hidden rounded-full bg-white/10"
+                role="progressbar" aria-valuenow={pct} aria-valuemin={0} aria-valuemax={100}
+                aria-label={`Cloning voices, ${done} of ${total} done`}>
                 <div className="h-full rounded-full bg-cyan-300 transition-all duration-500" style={{ width: `${pct}%` }} />
               </div>
               <button onClick={cancelCommit}
@@ -440,4 +458,60 @@ export default function NewCharacterPage() {
 
 function slug(name: string): string {
   return name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "character";
+}
+
+// ── client-side upload pre-check ──────────────────────────────────────────────
+// Mirrors the backend gate (service/ingest_api.py) so a bad file is caught
+// before it uploads instead of after a full round-trip + 400.
+const MAX_UPLOAD_BYTES = 50 * 1024 * 1024; // 50 MB — matches MAX_UPLOAD_BYTES
+const MIN_CLIP_SECONDS = 3;                // matches MIN_CLIP_SECONDS
+// Full backend extension whitelist (_AUDIO_EXTS).
+const ACCEPTED_EXTS = [
+  ".mp3", ".wav", ".wave", ".m4a", ".m4b", ".mp4", ".mov", ".ogg", ".oga",
+  ".opus", ".flac", ".aac", ".webm", ".wma", ".aiff", ".aif", ".aifc",
+  ".amr", ".3gp", ".mkv",
+];
+// Picker accept: broad mime families + every accepted extension.
+const ACCEPT_ATTR = ["audio/*", "video/*", ...ACCEPTED_EXTS].join(",");
+
+function extOf(name: string): string {
+  const i = name.lastIndexOf(".");
+  return i >= 0 ? name.slice(i).toLowerCase() : "";
+}
+
+// Probe duration by loading metadata into a throwaway <audio> element.
+// Resolves null when the browser can't determine it (backend re-probes).
+function probeDuration(file: File): Promise<number | null> {
+  return new Promise((resolve) => {
+    const url = URL.createObjectURL(file);
+    const a = document.createElement("audio");
+    a.preload = "metadata";
+    let settled = false;
+    const finish = (v: number | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(t); URL.revokeObjectURL(url); a.removeAttribute("src"); resolve(v);
+    };
+    // Some containers the backend accepts (mkv/amr/…) may never fire an event
+    // in the browser — never block the picker: fall back to "unknown" (null),
+    // and let the server re-probe.
+    const t = setTimeout(() => finish(null), 4000);
+    a.onloadedmetadata = () => finish(Number.isFinite(a.duration) ? a.duration : null);
+    a.onerror = () => finish(null);
+    a.src = url;
+  });
+}
+
+async function validateUpload(file: File): Promise<string | null> {
+  if (file.size === 0) return "empty file — choose an audio recording";
+  if (file.size > MAX_UPLOAD_BYTES) return `file too large — keep it under ${MAX_UPLOAD_BYTES / (1024 * 1024)} MB`;
+  const mimeOk = /^(audio|video)\//.test(file.type);
+  if (!ACCEPTED_EXTS.includes(extOf(file.name)) && !mimeOk) {
+    return "unsupported file type — upload an audio or video recording";
+  }
+  const dur = await probeDuration(file);
+  if (dur !== null && dur < MIN_CLIP_SECONDS) {
+    return `clip too short — record at least ${MIN_CLIP_SECONDS} seconds of speech`;
+  }
+  return null;
 }

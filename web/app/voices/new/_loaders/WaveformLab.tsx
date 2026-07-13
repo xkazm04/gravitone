@@ -86,6 +86,11 @@ export default function WaveformLab({ data }: { data: LoaderData }) {
         {p.transcript && !p.emotion_counts && (
           <p className="mx-auto mt-3 line-clamp-2 max-w-lg text-center text-[12px] italic text-white/45">“{p.transcript}”</p>
         )}
+        {(p.label_errors ?? 0) > 0 && (
+          <p className="font-jetbrains mt-3 text-center text-[11px] text-amber-200/70">
+            {p.label_errors} segment{p.label_errors === 1 ? "" : "s"} couldn’t be classified — falling back to baseline
+          </p>
+        )}
       </div>
     </div>
   );
