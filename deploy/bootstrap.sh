@@ -92,6 +92,6 @@ Point any ElevenLabs client at it:
     -d '{"text":"My own voice cloud, on one Arm box."}' --output hello.wav
 
 Manage keys/voices via the API or point the Gravitone studio at it
-(gravitone-web: GRAVITONE_URL + GRAVITONE_API_KEY).
+(web/: GRAVITONE_URL + GRAVITONE_API_KEY).
 ============================================================
 DONE

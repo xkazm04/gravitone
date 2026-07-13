@@ -209,21 +209,27 @@ curl -X POST "localhost:8080/v1/performance" \
 curl -s -H "xi-api-key: $KEY" localhost:8080/v1/characters/sarah/manifest
 ```
 
-## The full studio — two products
+## The full studio — two products, one repo
 
-Gravitone is **two products** that together form the studio:
+Gravitone is **two products** that together form the studio, living side by
+side in this monorepo:
 
 ```
+gravitone/
+├── service/   ← the TTS backend (Python / FastAPI, runs on Arm CPU)
+├── deploy/    ← one-click cloud deploy + Helm fleet chart
+└── web/       ← the studio UI (Next.js 15)
+
 ┌──────────────────────┐   GRAVITONE_URL    ┌───────────────────────────┐
-│  gravitone-web        │ ─────────────────▶ │  TTS backend (this repo)   │
-│  Next.js studio UI    │   /v1/* over HTTP  │  python -m service.app     │
-│  (auth, playground,   │                    │  :8080  · runs on Arm CPU  │
-│   voices, keys,       │                    │  pocket-tts clone + serve  │
-│   ingestion)          │                    └───────────────────────────┘
+│  web/ (studio)       │ ─────────────────▶ │  service/ (TTS backend)   │
+│  Next.js studio UI   │   /v1/* over HTTP  │  python -m service.app    │
+│  (auth, playground,  │                    │  :8080  · runs on Arm CPU │
+│   voices, keys,      │                    │  pocket-tts clone + serve │
+│   ingestion)         │                    └───────────────────────────┘
 └──────────────────────┘
 ```
 
-**Product 1 — TTS backend (this repo).** Run it per *Setup Instructions* above.
+**Product 1 — TTS backend (`service/`).** Run it per *Setup Instructions* above.
 For the **ingestion** feature (build a Character from a recording) the backend
 also needs, in its env:
 
@@ -233,17 +239,17 @@ GEMINI_API_KEY=…        # emotion classification (gemini-3.5-flash → 3.1-pro
 HF_TOKEN=…              # first-run only: gated pocket-tts voice-cloning weights
 ```
 
-**Product 2 — web studio (`gravitone-web`).** Next.js 15 app (playground, voice &
+**Product 2 — web studio (`web/`).** Next.js 15 app (playground, voice &
 Character management, API keys, Firebase Google-auth + Firestore profiles, and the
 recording-ingestion flow). It talks to the backend via **`GRAVITONE_URL`**:
 
 ```bash
-# gravitone-web/.env.local
+# web/.env.local
 GRAVITONE_URL=http://127.0.0.1:8080          # or https://tts.<your-domain> in prod
 NEXT_PUBLIC_FIREBASE_API_KEY=…               # web config (public by design)
 NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=…
 NEXT_PUBLIC_FIREBASE_PROJECT_ID=…
-# … (see gravitone-web/.env.example for the full set)
+# … (see web/.env.example for the full set)
 
 npm install && npm run dev                    # → http://localhost:3001
 ```
