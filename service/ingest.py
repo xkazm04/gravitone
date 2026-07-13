@@ -46,7 +46,7 @@ from typing import Callable
 
 from service.config import SETTINGS
 from service.emotions import BASELINE, EMOTION_SCALE
-from service.voices import VOICES_DIR, _load_meta, _save_meta, _slug
+from service.voices import VOICES_DIR, _load_meta, _slug, mutate_meta
 
 ELEVEN_KEY = os.environ.get("ELEVEN_LABS_API_KEY", "")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
@@ -550,7 +550,6 @@ def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: st
         if not evt.get("ok") or not Path(p["dst"]).is_file():
             _terminate()
             raise RuntimeError(f"clone {emo} failed: {evt.get('error') or 'export error'}")
-        meta = _load_meta()
         entry = {
             "name": name, "character_id": cid, "emotion": emo,
             "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -559,9 +558,11 @@ def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: st
             entry["consent"] = {
                 "consented_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "clip_sha256": clip_sha256, "statement": consent}
-        meta["voices"][p["voice_id"]] = entry
-        meta["characters"].setdefault(cid, {"name": name, "tags": ["ingested"]})
-        _save_meta(meta)
+
+        def _add(meta, entry=entry, vid=p["voice_id"]):
+            meta["voices"][vid] = entry
+            meta["characters"].setdefault(cid, {"name": name, "tags": ["ingested"]})
+        mutate_meta(_add)
         created.append({"voice_id": p["voice_id"], "emotion": emo, "seconds": p["seconds"]})
         done += 1
         if progress:
