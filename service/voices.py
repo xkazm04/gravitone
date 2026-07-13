@@ -9,6 +9,7 @@ is isolated from the serving workers. Metadata lives in `voices/_meta.json`.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -512,9 +513,19 @@ async def create_voice(
     character: str = Form(...),
     emotion: str = Form(BASELINE),
     tags: str = Form(""),
+    attested: str = Form(""),
+    statement: str = Form(""),
 ) -> Voice:
     """Clone one Voice (a character in a given emotion) from a recording.
-    A novel emotion name self-registers as a custom slot on this Character."""
+    A novel emotion name self-registers as a custom slot on this Character.
+
+    Cloning requires an ownership attestation: `attested` must be "true" and
+    `statement` non-empty. On success a consent receipt — the SAME shape ingest
+    stamps ({consented_at, clip_sha256, statement}) — is written into the
+    Voice's meta entry, so an API-cloned Voice carries provenance too."""
+    if attested.strip().lower() != "true" or not statement.strip():
+        raise HTTPException(422, "ownership attestation required to clone a voice")
+    statement = statement.strip()
     try:
         emotion = normalize_emotion(emotion or BASELINE)
     except ValueError as exc:
@@ -531,7 +542,9 @@ async def create_voice(
     with tempfile.TemporaryDirectory(prefix="gravitone-clone-") as td:
         tmp = Path(td)
         raw = tmp / f"raw-{file.filename or 'upload'}"
-        raw.write_bytes(await file.read())
+        raw_bytes = await file.read()
+        clip_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+        raw.write_bytes(raw_bytes)
         # Same canonical cleanup chain (denoise + loudnorm) as the ingest
         # pipeline — one filter for every clone path. Imported lazily to avoid a
         # module-load cycle (ingest imports voices).
@@ -556,6 +569,10 @@ async def create_voice(
         meta["voices"][voice_id] = {
             "name": character.strip(), "character_id": cid, "emotion": emotion,
             "created": created, "sample_seconds": seconds, "lang": "EN",
+            # Same consent-receipt shape ingest stamps (see ingest.commit).
+            "consent": {
+                "consented_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "clip_sha256": clip_sha256, "statement": statement},
         }
         cm = meta["characters"].setdefault(cid, {"name": character.strip(), "tags": []})
         for t in (t.strip().lower() for t in tags.split(",") if t.strip()):
@@ -571,7 +588,7 @@ async def create_voice(
 
     return Voice(voice_id=voice_id, character_id=cid, emotion=emotion,
                  name=f"{character.strip()} · {emotion}", category="cloned",
-                 created=created, sample_seconds=seconds)
+                 created=created, sample_seconds=seconds, consent=True)
 
 
 @router.patch("/v1/voices/{voice_id}", response_model=Voice)

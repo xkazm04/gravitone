@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { EMOTIONS, emotionMeta, isBaseEmotion } from "@/lib/emotions";
 import { useAuth } from "@/lib/useAuth";
 import { recordVoiceOwnership, type ConsentMethod } from "@/lib/voiceVault";
+import { CONSENT_STATEMENT } from "@/lib/consent";
 import type { Character, Voice } from "@/app/voices/_variants/data";
 
 export type Slot = {
@@ -95,6 +96,8 @@ export function useCharacterVoices(characterId: string) {
         fd.append("file", file, file.name);
         fd.append("character", character.name);
         fd.append("emotion", emotion);
+        fd.append("attested", "true"); // ownership attestation (gated in the UI)
+        fd.append("statement", CONSENT_STATEMENT);
         const r = await fetch("/api/voices", { method: "POST", body: fd });
         const body = await r.json().catch(() => ({}));
         if (!r.ok) throw new Error(body?.detail ?? `clone failed (${r.status})`);

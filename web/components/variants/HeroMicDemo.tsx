@@ -12,6 +12,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import { HERO_DEMO, SAMPLE_TEXT } from "@/lib/content";
 import { useAuth } from "@/lib/useAuth";
+import { CONSENT_STATEMENT } from "@/lib/consent";
 
 const MIN_SECONDS = 8;
 const MAX_SECONDS = 20;
@@ -65,6 +66,9 @@ export default function HeroMicDemo() {
       fd.append("file", new File([blob], `hero-demo.${ext}`, { type: blob.type }));
       fd.append("character", demoName);
       fd.append("emotion", "baseline");
+      // The visitor is recording their own voice live — self-attestation.
+      fd.append("attested", "true");
+      fd.append("statement", CONSENT_STATEMENT);
       const cr = await fetch("/api/voices", { method: "POST", body: fd });
       const voice = await cr.json().catch(() => ({}));
       if (!cr.ok) throw new Error(voice?.detail ?? "clone failed");

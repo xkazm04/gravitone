@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { CONSENT_STATEMENT } from "@/lib/consent";
 
 /** One speaker in ONE emotion. */
 export type Voice = {
@@ -79,6 +80,8 @@ export function useCharacters() {
       fd.append("character", character);
       fd.append("emotion", emotion);
       fd.append("tags", tags.join(","));
+      fd.append("attested", "true"); // ownership attestation (gated in the UI)
+      fd.append("statement", CONSENT_STATEMENT);
       const r = await fetch("/api/voices", { method: "POST", body: fd });
       const body = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(body?.detail ?? `clone failed (${r.status})`);

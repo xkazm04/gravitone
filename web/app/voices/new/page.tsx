@@ -8,6 +8,7 @@ import EmotionArt from "@/components/ui/EmotionArt";
 import { EMOTION_IDS, emotionMeta } from "@/lib/emotions";
 import { useAuth } from "@/lib/useAuth";
 import { recordVoiceOwnership } from "@/lib/voiceVault";
+import { CONSENT_STATEMENT } from "@/lib/consent";
 import WaveformLab from "./_loaders/WaveformLab";
 import type { LoaderData } from "./_loaders/shared";
 import {
@@ -15,11 +16,6 @@ import {
   type Character, type Job,
 } from "./_state/machine";
 import { useIngestJob } from "./_state/useIngestJob";
-
-// Kept in sync with the attestation label rendered in the review step; sent to
-// the backend so the consent receipt records exactly what the user agreed to.
-const CONSENT_STATEMENT =
-  "I own this voice or have the speaker's explicit consent to clone it.";
 
 export default function NewCharacterPage() {
   const { user } = useAuth();
