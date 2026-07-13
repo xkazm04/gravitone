@@ -338,15 +338,18 @@ async def create_voice(
         tmp = Path(td)
         raw = tmp / f"raw-{file.filename or 'upload'}"
         raw.write_bytes(await file.read())
+        # Same canonical cleanup chain (denoise + loudnorm) as the ingest
+        # pipeline — one filter for every clone path. Imported lazily to avoid a
+        # module-load cycle (ingest imports voices).
+        from service.ingest import clean_audio
         clean = tmp / "clean.wav"
-        ff = subprocess.run(
-            ["ffmpeg", "-y", "-i", str(raw), "-af", "highpass=f=80,loudnorm",
-             "-ac", "1", "-ar", "24000", str(clean)], capture_output=True)
-        if ff.returncode != 0 or not clean.is_file():
-            raise HTTPException(400, f"could not decode audio: {ff.stderr.decode(errors='ignore')[:200]}")
+        try:
+            clean_audio(raw, clean)
+        except RuntimeError as exc:
+            raise HTTPException(400, f"could not decode audio: {str(exc)[-200:]}")
         seconds = _wav_seconds(clean)
         if seconds and seconds < 3:
-            raise HTTPException(400, "recording too short — use at least 5 seconds (10–30s is best)")
+            raise HTTPException(400, "recording too short — use at least 3 seconds (10–30s is best)")
         ex = subprocess.run(
             [sys.executable, "-m", "pocket_tts", "export-voice", str(clean), str(out_path)],
             capture_output=True)

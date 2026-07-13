@@ -60,6 +60,17 @@ EMOTIONS = list(EMOTION_SCALE)
 # mapped back by segment index), and one segment's failure never kills the batch.
 LABEL_WORKERS = 4
 
+# THE one canonical clip-cleanup filter chain, shared by EVERY clone path so a
+# voice cloned via ingest (sovereign or cloud), the direct /v1/voices upload, or
+# clone_test.sh all get identical conditioning: highpass drops sub-80Hz rumble,
+# afftdn does spectral denoise, loudnorm normalizes loudness. Keep this the single
+# source of truth — do not inline a divergent filter string anywhere else.
+CLEANUP_FILTER = "highpass=f=80,afftdn=nf=-25,loudnorm"
+
+# A stem (or upload) shorter than this clones poorly; the pipeline flags stems
+# below it ineligible and commit refuses to clone them (unless allow_short).
+MIN_STEM_SECONDS = 4.0
+
 import urllib.request  # noqa: E402
 
 
@@ -68,6 +79,17 @@ def _log(m: str) -> None:
 
 
 # ── ffmpeg ────────────────────────────────────────────────────────────────────
+def clean_audio(src: Path, dst: Path, sr: int = 24000) -> None:
+    """Canonical clip cleanup → mono `sr`Hz wav using CLEANUP_FILTER. This is the
+    ONE cleanup entry point for every clone path (see CLEANUP_FILTER)."""
+    r = subprocess.run(
+        ["ffmpeg", "-y", "-i", str(src), "-af", CLEANUP_FILTER,
+         "-ac", "1", "-ar", str(sr), str(dst)],
+        capture_output=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"audio cleanup failed: {r.stderr.decode(errors='ignore')[-200:]}")
+
+
 def to_wav(src: Path, dst: Path, start: float | None = None, end: float | None = None) -> None:
     cmd = ["ffmpeg", "-y", "-i", str(src)]
     if start is not None:
@@ -172,14 +194,9 @@ def label_emotion(wav: Path, escalate_below: float = 0.7) -> dict:
 # ── sovereign mode (local-only, ffmpeg — audio never leaves the machine) ─────
 def clean_local(src: Path, dst: Path) -> None:
     """Local stand-in for the Voice Isolator: rumble filter + spectral denoise
-    + loudness normalization. Not studio isolation, but honest local cleanup."""
-    r = subprocess.run(
-        ["ffmpeg", "-y", "-i", str(src),
-         "-af", "highpass=f=80,afftdn=nf=-25,loudnorm",
-         "-ac", "1", "-ar", "24000", str(dst)],
-        capture_output=True)
-    if r.returncode != 0:
-        raise RuntimeError(f"local cleanup failed: {r.stderr.decode(errors='ignore')[-200:]}")
+    + loudness normalization (the canonical CLEANUP_FILTER). Not studio
+    isolation, but honest local cleanup — audio never leaves the machine."""
+    clean_audio(src, dst)
 
 
 def detect_speech(wav: Path, noise_db: float = -35.0, min_silence: float = 0.5,
@@ -313,7 +330,7 @@ def analyze(audio: Path, work_dir: Path,
     iso = work_dir / "iso.mp3"
     voice_isolate(audio, iso)
     clean = work_dir / "clean.wav"
-    to_wav(iso, clean)
+    clean_audio(iso, clean)  # canonical cleanup (adds loudnorm) after isolation
     prog("isolate", "done")
 
     # per-speaker stats + a preview clip (their longest utterance, capped)
@@ -332,7 +349,7 @@ def analyze(audio: Path, work_dir: Path,
 
 
 # ── LABEL + STEM for a chosen speaker ─────────────────────────────────────────
-def label_and_stem(work_dir: Path, target: str, min_stem: float = 4.0, limit: int = 40,
+def label_and_stem(work_dir: Path, target: str, min_stem: float = MIN_STEM_SECONDS, limit: int = 40,
                    progress: Callable[[str, str], None] | None = None,
                    partial: Callable[[dict], None] | None = None,
                    mode: str = "cloud") -> dict:
@@ -427,7 +444,7 @@ def resolve_mode(mode: str = "auto") -> str:
 
 
 # ── one-shot scan (CLI convenience: analyze → auto speaker → label) ────────────
-def scan(audio: Path, work_dir: Path, speaker: str = "auto", min_stem: float = 4.0,
+def scan(audio: Path, work_dir: Path, speaker: str = "auto", min_stem: float = MIN_STEM_SECONDS,
          limit: int = 40, progress: Callable[[str, str], None] | None = None,
          mode: str = "auto") -> dict:
     mode = resolve_mode(mode)
@@ -444,7 +461,8 @@ def scan(audio: Path, work_dir: Path, speaker: str = "auto", min_stem: float = 4
 def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: str | None = None,
            *, consent: str | None = None, clip_sha256: str | None = None,
            progress: Callable[[int, str | None], None] | None = None,
-           should_cancel: Callable[[], bool] | None = None) -> list[dict]:
+           should_cancel: Callable[[], bool] | None = None,
+           allow_short: bool = False) -> list[dict]:
     """Clone each accepted stem into a Voice.
 
     Cloning runs in ONE child process (`python -m service.export_stems`) that
@@ -454,7 +472,13 @@ def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: st
     stdout; we parse them to drive `progress(done, current)` and to poll
     `should_cancel()` between emotions (a cancel terminates the child after the
     current line). When `consent` (the attestation statement) is given, a consent
-    receipt is stamped into each created Voice's metadata."""
+    receipt is stamped into each created Voice's metadata.
+
+    Eligibility: a stem shorter than MIN_STEM_SECONDS clones poorly, so it is
+    SKIPPED (never cloned) and reported — the whole commit does not fail. Pass
+    `allow_short=True` (internal callers only; never exposed over HTTP) to clone
+    short stems anyway. The returned list contains only the Voices actually
+    created; skipped emotions are simply absent from it (and logged)."""
     cid = existing_cid or _slug(character)
     meta = _load_meta()
     name = meta["characters"].get(cid, {}).get("name", character) if existing_cid else character
@@ -463,14 +487,20 @@ def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: st
     if should_cancel and should_cancel():
         return created
 
-    # Build the export plan: one entry per accepted stem present on disk.
+    # Build the export plan: one entry per ELIGIBLE stem present on disk. Stems
+    # under the minimum are skipped (reported) instead of cloned into a bad Voice.
     plan: list[dict] = []  # {emotion, src, dst, voice_id, seconds}
+    skipped: list[dict] = []
     for emo in emotions:
         sw = work_dir / f"stem_{emo}.wav"
         if not sw.is_file():
             continue
         with wave.open(str(sw), "rb") as w:
             seconds = round(w.getnframes() / w.getframerate(), 2)
+        if not allow_short and seconds < MIN_STEM_SECONDS:
+            skipped.append({"emotion": emo, "seconds": seconds})
+            _log(f"commit: skipping '{emo}' — {seconds:.2f}s < {MIN_STEM_SECONDS:.0f}s minimum")
+            continue
         voice_id = f"{cid}-{emo}-{uuid.uuid4().hex[:6]}"
         plan.append({"emotion": emo, "src": str(sw), "seconds": seconds,
                      "voice_id": voice_id,
@@ -559,7 +589,7 @@ def main() -> None:
     ap.add_argument("audio")
     ap.add_argument("--character", required=True)
     ap.add_argument("--speaker", default="auto")
-    ap.add_argument("--min-stem", type=float, default=4.0)
+    ap.add_argument("--min-stem", type=float, default=MIN_STEM_SECONDS)
     ap.add_argument("--limit", type=int, default=40)
     ap.add_argument("--mode", default="auto", choices=["auto", "cloud", "sovereign"],
                     help="sovereign = local-only (ffmpeg), audio never leaves the machine")

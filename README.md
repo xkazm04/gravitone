@@ -52,6 +52,17 @@ study**:
    latency percentiles / throughput / server RTF / CPU / RAM, and the
    recommended safe cap. Emits `loadtest_result.json`.
 
+**Canonical audio cleanup.** Pocket TTS reproduces the *acoustic quality* of the
+reference clip, so every clone path conditions audio through **one** shared
+ffmpeg filter chain — `CLEANUP_FILTER` in `service/ingest.py`:
+`highpass=f=80,afftdn=nf=-25,loudnorm` (drop sub-80 Hz rumble → spectral denoise
+→ loudness-normalize) into 24 kHz mono. The ingest pipeline (sovereign local
+isolation **and** cloud post-isolation), the direct `POST /v1/voices` upload
+(`service.ingest.clean_audio`), and `clone_test.sh` all use this exact string, so
+a voice sounds the same however it was cloned. Change it in one place. Commit
+also enforces a **4 s minimum** per stem (`MIN_STEM_SECONDS`): shorter stems
+clone poorly, so they are skipped and reported rather than turned into a bad Voice.
+
 ### Measured performance — three Arm variants (all bf16, CPU-index ARM torch)
 
 | Platform | Single-stream RTF | In-process peak | 4-process scaling | Notes |

@@ -5,7 +5,8 @@
 #   ./clone_test.sh recordings/myvoice.mp3 ["custom test sentence"]
 #
 # Steps:
-#   1. ffmpeg -> clean 24 kHz mono wav (highpass + loudnorm) in recordings/processed/
+#   1. ffmpeg -> clean 24 kHz mono wav (canonical CLEANUP_FILTER: highpass +
+#      afftdn denoise + loudnorm) in recordings/processed/
 #   2. export-voice -> voices/<name>.safetensors (fast to reuse later)
 #   3. generate with the cloned voice -> samples/<name>.wav
 #
@@ -21,8 +22,13 @@ CLEAN="recordings/processed/${NAME}.wav"
 VOICE="voices/${NAME}.safetensors"
 OUT="samples/${NAME}.wav"
 
+# Canonical cleanup chain — MUST stay identical to service/ingest.py CLEANUP_FILTER
+# so every clone path (this script, /v1/voices, the ingest pipeline) conditions
+# reference audio the same way.
+CLEANUP_FILTER="highpass=f=80,afftdn=nf=-25,loudnorm"
+
 echo "==> [1/3] Converting '$IN' -> clean 24kHz mono wav"
-ffmpeg -y -i "$IN" -af "highpass=f=80,loudnorm" -ac 1 -ar 24000 "$CLEAN" -loglevel error
+ffmpeg -y -i "$IN" -af "$CLEANUP_FILTER" -ac 1 -ar 24000 "$CLEAN" -loglevel error
 echo "    wrote $CLEAN ($(ffprobe -v error -show_entries format=duration -of csv=p=0 "$CLEAN")s)"
 
 echo "==> [2/3] Exporting voice embedding -> $VOICE"
