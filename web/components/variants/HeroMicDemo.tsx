@@ -13,26 +13,13 @@ import { motion } from "framer-motion";
 import { HERO_DEMO, SAMPLE_TEXT } from "@/lib/content";
 import { useAuth } from "@/lib/useAuth";
 import { CONSENT_STATEMENT } from "@/lib/consent";
+import Equalizer from "@/components/ui/Equalizer";
 
 const MIN_SECONDS = 8;
 const MAX_SECONDS = 20;
 const ease = [0.22, 1, 0.36, 1] as const;
 
 type Phase = "idle" | "recording" | "cloning" | "rendering" | "ready" | "error";
-
-function Equalizer({ bars = 28, className = "" }: { bars?: number; className?: string }) {
-  return (
-    <div className={`flex items-end gap-[3px] ${className}`} aria-hidden>
-      {Array.from({ length: bars }).map((_, i) => (
-        <span
-          key={i}
-          className="eq-bar w-[3px] rounded-full bg-gradient-to-t from-cyan-400/40 to-cyan-200"
-          style={{ height: 40, animationDelay: `${(i % 9) * 0.09}s`, animationDuration: `${0.9 + (i % 5) * 0.12}s` }}
-        />
-      ))}
-    </div>
-  );
-}
 
 export default function HeroMicDemo() {
   const { ready, signIn } = useAuth();
