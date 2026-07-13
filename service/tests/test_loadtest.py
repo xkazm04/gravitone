@@ -86,5 +86,63 @@ class BuildResultTests(unittest.TestCase):
         self.assertEqual(res["topology"]["mode"], "single")
 
 
+# ---------------------------------------------------------------------------
+# Direction 1 — benchmark the topology we actually ship (service.replicas)
+# ---------------------------------------------------------------------------
+class ReplicasLaunchTests(unittest.TestCase):
+    def test_launch_command_reuses_the_real_cli(self) -> None:
+        cmd = lt.replicas_launch_command(4, 8080, 9080, host="127.0.0.1",
+                                         python="py")
+        self.assertEqual(cmd[:3], ["py", "-m", "service.replicas"])
+        self.assertIn("--replicas", cmd)
+        self.assertIn("4", cmd)
+        self.assertIn("--port", cmd)
+        self.assertIn("8080", cmd)
+        self.assertIn("--metrics-port", cmd)
+        self.assertIn("9080", cmd)
+        self.assertIn("127.0.0.1", cmd)
+
+    def test_default_metrics_port_matches_launcher(self) -> None:
+        self.assertEqual(lt.default_metrics_port(8080), 9080)
+
+
+class MetricsDeltaTests(unittest.TestCase):
+    def test_delta_over_pool_totals_incl_timeouts_abandoned(self) -> None:
+        before = {"received": 10, "completed": 8, "timeouts": 1, "abandoned": 2,
+                  "in_flight": 1, "queued": 0, "rejected_429": 0, "errored": 0}
+        after = {"received": 30, "completed": 26, "timeouts": 3, "abandoned": 5,
+                 "in_flight": 0, "queued": 1, "rejected_429": 2, "errored": 1}
+        d = lt.metrics_delta(before, after)
+        self.assertEqual(d["received"], 20)
+        self.assertEqual(d["completed"], 18)
+        self.assertEqual(d["timeouts"], 2)      # counter present in the delta
+        self.assertEqual(d["abandoned"], 3)      # counter present in the delta
+        self.assertEqual(d["rejected_429"], 2)
+        self.assertEqual(d["errored"], 1)
+
+    def test_missing_or_nonnumeric_counters_are_skipped(self) -> None:
+        # An empty "before" (e.g. scrape failed) yields no spurious negatives.
+        d = lt.metrics_delta({}, {"received": 5, "completed": "n/a"})
+        self.assertNotIn("received", d)   # no matching 'before' value
+        self.assertNotIn("completed", d)  # non-numeric
+
+    def test_topology_block_shape(self) -> None:
+        per_level = [{"concurrency": 1, "pool_delta": {"received": 12}}]
+        block = lt.topology_block("replicas", 4, per_level)
+        self.assertEqual(block["mode"], "replicas")
+        self.assertEqual(block["replicas"], 4)
+        self.assertEqual(block["aggregated_metrics_per_level"], per_level)
+
+
+class ScrapePoolTotalsTests(unittest.TestCase):
+    """The scrape helper must isolate the ramp from a flaky metrics port."""
+
+    def test_unreachable_metrics_port_returns_empty(self) -> None:
+        import asyncio
+        # Nothing is listening on this port -> httpx raises -> {} (not a crash).
+        totals = asyncio.run(lt._scrape_pool_totals("http://127.0.0.1:1/metrics"))
+        self.assertEqual(totals, {})
+
+
 if __name__ == "__main__":
     unittest.main()

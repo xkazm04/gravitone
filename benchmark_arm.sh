@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Gravitone benchmark — one command to characterize this Arm64 box.
 # Runs on a fresh Graviton (Ubuntu/Debian arm64): installs deps, warms the
-# model, sweeps in-process (workers x threads) configs, then runs the
-# process-scaling test, and prints a consolidated summary.
+# model, sweeps in-process (workers x threads) configs, then benchmarks the
+# shipped replica topology via `python -m service.replicas`, and prints a
+# consolidated summary.
 #
 #   bash benchmark_arm.sh
 #
@@ -71,34 +72,29 @@ run_cfg "1xAll"  1        "$NPROC" "1,2,3"
 run_cfg "2xHalf" 2        "$HALF"  "1,2,4"
 run_cfg "NxT2"   "$HALF"  2        "1,2,4,$NPROC"
 
-# ---------- 5. process-scaling ----------
-echo ">> process-scaling: $HALF single-worker procs x 2 threads (separate GILs)"
-for i in $(seq 0 $((HALF-1))); do
-  port=$((8080+i)); stop_port "$port"
-  TTS_WORKERS=1 TTS_TORCH_THREADS=2 TTS_PORT="$port" PYTHONUNBUFFERED=1 \
-    python -m service.app >"logs/proc_$port.log" 2>&1 &
+# ---------- 5. shipped topology: the real replica launcher ----------
+# Benchmark the SAME process the sizing advisor recommends: `service.replicas`.
+# loadtest --replicas starts/stops the launcher itself, polls /health for
+# readiness, and scrapes the aggregated metrics side port per level. This
+# replaces the old hand-rolled `service.app`-on-ports-8080+i scaling that was
+# never the thing we actually ship.
+echo ">> replica sweep: python -m service.replicas (the real launcher) at 1,2,4 replicas"
+stop_port 8080
+for R in 1 2 4; do
+  [ "$R" -gt "$NPROC" ] && { echo "   skip R=$R (> $NPROC cores)"; continue; }
+  echo ">> replicas=$R"
+  python -m service.loadtest --replicas "$R" --port 8080 --voice "$VOICE" \
+    --levels "1,2,4" --requests "$REQS" --out "results/replicas_$R.json" \
+    | tee "logs/lt_replicas_$R.log"
 done
-for i in $(seq 0 $((HALF-1))); do wait_ready $((8080+i)) || echo "!! proc $((8080+i)) not ready"; done
-lt_pids=()
-for i in $(seq 0 $((HALF-1))); do
-  port=$((8080+i))
-  python -m service.loadtest --url "http://127.0.0.1:$port" --voice "$VOICE" \
-    --levels 2 --requests 10 --out "results/proc_$port.json" >"logs/lt_proc_$port.log" 2>&1 &
-  lt_pids+=($!)
-done
-# Wait ONLY for the load-tests — a bare `wait` would also block on the
-# never-exiting service.app background processes started above.
-wait "${lt_pids[@]}"
 python - <<'PY'
 import json,glob
-tot=0; rows=[]
-for f in sorted(glob.glob("results/proc_80*.json")):
-    l=json.load(open(f))["levels"][0]; a=l["audio_s_per_wall_s"] or 0; tot+=a
-    rows.append((f.split('/')[-1], a, l["cpu_mean_pct"]))
-for name,a,c in rows: print(f"  {name:>22}  aud/s={a:<6} cpu%={c}")
-print(f"  AGGREGATE process-scaling throughput: {round(tot,3)} audio-sec/sec")
+print("  replica-topology throughput (aud/s at top level):")
+for f in sorted(glob.glob("results/replicas_*.json")):
+    d=json.load(open(f)); r=(d.get("topology") or {}).get("replicas")
+    l=d["levels"][-1]; a=l["audio_s_per_wall_s"]
+    print(f"    replicas={r}  conc={l['concurrency']}  aud/s={a}  p95_s={l['lat_p95_s']}")
 PY
-for i in $(seq 0 $((HALF-1))); do stop_port $((8080+i)); done
 
 # ---------- 6. summary ----------
 echo ""

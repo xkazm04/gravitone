@@ -28,6 +28,7 @@ import json
 import os
 import statistics
 import subprocess
+import sys
 import time
 
 import httpx
@@ -139,6 +140,119 @@ def build_result(rows, knee, recommended, *, route, fmt, corpus,
     if extra:
         result.update(extra)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Direction 1 — benchmark the topology we actually ship (service.replicas)
+# ---------------------------------------------------------------------------
+# Pool counters worth reporting per level (the launcher's aggregated totals).
+TOPOLOGY_METRIC_KEYS = (
+    "received", "completed", "rejected_429", "errored", "timeouts",
+    "abandoned", "in_flight", "queued",
+)
+
+
+def default_metrics_port(port: int) -> int:
+    """Where ``service.replicas`` serves aggregated /metrics by default."""
+    return port + 1000
+
+
+def replicas_launch_command(replicas: int, port: int, metrics_port: int,
+                            host: str = "127.0.0.1",
+                            python: str | None = None) -> list[str]:
+    """The exact ``python -m service.replicas`` argv the harness spawns.
+
+    Reuses the real launcher's CLI so the benchmark drives the SAME process the
+    sizing advisor recommends — no hand-rolled process scaling.
+    """
+    return [python or sys.executable, "-m", "service.replicas",
+            "--replicas", str(replicas),
+            "--port", str(port),
+            "--metrics-port", str(metrics_port),
+            "--host", host]
+
+
+def metrics_delta(before: dict, after: dict) -> dict:
+    """Per-counter (after - before) over the aggregated pool totals.
+
+    ``before``/``after`` are the ``totals`` dicts scraped from the launcher's
+    side metrics port around one level. Non-numeric or missing counters are
+    skipped so a partial scrape can't crash the run.
+    """
+    delta: dict = {}
+    for k in TOPOLOGY_METRIC_KEYS:
+        b, a = before.get(k), after.get(k)
+        if (isinstance(a, (int, float)) and not isinstance(a, bool)
+                and isinstance(b, (int, float)) and not isinstance(b, bool)):
+            delta[k] = a - b
+    return delta
+
+
+def topology_block(mode: str, replicas: int, per_level: list) -> dict:
+    """The result-JSON block describing WHAT topology produced these numbers.
+
+    mode "single" = one in-process server (``--url``); mode "replicas" = the
+    ``service.replicas`` launcher driving N single-worker processes, with the
+    aggregated pool-counter deltas captured around every level.
+    """
+    return {
+        "mode": mode,
+        "replicas": replicas,
+        "aggregated_metrics_per_level": per_level,
+    }
+
+
+async def _scrape_pool_totals(metrics_url: str) -> dict:
+    """Scrape the launcher's aggregated /metrics and return its pool totals
+    (empty dict if unreachable — a missing scrape must not abort the ramp)."""
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.get(metrics_url, timeout=5)
+            if r.status_code == 200:
+                return r.json().get("totals", {}) or {}
+    except Exception:  # noqa: BLE001
+        pass
+    return {}
+
+
+async def _wait_launcher_ready(serving_url: str, proc, timeout: float = 180.0,
+                               interval: float = 2.0) -> dict:
+    """Poll /health until the launcher serves 200, returning its config.
+
+    Raises RuntimeError with a clear message if the launcher process dies or
+    never becomes ready — so a dead subprocess is loud, not a silent hang.
+    """
+    deadline = time.perf_counter() + timeout
+    async with httpx.AsyncClient() as c:
+        while time.perf_counter() < deadline:
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    f"launcher exited before becoming ready (code {proc.returncode})")
+            try:
+                r = await c.get(f"{serving_url}/health", timeout=5)
+                if r.status_code == 200:
+                    return r.json().get("config", {})
+            except Exception:  # noqa: BLE001 - not up yet, keep polling
+                pass
+            await asyncio.sleep(interval)
+    raise RuntimeError(f"launcher at {serving_url} not ready within {timeout:.0f}s")
+
+
+def _stop_launcher(proc, grace_s: float = 10.0) -> None:
+    """Terminate the launcher cleanly (SIGTERM/terminate), SIGKILL if stubborn."""
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        proc.wait(timeout=grace_s)
+    except Exception:  # noqa: BLE001 - timed out; escalate
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 async def _one(client, url, voice, text, fmt, results):
@@ -268,61 +382,33 @@ def print_plan(result: dict) -> None:
     print(f"  TTS_WORKERS=1")
     print(f"  TTS_TORCH_THREADS={threads}        # {cores} cores / {cap} processes")
     print(f"  TTS_QUEUE_MAX={queue_max}          # ~4x cap of waiting requests")
+
+    # Print the EXACT launcher command — matching what was actually measured
+    # when the result came from --replicas mode, so the advice is grounded.
+    topo = result.get("topology") or {}
+    port = (result.get("args") or {}).get("port", 8000)
+    print("\nThe measured launcher runs exactly this topology:")
+    print(f"  python -m service.replicas --replicas {cap} --port {port}")
+    if topo.get("mode") == "replicas":
+        print(f"  (validated: this benchmark drove service.replicas at "
+              f"{topo.get('replicas')} replica(s) — see topology.aggregated_metrics_per_level)")
+    else:
+        print("  (single-server run: re-run with --replicas to measure this launcher directly)")
     print("\nScale by adding processes/replicas, not in-process workers (GIL-bound).")
     print("Full calculator + $/audio-hour comparison: the studio's /benchmarks page.")
     print("-" * 60)
 
 
-async def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--url", default="http://127.0.0.1:8080")
-    ap.add_argument("--voice", default="step4")
-    ap.add_argument("--text", default=TEXT_DEFAULT)
-    ap.add_argument("--format", default="wav_24000")
-    ap.add_argument("--levels", default="1,2,3,4,6,8",
-                    help="comma-separated concurrency levels to ramp through")
-    ap.add_argument("--requests", type=int, default=12,
-                    help="requests fired per level")
-    ap.add_argument("--warmup", type=int, default=2,
-                    help="synth requests fired (and discarded) before level 1 to warm the model")
-    ap.add_argument("--degrade-factor", type=float, default=2.0)
-    ap.add_argument("--cpu-ceiling", type=float, default=95.0)
-    ap.add_argument("--out", default="service/loadtest_result.json")
-    ap.add_argument("--plan", action="store_true",
-                    help="print the sizing advisor for an existing --out result and exit (no load run)")
-    args = ap.parse_args()
+async def run_ramp(args, levels, n_per_level, *, scrape=None):
+    """Ramp through ``levels``, print the live table, and return
+    ``(rows, knee, recommended, per_level_metrics)``.
 
-    if args.plan:
-        try:
-            with open(args.out) as f:
-                print_plan(json.load(f))
-        except FileNotFoundError:
-            print(f"{args.out} not found — run the load test first")
-        return
-
-    # readiness check — keep the /health config snapshot for the result JSON
-    # (it was previously printed then thrown away, so runs weren't reproducible).
-    service_config = {}
-    async with httpx.AsyncClient() as c:
-        h = await c.get(f"{args.url}/health", timeout=30)
-        if h.status_code != 200:
-            print(f"service not ready at {args.url} (status {h.status_code}). Start it first.")
-            return
-        service_config = h.json().get("config", {})
-        print("service config:", json.dumps(service_config))
-
-    levels = [int(x) for x in args.levels.split(",") if x.strip()]
-    # Equal sample size across every level so their percentile populations are
-    # comparable (computed ONCE, not per-level).
-    n_per_level = requests_per_level(args.requests, levels)
-
-    # Warm the model so level 1's baseline isn't polluted by cold-start.
-    if args.warmup > 0:
-        print(f"warming up: {args.warmup} discarded synth request(s) ...")
-        warmed = await warmup(args.url, args.voice, args.text, args.format, args.warmup)
-        print(f"warmup complete ({warmed}/{args.warmup} ok)")
-
+    If ``scrape`` (an async ``() -> pool-totals dict``) is supplied, the
+    aggregated pool counters are captured before/after each level and their
+    delta recorded — that's how the replica topology reports timeouts/abandoned.
+    """
     rows = []
+    per_level_metrics: list = []
     baseline_p95 = None
     knee = None
 
@@ -332,7 +418,9 @@ async def main():
     print("-" * len(hdr))
 
     for c in levels:
+        before = await scrape() if scrape is not None else None
         row = await run_level(args.url, args.voice, args.text, args.format, c, n_per_level)
+        after = await scrape() if scrape is not None else None
         mark_low_confidence(row)
         rows.append(row)
         print(f"{row['concurrency']:>4} {row['ok']:>4} {row['rejected_429']:>4} "
@@ -343,6 +431,12 @@ async def main():
         if row.get("low_confidence"):
             print(f"     ^ low confidence: only {row['ok']} sample(s) < {LOW_CONFIDENCE_N}; "
                   f"treat p95/p99 as indicative, not exact")
+        if scrape is not None:
+            delta = metrics_delta(before or {}, after or {})
+            per_level_metrics.append({"concurrency": c, "pool_delta": delta})
+            if delta:
+                print("     pool Δ: "
+                      + " ".join(f"{k}={v}" for k, v in delta.items() if v))
 
         if c == levels[0]:
             baseline_p95 = row["lat_p95_s"] or 0.0
@@ -369,17 +463,138 @@ async def main():
         print(f"No degradation across tested levels (up to {levels[-1]}). "
               f"Push higher with --levels to find the ceiling.")
     print("=" * 60)
+    return rows, knee, recommended, per_level_metrics
 
-    result = build_result(
-        rows, knee, recommended,
-        route="synth", fmt=args.format, corpus=args.text,
-        service_config=service_config, meta=runtime_metadata(),
-    )
+
+def _write_result(args, result) -> None:
     result["args"] = vars(args)
     with open(args.out, "w") as f:
         json.dump(result, f, indent=2)
     print(f"wrote {args.out}")
     print_plan(result)
+
+
+async def run_replicas_mode(args, levels, n_per_level) -> None:
+    """Direction 1: benchmark the topology we actually ship.
+
+    Starts the REAL launcher (``python -m service.replicas``), waits for
+    readiness on the serving port, ramps against it while scraping the
+    aggregated metrics side port per level, then stops the launcher cleanly.
+    Any launcher failure is surfaced loudly rather than hanging.
+    """
+    metrics_port = args.metrics_port or default_metrics_port(args.port)
+    cmd = replicas_launch_command(args.replicas, args.port, metrics_port,
+                                  host=args.launcher_host)
+    serving_url = f"http://127.0.0.1:{args.port}"
+    metrics_url = f"http://127.0.0.1:{metrics_port}/metrics"
+    print("launching shipped topology:", " ".join(cmd))
+    proc = subprocess.Popen(cmd)
+    try:
+        try:
+            service_config = await _wait_launcher_ready(serving_url, proc)
+        except RuntimeError as exc:
+            print(f"!! {exc}")
+            return
+        print(f"launcher ready on {serving_url} "
+              f"({args.replicas} replicas); aggregated metrics on {metrics_url}")
+
+        # The ramp + warmup target the launcher we just started, not --url.
+        args.url = serving_url
+        if args.warmup > 0:
+            print(f"warming up: {args.warmup} discarded synth request(s) ...")
+            warmed = await warmup(args.url, args.voice, args.text, args.format, args.warmup)
+            print(f"warmup complete ({warmed}/{args.warmup} ok)")
+
+        async def scrape():
+            return await _scrape_pool_totals(metrics_url)
+
+        rows, knee, recommended, per_level = await run_ramp(
+            args, levels, n_per_level, scrape=scrape)
+        if proc.poll() is not None:
+            print(f"!! launcher died during the ramp (code {proc.returncode}); "
+                  f"results below may be partial")
+
+        result = build_result(
+            rows, knee, recommended,
+            route="synth", fmt=args.format, corpus=args.text,
+            service_config=service_config, meta=runtime_metadata(),
+            extra={"topology": topology_block("replicas", args.replicas, per_level)})
+        _write_result(args, result)
+    finally:
+        _stop_launcher(proc)
+        print("launcher stopped")
+
+
+async def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--url", default="http://127.0.0.1:8080")
+    ap.add_argument("--voice", default="step4")
+    ap.add_argument("--text", default=TEXT_DEFAULT)
+    ap.add_argument("--format", default="wav_24000")
+    ap.add_argument("--levels", default="1,2,3,4,6,8",
+                    help="comma-separated concurrency levels to ramp through")
+    ap.add_argument("--requests", type=int, default=12,
+                    help="requests fired per level")
+    ap.add_argument("--warmup", type=int, default=2,
+                    help="synth requests fired (and discarded) before level 1 to warm the model")
+    ap.add_argument("--replicas", type=int, default=None,
+                    help="benchmark the shipped topology: start `python -m service.replicas` "
+                         "with N single-worker replicas and ramp against it")
+    ap.add_argument("--port", type=int, default=8080,
+                    help="client-facing port the launcher serves on (--replicas mode)")
+    ap.add_argument("--metrics-port", type=int, default=None,
+                    help="launcher's aggregated-metrics port (default: --port + 1000)")
+    ap.add_argument("--launcher-host", default="127.0.0.1",
+                    help="host the launcher binds (--replicas mode)")
+    ap.add_argument("--degrade-factor", type=float, default=2.0)
+    ap.add_argument("--cpu-ceiling", type=float, default=95.0)
+    ap.add_argument("--out", default="service/loadtest_result.json")
+    ap.add_argument("--plan", action="store_true",
+                    help="print the sizing advisor for an existing --out result and exit (no load run)")
+    args = ap.parse_args()
+
+    if args.plan:
+        try:
+            with open(args.out) as f:
+                print_plan(json.load(f))
+        except FileNotFoundError:
+            print(f"{args.out} not found — run the load test first")
+        return
+
+    levels = [int(x) for x in args.levels.split(",") if x.strip()]
+    # Equal sample size across every level so their percentile populations are
+    # comparable (computed ONCE, not per-level).
+    n_per_level = requests_per_level(args.requests, levels)
+
+    if args.replicas and args.replicas > 0:
+        await run_replicas_mode(args, levels, n_per_level)
+        return
+
+    # ---- single in-process server mode (--url) ----------------------------
+    # Readiness check — keep the /health config snapshot for the result JSON
+    # (it was previously printed then thrown away, so runs weren't reproducible).
+    service_config = {}
+    async with httpx.AsyncClient() as c:
+        h = await c.get(f"{args.url}/health", timeout=30)
+        if h.status_code != 200:
+            print(f"service not ready at {args.url} (status {h.status_code}). Start it first.")
+            return
+        service_config = h.json().get("config", {})
+        print("service config:", json.dumps(service_config))
+
+    # Warm the model so level 1's baseline isn't polluted by cold-start.
+    if args.warmup > 0:
+        print(f"warming up: {args.warmup} discarded synth request(s) ...")
+        warmed = await warmup(args.url, args.voice, args.text, args.format, args.warmup)
+        print(f"warmup complete ({warmed}/{args.warmup} ok)")
+
+    rows, knee, recommended, _ = await run_ramp(args, levels, n_per_level)
+    result = build_result(
+        rows, knee, recommended,
+        route="synth", fmt=args.format, corpus=args.text,
+        service_config=service_config, meta=runtime_metadata(),
+        extra={"topology": topology_block("single", 1, [])})
+    _write_result(args, result)
 
 
 if __name__ == "__main__":
