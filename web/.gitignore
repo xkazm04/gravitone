@@ -1,0 +1,22 @@
+/node_modules
+/.next
+/out
+/build
+.DS_Store
+*.pem
+npm-debug.log*
+.env*
+next-env.d.ts
+.vercel
+tsconfig.tsbuildinfo
+
+# local audio artifacts
+*.wav
+!.env.example
+
+# generated emotion art is committed (brand assets)
+!public/emotions/*.png
+
+# motionize skill working area + deps
+.claude/skills/motionize/out/
+.claude/skills/motionize/node_modules/

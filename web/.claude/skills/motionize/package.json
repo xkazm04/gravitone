@@ -1,0 +1,10 @@
+{
+  "name": "motionize-skill",
+  "private": true,
+  "type": "module",
+  "description": "Self-contained deps for the /motionize skill tools (kept out of the app's package.json).",
+  "dependencies": {
+    "@neplex/vectorizer": "^0.1.0",
+    "svgo": "^3.3.2"
+  }
+}
