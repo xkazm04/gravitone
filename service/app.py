@@ -348,21 +348,30 @@ async def text_to_speech_stream(
 
     async def _audio_stream():
         header_sent = False
-        for job in jobs:
-            try:
-                result = await asyncio.wait_for(
-                    asyncio.wrap_future(job.future),
-                    timeout=SETTINGS.request_timeout_s,
-                )
-            except (asyncio.TimeoutError, Exception):
-                # Status is already sent; the only signal left is closing the
-                # stream. The client sees a short clip / reset connection.
-                return
-            samples = result.wav_bytes[44:]  # strip the per-segment WAV header
-            if kind == "wav" and not header_sent:
-                yield _wav_stream_header(result.sample_rate)
-                header_sent = True
-            yield samples
+        consumed = 0
+        try:
+            for job in jobs:
+                try:
+                    result = await asyncio.wait_for(
+                        asyncio.wrap_future(job.future),
+                        timeout=SETTINGS.request_timeout_s,
+                    )
+                except (asyncio.TimeoutError, Exception):
+                    # Status is already sent; the only signal left is closing the
+                    # stream. The client sees a short clip / reset connection.
+                    return
+                consumed += 1
+                samples = result.wav_bytes[44:]  # strip the per-segment WAV header
+                if kind == "wav" and not header_sent:
+                    yield _wav_stream_header(result.sample_rate)
+                    header_sent = True
+                yield samples
+        finally:
+            # Stream over early (segment timeout/error, or the client hung up —
+            # GeneratorExit lands here): whatever is still queued will never be
+            # read, so mark it abandoned and let the workers skip it un-run.
+            for job in jobs[consumed:]:
+                job.abandoned.set()
 
     return StreamingResponse(
         _audio_stream(), media_type=content_type,
