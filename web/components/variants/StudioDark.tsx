@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { motion } from "framer-motion";
-import { BRAND, HERO, STATS, FEATURES, VOICES, SAMPLE_TEXT } from "@/lib/content";
+import { BRAND, HERO, STATS, FEATURES, VOICES, SAMPLE_TEXT, API_DOCS_URL } from "@/lib/content";
 import { useAuth } from "@/lib/useAuth";
 import UserMenu from "@/components/ui/UserMenu";
 import SwitchKit from "./SwitchKit";
@@ -89,10 +89,10 @@ export default function StudioDark() {
             </motion.p>
 
             <motion.div variants={rise} initial="hidden" animate="show" custom={3} className="mt-8 flex flex-wrap items-center gap-3">
-              <a href="#playground" className="cta-glow rounded-full bg-gradient-to-r from-cyan-300 to-cyan-200 px-6 py-3 text-sm font-semibold text-slate-950 transition hover:brightness-110">
+              <Link href="/playground" className="cta-glow rounded-full bg-gradient-to-r from-cyan-300 to-cyan-200 px-6 py-3 text-sm font-semibold text-slate-950 transition hover:brightness-110">
                 {HERO.primaryCta} →
-              </a>
-              <a href="#api" className="font-jetbrains rounded-full border border-white/15 px-6 py-3 text-sm text-white/85 transition hover:bg-white/5">
+              </Link>
+              <a href={API_DOCS_URL} target="_blank" rel="noreferrer" className="font-jetbrains rounded-full border border-white/15 px-6 py-3 text-sm text-white/85 transition hover:bg-white/5">
                 {HERO.secondaryCta}
               </a>
             </motion.div>
@@ -162,7 +162,12 @@ export default function StudioDark() {
                   <p className="text-sm text-white/80">{SAMPLE_TEXT}</p>
                   <div className="mt-4 flex items-center justify-between">
                     <Equalizer bars={20} className="h-8" />
-                    <button className="cta-glow rounded-full bg-cyan-300 px-5 py-2 text-sm font-semibold text-slate-950">Generate</button>
+                    <Link
+                      href={`/playground?text=${encodeURIComponent(SAMPLE_TEXT)}`}
+                      className="cta-glow rounded-full bg-cyan-300 px-5 py-2 text-sm font-semibold text-slate-950 transition hover:brightness-110"
+                    >
+                      Generate
+                    </Link>
                   </div>
                 </div>
               </div>

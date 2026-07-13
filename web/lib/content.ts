@@ -69,12 +69,11 @@ export const SWITCH = {
   note: "Same request shape · xi-api-key · wav/mp3/pcm",
 };
 
-export const NAV = [
-  { label: "Playground", href: "#playground" },
-  { label: "Voices", href: "#voices" },
-  { label: "API", href: "#api" },
-  { label: "Pricing", href: "#pricing" },
-];
+// Where "Read the API" points: the public README's ElevenLabs compat matrix —
+// the real, always-reachable API reference (the studio's own API panels are
+// behind auth).
+export const API_DOCS_URL =
+  "https://github.com/xkazm04/gravitone#elevenlabs-compatibility-matrix-drop-in-switch-kit";
 
 export const SAMPLE_TEXT =
   "Hi — this is my cloned voice, generated locally on an Arm CPU. If this sounds like me, the studio works.";
