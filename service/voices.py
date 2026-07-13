@@ -27,7 +27,9 @@ from pydantic import BaseModel
 
 from service.config import SETTINGS
 from service.demand import all_demand, demand_for
-from service.emotions import BASELINE, EMOTION_SCALE, normalize_emotion
+from service.emotions import (
+    BASELINE, EMOTION_SCALE, deterministic_fallback, normalize_emotion,
+)
 
 router = APIRouter(tags=["voices"])
 
@@ -481,7 +483,9 @@ def character_manifest(character_id: str) -> dict:
                         "consent": v.consent}
             for v in c.voices
         }
-        fallback = BASELINE if BASELINE in native else next(iter(native), None)
+        # Same deterministic pick resolve() uses, so the manifest can never
+        # advertise a fallback the synthesis path wouldn't actually choose.
+        fallback = deterministic_fallback(native)
         return {
             "character_id": c.character_id,
             "name": c.name,
