@@ -63,8 +63,12 @@ run_cfg(){ # name workers threads levels
   stop_port 8080
   TTS_WORKERS="$w" TTS_TORCH_THREADS="$t" TTS_PORT=8080 PYTHONUNBUFFERED=1 \
     python -m service.app >"logs/svc_$name.log" 2>&1 &
+  local svc_pid=$!
   wait_ready 8080 || { echo "!! cfg $name failed"; tail -20 "logs/svc_$name.log"; return 1; }
+  # --server-pid = the app we just launched: its process-tree CPU is measured
+  # apart from the co-located load generator (honest server_cpu_* vs driver_cpu_*).
   python -m service.loadtest --url http://127.0.0.1:8080 --voice "$VOICE" \
+    --server-pid "$svc_pid" \
     --levels "$levels" --requests "$REQS" --out "results/inproc_$name.json" | tee "logs/lt_$name.log"
   stop_port 8080
 }

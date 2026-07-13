@@ -207,7 +207,7 @@ class StreamRequestTests(unittest.TestCase):
     def _run(self, status, chunks=()):
         import asyncio
         results = {"lat": [], "ttfb": [], "rtf": [], "audio": [],
-                   "rejected": 0, "errors": 0, "unsupported": 0}
+                   "rejected": 0, "errors": 0, "timeouts": 0, "unsupported": 0}
         client = self._FakeClient(self._FakeStreamResp(status, chunks))
         asyncio.run(lt._one_stream(client, "http://x", "v", "hi", "wav_24000", results))
         return results
@@ -228,6 +228,118 @@ class StreamRequestTests(unittest.TestCase):
         r = self._run(429)
         self.assertEqual(r["rejected"], 1)
         self.assertEqual(r["errors"], 0)
+
+    def test_504_counts_as_timeout_not_error(self) -> None:
+        r = self._run(504)
+        self.assertEqual(r["timeouts"], 1)   # distinct timeout bucket
+        self.assertEqual(r["errors"], 0)
+        self.assertEqual(len(r["lat"]), 0)
+
+
+# ---------------------------------------------------------------------------
+# Honest measurement accounting: 504 timeouts + server/driver CPU split
+# ---------------------------------------------------------------------------
+class ClassifyResponseTests(unittest.TestCase):
+    def test_status_buckets(self) -> None:
+        self.assertEqual(lt.classify_response(200), "ok")
+        self.assertEqual(lt.classify_response(429), "rejected")
+        self.assertEqual(lt.classify_response(504), "timeout")   # its OWN bucket
+        self.assertEqual(lt.classify_response(500), "error")
+        self.assertEqual(lt.classify_response(503), "error")
+
+
+class LevelDegradedTests(unittest.TestCase):
+    def _row(self, **kw):
+        base = {"rejected_429": 0, "timeouts": 0, "errors": 0,
+                "lat_p95_s": 1.0, "cpu_mean_pct": 10.0, "server_rtf_mean": 2.0}
+        base.update(kw)
+        return base
+
+    def test_clean_level_is_not_degraded(self) -> None:
+        self.assertFalse(lt.level_degraded(self._row(), 1.0, 2.0, 95.0))
+
+    def test_any_timeout_degrades_like_an_error(self) -> None:
+        self.assertTrue(lt.level_degraded(self._row(timeouts=1), 1.0, 2.0, 95.0))
+
+    def test_any_429_degrades(self) -> None:
+        self.assertTrue(lt.level_degraded(self._row(rejected_429=1), 1.0, 2.0, 95.0))
+
+    def test_any_error_degrades(self) -> None:
+        self.assertTrue(lt.level_degraded(self._row(errors=1), 1.0, 2.0, 95.0))
+
+    def test_p95_blowup_degrades(self) -> None:
+        # p95 5.0 vs baseline 1.0 with factor 2.0 -> degraded
+        self.assertTrue(lt.level_degraded(self._row(lat_p95_s=5.0), 1.0, 2.0, 95.0))
+
+    def test_cpu_saturated_and_slower_than_realtime_degrades(self) -> None:
+        row = self._row(cpu_mean_pct=99.0, server_rtf_mean=0.5)
+        self.assertTrue(lt.level_degraded(row, 1.0, 2.0, 95.0))
+
+    def test_cpu_high_but_realtime_ok_is_not_degraded(self) -> None:
+        row = self._row(cpu_mean_pct=99.0, server_rtf_mean=1.5)
+        self.assertFalse(lt.level_degraded(row, 1.0, 2.0, 95.0))
+
+
+class _FakeProc:
+    """Minimal psutil.Process stand-in for the CPU-split tests."""
+
+    def __init__(self, cpu, children=(), raise_on_cpu=False):
+        self._cpu = cpu
+        self._children = list(children)
+        self._raise = raise_on_cpu
+
+    def cpu_percent(self, interval=None):
+        if self._raise:
+            raise RuntimeError("process gone")
+        return self._cpu
+
+    def children(self, recursive=False):
+        return self._children
+
+
+class CpuSplitTests(unittest.TestCase):
+    def test_proc_tree_sums_root_and_descendants(self) -> None:
+        proc = _FakeProc(50.0, children=[_FakeProc(30.0), _FakeProc(20.0)])
+        self.assertEqual(lt._proc_tree_cpu(proc), 100.0)
+
+    def test_proc_tree_none_when_no_proc(self) -> None:
+        self.assertIsNone(lt._proc_tree_cpu(None))
+
+    def test_proc_tree_none_when_root_gone(self) -> None:
+        self.assertIsNone(lt._proc_tree_cpu(_FakeProc(0.0, raise_on_cpu=True)))
+
+    def test_proc_tree_skips_a_reaped_child(self) -> None:
+        # A child that vanishes mid-sample is skipped, not fatal.
+        proc = _FakeProc(40.0, children=[_FakeProc(0.0, raise_on_cpu=True),
+                                         _FakeProc(10.0)])
+        self.assertEqual(lt._proc_tree_cpu(proc), 50.0)
+
+    def test_cpu_stats_mean_and_max(self) -> None:
+        self.assertEqual(lt._cpu_stats([10.0, 20.0, 30.0]), (20.0, 30.0))
+
+    def test_cpu_stats_empty_is_none(self) -> None:
+        self.assertEqual(lt._cpu_stats([]), (None, None))
+
+    def test_driver_saturation_threshold(self) -> None:
+        self.assertTrue(lt.is_driver_saturated(90.0))    # exactly the line
+        self.assertTrue(lt.is_driver_saturated(150.0))
+        self.assertFalse(lt.is_driver_saturated(89.9))
+        self.assertFalse(lt.is_driver_saturated(None))   # no driver sample
+
+    def test_cpu_accounting_note_reflects_pid_presence(self) -> None:
+        with_pid = lt.cpu_accounting_note(1234)
+        self.assertIn("server_cpu_", with_pid)
+        self.assertIn("driver_cpu_", with_pid)
+        without = lt.cpu_accounting_note(None)
+        self.assertIn("host-only", without)
+        self.assertIn("--server-pid", without)
+
+
+class SingleServerMetricsScrapeTests(unittest.TestCase):
+    def test_unreachable_metrics_returns_empty(self) -> None:
+        import asyncio
+        totals = asyncio.run(lt._scrape_server_metrics("http://127.0.0.1:1/metrics"))
+        self.assertEqual(totals, {})
 
 
 if __name__ == "__main__":

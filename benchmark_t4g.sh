@@ -45,12 +45,16 @@ stop_port(){ fuser -k 8080/tcp >/dev/null 2>&1 || true; sleep 2; }
 stop_port
 TTS_WORKERS=1 TTS_TORCH_THREADS="$NPROC" TTS_PORT=8080 PYTHONUNBUFFERED=1 \
   python -m service.app >logs/svc.log 2>&1 &
+SVC_PID=$!
 wait_ready || { echo "!! service failed"; tail -30 logs/svc.log; exit 1; }
 echo ">> warming model (downloads weights once) ..."
 curl -s -X POST "http://127.0.0.1:8080/v1/text-to-speech/$VOICE?output_format=wav_24000" \
   -H 'Content-Type: application/json' -d '{"text":"warmup sentence."}' -o /dev/null
 echo ">> load test (single worker, short) ..."
+# --server-pid = the app we launched: honest server_cpu_* vs driver_cpu_* split
+# (the load generator is co-located on this small box, so it matters most here).
 python -m service.loadtest --url http://127.0.0.1:8080 --voice "$VOICE" \
+  --server-pid "$SVC_PID" \
   --levels 1,2 --requests 4 --out results/t4g.json
 stop_port
 echo "T4G SMOKE COMPLETE"
