@@ -35,8 +35,41 @@ export type SpeakResult = {
   seconds: number;
   kb: number;
   rtf: number;
+  // Honest timing: server-side synthesis time and queue wait (0 when the
+  // backend did not report them, e.g. the browser fallback).
+  synthSeconds: number;
+  queueSeconds: number;
+  // ElevenLabs settings the backend accepted but could not honestly apply
+  // (e.g. similarity_boost, style) — surfaced so the no-op is never silent.
+  ignoredSettings: string[];
   segments: Segment[];
 };
+
+/**
+ * The backend refused with 429 backpressure (queue full). This is NOT a reason
+ * to drop to the browser voice — the engine is up and will accept a retry — so
+ * it is thrown distinctly instead of collapsing into the fallback path.
+ */
+export class EngineBusyError extends Error {
+  readonly retryAfterSec: number;
+  constructor(retryAfterSec: number) {
+    super("engine busy — retry in a moment");
+    this.name = "EngineBusyError";
+    this.retryAfterSec = retryAfterSec;
+  }
+}
+
+/** Parse a Retry-After header (delta-seconds form) into a number, default 1. */
+function parseRetryAfter(header: string | null): number {
+  const n = Number(header);
+  return Number.isFinite(n) && n > 0 ? Math.ceil(n) : 1;
+}
+
+/** Split an X-Ignored-Settings CSV header into its setting names. */
+function decodeIgnored(header: string | null): string[] {
+  if (!header) return [];
+  return header.split(",").map((s) => s.trim()).filter(Boolean);
+}
 
 function decodeSegments(header: string | null): Segment[] {
   if (!header) return [];
@@ -54,8 +87,9 @@ function decodeSegments(header: string | null): Segment[] {
  */
 export async function speak(text: string, characterId: string, expr: Expression): Promise<SpeakResult> {
   const trimmed = text.trim();
+  let res: Response | null = null;
   try {
-    const res = await fetch("/api/speak", {
+    res = await fetch("/api/speak", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -64,11 +98,25 @@ export async function speak(text: string, characterId: string, expr: Expression)
         voice_settings: { temperature: expr.temperature, stability: expr.stability, quality: expr.quality },
       }),
     });
+  } catch {
+    // Network / proxy-unreachable — the engine is genuinely out of reach, so
+    // the browser voice is the honest fallback (handled below).
+    res = null;
+  }
+
+  if (res) {
+    // Backpressure is up-but-busy, not down: surface it distinctly so the UI
+    // offers a retry rather than silently substituting the browser voice.
+    if (res.status === 429) {
+      throw new EngineBusyError(parseRetryAfter(res.headers.get("Retry-After")));
+    }
     if (res.ok) {
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const hdrSec = Number(res.headers.get("X-Audio-Seconds"));
       const hdrRtf = Number(res.headers.get("X-Realtime-Factor"));
+      const hdrSynth = Number(res.headers.get("X-Synth-Seconds"));
+      const hdrQueue = Number(res.headers.get("X-Queue-Seconds"));
       // Waveform extraction is best-effort — a decode hiccup on the concatenated
       // multi-segment WAV must NOT drop us to the browser fallback (that was the
       // "composition produces no audio" bug). Keep the real audio; fake the bars.
@@ -86,16 +134,20 @@ export async function speak(text: string, characterId: string, expr: Expression)
         seconds: Math.round((hdrSec || duration) * 10) / 10,
         kb: Math.round(blob.size / 1024),
         rtf: hdrRtf || 0,
+        synthSeconds: Number.isFinite(hdrSynth) ? hdrSynth : 0,
+        queueSeconds: Number.isFinite(hdrQueue) ? hdrQueue : 0,
+        ignoredSettings: decodeIgnored(res.headers.get("X-Ignored-Settings")),
         segments: decodeSegments(res.headers.get("X-Segments")),
       };
     }
-  } catch {
-    /* fall through */
+    // Any other upstream failure (502/503/500) keeps the browser fallback.
   }
+
   const plain = stripTags(trimmed);
   const seconds = Math.max(1.5, Math.round(plain.length * 0.055 * 10) / 10);
   return {
     mode: "browser", peaks: waveHeights(plain.length * 31 + 7, 56),
-    seconds, kb: 0, rtf: 0, segments: [],
+    seconds, kb: 0, rtf: 0, synthSeconds: 0, queueSeconds: 0,
+    ignoredSettings: [], segments: [],
   };
 }

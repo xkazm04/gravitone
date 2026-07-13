@@ -21,6 +21,11 @@ export type Take = {
   seconds: number;
   kb: number;
   rtf: number;
+  // Honest timing (server-side synthesis time + queue wait, seconds) and any
+  // accepted-but-inert voice settings the backend reported ignoring.
+  synthSeconds: number;
+  queueSeconds: number;
+  ignoredSettings: string[];
   segments: Segment[];
   // The expression knobs this take was rendered with — together with text +
   // characterId this is the exact reproduction recipe for the code export.

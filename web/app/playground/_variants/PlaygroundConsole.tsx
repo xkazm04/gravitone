@@ -15,7 +15,7 @@ import { EASE } from "@/components/ui/tokens";
 import { EMOTION_IDS, emotionMeta, wrapWithTag } from "@/lib/emotions";
 import EmotionArt from "@/components/ui/EmotionArt";
 import { DEFAULT_EXPRESSION, DEFAULT_TEXT, stripTags, type Expression, type Take } from "./shared";
-import { speak } from "./engine";
+import { speak, EngineBusyError } from "./engine";
 import { useAudioPlayer } from "./useAudioPlayer";
 import EmotionPicker from "./EmotionPicker";
 import TakeCode from "./TakeCode";
@@ -61,6 +61,11 @@ export default function PlaygroundConsole() {
   const [charId, setCharId] = useState<string>("");
   const [expr, setExpr] = useState<Expression>(DEFAULT_EXPRESSION);
   const [busy, setBusy] = useState(false);
+  // Backpressure (429): engine is up but busy — offer a retry, never fall to
+  // the browser voice. null = no pending backpressure.
+  const [busyNotice, setBusyNotice] = useState<{ retryAfterSec: number } | null>(null);
+  // Transient error surface so generation failures are never silent.
+  const [toast, setToast] = useState<string | null>(null);
   const [takes, setTakes] = useState<Take[]>([]);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [codeFor, setCodeFor] = useState<string | null>(null); // take id with the code panel open
@@ -187,6 +192,8 @@ export default function PlaygroundConsole() {
   async function generate() {
     if (!plain || busy || !character) return;
     setBusy(true);
+    setBusyNotice(null);
+    setToast(null);
     try {
       const r = await speak(text, character.character_id, expr);
       seq.current += 1;
@@ -194,8 +201,17 @@ export default function PlaygroundConsole() {
         id: `take-${seq.current}`, text: text.trim(),
         characterId: character.character_id, characterName: character.name,
         mode: r.mode, url: r.url, peaks: r.peaks, seconds: r.seconds, kb: r.kb, rtf: r.rtf,
-        segments: r.segments, expr: { ...expr },
+        synthSeconds: r.synthSeconds, queueSeconds: r.queueSeconds,
+        ignoredSettings: r.ignoredSettings, segments: r.segments, expr: { ...expr },
       }, ...t]);
+    } catch (e) {
+      // Backpressure keeps the engine reachable — offer a retry. Anything else
+      // is a genuine failure that must be visible, not swallowed.
+      if (e instanceof EngineBusyError) {
+        setBusyNotice({ retryAfterSec: e.retryAfterSec });
+      } else {
+        setToast("Generation failed — the backend returned an error. Please try again.");
+      }
     } finally { setBusy(false); }
   }
 
@@ -222,6 +238,26 @@ export default function PlaygroundConsole() {
         <p className="font-jetbrains mt-4 rounded-lg border border-amber-400/25 bg-amber-400/5 px-4 py-2 text-[11px] text-amber-200/90">
           Gravitone backend unreachable — speaking with your browser voice (metatags ignored).
         </p>
+      )}
+
+      {busyNotice && (
+        <div className="font-jetbrains mt-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-400/30 bg-amber-400/5 px-4 py-2 text-[11px] text-amber-200/90">
+          <span>Engine busy — the render queue is full. Retry in a moment{busyNotice.retryAfterSec > 0 ? ` (~${busyNotice.retryAfterSec}s)` : ""}.</span>
+          <button
+            onClick={() => void generate()}
+            disabled={busy}
+            className="rounded-full border border-amber-400/40 bg-amber-400/10 px-3 py-1 text-amber-100 transition hover:bg-amber-400/20 disabled:opacity-40"
+          >
+            {busy ? "retrying…" : "↻ retry"}
+          </button>
+        </div>
+      )}
+
+      {toast && (
+        <div className="font-jetbrains mt-4 flex items-center justify-between gap-3 rounded-lg border border-rose-400/30 bg-rose-400/5 px-4 py-2 text-[11px] text-rose-200/90">
+          <span>{toast}</span>
+          <button onClick={() => setToast(null)} aria-label="Dismiss" className="text-rose-200/70 transition hover:text-rose-100">✕</button>
+        </div>
       )}
 
       {/* character rail */}
@@ -408,6 +444,8 @@ export default function PlaygroundConsole() {
                   <div className="font-jetbrains hidden shrink-0 items-center gap-4 text-[11px] text-white/65 sm:flex">
                     <span className="text-white/80">{t.characterName}</span>
                     <span>{t.seconds}s</span>
+                    {t.synthSeconds > 0 && <span title="server-side synthesis time">{t.synthSeconds}s synth</span>}
+                    {t.queueSeconds > 0 && <span title="time spent waiting in the render queue">{t.queueSeconds}s queue</span>}
                     {t.rtf > 0 && <span className="text-cyan-300">{t.rtf}× rt</span>}
                     {t.kb > 0 && <span>{t.kb} kb</span>}
                   </div>
@@ -476,6 +514,13 @@ export default function PlaygroundConsole() {
                       );
                     })}
                   </div>
+                )}
+
+                {t.ignoredSettings.length > 0 && (
+                  <p className="font-jetbrains mt-3 inline-flex flex-wrap items-center gap-1.5 rounded-lg border border-amber-400/20 bg-amber-400/5 px-2.5 py-1 text-[11px] text-amber-200/85">
+                    <span aria-hidden>⚠</span>
+                    {t.ignoredSettings.join(", ")} ignored — not a Pocket TTS knob.
+                  </p>
                 )}
 
                 <p className="mt-2 line-clamp-1 text-sm text-white/65">{t.text}</p>
