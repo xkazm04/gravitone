@@ -86,18 +86,40 @@ def main(argv: list[str] | None = None) -> int:
     rc = 0
     for st in stems:
         emo, src, dst = st.get("emotion"), st.get("src"), Path(st.get("dst"))
-        try:
-            state = model.get_state_for_audio_prompt(str(src), truncate=True)
-            _save_voice_state(model, state, dst)
-            ok = dst.is_file()
-            _emit({"emotion": emo, "ok": ok,
-                   "error": None if ok else "no output written"})
-            if not ok:
-                rc = 1
-        except Exception as exc:  # noqa: BLE001 - report + continue the batch
-            _emit({"emotion": emo, "ok": False, "error": str(exc)[:200]})
+        err = _export_one(model, src, dst)
+        _emit({"emotion": emo, "ok": err is None, "error": err})
+        if err is not None:
             rc = 1
     return rc
+
+
+def _export_one(model, src, dst: Path) -> str | None:
+    """Export one stem; return an error string or None on success.
+
+    The in-process save is only trusted after a LOAD-BACK through
+    ``get_state_for_audio_prompt(<dst>)`` — the exact call the serving worker
+    makes — so a serializer/format mismatch can never ship a voice that later
+    fails to load. Any failure falls back to the proven ``pocket_tts
+    export-voice`` CLI for that stem (one cold model load, failure path only).
+    """
+    import subprocess
+    try:
+        state = model.get_state_for_audio_prompt(str(src), truncate=True)
+        _save_voice_state(model, state, dst)
+        if dst.is_file():
+            model.get_state_for_audio_prompt(str(dst), truncate=True)  # round-trip check
+            return None
+        first_err = "no output written"
+    except Exception as exc:  # noqa: BLE001 - fall back to the CLI below
+        first_err = str(exc)[:200]
+    dst.unlink(missing_ok=True)  # never leave a half-written/unloadable file
+    ex = subprocess.run(
+        [sys.executable, "-m", "pocket_tts", "export-voice", str(src), str(dst)],
+        capture_output=True)
+    if ex.returncode == 0 and dst.is_file():
+        return None
+    cli_err = ex.stderr.decode(errors="ignore")[-150:]
+    return f"in-process export failed ({first_err}); CLI fallback failed: {cli_err}"
 
 
 if __name__ == "__main__":
