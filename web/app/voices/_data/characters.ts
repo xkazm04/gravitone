@@ -89,6 +89,16 @@ async function fetchRoster(): Promise<Character[]> {
   return (await r.json()) as Character[];
 }
 
+/** Fetch ONE Character (the detail page). Returns null on 404 so the page can
+ *  render its "no such character" state. Downloading the whole roster to
+ *  `.find()` a single character was the old, wasteful path. */
+async function fetchCharacter(id: string): Promise<Character | null> {
+  const r = await fetch(`/api/characters/${encodeURIComponent(id)}`, { cache: "no-store" });
+  if (r.status === 404) return null;
+  if (!r.ok) throw new Error(r.status === 503 ? "Gravitone backend unreachable" : `error ${r.status}`);
+  return (await r.json()) as Character;
+}
+
 /** Clone one Voice (character + emotion) from a recording. Throws on failure. */
 export async function cloneVoice(
   character: string,
@@ -218,8 +228,7 @@ export function useCharacter(characterId: string) {
 
   const refresh = useCallback(async () => {
     try {
-      const cs = await fetchRoster();
-      setCharacter(cs.find((c) => c.character_id === characterId) ?? null);
+      setCharacter(await fetchCharacter(characterId));
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : "failed to load character");

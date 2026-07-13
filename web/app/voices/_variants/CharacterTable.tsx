@@ -9,11 +9,26 @@ import Link from "next/link";
 import { Button, Eyebrow } from "@/components/ui/Primitives";
 import { EMOTIONS } from "@/lib/emotions";
 import TagEditor from "./TagEditor";
-import { hueOf, relTime, useCharacters, useVoicePreview, type Character } from "../_data/characters";
+import { hueOf, relTime, useCharacters, useVoicePreview, patchCharacterReq, deleteCharacterReq, type Character } from "../_data/characters";
 import { useAuth } from "@/lib/useAuth";
 import { CONSENT_PROMPT, recordVoiceOwnership } from "@/lib/voiceVault";
 
 type SortKey = "name" | "category" | "lang" | "coverage" | "created";
+
+/** Run `task` over `items` with at most `limit` in flight; collects failures. */
+async function runPool<T>(items: T[], limit: number, task: (item: T) => Promise<void>): Promise<Error[]> {
+  const errors: Error[] = [];
+  let i = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (i < items.length) {
+      const item = items[i++];
+      try { await task(item); }
+      catch (e) { errors.push(e instanceof Error ? e : new Error(String(e))); }
+    }
+  });
+  await Promise.all(workers);
+  return errors;
+}
 
 function CoverageBar({ c }: { c: Character }) {
   return (
@@ -83,15 +98,24 @@ export default function CharacterTable() {
   async function applyBulkTag() {
     const t = bulkTag.trim().toLowerCase();
     if (!t) return;
-    for (const id of selected) {
-      const c = characters.find((x) => x.character_id === id);
-      if (c && !c.tags.includes(t)) await patchCharacter(id, { tags: [...c.tags, t] });
-    }
+    const targets = [...selected]
+      .map((id) => characters.find((x) => x.character_id === id))
+      .filter((c): c is Character => !!c && !c.tags.includes(t));
+    setCloneErr(null);
+    // Bounded parallel (≤6 in flight) + one refresh at the end, instead of N
+    // serial round-trips each triggering their own re-sync.
+    const errs = await runPool(targets, 6, async (c) => { await patchCharacterReq(c.character_id, { tags: [...c.tags, t] }); });
     setBulkTag("");
+    await refresh();
+    if (errs.length) setCloneErr(`${errs.length} tag update${errs.length > 1 ? "s" : ""} failed: ${errs[0].message}`);
   }
   async function bulkDelete() {
-    for (const id of clonedSelected) await deleteCharacter(id);
+    const ids = clonedSelected;
+    setCloneErr(null);
+    const errs = await runPool(ids, 6, (id) => deleteCharacterReq(id));
     setSelected(new Set());
+    await refresh();
+    if (errs.length) setCloneErr(`${errs.length} delete${errs.length > 1 ? "s" : ""} failed: ${errs[0].message}`);
   }
   async function onFile(f: File) {
     if (!window.confirm(CONSENT_PROMPT)) return; // Voice Vault attestation gate

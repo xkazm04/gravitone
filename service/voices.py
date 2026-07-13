@@ -428,6 +428,16 @@ def get_characters() -> list[Character]:
     return list_characters()
 
 
+@router.get("/v1/characters/{character_id}", response_model=Character)
+def get_character(character_id: str) -> Character:
+    """One assembled Character by id. Lets the studio's detail page fetch a
+    single character instead of downloading the whole roster to `.find()` one."""
+    for c in list_characters():
+        if c.character_id == character_id:
+            return c
+    raise HTTPException(404, "character not found")
+
+
 def all_voices() -> list[Voice]:
     """Flat list of every Voice across every Character (built-in + cloned)."""
     return [v for c in list_characters() for v in c.voices]
