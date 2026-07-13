@@ -25,7 +25,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import statistics
+import subprocess
 import time
 
 import httpx
@@ -40,6 +42,14 @@ TEXT_DEFAULT = (
     "It is long enough to produce several seconds of audio per request."
 )
 
+# Result-JSON schema version. Bump when the shape changes so two result files
+# can be compared safely (v1 = the pre-versioned shape; v2 = self-describing).
+SCHEMA_VERSION = 2
+
+# Below this many successful samples per level, p95/p99 are statistically noisy
+# and get flagged rather than trusted.
+LOW_CONFIDENCE_N = 20
+
 
 def pct(data, p):
     if not data:
@@ -47,6 +57,88 @@ def pct(data, p):
     s = sorted(data)
     k = min(len(s) - 1, int(round((p / 100.0) * (len(s) - 1))))
     return round(s[k], 4)
+
+
+# ---------------------------------------------------------------------------
+# Reproducibility metadata (pure, unit-testable without a live server)
+# ---------------------------------------------------------------------------
+def git_sha() -> str:
+    """Short git SHA of the harness that produced a result, or "unknown"."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
+    except Exception:  # noqa: BLE001 - git absent / not a repo / timeout
+        pass
+    return "unknown"
+
+
+def torch_version() -> str | None:
+    """torch.__version__ if importable (guarded — torch is optional here)."""
+    try:
+        import torch  # noqa: PLC0415 - optional, import only when asked
+        return str(torch.__version__)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def runtime_metadata() -> dict:
+    """The reproducibility stamp embedded in every result JSON."""
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "git_sha": git_sha(),
+        "torch_version": torch_version(),
+        # The Neoverse BF16 fast-math switch — the single biggest perf lever on
+        # Arm, so a result is meaningless without recording which mode it ran in.
+        "onednn_fpmath_mode": os.environ.get("ONEDNN_DEFAULT_FPMATH_MODE"),
+    }
+
+
+def requests_per_level(requested: int, levels: list[int]) -> int:
+    """One sample size for EVERY level so their percentile populations match.
+
+    The old code fired ``max(requested, concurrency)`` per level, so higher
+    levels drew from bigger populations — p95s across levels weren't comparable.
+    Fix: pick the sample size once (enough to fill the busiest level).
+    """
+    ceiling = max(levels) if levels else requested
+    return max(requested, ceiling)
+
+
+def mark_low_confidence(row: dict, threshold: int = LOW_CONFIDENCE_N) -> dict:
+    """Flag a level whose successful-sample count is too small to trust p95/p99."""
+    if row.get("ok", 0) < threshold:
+        row["low_confidence"] = True
+    return row
+
+
+def build_result(rows, knee, recommended, *, route, fmt, corpus,
+                 service_config, meta, extra=None) -> dict:
+    """Assemble the self-describing result document (schema v2).
+
+    Everything needed to reproduce/compare a run travels WITH the numbers:
+    schema version, git SHA, torch + fpmath mode, the server's own /health
+    config, and exactly what was sent (corpus/format/route).
+    """
+    result = {
+        "schema_version": meta["schema_version"],
+        "git_sha": meta["git_sha"],
+        "torch_version": meta["torch_version"],
+        "onednn_fpmath_mode": meta["onednn_fpmath_mode"],
+        "route": route,
+        "format": fmt,
+        "corpus": corpus,
+        "service_config": service_config,
+        "levels": rows,
+        "knee": knee,
+        "recommended_cap": recommended,
+    }
+    if extra:
+        result.update(extra)
+    return result
 
 
 async def _one(client, url, voice, text, fmt, results):
@@ -125,6 +217,22 @@ async def run_level(url, voice, text, fmt, concurrency, n_requests):
     }
 
 
+async def warmup(url, voice, text, fmt, n):
+    """Fire N synth requests before the ramp so level 1 doesn't eat cold-start.
+
+    These requests are thrown away — never recorded in any level's stats — so a
+    standalone run's baseline reflects warm steady-state, not a first-token cold
+    model load. Returns the count of successful warmups (for reporting only).
+    """
+    if n <= 0:
+        return 0
+    results = {"lat": [], "rtf": [], "audio": [], "rejected": 0, "errors": 0}
+    async with httpx.AsyncClient() as client:
+        for _ in range(n):
+            await _one(client, url, voice, text, fmt, results)
+    return len(results["lat"])
+
+
 def print_plan(result: dict) -> None:
     """Sizing advisor: translate measured knee data into the exact deployment
     env vars (mirrors the /benchmarks capacity planner in the web studio).
@@ -175,6 +283,8 @@ async def main():
                     help="comma-separated concurrency levels to ramp through")
     ap.add_argument("--requests", type=int, default=12,
                     help="requests fired per level")
+    ap.add_argument("--warmup", type=int, default=2,
+                    help="synth requests fired (and discarded) before level 1 to warm the model")
     ap.add_argument("--degrade-factor", type=float, default=2.0)
     ap.add_argument("--cpu-ceiling", type=float, default=95.0)
     ap.add_argument("--out", default="service/loadtest_result.json")
@@ -190,15 +300,28 @@ async def main():
             print(f"{args.out} not found — run the load test first")
         return
 
-    # readiness check
+    # readiness check — keep the /health config snapshot for the result JSON
+    # (it was previously printed then thrown away, so runs weren't reproducible).
+    service_config = {}
     async with httpx.AsyncClient() as c:
         h = await c.get(f"{args.url}/health", timeout=30)
         if h.status_code != 200:
             print(f"service not ready at {args.url} (status {h.status_code}). Start it first.")
             return
-        print("service config:", json.dumps(h.json().get("config", {})))
+        service_config = h.json().get("config", {})
+        print("service config:", json.dumps(service_config))
 
     levels = [int(x) for x in args.levels.split(",") if x.strip()]
+    # Equal sample size across every level so their percentile populations are
+    # comparable (computed ONCE, not per-level).
+    n_per_level = requests_per_level(args.requests, levels)
+
+    # Warm the model so level 1's baseline isn't polluted by cold-start.
+    if args.warmup > 0:
+        print(f"warming up: {args.warmup} discarded synth request(s) ...")
+        warmed = await warmup(args.url, args.voice, args.text, args.format, args.warmup)
+        print(f"warmup complete ({warmed}/{args.warmup} ok)")
+
     rows = []
     baseline_p95 = None
     knee = None
@@ -209,13 +332,17 @@ async def main():
     print("-" * len(hdr))
 
     for c in levels:
-        row = await run_level(args.url, args.voice, args.text, args.format, c, max(args.requests, c))
+        row = await run_level(args.url, args.voice, args.text, args.format, c, n_per_level)
+        mark_low_confidence(row)
         rows.append(row)
         print(f"{row['concurrency']:>4} {row['ok']:>4} {row['rejected_429']:>4} "
               f"{row['errors']:>4} {str(row['lat_p50_s']):>7} {str(row['lat_p95_s']):>7} "
               f"{str(row['throughput_req_s']):>6} {str(row['audio_s_per_wall_s']):>6} "
               f"{str(row['server_rtf_mean']):>5} {str(row['cpu_mean_pct']):>5} "
               f"{str(row['mem_max_pct']):>5}")
+        if row.get("low_confidence"):
+            print(f"     ^ low confidence: only {row['ok']} sample(s) < {LOW_CONFIDENCE_N}; "
+                  f"treat p95/p99 as indicative, not exact")
 
         if c == levels[0]:
             baseline_p95 = row["lat_p95_s"] or 0.0
@@ -243,8 +370,12 @@ async def main():
               f"Push higher with --levels to find the ceiling.")
     print("=" * 60)
 
-    result = {"levels": rows, "knee": knee, "recommended_cap": recommended,
-              "args": vars(args)}
+    result = build_result(
+        rows, knee, recommended,
+        route="synth", fmt=args.format, corpus=args.text,
+        service_config=service_config, meta=runtime_metadata(),
+    )
+    result["args"] = vars(args)
     with open(args.out, "w") as f:
         json.dump(result, f, indent=2)
     print(f"wrote {args.out}")
