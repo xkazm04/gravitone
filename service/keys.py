@@ -10,6 +10,8 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +24,17 @@ from service.config import SETTINGS
 router = APIRouter(prefix="/v1/keys", tags=["keys"])
 
 KEYS_PATH = Path(SETTINGS.voices_dir).parent / "api_keys.json"
+
+# The key store is a single JSON file mutated by concurrent authenticated
+# requests. Serialize every read-modify-write under one process-wide lock so
+# interleaved writes can't truncate/corrupt it. `last_used` bumps are hot (one
+# per authenticated request) but low-value, so they are debounced: the
+# in-memory view is always current, but the file is only rewritten when the
+# persisted timestamp is stale by more than _LAST_USED_DEBOUNCE_S.
+_STORE_LOCK = threading.Lock()
+_LAST_USED_DEBOUNCE_S = 60.0
+_LAST_USED: dict[str, str] = {}        # kid -> current iso timestamp (in-memory)
+_LAST_PERSIST: dict[str, float] = {}   # kid -> monotonic time of last file write
 # tts=synthesize, voices=manage, clone=upload,
 # performance=multi-character scripts (/v1/performance — the premium tier)
 SCOPES = ["tts", "voices", "clone", "performance"]
@@ -72,9 +85,12 @@ def _new_secret() -> tuple[str, str]:
 
 
 def _public(k: dict) -> ApiKey:
+    # Prefer the in-memory last_used so a debounced (not-yet-persisted) bump is
+    # still reflected to callers.
+    last_used = _LAST_USED.get(k["id"], k.get("last_used"))
     return ApiKey(
         id=k["id"], name=k["name"], prefix=k["prefix"], scopes=k["scopes"],
-        created=k["created"], last_used=k.get("last_used"), revoked=k.get("revoked", False),
+        created=k["created"], last_used=last_used, revoked=k.get("revoked", False),
     )
 
 
@@ -97,47 +113,63 @@ def create_key(req: CreateKey) -> ApiKeyWithSecret:
     secret, prefix = _new_secret()
     kid = uuid.uuid4().hex[:12]
     created = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    data = _load()
-    data[kid] = {
-        "id": kid, "name": req.name.strip() or "Untitled key", "prefix": prefix,
-        "hash": _hash(secret), "scopes": req.scopes or ["tts"], "created": created,
-        "last_used": None, "revoked": False,
-    }
-    _save(data)
-    return ApiKeyWithSecret(**_public(data[kid]).model_dump(), secret=secret)
+    with _STORE_LOCK:
+        data = _load()
+        data[kid] = {
+            "id": kid, "name": req.name.strip() or "Untitled key", "prefix": prefix,
+            "hash": _hash(secret), "scopes": req.scopes or ["tts"], "created": created,
+            "last_used": None, "revoked": False,
+        }
+        _save(data)
+        entry = data[kid]
+    return ApiKeyWithSecret(**_public(entry).model_dump(), secret=secret)
 
 
 @router.post("/{kid}/rotate", response_model=ApiKeyWithSecret)
 def rotate_key(kid: str) -> ApiKeyWithSecret:
-    data = _load()
-    if kid not in data:
-        raise HTTPException(404, "key not found")
     secret, prefix = _new_secret()
-    data[kid]["hash"] = _hash(secret)
-    data[kid]["prefix"] = prefix
-    data[kid]["revoked"] = False
-    _save(data)
-    return ApiKeyWithSecret(**_public(data[kid]).model_dump(), secret=secret)
+    with _STORE_LOCK:
+        data = _load()
+        if kid not in data:
+            raise HTTPException(404, "key not found")
+        # Rotating must NEVER silently resurrect a revoked key.
+        if data[kid].get("revoked"):
+            raise HTTPException(409, "cannot rotate a revoked key")
+        data[kid]["hash"] = _hash(secret)
+        data[kid]["prefix"] = prefix
+        _save(data)
+        entry = data[kid]
+    return ApiKeyWithSecret(**_public(entry).model_dump(), secret=secret)
 
 
 @router.delete("/{kid}", status_code=204)
 def delete_key(kid: str) -> None:
-    data = _load()
-    if kid not in data:
-        raise HTTPException(404, "key not found")
-    del data[kid]
-    _save(data)
+    with _STORE_LOCK:
+        data = _load()
+        if kid not in data:
+            raise HTTPException(404, "key not found")
+        del data[kid]
+        _save(data)
+        _LAST_USED.pop(kid, None)
+        _LAST_PERSIST.pop(kid, None)
 
 
 def validate_key(secret: str | None, scope: str = "tts") -> bool:
-    """True if `secret` is an active key with `scope`. Updates last_used."""
+    """True if `secret` is an active key with `scope`. Bumps last_used
+    (in-memory always; persisted at most once per _LAST_USED_DEBOUNCE_S)."""
     if not secret:
         return False
     h = _hash(secret)
-    data = _load()
-    for k in data.values():
-        if k.get("hash") == h and not k.get("revoked") and scope in k.get("scopes", []):
-            k["last_used"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-            _save(data)
-            return True
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with _STORE_LOCK:
+        data = _load()
+        for kid, k in data.items():
+            if k.get("hash") == h and not k.get("revoked") and scope in k.get("scopes", []):
+                _LAST_USED[kid] = now_iso  # in-memory view is always current
+                k["last_used"] = now_iso
+                last = _LAST_PERSIST.get(kid)
+                if last is None or (time.monotonic() - last) > _LAST_USED_DEBOUNCE_S:
+                    _save(data)
+                    _LAST_PERSIST[kid] = time.monotonic()
+                return True
     return False

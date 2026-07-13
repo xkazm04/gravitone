@@ -97,12 +97,14 @@ class FakeEngine:
     """
 
     def __init__(self, workers: int = 2, delay: float = 0.15,
-                 capacity: int = 1000, delays: dict[str, float] | None = None):
+                 capacity: int = 1000, delays: dict[str, float] | None = None,
+                 error: str | None = None):
         self.metrics = _FakeMetrics()
         self.workers = workers
         self.delay = delay
         self.delays = delays or {}
         self.capacity = capacity
+        self.error = error  # if set, the worker future raises RuntimeError(error)
         self._pool = ThreadPoolExecutor(max_workers=workers)
         self._lock = threading.Lock()
         self._admitted = 0
@@ -127,6 +129,8 @@ class FakeEngine:
                 self.max_concurrent = max(self.max_concurrent, self._cur)
             try:
                 time.sleep(delay)
+                if self.error is not None:
+                    raise RuntimeError(self.error)
                 marker = (len(self.submit_order) + hash(text)) & 0x7FFF
                 future.set_result(SynthResult(
                     wav_bytes=make_wav(marker),

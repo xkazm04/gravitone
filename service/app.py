@@ -16,8 +16,10 @@ a managed `/v1/keys` key via `xi-api-key` / `Authorization: Bearer`.
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import struct
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -40,6 +42,8 @@ from service.packs import router as packs_router
 from service.takes import router as takes_router, reviews_router
 
 ENGINE: TtsEngine | None = None
+
+logger = logging.getLogger("gravitone")
 
 
 @asynccontextmanager
@@ -110,9 +114,19 @@ async def _await_result(job):
             timeout=SETTINGS.request_timeout_s,
         )
     except asyncio.TimeoutError:
+        if ENGINE is not None:
+            ENGINE.metrics.on_timeout()
         raise HTTPException(status_code=504, detail="synthesis timed out")
-    except Exception as exc:  # noqa: BLE001 - worker error -> 500
-        raise HTTPException(status_code=500, detail=f"synthesis failed: {exc}")
+    except Exception as exc:  # noqa: BLE001 - worker error -> sanitized 500
+        # Never leak the raw worker exception to the client: log it server-side
+        # against a short request id and hand the caller only that id.
+        request_id = uuid.uuid4().hex[:8]
+        logger.error("synthesis failed [request %s]: %s", request_id, exc,
+                     exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"synthesis failed (request {request_id})",
+        )
 
 
 async def _submit_and_wait(voice_id: str, text: str, overrides: dict,

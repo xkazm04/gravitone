@@ -98,6 +98,7 @@ class Metrics:
         self.completed = 0
         self.rejected = 0     # 429s (admission refused)
         self.errored = 0
+        self.timeouts = 0     # 504s (synthesis exceeded request_timeout_s)
         self.in_flight = 0    # currently inside generate()
         self.queued = 0       # admitted but not yet being processed
         self._latencies: deque[float] = deque(maxlen=window)   # end-to-end seconds
@@ -114,6 +115,10 @@ class Metrics:
     def on_rejected(self):
         with self._lock:
             self.rejected += 1
+
+    def on_timeout(self):
+        with self._lock:
+            self.timeouts += 1
 
     def on_enqueue(self):
         with self._lock:
@@ -156,6 +161,7 @@ class Metrics:
                 "completed": self.completed,
                 "rejected_429": self.rejected,
                 "errored": self.errored,
+                "timeouts": self.timeouts,
                 "in_flight": self.in_flight,
                 "queued": self.queued,
                 "audio_seconds_total": round(self.audio_seconds_total, 2),
