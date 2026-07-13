@@ -16,11 +16,13 @@ a managed `/v1/keys` key via `xi-api-key` / `Authorization: Bearer`.
 from __future__ import annotations
 
 import asyncio
+import re
+import struct
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 import base64
@@ -154,6 +156,43 @@ def _resolve_emotion_address(voice_id: str, emotion: str | None) -> tuple[str, d
     }
 
 
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split free text into sentence-sized synthesis units for streaming.
+
+    Deliberately simple (no metatag grammar — the streaming route mirrors the
+    plain-text /v1/text-to-speech surface, not /v1/speak): break after
+    sentence-final punctuation followed by whitespace. Text with no such
+    punctuation stays a single unit.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    parts = [p.strip() for p in _SENTENCE_SPLIT_RE.split(text)]
+    parts = [p for p in parts if p]
+    return parts or [text]
+
+
+def _wav_stream_header(sample_rate: int, channels: int = 1, bits: int = 16) -> bytes:
+    """A 44-byte PCM WAV header for a stream of unknown total length.
+
+    The RIFF/data sizes are set to the 32-bit max (streaming WAV convention):
+    the client plays until the connection closes rather than trusting a length
+    it cannot know up front. Byte-identical layout to what scipy writes, so a
+    single header followed by raw PCM16 samples is a valid WAV.
+    """
+    byte_rate = sample_rate * channels * bits // 8
+    block_align = channels * bits // 8
+    return (
+        b"RIFF" + struct.pack("<I", 0xFFFFFFFF) + b"WAVE"
+        + b"fmt " + struct.pack("<IHHIIHH", 16, 1, channels, sample_rate,
+                                byte_rate, block_align, bits)
+        + b"data" + struct.pack("<I", 0xFFFFFFFF - 44)
+    )
+
+
 def _parse_format(output_format: str) -> tuple[str, str]:
     """Return (kind, content_type). kind in {wav, mp3, pcm}."""
     fmt = (output_format or "wav").lower()
@@ -199,6 +238,91 @@ async def text_to_speech(
             "X-Queue-Seconds": str(result.queue_seconds),
             "X-Realtime-Factor": str(round(result.audio_seconds / result.synth_seconds, 3))
             if result.synth_seconds else "n/a",
+            **emotion_headers,
+        },
+    )
+
+
+@app.post("/v1/text-to-speech/{voice_id}/stream",
+          dependencies=[Depends(require_scope("tts"))])
+async def text_to_speech_stream(
+    voice_id: str,
+    req: TTSRequest,
+    output_format: str = Query("wav_24000"),
+    emotion: str | None = Query(None, description="Gravitone extension: address a Character's emotion voice (or use {character_id}:{emotion} as the path voice_id)"),
+):
+    """Low-latency streaming synthesis (ElevenLabs' headline feature).
+
+    The text is sentence-split, every sentence is submitted to the worker pool
+    up front (so admission — the 429 backpressure decision — happens BEFORE any
+    bytes are streamed, never mid-stream), and audio is streamed back IN ORDER
+    as each segment finishes. Because segments synthesize concurrently across
+    workers, the first chunk leaves before the last segment is done — latency to
+    first byte drops from full-synthesis time to first-sentence time.
+
+    Formats: `pcm_*` streams raw PCM16 chunks; `wav_*` streams a single
+    streaming WAV header then raw PCM16 samples; `mp3_*` returns 501 (MP3 needs
+    the whole clip to transcode, which defeats streaming — use the non-stream
+    route for MP3).
+
+    Timing headers: the per-synthesis timing headers of the non-stream route
+    (X-Synth-Seconds, X-Realtime-Factor, …) are intentionally ABSENT here —
+    HTTP response headers are flushed before synthesis completes, so those
+    numbers cannot be known when the headers go out. Only pre-stream headers
+    (X-Stream, X-Stream-Segments, emotion resolution) are emitted.
+
+    A script with more sentences than the pool admission window (workers +
+    queue_max) is rejected with 429 up front rather than truncated mid-stream.
+    """
+    assert ENGINE is not None
+    kind, content_type = _parse_format(output_format)
+    if kind == "mp3":
+        raise HTTPException(
+            status_code=501,
+            detail="mp3 is not supported on the streaming endpoint (transcoding "
+                   "needs the complete clip); use output_format=pcm_24000 or "
+                   "wav_24000 to stream, or the non-streaming route for mp3",
+        )
+    voice_id, emotion_headers = _resolve_emotion_address(voice_id, emotion)
+
+    sentences = _split_sentences(req.text)
+    overrides = _overrides(req.voice_settings)
+
+    # Submit every segment up front: this decides admission (429) before we
+    # commit to a streaming response, keeping backpressure semantics identical
+    # to the non-stream route. Workers pick them up concurrently.
+    jobs = []
+    try:
+        for text in sentences:
+            jobs.append(ENGINE.submit(voice_id=voice_id, text=text,
+                                      overrides=overrides,
+                                      frames_after_eos=req.frames_after_eos))
+    except AdmissionRejected as exc:
+        return _backpressure_response(_Backpressure(str(exc)))
+
+    async def _audio_stream():
+        header_sent = False
+        for job in jobs:
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.wrap_future(job.future),
+                    timeout=SETTINGS.request_timeout_s,
+                )
+            except (asyncio.TimeoutError, Exception):
+                # Status is already sent; the only signal left is closing the
+                # stream. The client sees a short clip / reset connection.
+                return
+            samples = result.wav_bytes[44:]  # strip the per-segment WAV header
+            if kind == "wav" and not header_sent:
+                yield _wav_stream_header(result.sample_rate)
+                header_sent = True
+            yield samples
+
+    return StreamingResponse(
+        _audio_stream(), media_type=content_type,
+        headers={
+            "X-Stream": "true",
+            "X-Stream-Segments": str(len(jobs)),
             **emotion_headers,
         },
     )
