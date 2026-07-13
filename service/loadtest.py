@@ -571,6 +571,14 @@ async def run_replicas_mode(args, levels, n_per_level) -> None:
             return
         print(f"launcher ready on {serving_url} "
               f"({args.replicas} replicas); aggregated metrics on {metrics_url}")
+        if not sys.platform.startswith("linux") and args.replicas > 1:
+            # Without SO_REUSEPORT the launcher falls back to sequential ports
+            # and this ramp only ever hits the first replica — the other N-1
+            # sit idle. Numbers from such a run measure ONE replica, not N.
+            print(f"!! non-Linux box: replicas serve sequential ports and this "
+                  f"ramp targets only port {args.port} (replica 0 of "
+                  f"{args.replicas}). Treat throughput as single-replica; the "
+                  f"real N-replica measurement needs the Arm Linux target.")
 
         # The ramp + warmup target the launcher we just started, not --url.
         args.url = serving_url
