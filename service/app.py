@@ -21,6 +21,7 @@ import re
 import struct
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
@@ -35,7 +36,8 @@ from service.config import SETTINGS
 from service.demand import record_fallback
 from service.emotions import parse_segments, resolve
 from service.engine import (
-    AdmissionRejected, ShuttingDown, TtsEngine, concat_wavs, wav_bytes_to_mp3,
+    AdmissionRejected, ShuttingDown, TtsEngine, concat_wavs,
+    resample_pcm16, resample_wav_bytes, wav_bytes_to_mp3,
 )
 from service.voices import emotion_map, router as voices_router
 from service.keys import router as keys_router
@@ -76,6 +78,19 @@ class VoiceSettings(BaseModel):
     Pocket TTS has no emotion/style/speed parameter — expression lives in the
     reference audio. What IS tunable are the sampling knobs below, which the
     engine applies to the worker's model instance per request.
+
+    ElevenLabs compatibility — accepted-but-inert settings:
+        `similarity_boost` and `style` are part of the ElevenLabs VoiceSettings
+        contract, so clients send them. Pocket TTS exposes only three sampling
+        knobs (temperature -> temp, stability -> noise_clamp, quality ->
+        lsd_decode_steps), each already claimed by the setting of the same
+        intent above. There is NO honest, non-colliding knob left for
+        similarity_boost (reference adherence) or style (style exaggeration),
+        so rather than silently pretend to apply them we accept them and treat
+        them as inert. When a client sends either, the response carries an
+        `X-Ignored-Settings: similarity_boost,style` header so the no-op is
+        visible, never silent. If pocket-tts later exposes a reference-adherence
+        or style knob, map it here and drop the name from `_ignored_settings`.
     """
     # 0.5 (consistent) .. 1.0 (expressive). Model default 0.7.
     temperature: float | None = None
@@ -83,7 +98,8 @@ class VoiceSettings(BaseModel):
     stability: float | None = None
     # 1 (fast) .. 5 (best). Mapped to `lsd_decode_steps`; costs realtime factor.
     quality: int | None = None
-    # accepted for ElevenLabs compatibility; not honoured by pocket-tts
+    # Accepted for ElevenLabs compatibility; inert (see class docstring). A
+    # request that sets either is reported via the X-Ignored-Settings header.
     similarity_boost: float | None = None
     style: float | None = None
 
@@ -102,6 +118,27 @@ def _overrides(vs: VoiceSettings | None) -> dict:
     if vs.quality is not None:
         o["lsd_decode_steps"] = max(1, min(5, int(vs.quality)))
     return o
+
+
+def _ignored_settings(vs: VoiceSettings | None) -> list[str]:
+    """ElevenLabs VoiceSettings fields we accept but cannot honestly honour.
+
+    Returns the names actually present on this request (so the header only
+    appears when a client really sent one), preserving a stable order."""
+    if vs is None:
+        return []
+    ignored = []
+    if vs.similarity_boost is not None:
+        ignored.append("similarity_boost")
+    if vs.style is not None:
+        ignored.append("style")
+    return ignored
+
+
+def _ignored_headers(vs: VoiceSettings | None) -> dict[str, str]:
+    """{'X-Ignored-Settings': 'similarity_boost,style'} or {} if none ignored."""
+    names = _ignored_settings(vs)
+    return {"X-Ignored-Settings": ",".join(names)} if names else {}
 
 
 class TTSRequest(BaseModel):
@@ -239,14 +276,78 @@ def _wav_stream_header(sample_rate: int, channels: int = 1, bits: int = 16) -> b
     )
 
 
-def _parse_format(output_format: str) -> tuple[str, str]:
-    """Return (kind, content_type). kind in {wav, mp3, pcm}."""
-    fmt = (output_format or "wav").lower()
-    if fmt.startswith("mp3"):
-        return "mp3", "audio/mpeg"
-    if fmt.startswith("pcm"):
-        return "pcm", "audio/basic"
-    return "wav", "audio/wav"
+# ElevenLabs output_format grammar we honour. Native synthesis rate is 24000;
+# any other rate is resampled (pcm/wav) or handed to ffmpeg -ar (mp3).
+_MP3_RATES = (22050, 24000, 44100)
+_MP3_BITRATES = (32, 64, 96, 128, 192)
+_PCM_RATES = (8000, 16000, 22050, 24000, 44100, 48000)  # wav uses the same set
+_NATIVE_RATE = 24000
+
+_SUPPORTED_FORMATS_MSG = (
+    "Supported output_format: "
+    "mp3_{22050|24000|44100}_{32|64|96|128|192}, "
+    "pcm_{8000|16000|22050|24000|44100|48000}, "
+    "wav_{8000|16000|22050|24000|44100|48000} "
+    "(bare 'mp3' | 'wav' | 'pcm' default to 24000; 'mp3' defaults to 128k)."
+)
+
+
+@dataclass
+class _AudioFormat:
+    kind: str          # wav | mp3 | pcm
+    sample_rate: int   # requested output rate
+    bitrate: int | None  # kbps, mp3 only
+    content_type: str
+
+
+def _bad_format(output_format: str) -> HTTPException:
+    return HTTPException(
+        status_code=400,
+        detail=f"unsupported output_format {output_format!r}. " + _SUPPORTED_FORMATS_MSG)
+
+
+def _parse_format(output_format: str) -> _AudioFormat:
+    """Parse an ElevenLabs `output_format` into a validated _AudioFormat.
+
+    Grammar: `mp3_{sr}_{bitrate}` | `pcm_{sr}` | `wav_{sr}`, plus the bare
+    forms `mp3` | `pcm` | `wav`. Unsupported kinds, rates or bitrates raise a
+    400 that lists exactly what IS supported (never a silent fallback to a rate
+    the caller didn't ask for)."""
+    fmt = (output_format or "wav_24000").lower().strip()
+    parts = fmt.split("_")
+    kind = parts[0]
+
+    if kind == "mp3":
+        if len(parts) == 1:
+            sr, bitrate = _NATIVE_RATE, 128
+        elif len(parts) == 3:
+            try:
+                sr, bitrate = int(parts[1]), int(parts[2])
+            except ValueError:
+                raise _bad_format(output_format)
+            if sr not in _MP3_RATES or bitrate not in _MP3_BITRATES:
+                raise _bad_format(output_format)
+        else:
+            raise _bad_format(output_format)
+        return _AudioFormat("mp3", sr, bitrate, "audio/mpeg")
+
+    if kind in ("pcm", "wav"):
+        if len(parts) == 1:
+            sr = _NATIVE_RATE
+        elif len(parts) == 2:
+            try:
+                sr = int(parts[1])
+            except ValueError:
+                raise _bad_format(output_format)
+            if sr not in _PCM_RATES:
+                raise _bad_format(output_format)
+        else:
+            raise _bad_format(output_format)
+        if kind == "pcm":
+            return _AudioFormat("pcm", sr, None, "application/octet-stream")
+        return _AudioFormat("wav", sr, None, "audio/wav")
+
+    raise _bad_format(output_format)
 
 
 @app.post("/v1/text-to-speech/{voice_id}", dependencies=[Depends(require_scope("tts"))])
@@ -257,7 +358,7 @@ async def text_to_speech(
     emotion: str | None = Query(None, description="Gravitone extension: address a Character's emotion voice (or use {character_id}:{emotion} as the path voice_id)"),
 ):
     assert ENGINE is not None
-    kind, content_type = _parse_format(output_format)
+    fmt = _parse_format(output_format)  # 400s early on an unsupported format
     voice_id, emotion_headers = _resolve_emotion_address(voice_id, emotion)
 
     try:
@@ -267,24 +368,40 @@ async def text_to_speech(
         # Backpressure: tell the client to retry — the queue cap was hit.
         return _backpressure_response(exc)
 
+    native_rate = result.sample_rate
+    extra_headers: dict[str, str] = {}
     loop = asyncio.get_event_loop()
-    if kind == "mp3":
-        body = await loop.run_in_executor(None, wav_bytes_to_mp3, result.wav_bytes)
-    elif kind == "pcm":
+    if fmt.kind == "mp3":
+        # Honour the requested bitrate and (via ffmpeg -ar) sample rate.
+        bitrate = f"{fmt.bitrate}k"
+        ar = fmt.sample_rate if fmt.sample_rate != native_rate else None
+        body = await loop.run_in_executor(
+            None, lambda: wav_bytes_to_mp3(result.wav_bytes, bitrate=bitrate, sample_rate=ar))
+    elif fmt.kind == "pcm":
+        wav = result.wav_bytes
+        if fmt.sample_rate != native_rate:
+            wav = await loop.run_in_executor(
+                None, resample_wav_bytes, wav, fmt.sample_rate)
         # strip the 44-byte WAV header -> raw PCM16
-        body = result.wav_bytes[44:]
-    else:
+        body = wav[44:]
+        extra_headers["X-Sample-Rate"] = str(fmt.sample_rate)
+    else:  # wav
         body = result.wav_bytes
+        if fmt.sample_rate != native_rate:
+            body = await loop.run_in_executor(
+                None, resample_wav_bytes, body, fmt.sample_rate)
 
     return Response(
-        content=body, media_type=content_type,
+        content=body, media_type=fmt.content_type,
         headers={
             "X-Audio-Seconds": str(result.audio_seconds),
             "X-Synth-Seconds": str(result.synth_seconds),
             "X-Queue-Seconds": str(result.queue_seconds),
             "X-Realtime-Factor": str(round(result.audio_seconds / result.synth_seconds, 3))
             if result.synth_seconds else "n/a",
+            **extra_headers,
             **emotion_headers,
+            **_ignored_headers(req.voice_settings),
         },
     )
 
@@ -321,8 +438,8 @@ async def text_to_speech_stream(
     queue_max) is rejected with 429 up front rather than truncated mid-stream.
     """
     assert ENGINE is not None
-    kind, content_type = _parse_format(output_format)
-    if kind == "mp3":
+    fmt = _parse_format(output_format)  # 400s early on an unsupported format
+    if fmt.kind == "mp3":
         raise HTTPException(
             status_code=501,
             detail="mp3 is not supported on the streaming endpoint (transcoding "
@@ -346,6 +463,8 @@ async def text_to_speech_stream(
     except AdmissionRejected as exc:
         return _backpressure_response(_Backpressure(str(exc)))
 
+    loop = asyncio.get_event_loop()
+
     async def _audio_stream():
         header_sent = False
         consumed = 0
@@ -361,9 +480,17 @@ async def text_to_speech_stream(
                     # stream. The client sees a short clip / reset connection.
                     return
                 consumed += 1
-                samples = result.wav_bytes[44:]  # strip the per-segment WAV header
-                if kind == "wav" and not header_sent:
-                    yield _wav_stream_header(result.sample_rate)
+                native_rate = result.sample_rate
+                # Honour a pcm_{sr}/wav_{sr} suffix: resample each segment before
+                # yielding so the stream carries the rate the caller asked for.
+                if fmt.sample_rate != native_rate:
+                    wav = await loop.run_in_executor(
+                        None, resample_wav_bytes, result.wav_bytes, fmt.sample_rate)
+                else:
+                    wav = result.wav_bytes
+                samples = wav[44:]  # strip the per-segment WAV header
+                if fmt.kind == "wav" and not header_sent:
+                    yield _wav_stream_header(fmt.sample_rate)
                     header_sent = True
                 yield samples
         finally:
@@ -373,13 +500,18 @@ async def text_to_speech_stream(
             for job in jobs[consumed:]:
                 job.abandoned.set()
 
+    stream_headers = {
+        "X-Stream": "true",
+        "X-Stream-Segments": str(len(jobs)),
+        **emotion_headers,
+        **_ignored_headers(req.voice_settings),
+    }
+    if fmt.kind == "pcm":
+        stream_headers["X-Sample-Rate"] = str(fmt.sample_rate)
+
     return StreamingResponse(
-        _audio_stream(), media_type=content_type,
-        headers={
-            "X-Stream": "true",
-            "X-Stream-Segments": str(len(jobs)),
-            **emotion_headers,
-        },
+        _audio_stream(), media_type=fmt.content_type,
+        headers=stream_headers,
     )
 
 
@@ -470,6 +602,7 @@ async def speak(
             "X-Synth-Seconds": str(round(total_synth, 3)),
             "X-Realtime-Factor": str(rtf),
             "X-Segments": base64.b64encode(json.dumps(report).encode()).decode(),
+            **_ignored_headers(req.voice_settings),
         },
     )
 
@@ -497,6 +630,9 @@ async def performance(req: PerformanceRequest):
     scope (the root key always passes).
     """
     assert ENGINE is not None
+
+    ignored = sorted({s for line in req.lines for s in _ignored_settings(line.voice_settings)},
+                     key=["similarity_boost", "style"].index)
 
     # Fail fast: validate every character before synthesizing anything.
     emaps: dict[str, dict[str, str]] = {}
@@ -553,6 +689,7 @@ async def performance(req: PerformanceRequest):
             "X-Synth-Seconds": str(round(total_synth, 3)),
             "X-Realtime-Factor": str(rtf),
             "X-Performance-Report": base64.b64encode(json.dumps(report).encode()).decode(),
+            **({"X-Ignored-Settings": ",".join(ignored)} if ignored else {}),
         },
     )
 

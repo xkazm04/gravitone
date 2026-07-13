@@ -74,6 +74,43 @@ class Character(BaseModel):
     scale: list[str] = list(EMOTION_SCALE)
 
 
+class VoiceList(BaseModel):
+    """ElevenLabs-shaped envelope for GET /v1/voices.
+
+    ElevenLabs clients (and the official SDK) read `.voices` off the response,
+    so the list is wrapped in an object rather than returned bare. Each Voice
+    already carries the EL-compatible fields (voice_id, name, category) plus
+    Gravitone's own (character_id, emotion, lang, …) — purely additive."""
+    voices: list[Voice]
+
+
+class ModelLanguage(BaseModel):
+    language_id: str
+    name: str
+
+
+class Model(BaseModel):
+    """ElevenLabs-shaped model description for GET /v1/models."""
+    model_id: str
+    name: str
+    can_do_text_to_speech: bool = True
+    can_do_voice_conversion: bool = False
+    can_be_finetuned: bool = False
+    can_use_style: bool = False
+    can_use_speaker_boost: bool = False
+    serves_pro_voices: bool = False
+    languages: list[ModelLanguage] = []
+    description: str = ""
+
+
+# Languages Gravitone's built-in voices cover (ISO code -> display name). Used
+# to populate the GET /v1/models `languages` array.
+_MODEL_LANGUAGES = {
+    "EN": ("en", "English"), "IT": ("it", "Italian"), "ES": ("es", "Spanish"),
+    "DE": ("de", "German"), "PT": ("pt", "Portuguese"), "FR": ("fr", "French"),
+}
+
+
 class EmotionReq(BaseModel):
     name: str
 
@@ -272,9 +309,47 @@ def get_characters() -> list[Character]:
     return list_characters()
 
 
-@router.get("/v1/voices", response_model=list[Voice])
-def get_voices() -> list[Voice]:
+def all_voices() -> list[Voice]:
+    """Flat list of every Voice across every Character (built-in + cloned)."""
     return [v for c in list_characters() for v in c.voices]
+
+
+@router.get("/v1/voices", response_model=VoiceList)
+def get_voices() -> VoiceList:
+    """List available voices, ElevenLabs-shaped: `{"voices": [...]}`.
+
+    (Was a bare JSON array — EL clients read `.voices`, so the array is now
+    wrapped. The studio lists via /v1/characters, not this endpoint.)"""
+    return VoiceList(voices=all_voices())
+
+
+@router.get("/v1/voices/{voice_id}", response_model=Voice)
+def get_voice(voice_id: str) -> Voice:
+    """One voice by id (ElevenLabs GET /v1/voices/{voice_id})."""
+    for v in all_voices():
+        if v.voice_id == voice_id:
+            return v
+    raise HTTPException(404, {"status": "voice_not_found",
+                             "message": f"voice '{voice_id}' not found"})
+
+
+@router.get("/v1/models", response_model=list[Model])
+def get_models() -> list[Model]:
+    """Describe Gravitone's synthesis model, ElevenLabs GET /v1/models-shaped.
+
+    A single static model — pocket-tts, CPU-only, expressive TTS. Returned as a
+    bare list to match ElevenLabs (its /v1/models returns an array)."""
+    langs = [ModelLanguage(language_id=code, name=name)
+             for (code, name) in _MODEL_LANGUAGES.values()]
+    return [Model(
+        model_id="gravitone_pocket_v1",
+        name="Gravitone Pocket TTS",
+        can_do_text_to_speech=True,
+        languages=langs,
+        description="Arm-native, CPU-only expressive text-to-speech (pocket-tts). "
+                    "Emotion lives in the reference voice; expression is tuned via "
+                    "voice_settings (temperature, stability, quality).",
+    )]
 
 
 @router.get("/v1/characters/{character_id}/manifest")

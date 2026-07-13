@@ -28,6 +28,7 @@ from typing import Optional
 
 import numpy as np
 import scipy.io.wavfile
+import scipy.signal
 import torch
 
 from service.config import SETTINGS
@@ -73,17 +74,82 @@ def concat_wavs(chunks: list[bytes]) -> bytes:
     return out.getvalue()
 
 
-def wav_bytes_to_mp3(wav_bytes: bytes, bitrate: str = "128k") -> bytes:
+def wav_bytes_to_mp3(wav_bytes: bytes, bitrate: str = "128k",
+                     sample_rate: int | None = None) -> bytes:
     """Transcode WAV -> MP3 via ffmpeg (must be on PATH). ElevenLabs default
-    is MP3; we keep WAV as the fast path and encode MP3 only on request."""
+    is MP3; we keep WAV as the fast path and encode MP3 only on request.
+
+    ``bitrate`` (e.g. "192k") is passed to ffmpeg ``-b:a`` so the caller's
+    requested ``mp3_{sr}_{bitrate}`` bitrate is honoured instead of a hardcoded
+    128k. ``sample_rate`` (e.g. 44100), when given, is passed to ffmpeg ``-ar``
+    so ffmpeg resamples to the requested rate as part of the encode."""
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
+           "-i", "pipe:0", "-f", "mp3", "-b:a", bitrate]
+    if sample_rate is not None:
+        cmd += ["-ar", str(sample_rate)]
+    cmd.append("pipe:1")
     proc = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-loglevel", "error",
-         "-i", "pipe:0", "-f", "mp3", "-b:a", bitrate, "pipe:1"],
-        input=wav_bytes, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        cmd, input=wav_bytes, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg mp3 encode failed: {proc.stderr.decode(errors='ignore')[:300]}")
     return proc.stdout
+
+
+# ----------------------------------------------------------------------------
+# Resampling (honouring pcm_{sr} / wav_{sr} output formats)
+# ----------------------------------------------------------------------------
+def _resample_factors(src_rate: int, dst_rate: int) -> tuple[int, int]:
+    """(up, down) integer factors for a src->dst rate change, reduced by gcd.
+
+    e.g. 24000 -> 16000 gives up=2, down=3 (16000/8000, 24000/8000)."""
+    from math import gcd
+    g = gcd(src_rate, dst_rate)
+    return dst_rate // g, src_rate // g
+
+
+def resample_pcm16(samples: "np.ndarray", src_rate: int, dst_rate: int) -> "np.ndarray":
+    """Resample a mono int16 sample array from src_rate to dst_rate.
+
+    Uses ``scipy.signal.resample_poly`` (polyphase FIR — the right tool for an
+    integer-ratio rate change) with up/down factors derived from the gcd of the
+    two rates. A no-op when the rates match. Returns int16 clamped to range."""
+    if src_rate == dst_rate:
+        return samples
+    up, down = _resample_factors(src_rate, dst_rate)
+    out = scipy.signal.resample_poly(samples.astype(np.float64), up, down)
+    return np.clip(np.round(out), -32768, 32767).astype(np.int16)
+
+
+def _read_wav_pcm16(wav_bytes: bytes) -> tuple["np.ndarray", int, int]:
+    """(samples int16, sample_rate, channels) from a PCM16 WAV via stdlib wave."""
+    with wave.open(io.BytesIO(wav_bytes), "rb") as w:
+        sr, nch = w.getframerate(), w.getnchannels()
+        frames = w.readframes(w.getnframes())
+    return np.frombuffer(frames, dtype=np.int16), sr, nch
+
+
+def _write_wav_pcm16(samples: "np.ndarray", sample_rate: int, channels: int = 1) -> bytes:
+    """Serialize an int16 sample array to a PCM16 WAV via stdlib wave.
+
+    Deliberately stdlib (not scipy.io.wavfile) so the header layout matches
+    ``concat_wavs`` and the streaming route, and so it works under the test
+    shims where scipy's writer is a stub."""
+    out = io.BytesIO()
+    with wave.open(out, "wb") as w:
+        w.setnchannels(channels)
+        w.setsampwidth(2)
+        w.setframerate(sample_rate)
+        w.writeframes(np.ascontiguousarray(samples, dtype="<i2").tobytes())
+    return out.getvalue()
+
+
+def resample_wav_bytes(wav_bytes: bytes, dst_rate: int) -> bytes:
+    """Return WAV bytes resampled to dst_rate (no-op when already at dst_rate)."""
+    samples, src_rate, nch = _read_wav_pcm16(wav_bytes)
+    if src_rate == dst_rate:
+        return wav_bytes
+    return _write_wav_pcm16(resample_pcm16(samples, src_rate, dst_rate), dst_rate, nch)
 
 
 # ----------------------------------------------------------------------------

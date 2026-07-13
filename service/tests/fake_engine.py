@@ -33,9 +33,24 @@ def _install_shims() -> None:
         wavfile.write = lambda *a, **k: None
         scipy_io.wavfile = wavfile
         scipy.io = scipy_io
+        # scipy.signal.resample_poly — real scipy isn't installed here, so we
+        # shim a deterministic stand-in that RECORDS its (len, up, down) calls
+        # on `resample_poly.calls` and returns the input unchanged. Tests assert
+        # the engine helper derives the right up/down factors (e.g. 24000->16000
+        # => up=2, down=3) without needing real DSP.
+        scipy_signal = types.ModuleType("scipy.signal")
+
+        def _fake_resample_poly(x, up, down, **kwargs):
+            _fake_resample_poly.calls.append((len(x), int(up), int(down)))
+            return x
+
+        _fake_resample_poly.calls = []
+        scipy_signal.resample_poly = _fake_resample_poly
+        scipy.signal = scipy_signal
         sys.modules["scipy"] = scipy
         sys.modules["scipy.io"] = scipy_io
         sys.modules["scipy.io.wavfile"] = wavfile
+        sys.modules["scipy.signal"] = scipy_signal
     if "pocket_tts" not in sys.modules:
         pocket = types.ModuleType("pocket_tts")
         pocket.TTSModel = object
