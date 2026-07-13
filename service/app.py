@@ -34,7 +34,9 @@ from service.auth import require_read_write, require_scope
 from service.config import SETTINGS
 from service.demand import record_fallback
 from service.emotions import parse_segments, resolve
-from service.engine import AdmissionRejected, TtsEngine, concat_wavs, wav_bytes_to_mp3
+from service.engine import (
+    AdmissionRejected, ShuttingDown, TtsEngine, concat_wavs, wav_bytes_to_mp3,
+)
 from service.voices import emotion_map, router as voices_router
 from service.keys import router as keys_router
 from service.ingest_api import router as ingest_router
@@ -53,10 +55,19 @@ async def lifespan(app: FastAPI):
     # Model loading is blocking; do it off the event loop.
     await asyncio.get_event_loop().run_in_executor(None, ENGINE.start)
     yield
-    ENGINE.stop()
+    # Graceful drain: stop admitting, fail queued jobs fast (no caller hangs on
+    # the request timeout), let in-flight generations finish, join workers.
+    await asyncio.get_event_loop().run_in_executor(None, ENGINE.stop)
 
 
 app = FastAPI(title="Pocket TTS Service", version="1.0.0", lifespan=lifespan)
+
+
+@app.exception_handler(ShuttingDown)
+async def _shutting_down_handler(request: Request, exc: ShuttingDown):
+    """A submit refused because the pool is draining -> 503 + Retry-After."""
+    return JSONResponse(status_code=503, content={"detail": "server shutting down"},
+                        headers={"Retry-After": "1"})
 
 
 class VoiceSettings(BaseModel):
@@ -124,6 +135,10 @@ async def _await_result(job):
         if abandoned is not None:
             abandoned.set()
         raise HTTPException(status_code=504, detail="synthesis timed out")
+    except ShuttingDown:
+        # The job was drained by a graceful shutdown — tell the caller to retry
+        # elsewhere rather than logging it as an internal synthesis failure.
+        raise HTTPException(status_code=503, detail="server shutting down")
     except Exception as exc:  # noqa: BLE001 - worker error -> sanitized 500
         # Never leak the raw worker exception to the client: log it server-side
         # against a short request id and hand the caller only that id.

@@ -129,6 +129,13 @@ class Metrics:
             self.queued -= 1
             self.abandoned += 1
 
+    def on_drain(self):
+        # A queued job failed fast during graceful shutdown: undo its queue
+        # count. Kept distinct from on_abandoned (no counter bump) — draining is
+        # an operator action, not caller behaviour.
+        with self._lock:
+            self.queued -= 1
+
     def on_enqueue(self):
         with self._lock:
             self.queued += 1
@@ -285,6 +292,16 @@ class _Worker(threading.Thread):
                 self.engine._admit.release()
                 self.engine._queue.task_done()
                 continue
+            if self.engine._stopping:
+                # Graceful drain raced this job onto us after shutdown began:
+                # fail it fast rather than start a fresh generation. (Jobs
+                # already inside generate_audio still run to completion.)
+                if not job.future.done():
+                    job.future.set_exception(ShuttingDown("server shutting down"))
+                self.engine.metrics.on_drain()
+                self.engine._admit.release()
+                self.engine._queue.task_done()
+                continue
             self.engine.metrics.on_start()
             t_start = time.perf_counter()
             prev: dict = {}
@@ -330,6 +347,11 @@ class AdmissionRejected(Exception):
     """Raised when the queue is full — maps to HTTP 429."""
 
 
+class ShuttingDown(Exception):
+    """Raised when a submit arrives (or a queued job is drained) during
+    graceful shutdown — maps to HTTP 503."""
+
+
 class TtsEngine:
     def __init__(self):
         torch.set_num_threads(SETTINGS.torch_threads)
@@ -347,10 +369,48 @@ class TtsEngine:
         for w in self._workers:
             w.ready.wait()  # block until every model instance is loaded
 
-    def stop(self):
+    def stop(self, drain_timeout_s: float = 10.0):
+        """Graceful drain shutdown.
+
+        1. Stop accepting new submits (``submit`` now raises ``ShuttingDown``).
+        2. Fail every QUEUED (not-yet-started) job fast with ``ShuttingDown`` —
+           a restart shouldn't wait for a deep queue to synthesize. Jobs already
+           inside ``generate_audio`` finish on their own (the call is atomic).
+        3. Wake the workers and join them within ``drain_timeout_s``.
+
+        Every pending future is resolved (result or exception) before this
+        returns, so no caller hangs waiting on the request timeout.
+        """
         self._stopping = True
+        # Fail queued jobs before we hand out sentinels so callers unblock now.
+        self._drain_queue()
         for _ in self._workers:
-            self._queue.put(None)
+            self._queue.put(None)  # unblock any worker parked in queue.get
+        deadline = time.monotonic() + drain_timeout_s
+        for w in self._workers:
+            w.join(timeout=max(0.0, deadline - time.monotonic()))
+        # An in-flight job that finished during the join may have let its worker
+        # loop once more and dequeue nothing (it exits on _stopping); but a job
+        # could also have raced onto the queue between the first drain and the
+        # sentinels. Sweep once more so nothing is left unresolved.
+        self._drain_queue()
+
+    def _drain_queue(self):
+        """Resolve every still-queued job with a ShuttingDown error and release
+        its admission permit. Idempotent; safe to call repeatedly."""
+        while True:
+            try:
+                job = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if job is None:  # a shutdown sentinel — nothing to resolve
+                self._queue.task_done()
+                continue
+            if not job.future.done():
+                job.future.set_exception(ShuttingDown("server shutting down"))
+            self.metrics.on_drain()
+            self._admit.release()
+            self._queue.task_done()
 
     @property
     def ready(self) -> bool:
@@ -359,7 +419,12 @@ class TtsEngine:
     def submit(self, voice_id: str, text: str, overrides: Optional[dict] = None,
                max_tokens: Optional[int] = None,
                frames_after_eos: Optional[int] = None) -> Job:
-        """Admit a job or raise AdmissionRejected (429). Non-blocking admission."""
+        """Admit a job or raise AdmissionRejected (429). Non-blocking admission.
+
+        Once graceful shutdown has begun, refuses new work with ShuttingDown
+        (503) so a draining process doesn't admit jobs it will only fail."""
+        if self._stopping:
+            raise ShuttingDown("server shutting down")
         self.metrics.on_received()
         if not self._admit.acquire(blocking=False):
             self.metrics.on_rejected()
