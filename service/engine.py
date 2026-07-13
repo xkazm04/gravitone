@@ -20,7 +20,7 @@ import subprocess
 import threading
 import time
 import wave
-from collections import deque
+from collections import OrderedDict, deque
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -99,6 +99,7 @@ class Metrics:
         self.rejected = 0     # 429s (admission refused)
         self.errored = 0
         self.timeouts = 0     # 504s (synthesis exceeded request_timeout_s)
+        self.abandoned = 0    # jobs skipped un-run because the caller gave up
         self.in_flight = 0    # currently inside generate()
         self.queued = 0       # admitted but not yet being processed
         self._latencies: deque[float] = deque(maxlen=window)   # end-to-end seconds
@@ -119,6 +120,14 @@ class Metrics:
     def on_timeout(self):
         with self._lock:
             self.timeouts += 1
+
+    def on_abandoned(self):
+        # A queued job the caller already gave up on (504/disconnect): it was
+        # admitted (queued++) but never started (no on_start), so undo the
+        # queue count and tally it as abandoned rather than errored/completed.
+        with self._lock:
+            self.queued -= 1
+            self.abandoned += 1
 
     def on_enqueue(self):
         with self._lock:
@@ -162,6 +171,7 @@ class Metrics:
                 "rejected_429": self.rejected,
                 "errored": self.errored,
                 "timeouts": self.timeouts,
+                "abandoned": self.abandoned,
                 "in_flight": self.in_flight,
                 "queued": self.queued,
                 "audio_seconds_total": round(self.audio_seconds_total, 2),
@@ -196,6 +206,13 @@ class Job:
     overrides: dict = field(default_factory=dict)
     future: Future = field(default_factory=Future)
     t_enqueue: float = field(default_factory=time.perf_counter)
+    # Set by the API layer when the caller has given up (504 timeout or client
+    # disconnect). The worker checks this BEFORE starting synthesis and skips
+    # the job if set — no wasted generation, permit released immediately. There
+    # is no mid-generation cancellation: generate_audio is a single atomic C/
+    # torch call with no cooperative cancel point, so a job already inside the
+    # model runs to completion; only jobs still queued can be skipped.
+    abandoned: threading.Event = field(default_factory=threading.Event)
 
 
 @dataclass
@@ -207,25 +224,36 @@ class SynthResult:
     queue_seconds: float
 
 
+# A worker loads a fresh model state per distinct voice and keeps it hot. The
+# cache is bounded (LRU) so a long-lived process that serves many one-off voices
+# doesn't grow its resident set without limit.
+_VOICE_CACHE_MAX = 8
+
+
 class _Worker(threading.Thread):
     def __init__(self, idx: int, engine: "TtsEngine"):
         super().__init__(name=f"tts-worker-{idx}", daemon=True)
         self.idx = idx
         self.engine = engine
         self.model = None
-        self._voice_cache: dict[str, dict] = {}
+        # LRU: most-recently-used voice kept at the end; evict from the front.
+        self._voice_cache: "OrderedDict[str, dict]" = OrderedDict()
         self.ready = threading.Event()
 
     # -- voice loading (per-instance; states are model-specific) -----------
     def _voice_state(self, voice_id: str) -> dict:
         st = self._voice_cache.get(voice_id)
         if st is not None:
+            self._voice_cache.move_to_end(voice_id)  # mark most-recently-used
             return st
         # 1) exported embedding in the voices dir, 2) a raw path, 3) a builtin name
         cand = Path(SETTINGS.voices_dir) / f"{voice_id}.safetensors"
         source = str(cand) if cand.is_file() else voice_id
         st = self.model.get_state_for_audio_prompt(source, truncate=True)
         self._voice_cache[voice_id] = st
+        self._voice_cache.move_to_end(voice_id)
+        if len(self._voice_cache) > _VOICE_CACHE_MAX:
+            self._voice_cache.popitem(last=False)  # evict least-recently-used
         return st
 
     def run(self):
@@ -247,6 +275,16 @@ class _Worker(threading.Thread):
                 continue
             if job is None:  # shutdown sentinel
                 break
+            if job.abandoned.is_set():
+                # Caller already gave up (504/disconnect): skip synthesis
+                # entirely rather than burn a full generation on a result no
+                # one will read. Release the admission permit immediately and
+                # resolve the future as cancelled (not errored).
+                self.engine.metrics.on_abandoned()
+                job.future.cancel()
+                self.engine._admit.release()
+                self.engine._queue.task_done()
+                continue
             self.engine.metrics.on_start()
             t_start = time.perf_counter()
             prev: dict = {}

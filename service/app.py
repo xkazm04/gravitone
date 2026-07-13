@@ -116,6 +116,13 @@ async def _await_result(job):
     except asyncio.TimeoutError:
         if ENGINE is not None:
             ENGINE.metrics.on_timeout()
+        # Signal the worker pool the caller has given up: a job still queued
+        # will be skipped un-run (permit freed immediately) instead of burning
+        # a full generation no one will read. A job already inside the model
+        # runs to completion (generate_audio is atomic — no cancel point).
+        abandoned = getattr(job, "abandoned", None)
+        if abandoned is not None:
+            abandoned.set()
         raise HTTPException(status_code=504, detail="synthesis timed out")
     except Exception as exc:  # noqa: BLE001 - worker error -> sanitized 500
         # Never leak the raw worker exception to the client: log it server-side
