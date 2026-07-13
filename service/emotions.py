@@ -30,7 +30,11 @@ from dataclasses import dataclass
 
 BASELINE = "baseline"
 
-# Template scale the user fills in one-by-one. Order is the display order.
+# Base scale every Character starts with. Order is the display order.
+# Characters may extend this with CUSTOM emotions ("sarcastic", "battle_cry")
+# — the tag grammar and the slot model never cared about the vocabulary, so a
+# custom emotion is a first-class slot: record a Voice, address it via the API,
+# fall back to baseline when absent. See voices.py::character_scale.
 EMOTION_SCALE: list[str] = [
     BASELINE,
     "calm",
@@ -41,6 +45,21 @@ EMOTION_SCALE: list[str] = [
     "whisper",
     "confused",
 ]
+
+_EMOTION_RE = re.compile(r"^[a-z][a-z0-9_]{1,23}$")
+
+
+def normalize_emotion(name: str) -> str:
+    """Canonical form of a (possibly custom) emotion name, or ValueError.
+    Lowercase, snake_case, 2-24 chars — the same shape the tag grammar and
+    voice_id slugs can carry safely."""
+    slug = re.sub(r"[\s-]+", "_", (name or "").strip().lower())
+    if not _EMOTION_RE.match(slug):
+        raise ValueError(
+            "emotion must be 2-24 chars, start with a letter, and use only "
+            "lowercase letters, digits and underscores"
+        )
+    return slug
 
 _TAG_RE = re.compile(r"\[(/?)([a-zA-Z_]*)\]")
 

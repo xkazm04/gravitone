@@ -88,6 +88,9 @@ def export_pack(character_id: str) -> Response:
         "character": {
             "character_id": character.character_id, "name": character.name,
             "tags": character.tags, "lang": character.lang,
+            # custom slots travel with the pack — a bought Character keeps its
+            # bespoke palette ("sarcastic", "battle_cry") on any instance
+            "custom_emotions": character.custom_emotions,
         },
         "license": "",   # creator fills in before publishing
         "creator": "",
@@ -176,7 +179,11 @@ async def import_pack(
             "sample_seconds": v.get("sample_seconds"), "lang": src.get("lang", "EN"),
             "imported": {"from": src.get("character_id"), "at": created},
         }
-    meta["characters"].setdefault(cid, {"name": name, "tags": list(src.get("tags") or [])})
+    meta["characters"].setdefault(cid, {
+        "name": name,
+        "tags": list(src.get("tags") or []),
+        "custom_emotions": [e for e in (src.get("custom_emotions") or []) if isinstance(e, str)],
+    })
     _save_meta(meta)
 
     imported = next((c for c in list_characters() if c.character_id == cid), None)
