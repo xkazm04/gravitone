@@ -172,6 +172,9 @@ def main() -> None:
     rc = cert["recommended_config"]
     print(f"Config: {rc['replicas']} replicas x TTS_TORCH_THREADS={rc['TTS_TORCH_THREADS']}, "
           f"TTS_QUEUE_MAX={rc['TTS_QUEUE_MAX']}")
+    # The launcher pins TTS_WORKERS=1 and the per-replica thread budget itself;
+    # this is the exact command that runs the recommended topology.
+    print(f"Run it: python -m service.replicas --replicas {rc['replicas']} --port 8000")
     print(f"wrote {a.out}")
     if cert["verdict"] == "certified":
         print("Add your box to the matrix: PR this file per docs/SUPPORTED_HARDWARE.md")

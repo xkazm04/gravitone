@@ -156,6 +156,40 @@ python -m service.loadtest \
   --voice alba --levels 1,2,3,4,6,8 --requests 8
 ```
 
+### Scaling on Arm — the replica launcher
+
+The model is **GIL/serialization-bound**, so the way to use all your cores is to
+run **N single-worker processes**, not one N-worker process (the load-test and
+certification harnesses both recommend exactly this). `service/replicas.py` is
+the supervisor that runs that topology:
+
+```bash
+# Run 4 single-worker replicas on one box (deploy target: Arm Linux).
+python -m service.replicas --replicas 4 --port 8000
+```
+
+What it does:
+- **Spawns N uvicorn single-worker replicas** and pins each one's thread budget
+  (`TTS_WORKERS=1`, plus `TTS_TORCH_THREADS` / `OMP_NUM_THREADS` /
+  `OPENBLAS_NUM_THREADS` / `MKL_NUM_THREADS = max(1, cores // replicas)`) **before**
+  each process starts, so the replicas don't oversubscribe the CPU.
+- **Shares one client-facing port** via `SO_REUSEPORT` on **Arm Linux** — the
+  kernel load-balances connections across replicas, so clients hit a single
+  `:8000`. On non-Linux dev boxes that kernel feature isn't available, so it
+  **falls back to sequential ports** `8000, 8001, … 8000+N-1` (logged at start-up).
+- **Supervises** the replicas: restarts a dead one with bounded exponential
+  backoff, fans `SIGTERM` out to all children on shutdown, and waits for them.
+- **Aggregated metrics**: a stdlib HTTP endpoint on `--metrics-port` (default
+  `--port + 1000`, e.g. `:9000`) fans `GET /metrics` out to every replica and
+  returns `{"replicas": [...], "totals": {received, completed, rejected_429,
+  errored, timeouts, abandoned, in_flight, queued}}`. Per-replica totals are
+  exact in the sequential-port mode; under `SO_REUSEPORT` the replicas answer on
+  one shared port and aren't individually addressable (documented trade-off —
+  use `--no-reuse-port` if you need per-replica accuracy).
+
+`python -m service.certify` prints the recommended replica count for your box
+and the exact `service.replicas` command to run it.
+
 ### ElevenLabs compatibility matrix (drop-in switch kit)
 
 Migrating an existing ElevenLabs integration is a **base-URL change** — same

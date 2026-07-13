@@ -51,7 +51,12 @@ class Settings:
     # WORKERS independent model instances process requests in parallel.
     # Generation is NOT thread-safe (see tts_model.py docstrings), so each
     # worker owns its own TTSModel. This is the hard parallelism ceiling.
-    workers: int = _int("TTS_WORKERS", 2)
+    #
+    # Default is 1: the model is GIL/serialization-bound, so the load-test and
+    # certification harnesses (service.loadtest / service.certify) recommend
+    # scaling by PROCESS, not in-process worker. Run N single-worker replicas
+    # with `python -m service.replicas --replicas N` rather than raising this.
+    workers: int = _int("TTS_WORKERS", 1)
     # Extra requests allowed to WAIT in the queue once all workers are busy.
     # Beyond (workers + queue_max) in flight -> HTTP 429 (backpressure).
     queue_max: int = _int("TTS_QUEUE_MAX", 32)
