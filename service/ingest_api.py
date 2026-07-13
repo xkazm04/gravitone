@@ -251,7 +251,8 @@ def _commit_progress(job: dict, done: int, total: int, current: str | None) -> N
         _persist(job)
 
 
-def _do_commit(job_id: str, character: str, emotions: list[str], character_id: str | None) -> None:
+def _do_commit(job_id: str, character: str, emotions: list[str], character_id: str | None,
+               statement: str) -> None:
     job = JOBS[job_id]
     total = len(emotions)
 
@@ -262,6 +263,7 @@ def _do_commit(job_id: str, character: str, emotions: list[str], character_id: s
     try:
         created = ingest.commit(
             Path(job["work_dir"]), character, emotions, character_id,
+            consent=statement, clip_sha256=job.get("clip_sha256"),
             progress=lambda done, cur: _commit_progress(job, done, total, cur),
             should_cancel=cancelled)
     except Exception as exc:  # noqa: BLE001
@@ -372,6 +374,10 @@ class CommitReq(BaseModel):
     character: str
     emotions: list[str]
     character_id: str | None = None
+    # Server-side consent gate: a direct API caller must attest ownership, and
+    # the statement is stored as a receipt on every created Voice.
+    attested: bool = False
+    statement: str = ""
 
 
 @router.post("/{job_id}/commit")
@@ -388,6 +394,9 @@ def commit(job_id: str, req: CommitReq):
             raise HTTPException(409, "scan not finished")
         if not req.character.strip() and not req.character_id:
             raise HTTPException(400, "character name required")
+        statement = req.statement.strip()
+        if not req.attested or not statement:
+            raise HTTPException(422, "ownership attestation required to clone a voice")
         job["status"] = "committing"
         job["cancel"] = False
         job["committed"] = None
@@ -395,7 +404,7 @@ def commit(job_id: str, req: CommitReq):
         _persist(job)
     threading.Thread(
         target=_do_commit,
-        args=(job_id, req.character.strip(), req.emotions, req.character_id),
+        args=(job_id, req.character.strip(), req.emotions, req.character_id, statement),
         daemon=True).start()
     return {"status": "committing"}
 

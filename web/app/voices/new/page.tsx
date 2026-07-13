@@ -157,7 +157,7 @@ export default function NewCharacterPage() {
     try {
       // async commit: the backend returns immediately; the committing poller
       // follows per-emotion progress through to 'committed' / 'error'.
-      const r = await fetch(`/api/ingest/${jobId}/commit`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ character, emotions: [...selected], character_id }) });
+      const r = await fetch(`/api/ingest/${jobId}/commit`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ character, emotions: [...selected], character_id, attested: consented, statement: CONSENT_STATEMENT }) });
       const j = await r.json();
       if (!r.ok) throw new Error(j?.detail ?? "commit failed");
     } catch (e) { setError(e instanceof Error ? e.message : "commit failed"); setPhase("review"); }

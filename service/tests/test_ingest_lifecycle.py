@@ -151,7 +151,8 @@ class CommitLifecycleTests(unittest.TestCase):
             job["partial"] = {"emotions_done": 0, "emotions_total": 2, "current": None}
             ingest_api.JOBS["c1"] = job
 
-            def fake_commit(work_dir, character, emotions, cid, *, progress=None, should_cancel=None):
+            def fake_commit(work_dir, character, emotions, cid, *, consent=None,
+                            clip_sha256=None, progress=None, should_cancel=None):
                 out = []
                 for idx, emo in enumerate(emotions):
                     if should_cancel and should_cancel():
@@ -164,7 +165,7 @@ class CommitLifecycleTests(unittest.TestCase):
                 return out
 
             with mock.patch.object(ingest_api.ingest, "commit", side_effect=fake_commit):
-                ingest_api._do_commit("c1", "Ada", ["happy", "sad"], None)
+                ingest_api._do_commit("c1", "Ada", ["happy", "sad"], None, "I consent.")
 
             self.assertEqual(job["status"], "committed")
             self.assertEqual(len(job["committed"]), 2)
@@ -176,7 +177,8 @@ class CommitLifecycleTests(unittest.TestCase):
             job = _make_job(Path(td), "c2", "committing", time.time())
             ingest_api.JOBS["c2"] = job
 
-            def fake_commit(work_dir, character, emotions, cid, *, progress=None, should_cancel=None):
+            def fake_commit(work_dir, character, emotions, cid, *, consent=None,
+                            clip_sha256=None, progress=None, should_cancel=None):
                 out = []
                 for idx, emo in enumerate(emotions):
                     if should_cancel and should_cancel():
@@ -186,7 +188,7 @@ class CommitLifecycleTests(unittest.TestCase):
                 return out
 
             with mock.patch.object(ingest_api.ingest, "commit", side_effect=fake_commit):
-                ingest_api._do_commit("c2", "Ada", ["happy", "sad"], None)
+                ingest_api._do_commit("c2", "Ada", ["happy", "sad"], None, "I consent.")
 
             # cancel flag set → _do_commit must not overwrite status to 'committed'
             self.assertNotEqual(job["status"], "committed")
@@ -205,6 +207,87 @@ class CommitLifecycleTests(unittest.TestCase):
     def test_cancel_unknown_returns_expired(self):
         resp = ingest_api.cancel_job("nope")
         self.assertEqual(resp.status_code, 404)
+
+
+class ConsentTests(unittest.TestCase):
+    def setUp(self):
+        self._orig_jobs = dict(ingest_api.JOBS)
+        ingest_api.JOBS.clear()
+
+    def tearDown(self):
+        ingest_api.JOBS.clear()
+        ingest_api.JOBS.update(self._orig_jobs)
+
+    def test_commit_requires_attestation(self):
+        from fastapi import HTTPException
+        with TemporaryDirectory() as td:
+            job = _make_job(Path(td), "a", "done", time.time())
+            ingest_api.JOBS["a"] = job
+            req = ingest_api.CommitReq(character="Ada", emotions=["happy"], attested=False)
+            with self.assertRaises(HTTPException) as ctx:
+                ingest_api.commit("a", req)
+            self.assertEqual(ctx.exception.status_code, 422)
+
+    def test_commit_requires_nonempty_statement(self):
+        from fastapi import HTTPException
+        with TemporaryDirectory() as td:
+            job = _make_job(Path(td), "b", "done", time.time())
+            ingest_api.JOBS["b"] = job
+            req = ingest_api.CommitReq(character="Ada", emotions=["happy"],
+                                       attested=True, statement="   ")
+            with self.assertRaises(HTTPException) as ctx:
+                ingest_api.commit("b", req)
+            self.assertEqual(ctx.exception.status_code, 422)
+
+    def test_consent_receipt_written_into_meta(self):
+        from service import ingest as ing
+        from service import voices as vc
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            wd = root / "work"
+            wd.mkdir()
+            (wd / "stem_happy.wav").write_bytes(b"fake")
+
+            def fake_run(cmd, capture_output=False):
+                # pocket_tts export-voice → create the output safetensors
+                Path(cmd[-1]).write_bytes(b"tensors")
+                return mock.Mock(returncode=0)
+
+            fake_wave = mock.MagicMock()
+            fake_wave.__enter__.return_value.getnframes.return_value = 24000
+            fake_wave.__enter__.return_value.getframerate.return_value = 24000
+
+            with mock.patch.object(ing, "VOICES_DIR", root), \
+                 mock.patch.object(vc, "VOICES_DIR", root), \
+                 mock.patch.object(vc, "META_PATH", root / "_meta.json"), \
+                 mock.patch.object(ing.subprocess, "run", side_effect=fake_run), \
+                 mock.patch.object(ing.wave, "open", return_value=fake_wave):
+                created = ing.commit(wd, "Ada", ["happy"], None,
+                                     consent="I own this voice.", clip_sha256="deadbeef")
+                self.assertEqual(len(created), 1)
+                meta = json.loads((root / "_meta.json").read_text("utf-8"))
+            entry = next(iter(meta["voices"].values()))
+            self.assertEqual(entry["consent"]["statement"], "I own this voice.")
+            self.assertEqual(entry["consent"]["clip_sha256"], "deadbeef")
+            self.assertIn("consented_at", entry["consent"])
+
+    def test_voice_consent_flag_from_meta(self):
+        from service import voices as vc
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "consented.safetensors").write_bytes(b"x")
+            (root / "legacy.safetensors").write_bytes(b"x")
+            meta = {"voices": {
+                "consented": {"name": "Ada", "character_id": "ada", "emotion": "happy",
+                              "consent": {"statement": "ok", "clip_sha256": "h",
+                                          "consented_at": "2026-01-01T00:00:00+00:00"}},
+                "legacy": {"name": "Old", "character_id": "old", "emotion": "baseline"},
+            }, "characters": {"ada": {"name": "Ada"}, "old": {"name": "Old"}}}
+            with mock.patch.object(vc, "VOICES_DIR", root):
+                voices = vc._cloned_voices(meta)
+            by_id = {v.voice_id: v for v in voices}
+            self.assertTrue(by_id["consented"].consent)
+            self.assertFalse(by_id["legacy"].consent)
 
 
 if __name__ == "__main__":

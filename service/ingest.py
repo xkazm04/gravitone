@@ -404,11 +404,13 @@ def scan(audio: Path, work_dir: Path, speaker: str = "auto", min_stem: float = 4
 
 # ── COMMIT (clone selected stems) ─────────────────────────────────────────────
 def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: str | None = None,
-           *, progress: Callable[[int, str | None], None] | None = None,
+           *, consent: str | None = None, clip_sha256: str | None = None,
+           progress: Callable[[int, str | None], None] | None = None,
            should_cancel: Callable[[], bool] | None = None) -> list[dict]:
     """Clone each accepted stem into a Voice. `progress(done, current)` fires
     per emotion for live UI; `should_cancel()` is polled between emotions so an
-    async commit can stop cleanly."""
+    async commit can stop cleanly. When `consent` (the attestation statement) is
+    given, a consent receipt is stamped into each created Voice's metadata."""
     cid = existing_cid or _slug(character)
     meta = _load_meta()
     name = meta["characters"].get(cid, {}).get("name", character) if existing_cid else character
@@ -431,10 +433,15 @@ def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: st
         if ex.returncode != 0 or not out.is_file():
             raise RuntimeError(f"clone {emo} failed: {ex.stderr.decode(errors='ignore')[-200:]}")
         meta = _load_meta()
-        meta["voices"][voice_id] = {
+        entry = {
             "name": name, "character_id": cid, "emotion": emo,
             "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "sample_seconds": seconds, "lang": "EN", "source": "ingest"}
+        if consent is not None:
+            entry["consent"] = {
+                "consented_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "clip_sha256": clip_sha256, "statement": consent}
+        meta["voices"][voice_id] = entry
         meta["characters"].setdefault(cid, {"name": name, "tags": ["ingested"]})
         _save_meta(meta)
         created.append({"voice_id": voice_id, "emotion": emo, "seconds": seconds})

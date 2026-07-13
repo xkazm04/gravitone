@@ -50,6 +50,9 @@ class Voice(BaseModel):
     lang: str = "EN"
     created: str | None = None
     sample_seconds: float | None = None
+    # True when a consent receipt is stored for this voice (ingest flow).
+    # Pre-existing / built-in voices report False (never migrated).
+    consent: bool = False
 
 
 class Character(BaseModel):
@@ -138,6 +141,7 @@ def _cloned_voices(meta: dict) -> list[Voice]:
             voice_id=p.stem, character_id=cid, emotion=emo,
             name=f"{cname} · {emo}", category="cloned", lang=m.get("lang", "EN"),
             created=m.get("created"), sample_seconds=m.get("sample_seconds"),
+            consent=bool(m.get("consent")),
         ))
     return out
 
@@ -282,7 +286,8 @@ def character_manifest(character_id: str) -> dict:
         if c.character_id != character_id:
             continue
         native = {
-            v.emotion: {"voice_id": v.voice_id, "sample_seconds": v.sample_seconds}
+            v.emotion: {"voice_id": v.voice_id, "sample_seconds": v.sample_seconds,
+                        "consent": v.consent}
             for v in c.voices
         }
         fallback = BASELINE if BASELINE in native else next(iter(native), None)
