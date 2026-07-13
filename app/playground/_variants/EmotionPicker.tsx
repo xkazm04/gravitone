@@ -10,7 +10,7 @@ import { createPortal } from "react-dom";
 import Link from "next/link";
 import { AnimatePresence, motion } from "framer-motion";
 import EmotionArt from "@/components/ui/EmotionArt";
-import { EMOTIONS } from "@/lib/emotions";
+import { EMOTION_IDS, emotionMeta } from "@/lib/emotions";
 import { EASE } from "@/components/ui/tokens";
 
 const R = 150;
@@ -20,6 +20,7 @@ export default function EmotionPicker({
   onClose,
   onPick,
   available,
+  scale,
   characterName,
   characterId,
 }: {
@@ -27,6 +28,7 @@ export default function EmotionPicker({
   onClose: () => void;
   onPick: (emotion: string) => void;
   available: string[];
+  scale: string[]; // the character's palette — base scale + custom slots
   characterName: string;
   characterId: string;
 }) {
@@ -77,11 +79,13 @@ export default function EmotionPicker({
                 </div>
               </div>
 
-              {EMOTIONS.map((e, i) => {
-                const a = (i / EMOTIONS.length) * Math.PI * 2 - Math.PI / 2;
+              {scale.map((id, i) => {
+                const e = emotionMeta(id);
+                const a = (i / scale.length) * Math.PI * 2 - Math.PI / 2;
                 const x = Math.cos(a) * R;
                 const y = Math.sin(a) * R;
-                const has = available.includes(e.id);
+                const has = available.includes(id);
+                const custom = !EMOTION_IDS.includes(id);
                 // Positioning transform lives on a plain wrapper; the animated
                 // button only touches opacity/scale (so framer's transform can't
                 // clobber the translate — that was the "all nodes stacked" bug).
@@ -96,7 +100,10 @@ export default function EmotionPicker({
                     >
                       <span
                         className="relative grid h-16 w-16 place-items-center overflow-hidden rounded-full border bg-black/60 transition-transform duration-300 group-hover:scale-110"
-                        style={{ borderColor: has ? `hsl(${e.hue} 85% 60%)` : "rgba(255,255,255,0.15)" }}
+                        style={{
+                          borderColor: has ? `hsl(${e.hue} 85% 60%)` : "rgba(255,255,255,0.15)",
+                          borderStyle: custom ? "dashed" : "solid", // custom slots read as bespoke
+                        }}
                       >
                         {/* hue glow — fades in on hover, out on leave */}
                         <span

@@ -1,10 +1,13 @@
 import Image from "next/image";
 import { emotionMeta } from "@/lib/emotions";
+import GeneratedGlyph from "./GeneratedGlyph";
 
 /**
- * Glowing per-emotion emblem. The source art is line-art on pure black, so
- * `mix-blend-screen` drops the black cleanly on the dark UI. `dim` fades
- * unavailable slots. Set `size` to the rendered px box.
+ * Glowing per-emotion emblem. Base emotions use hand-traced art (line-art on
+ * pure black, so `mix-blend-screen` drops the black cleanly on the dark UI);
+ * CUSTOM emotions have no baked image and fall back to their procedural
+ * sigil, generated deterministically from the name. `dim` fades unavailable
+ * slots. Set `size` to the rendered px box.
  */
 export default function EmotionArt({
   emotion,
@@ -18,6 +21,11 @@ export default function EmotionArt({
   className?: string;
 }) {
   const m = emotionMeta(emotion);
+
+  if (!m.art) {
+    return <GeneratedGlyph emotion={emotion} size={size} dim={dim} className={className} />;
+  }
+
   return (
     <Image
       src={m.art}

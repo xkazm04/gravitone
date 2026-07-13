@@ -12,7 +12,7 @@ import Link from "next/link";
 import { AnimatePresence, motion } from "framer-motion";
 import { Button, Eyebrow } from "@/components/ui/Primitives";
 import { EASE } from "@/components/ui/tokens";
-import { EMOTION_IDS, EMOTIONS, emotionMeta, wrapWithTag } from "@/lib/emotions";
+import { EMOTION_IDS, emotionMeta, wrapWithTag } from "@/lib/emotions";
 import EmotionArt from "@/components/ui/EmotionArt";
 import { DEFAULT_EXPRESSION, DEFAULT_TEXT, stripTags, type Expression, type Take } from "./shared";
 import { speak } from "./engine";
@@ -23,6 +23,7 @@ import TakeCode from "./TakeCode";
 type Character = {
   character_id: string; name: string; category: "cloned" | "premade";
   emotions: string[]; coverage: number; total: number; lang: string;
+  scale?: string[]; custom_emotions?: string[]; // the character's own palette
 };
 
 function Bars({ peaks, progress = 0, active = false, className = "" }: { peaks: number[]; progress?: number; active?: boolean; className?: string }) {
@@ -78,6 +79,11 @@ export default function PlaygroundConsole() {
   }, []);
 
   const character = useMemo(() => characters.find((c) => c.character_id === charId), [characters, charId]);
+  // The active Character's palette: base scale + its custom slots.
+  const scale = useMemo(
+    () => (character?.scale?.length ? character.scale : EMOTION_IDS),
+    [character],
+  );
   const plain = stripTags(text);
   const estSec = Math.max(1.5, Math.round(plain.length * 0.055 * 10) / 10);
   const usingFallback = takes.some((t) => t.mode === "browser");
@@ -142,6 +148,7 @@ export default function PlaygroundConsole() {
         onClose={() => setPickerOpen(false)}
         onPick={insertEmotion}
         available={character?.emotions ?? ["baseline"]}
+        scale={scale}
         characterName={character?.name ?? "Character"}
         characterId={character?.character_id ?? ""}
       />
@@ -203,16 +210,18 @@ export default function PlaygroundConsole() {
               </button>
             </div>
             <div className="flex flex-wrap gap-1.5">
-              {EMOTIONS.map((e) => {
-                const has = character?.emotions.includes(e.id) ?? false;
+              {scale.map((id) => {
+                const e = emotionMeta(id);
+                const has = character?.emotions.includes(id) ?? false;
+                const custom = !EMOTION_IDS.includes(id);
                 return (
-                  <button key={e.id} onClick={() => insertEmotion(e.id)}
+                  <button key={id} onClick={() => insertEmotion(id)}
                     title={has ? `${e.label} — available` : `${e.label} — not recorded, falls back to baseline`}
                     className={`font-jetbrains inline-flex items-center gap-1.5 rounded-full py-1 pl-1 pr-2.5 text-[11px] transition ${
-                      has ? "border border-white/15 bg-white/5 text-white/85 hover:border-cyan-400/40"
-                          : "border border-dashed border-white/12 text-white/60 hover:text-white/60"}`}>
+                      has ? `border bg-white/5 text-white/85 ${custom ? "border-violet-400/30 hover:border-violet-400/60" : "border-white/15 hover:border-cyan-400/40"}`
+                          : `border border-dashed text-white/60 ${custom ? "border-violet-400/20" : "border-white/12"}`}`}>
                     <span className="grid h-5 w-5 place-items-center overflow-hidden rounded-full bg-black/50">
-                      <EmotionArt emotion={e.id} size={20} dim={!has} />
+                      <EmotionArt emotion={id} size={20} dim={!has} />
                     </span>
                     {e.label}
                   </button>

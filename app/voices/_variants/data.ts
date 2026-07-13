@@ -28,6 +28,9 @@ export type Character = {
   created?: string | null;
   // Fallback telemetry: unmet requests per still-missing emotion.
   demand?: Record<string, number>;
+  // This Character's effective palette: base scale + its custom slots.
+  scale?: string[];
+  custom_emotions?: string[];
 };
 
 export function hueOf(id: string): number {

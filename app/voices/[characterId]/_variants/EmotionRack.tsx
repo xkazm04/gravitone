@@ -4,6 +4,7 @@
 // per emotion slot: status, sample, voice id, added, actions. Space-efficient and
 // practical; every slot is visible at once with no scrolling or spatial hunting.
 
+import { useState } from "react";
 import { useVoicePreview } from "@/app/voices/_variants/data";
 import { relTime } from "@/app/voices/_variants/data";
 import EmotionArt from "@/components/ui/EmotionArt";
@@ -11,13 +12,37 @@ import { pickAudio, type Slot } from "./useCharacterVoices";
 
 export default function EmotionRack({
   name, slots, coverage, total, busySlot, addVoice, removeVoice, onRecord,
+  addCustomEmotion, removeCustomEmotion,
 }: {
   name: string; slots: Slot[]; coverage: number; total: number; busySlot: string | null;
   addVoice: (emotion: string, f: File) => void; removeVoice: (id: string) => void;
   onRecord: (emotion: string) => void; // open the guided capture session
+  addCustomEmotion: (name: string) => Promise<void>;
+  removeCustomEmotion: (emotion: string) => Promise<void>;
 }) {
   const { preview, playingId, busyId } = useVoicePreview();
+  const [custom, setCustom] = useState("");
+  const [minting, setMinting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
   const missing = total - coverage;
+
+  async function mint() {
+    const n = custom.trim();
+    if (!n || minting) return;
+    setMinting(true); setErr(null);
+    try {
+      await addCustomEmotion(n);
+      setCustom("");
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "could not add the slot");
+    } finally { setMinting(false); }
+  }
+
+  async function dropSlot(emotion: string) {
+    setErr(null);
+    try { await removeCustomEmotion(emotion); }
+    catch (e) { setErr(e instanceof Error ? e.message : "could not remove the slot"); }
+  }
 
   return (
     <div className="py-4">
@@ -27,6 +52,10 @@ export default function EmotionRack({
           {coverage}/{total} recorded{missing > 0 && <span className="ml-2 text-amber-300/70">· {missing} fall back to baseline</span>}
         </span>
       </div>
+
+      {err && (
+        <p className="font-jetbrains mb-3 rounded-lg border border-amber-400/25 bg-amber-400/5 px-3 py-2 text-[11px] text-amber-200/90">{err}</p>
+      )}
 
       <div className="glass-panel overflow-x-auto rounded-xl">
         <table className="w-full min-w-[760px] border-collapse text-sm">
@@ -69,6 +98,12 @@ export default function EmotionRack({
                         <EmotionArt emotion={s.emotion} size={34} dim={!filled} />
                       </span>
                       <span className="text-sm font-medium text-white">{s.label}</span>
+                      {s.custom && (
+                        <span title="Custom emotion — glyph generated from the name"
+                          className="font-jetbrains rounded-full border border-violet-400/30 bg-violet-400/10 px-1.5 py-0.5 text-[10px] text-violet-200">
+                          custom
+                        </span>
+                      )}
                     </div>
                   </td>
 
@@ -110,6 +145,13 @@ export default function EmotionRack({
                           className="font-jetbrains ml-3 text-[11px] text-white/45 transition hover:text-white/80 disabled:opacity-50">
                           upload
                         </button>
+                        {s.custom && (
+                          <button onClick={() => void dropSlot(s.emotion)} disabled={isBusy}
+                            title="Remove this custom slot"
+                            className="font-jetbrains ml-3 text-[11px] text-white/35 transition hover:text-rose-300 disabled:opacity-50">
+                            drop
+                          </button>
+                        )}
                       </>
                     )}
                   </td>
@@ -118,6 +160,36 @@ export default function EmotionRack({
             })}
           </tbody>
         </table>
+      </div>
+
+      {/* custom emotion palette — the scale is a platform primitive, not a constant */}
+      <div className="glass-panel mt-4 rounded-xl p-4">
+        <div className="flex flex-wrap items-center gap-3">
+          <span className="font-jetbrains text-[11px] uppercase tracking-widest text-white/60">
+            extend the palette
+          </span>
+          <input
+            value={custom}
+            onChange={(e) => setCustom(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && void mint()}
+            placeholder="sarcastic, battle cry, asmr…"
+            maxLength={24}
+            className="font-hanken w-56 rounded-lg border border-white/12 bg-white/[0.03] px-3 py-1.5 text-sm text-white placeholder:text-white/40 focus:border-violet-400/40 focus:outline-none"
+          />
+          <button
+            onClick={() => void mint()}
+            disabled={!custom.trim() || minting}
+            className="font-jetbrains cursor-pointer rounded-full border border-violet-400/30 bg-violet-400/10 px-3 py-1.5 text-[12px] text-violet-200 transition hover:bg-violet-400/20 disabled:opacity-40"
+          >
+            {minting ? "adding…" : "+ custom emotion"}
+          </button>
+        </div>
+        <p className="font-jetbrains mt-2 text-[11px] leading-relaxed text-white/45">
+          A custom slot is addressable immediately —{" "}
+          <span className="text-violet-200">{name.toLowerCase().replace(/\s+/g, "-")}:{custom.trim().toLowerCase().replace(/[\s-]+/g, "_") || "sarcastic"}</span>{" "}
+          in the API and <span className="text-violet-200">[{custom.trim().toLowerCase().replace(/[\s-]+/g, "_") || "sarcastic"}]</span> in metatags — and
+          falls back to baseline until you record it. Its glyph is generated from the name.
+        </p>
       </div>
     </div>
   );

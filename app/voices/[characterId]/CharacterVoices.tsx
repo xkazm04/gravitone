@@ -12,16 +12,18 @@ import ApiPanel from "./_variants/ApiPanel";
 
 // Rack won the voice-overview round — rendered directly, no switcher.
 export default function CharacterVoices({ characterId }: { characterId: string }) {
-  const { character, slots, coverage, total, loading, error, busySlot, addVoice, removeVoice } =
-    useCharacterVoices(characterId);
+  const { character, slots, coverage, total, loading, error, busySlot, addVoice, removeVoice,
+          addCustomEmotion, removeCustomEmotion } = useCharacterVoices(characterId);
   const [recording, setRecording] = useState<string | null>(null);
 
   // Deep link from playground fallbacks: /voices/{id}?record=angry opens the
   // guided recorder. Read via window.location so no Suspense boundary needed.
+  // Accepts custom slots too — validated against the character's own scale.
   useEffect(() => {
     const wanted = new URLSearchParams(window.location.search).get("record");
-    if (wanted && EMOTION_IDS.includes(wanted)) setRecording(wanted);
-  }, []);
+    if (!wanted) return;
+    if (EMOTION_IDS.includes(wanted) || character?.scale?.includes(wanted)) setRecording(wanted);
+  }, [character]);
 
   // GuidedRecorder needs a throwing clone (it drives its own state machine).
   // Self-recorded here = the speaker IS the attester (Voice Vault consent).
@@ -89,6 +91,7 @@ export default function CharacterVoices({ characterId }: { characterId: string }
           name={character.name} slots={slots} coverage={coverage} total={total}
           busySlot={busySlot} addVoice={addVoiceWithConsent} removeVoice={removeVoice}
           onRecord={setRecording}
+          addCustomEmotion={addCustomEmotion} removeCustomEmotion={removeCustomEmotion}
         />
       </div>
 

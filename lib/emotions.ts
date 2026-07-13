@@ -24,8 +24,27 @@ export const EMOTIONS: EmotionMeta[] = [
 export const BASELINE = "baseline";
 export const EMOTION_IDS = EMOTIONS.map((e) => e.id);
 
+import { hueFor } from "./glyphs/generate";
+
+/** True for the eight emotions that ship hand-traced art. */
+export function isBaseEmotion(id: string): boolean {
+  return EMOTION_IDS.includes(id);
+}
+
+/**
+ * Metadata for any emotion — including a Character's CUSTOM slots, which have
+ * no baked art. Custom emotions get a deterministic hue and an empty `art`
+ * path; EmotionArt renders their procedural sigil instead of an image.
+ */
 export function emotionMeta(id: string): EmotionMeta {
-  return EMOTIONS.find((e) => e.id === id) ?? EMOTIONS[0];
+  const known = EMOTIONS.find((e) => e.id === id);
+  if (known) return known;
+  return {
+    id,
+    label: id.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()),
+    hue: hueFor(id),
+    art: "", // no baked image — generated glyph
+  };
 }
 
 /** Wrap a selection (or insert an empty pair) with an emotion metatag. */
