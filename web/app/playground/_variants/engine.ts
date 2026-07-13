@@ -1,31 +1,63 @@
 "use client";
 
-import { stripTags, waveHeights, type Expression, type Segment } from "./shared";
+import { stripTags, waveHeights, type Expression, type Segment, type Take } from "./shared";
+
+// One module-level AudioContext shared across every peak computation. Browsers
+// cap the number of live AudioContexts (~6), so minting a fresh one per take
+// (and closing it) churned toward that ceiling; a single resumable context
+// decodes every take. Never closed — it lives for the page's lifetime.
+let sharedCtx: AudioContext | null = null;
+
+function peakContext(): AudioContext {
+  if (!sharedCtx) {
+    const AC: typeof AudioContext =
+      window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    sharedCtx = new AC();
+  }
+  // A context can auto-suspend (autoplay policy); resume before decoding.
+  if (sharedCtx.state === "suspended") void sharedCtx.resume();
+  return sharedCtx;
+}
 
 /** Decode a WAV blob and reduce it to N peak bars + true duration. */
 export async function computePeaks(blob: Blob, n = 56): Promise<{ peaks: number[]; duration: number }> {
-  const AC: typeof AudioContext =
-    window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-  const ctx = new AC();
-  try {
-    const buf = await ctx.decodeAudioData(await blob.arrayBuffer());
-    const data = buf.getChannelData(0);
-    const chunk = Math.max(1, Math.floor(data.length / n));
-    const peaks: number[] = [];
-    for (let i = 0; i < n; i++) {
-      let peak = 0;
-      const start = i * chunk;
-      for (let j = start; j < start + chunk && j < data.length; j++) {
-        const v = Math.abs(data[j]);
-        if (v > peak) peak = v;
-      }
-      peaks.push(peak);
+  const ctx = peakContext();
+  const buf = await ctx.decodeAudioData(await blob.arrayBuffer());
+  const data = buf.getChannelData(0);
+  const chunk = Math.max(1, Math.floor(data.length / n));
+  const peaks: number[] = [];
+  for (let i = 0; i < n; i++) {
+    let peak = 0;
+    const start = i * chunk;
+    for (let j = start; j < start + chunk && j < data.length; j++) {
+      const v = Math.abs(data[j]);
+      if (v > peak) peak = v;
     }
-    const max = Math.max(...peaks, 0.001);
-    return { peaks: peaks.map((p) => Math.max(0.06, p / max)), duration: buf.duration };
-  } finally {
-    void ctx.close();
+    peaks.push(peak);
   }
+  const max = Math.max(...peaks, 0.001);
+  return { peaks: peaks.map((p) => Math.max(0.06, p / max)), duration: buf.duration };
+}
+
+/**
+ * Publish a take to the backend as a public Voice Card and return its id.
+ * The single upload path shared by "↗ share" and the client-review flow — both
+ * turn the take's audio blob into the same multipart POST to /api/takes.
+ * Throws for browser-fallback takes (no audio blob to publish).
+ */
+export async function uploadTake(t: Take): Promise<string> {
+  if (!t.url) throw new Error("browser-fallback takes cannot be shared");
+  const blob = await (await fetch(t.url)).blob();
+  const fd = new FormData();
+  fd.append("file", blob, "take.wav");
+  fd.append("meta", JSON.stringify({
+    character_id: t.characterId, character_name: t.characterName,
+    text: t.text, seconds: t.seconds, rtf: t.rtf, segments: t.segments,
+  }));
+  const r = await fetch("/api/takes", { method: "POST", body: fd });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j?.detail ?? "could not publish the take");
+  return j.take_id as string;
 }
 
 export type SpeakResult = {

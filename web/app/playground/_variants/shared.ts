@@ -30,6 +30,8 @@ export type Take = {
   // The expression knobs this take was rendered with — together with text +
   // characterId this is the exact reproduction recipe for the code export.
   expr: Expression;
+  // Epoch ms the take was rendered — the sort key for session restore.
+  createdAt: number;
 };
 
 /** Expression controls. Pocket TTS has no emotion/speed parameter — these are

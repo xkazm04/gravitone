@@ -15,7 +15,8 @@ import { EASE } from "@/components/ui/tokens";
 import { EMOTION_IDS, emotionMeta, wrapWithTag } from "@/lib/emotions";
 import EmotionArt from "@/components/ui/EmotionArt";
 import { DEFAULT_EXPRESSION, DEFAULT_TEXT, stripTags, type Expression, type Take } from "./shared";
-import { speak, EngineBusyError } from "./engine";
+import { speak, uploadTake, EngineBusyError } from "./engine";
+import { putTake, getRecentTakes, deleteTake } from "@/lib/takeStore";
 import { useAudioPlayer } from "./useAudioPlayer";
 import EmotionPicker from "./EmotionPicker";
 import TakeCode from "./TakeCode";
@@ -99,6 +100,34 @@ export default function PlaygroundConsole() {
       .catch(() => setCharacters([]));
   }, []);
 
+  // Restore the most recent session takes from IndexedDB on mount so a refresh
+  // no longer destroys the log. Each restored take carries a fresh object URL.
+  useEffect(() => {
+    let cancelled = false;
+    getRecentTakes(20)
+      .then((restored) => {
+        if (cancelled || restored.length === 0) {
+          // Unmounted before restore landed — revoke the URLs we just minted.
+          if (cancelled) for (const t of restored) if (t.url) URL.revokeObjectURL(t.url);
+          return;
+        }
+        setTakes((current) => {
+          const known = new Set(current.map((t) => t.id));
+          return [...current, ...restored.filter((t) => !known.has(t.id))];
+        });
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
+  // Revoke every take's object URL on unmount so navigating away doesn't leak
+  // them (object URLs outlive component teardown in an SPA).
+  const takesRef = useRef<Take[]>([]);
+  useEffect(() => { takesRef.current = takes; }, [takes]);
+  useEffect(() => () => {
+    for (const t of takesRef.current) if (t.url) URL.revokeObjectURL(t.url);
+  }, []);
+
   const character = useMemo(() => characters.find((c) => c.character_id === charId), [characters, charId]);
   // The active Character's palette: base scale + its custom slots.
   const scale = useMemo(
@@ -120,27 +149,18 @@ export default function PlaygroundConsole() {
 
   /** Persist a take server-side, mint its /t/{id} page, copy the link. */
   async function share(t: Take) {
-    if (!t.url || shares[t.id]) {
-      const existing = shares[t.id];
-      if (existing && existing !== "pending" && existing !== "error") {
-        await navigator.clipboard.writeText(`${window.location.origin}/t/${existing}`).catch(() => {});
-      }
+    const existing = shares[t.id];
+    if (existing && existing !== "pending" && existing !== "error") {
+      // Already published — clicking again just re-copies the link.
+      await navigator.clipboard.writeText(`${window.location.origin}/t/${existing}`).catch(() => {});
       return;
     }
+    if (!t.url || existing === "pending") return;
     setShares((s) => ({ ...s, [t.id]: "pending" }));
     try {
-      const blob = await (await fetch(t.url)).blob();
-      const fd = new FormData();
-      fd.append("file", blob, "take.wav");
-      fd.append("meta", JSON.stringify({
-        character_id: t.characterId, character_name: t.characterName,
-        text: t.text, seconds: t.seconds, rtf: t.rtf, segments: t.segments,
-      }));
-      const r = await fetch("/api/takes", { method: "POST", body: fd });
-      const j = await r.json().catch(() => ({}));
-      if (!r.ok) throw new Error(j?.detail ?? "share failed");
-      setShares((s) => ({ ...s, [t.id]: j.take_id as string }));
-      await navigator.clipboard.writeText(`${window.location.origin}/t/${j.take_id}`).catch(() => {});
+      const id = await uploadTake(t);
+      setShares((s) => ({ ...s, [t.id]: id }));
+      await navigator.clipboard.writeText(`${window.location.origin}/t/${id}`).catch(() => {});
     } catch {
       setShares((s) => ({ ...s, [t.id]: "error" }));
       setTimeout(() => setShares((s) => { const { [t.id]: _, ...rest } = s; return rest; }), 2000);
@@ -151,18 +171,7 @@ export default function PlaygroundConsole() {
   async function ensureShared(t: Take): Promise<string> {
     const existing = shares[t.id];
     if (existing && existing !== "pending" && existing !== "error") return existing;
-    if (!t.url) throw new Error("browser-fallback takes cannot be reviewed");
-    const blob = await (await fetch(t.url)).blob();
-    const fd = new FormData();
-    fd.append("file", blob, "take.wav");
-    fd.append("meta", JSON.stringify({
-      character_id: t.characterId, character_name: t.characterName,
-      text: t.text, seconds: t.seconds, rtf: t.rtf, segments: t.segments,
-    }));
-    const r = await fetch("/api/takes", { method: "POST", body: fd });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(j?.detail ?? "could not publish the take");
-    const id = j.take_id as string;
+    const id = await uploadTake(t);
     setShares((s) => ({ ...s, [t.id]: id }));
     return id;
   }
@@ -189,6 +198,27 @@ export default function PlaygroundConsole() {
     } finally { setReviewBusy(false); }
   }
 
+  /** Persist a take (audio blob + metadata) so it survives a refresh. */
+  async function persistTake(t: Take) {
+    try {
+      const blob = t.url ? await (await fetch(t.url)).blob() : null;
+      await putTake(t, blob);
+    } catch { /* best-effort — the take still lives in state */ }
+  }
+
+  /** Delete a take: revoke its object URL, drop it from the store + all state. */
+  function removeTake(id: string) {
+    setTakes((list) => {
+      const t = list.find((x) => x.id === id);
+      if (t?.url) URL.revokeObjectURL(t.url);
+      return list.filter((x) => x.id !== id);
+    });
+    setReviewSel((s) => { const n = new Set(s); n.delete(id); return n; });
+    setCodeFor((c) => (c === id ? null : c));
+    setShares((s) => { const { [id]: _, ...rest } = s; return rest; });
+    void deleteTake(id);
+  }
+
   async function generate() {
     if (!plain || busy || !character) return;
     setBusy(true);
@@ -197,13 +227,18 @@ export default function PlaygroundConsole() {
     try {
       const r = await speak(text, character.character_id, expr);
       seq.current += 1;
-      setTakes((t) => [{
-        id: `take-${seq.current}`, text: text.trim(),
+      // Timestamped id so restored takes (which keep their stored ids) never
+      // collide with freshly generated ones.
+      const take: Take = {
+        id: `take-${Date.now()}-${seq.current}`, text: text.trim(),
         characterId: character.character_id, characterName: character.name,
         mode: r.mode, url: r.url, peaks: r.peaks, seconds: r.seconds, kb: r.kb, rtf: r.rtf,
         synthSeconds: r.synthSeconds, queueSeconds: r.queueSeconds,
         ignoredSettings: r.ignoredSettings, segments: r.segments, expr: { ...expr },
-      }, ...t]);
+        createdAt: Date.now(),
+      };
+      setTakes((t) => [take, ...t]);
+      void persistTake(take);
     } catch (e) {
       // Backpressure keeps the engine reachable — offer a retry. Anything else
       // is a genuine failure that must be visible, not swallowed.
@@ -481,6 +516,14 @@ export default function PlaygroundConsole() {
                     <span title="Connect a Gravitone endpoint to export WAV"
                       className="font-jetbrains shrink-0 cursor-not-allowed rounded-lg border border-white/10 px-3 py-1.5 text-[11px] text-white/50">↓ wav</span>
                   )}
+                  <button
+                    onClick={() => removeTake(t.id)}
+                    title="Delete this take from the log"
+                    aria-label="Delete take"
+                    className="font-jetbrains shrink-0 rounded-lg border border-white/15 px-3 py-1.5 text-[11px] text-white/60 transition hover:border-rose-400/40 hover:text-rose-200"
+                  >
+                    ✕
+                  </button>
                 </div>
 
                 {codeFor === t.id && t.mode === "gravitone" && <TakeCode take={t} />}
