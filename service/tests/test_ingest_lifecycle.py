@@ -5,6 +5,7 @@ call (ffmpeg / ffprobe / pocket_tts) is mocked — no audio, no network, no mode
 """
 from __future__ import annotations
 
+import io
 import json
 import time
 import unittest
@@ -13,6 +14,38 @@ from tempfile import TemporaryDirectory
 from unittest import mock
 
 from service import ingest_api
+
+
+class _FakeExportPopen:
+    """Stand-in for the one-load `service.export_stems` child. Reads the spec
+    the parent wrote, 'exports' each stem (writes its dst file), and streams one
+    JSON status line per stem on stdout — exactly the real protocol. Counts how
+    many times it was spawned so a test can prove ONE load serves N stems."""
+
+    spawned = 0
+
+    def __init__(self, cmd, stdout=None, stderr=None, text=None):
+        type(self).spawned += 1
+        self.terminated = False
+        spec = json.loads(Path(cmd[-1]).read_text("utf-8"))
+        self._stems = spec["stems"]
+        self.stdout = self._gen()
+        self.stderr = io.StringIO("")
+        self.returncode = 0
+
+    def _gen(self):
+        for stem in self._stems:
+            Path(stem["dst"]).write_bytes(b"tensors")  # emulate the export
+            yield json.dumps({"emotion": stem["emotion"], "ok": True}) + "\n"
+
+    def wait(self, timeout=None):
+        return 0
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.terminated = True
 
 
 class ValidationTests(unittest.TestCase):
@@ -248,23 +281,21 @@ class ConsentTests(unittest.TestCase):
             wd.mkdir()
             (wd / "stem_happy.wav").write_bytes(b"fake")
 
-            def fake_run(cmd, capture_output=False):
-                # pocket_tts export-voice → create the output safetensors
-                Path(cmd[-1]).write_bytes(b"tensors")
-                return mock.Mock(returncode=0)
-
+            _FakeExportPopen.spawned = 0
+            # 6s stem — comfortably over the 4s eligibility floor.
             fake_wave = mock.MagicMock()
-            fake_wave.__enter__.return_value.getnframes.return_value = 24000
+            fake_wave.__enter__.return_value.getnframes.return_value = 24000 * 6
             fake_wave.__enter__.return_value.getframerate.return_value = 24000
 
             with mock.patch.object(ing, "VOICES_DIR", root), \
                  mock.patch.object(vc, "VOICES_DIR", root), \
                  mock.patch.object(vc, "META_PATH", root / "_meta.json"), \
-                 mock.patch.object(ing.subprocess, "run", side_effect=fake_run), \
+                 mock.patch.object(ing.subprocess, "Popen", _FakeExportPopen), \
                  mock.patch.object(ing.wave, "open", return_value=fake_wave):
                 created = ing.commit(wd, "Ada", ["happy"], None,
                                      consent="I own this voice.", clip_sha256="deadbeef")
                 self.assertEqual(len(created), 1)
+                self.assertEqual(_FakeExportPopen.spawned, 1)  # one model load
                 meta = json.loads((root / "_meta.json").read_text("utf-8"))
             entry = next(iter(meta["voices"].values()))
             self.assertEqual(entry["consent"]["statement"], "I own this voice.")

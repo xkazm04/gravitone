@@ -36,12 +36,15 @@ import mimetypes
 import os
 import subprocess
 import sys
+import threading
 import uuid
 import wave
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from service.config import SETTINGS
 from service.emotions import BASELINE, EMOTION_SCALE
 from service.voices import VOICES_DIR, _load_meta, _save_meta, _slug
 
@@ -50,6 +53,12 @@ GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 FLASH_MODEL = os.environ.get("INGEST_FLASH_MODEL", "gemini-3.5-flash")
 PRO_MODEL = os.environ.get("INGEST_PRO_MODEL", "gemini-3.1-pro-preview")
 EMOTIONS = list(EMOTION_SCALE)
+
+# Bounded pool for per-segment labeling. Cloud labeling does an ffmpeg extract +
+# a blocking Gemini urlopen per segment; running a handful concurrently overlaps
+# the network waits without stampeding the API. Order stays stable (results are
+# mapped back by segment index), and one segment's failure never kills the batch.
+LABEL_WORKERS = 4
 
 import urllib.request  # noqa: E402
 
@@ -336,33 +345,62 @@ def label_and_stem(work_dir: Path, target: str, min_stem: float = 4.0, limit: in
     clean = work_dir / "clean.wav"
 
     prog("label", "active")
-    labelled: list[dict] = []
-    counts: dict[str, int] = {}
     todo = tsegs[:limit]
-    for i, s in enumerate(todo):
+    # Each segment is extracted + classified on a bounded pool; results are
+    # written back BY INDEX so the final order is identical to serial labeling.
+    results: list[dict | None] = [None] * len(todo)
+    counts: dict[str, int] = {}
+    state = {"done": 0, "errors": 0}
+    prog_lock = threading.Lock()
+
+    def _label_seg(i: int, s: dict) -> None:
+        """Extract + classify one segment. A failure (ffmpeg extract OR the
+        classifier) degrades THIS segment to baseline and is counted, without
+        killing the batch."""
         seg_wav = work_dir / f"seg_{i:03d}.wav"
-        to_wav(clean, seg_wav, s["start"], s["end"])
-        if mode == "sovereign":
-            # No cloud classifier: everything is baseline. Emotions get added
-            # afterwards via the studio's guided per-emotion recorder.
-            lab = {"emotion": BASELINE, "confidence": 1.0, "cue": "", "model": "local"}
-        else:
-            lab = label_emotion(seg_wav)
-        lab.update({"i": i, "dur": round(s["end"] - s["start"], 2), "text": s["text"][:60], "wav": str(seg_wav)})
-        labelled.append(lab)
-        counts[lab["emotion"]] = counts.get(lab["emotion"], 0) + 1
-        if partial:
-            partial({"segments_total": len(todo), "segments_done": i + 1, "emotion_counts": dict(counts)})
+        failed = False
+        try:
+            to_wav(clean, seg_wav, s["start"], s["end"])
+            if mode == "sovereign":
+                # No cloud classifier: everything is baseline. Emotions get added
+                # afterwards via the studio's guided per-emotion recorder.
+                lab = {"emotion": BASELINE, "confidence": 1.0, "cue": "", "model": "local"}
+            else:
+                lab = label_emotion(seg_wav)
+        except Exception:  # noqa: BLE001 - one segment must not fail the batch
+            failed = True
+            lab = {"emotion": BASELINE, "confidence": 0.0, "cue": "", "model": "error"}
+        lab.update({"i": i, "dur": round(s["end"] - s["start"], 2),
+                    "text": s["text"][:60], "wav": str(seg_wav),
+                    "ok": (not failed) and seg_wav.is_file()})
+        with prog_lock:
+            results[i] = lab
+            counts[lab["emotion"]] = counts.get(lab["emotion"], 0) + 1
+            state["done"] += 1
+            if failed:
+                state["errors"] += 1
+            if partial:
+                partial({"segments_total": len(todo), "segments_done": state["done"],
+                         "emotion_counts": dict(counts), "label_errors": state["errors"]})
+
+    if todo:
+        with ThreadPoolExecutor(max_workers=min(LABEL_WORKERS, len(todo))) as pool:
+            for fut in [pool.submit(_label_seg, i, s) for i, s in enumerate(todo)]:
+                fut.result()  # re-raise only truly unexpected errors (not per-seg)
+    labelled = [r for r in results if r is not None]
     prog("label", "done")
 
     prog("stem", "active")
+    # Only segments whose wav was actually written can feed a stem; a segment
+    # that failed extraction is still labelled/counted but contributes no audio.
+    usable = [l for l in labelled if l.get("ok")]
     by_emotion: dict[str, list[dict]] = {}
-    for lab in labelled:
+    for lab in usable:
         by_emotion.setdefault(lab["emotion"], []).append(lab)
     stems: list[dict] = []
     base_wav = work_dir / "stem_baseline.wav"
-    base_dur = concat_wavs([Path(l["wav"]) for l in labelled], base_wav)
-    stems.append({"emotion": BASELINE, "seconds": base_dur, "segments": len(labelled),
+    base_dur = concat_wavs([Path(l["wav"]) for l in usable], base_wav)
+    stems.append({"emotion": BASELINE, "seconds": base_dur, "segments": len(usable),
                   "eligible": base_dur >= min_stem, "cues": []})
     for emo, labs in by_emotion.items():
         if emo == BASELINE:
@@ -407,46 +445,107 @@ def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: st
            *, consent: str | None = None, clip_sha256: str | None = None,
            progress: Callable[[int, str | None], None] | None = None,
            should_cancel: Callable[[], bool] | None = None) -> list[dict]:
-    """Clone each accepted stem into a Voice. `progress(done, current)` fires
-    per emotion for live UI; `should_cancel()` is polled between emotions so an
-    async commit can stop cleanly. When `consent` (the attestation statement) is
-    given, a consent receipt is stamped into each created Voice's metadata."""
+    """Clone each accepted stem into a Voice.
+
+    Cloning runs in ONE child process (`python -m service.export_stems`) that
+    loads the Pocket TTS model a single time and exports every stem in a loop —
+    instead of one `pocket_tts export-voice` subprocess (one cold ~15s CPU model
+    load) per emotion. The child streams a JSON status line per finished stem on
+    stdout; we parse them to drive `progress(done, current)` and to poll
+    `should_cancel()` between emotions (a cancel terminates the child after the
+    current line). When `consent` (the attestation statement) is given, a consent
+    receipt is stamped into each created Voice's metadata."""
     cid = existing_cid or _slug(character)
     meta = _load_meta()
     name = meta["characters"].get(cid, {}).get("name", character) if existing_cid else character
+
     created: list[dict] = []
-    for idx, emo in enumerate(emotions):
-        if should_cancel and should_cancel():
-            break
-        if progress:
-            progress(idx, emo)
+    if should_cancel and should_cancel():
+        return created
+
+    # Build the export plan: one entry per accepted stem present on disk.
+    plan: list[dict] = []  # {emotion, src, dst, voice_id, seconds}
+    for emo in emotions:
         sw = work_dir / f"stem_{emo}.wav"
         if not sw.is_file():
             continue
         with wave.open(str(sw), "rb") as w:
             seconds = round(w.getnframes() / w.getframerate(), 2)
         voice_id = f"{cid}-{emo}-{uuid.uuid4().hex[:6]}"
-        out = VOICES_DIR / f"{voice_id}.safetensors"
-        VOICES_DIR.mkdir(parents=True, exist_ok=True)
-        ex = subprocess.run([sys.executable, "-m", "pocket_tts", "export-voice", str(sw), str(out)],
-                            capture_output=True)
-        if ex.returncode != 0 or not out.is_file():
-            raise RuntimeError(f"clone {emo} failed: {ex.stderr.decode(errors='ignore')[-200:]}")
+        plan.append({"emotion": emo, "src": str(sw), "seconds": seconds,
+                     "voice_id": voice_id,
+                     "dst": str(VOICES_DIR / f"{voice_id}.safetensors")})
+
+    if not plan:
+        if progress:
+            progress(len(emotions), None)
+        return created
+
+    VOICES_DIR.mkdir(parents=True, exist_ok=True)
+    spec_path = work_dir / "export_spec.json"
+    spec_path.write_text(json.dumps({
+        "language": SETTINGS.language, "quantize": SETTINGS.quantize,
+        "stems": [{"emotion": p["emotion"], "src": p["src"], "dst": p["dst"]} for p in plan],
+    }), "utf-8")
+
+    by_emotion = {p["emotion"]: p for p in plan}
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "service.export_stems", str(spec_path)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def _terminate() -> None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except Exception:  # noqa: BLE001
+            proc.kill()
+
+    done = 0
+    cancelled = False
+    if progress:
+        progress(0, plan[0]["emotion"])
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            evt = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        emo = evt.get("emotion")
+        p = by_emotion.get(emo)
+        if p is None:
+            continue
+        if not evt.get("ok") or not Path(p["dst"]).is_file():
+            _terminate()
+            raise RuntimeError(f"clone {emo} failed: {evt.get('error') or 'export error'}")
         meta = _load_meta()
         entry = {
             "name": name, "character_id": cid, "emotion": emo,
             "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "sample_seconds": seconds, "lang": "EN", "source": "ingest"}
+            "sample_seconds": p["seconds"], "lang": "EN", "source": "ingest"}
         if consent is not None:
             entry["consent"] = {
                 "consented_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "clip_sha256": clip_sha256, "statement": consent}
-        meta["voices"][voice_id] = entry
+        meta["voices"][p["voice_id"]] = entry
         meta["characters"].setdefault(cid, {"name": name, "tags": ["ingested"]})
         _save_meta(meta)
-        created.append({"voice_id": voice_id, "emotion": emo, "seconds": seconds})
+        created.append({"voice_id": p["voice_id"], "emotion": emo, "seconds": p["seconds"]})
+        done += 1
         if progress:
-            progress(idx + 1, None)
+            progress(done, None)
+        if should_cancel and should_cancel():  # cancel between emotions
+            cancelled = True
+            _terminate()
+            break
+        if progress and done < len(plan):
+            progress(done, plan[done]["emotion"])
+    ret = proc.wait()
+    if not cancelled and ret != 0 and len(created) < len(plan):
+        err = (proc.stderr.read() if proc.stderr else "")[-200:]
+        raise RuntimeError(f"clone failed: {err or 'export_stems exited nonzero'}")
     return created
 
 
