@@ -42,11 +42,12 @@ export default function NewCharacterPage() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const [playing, setPlaying] = useState<string | null>(null);
 
+  // Cloneable characters change rarely; fetch once on mount, not per phase.
   useEffect(() => {
     fetch("/api/characters", { cache: "no-store" }).then((r) => (r.ok ? r.json() : []))
       .then((cs: (Character & { category: string })[]) => setCharacters(cs.filter((c) => c.category === "cloned")))
       .catch(() => {});
-  }, [phase]);
+  }, []);
 
   // ONE poller for both the analyze leg and the commit leg.
   useIngestJob({

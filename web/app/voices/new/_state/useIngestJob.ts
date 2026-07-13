@@ -11,7 +11,18 @@ import { TERMINAL_STATUSES, type Job } from "./machine";
  * Polling stops as soon as a terminal status arrives (done / committed / error
  * / cancelled / expired) and whenever `enabled` goes false (the reducer moves
  * to a non-polling phase).
+ *
+ * Backoff: a step moves fast early and then plateaus, so we poll 1.5s for the
+ * first ~20s of a step, 3s for the next ~20s, then 5s. The clock resets each
+ * time the server's `step` changes, so every new stage gets tight polling
+ * again.
  */
+function pollDelay(msInStep: number): number {
+  if (msInStep < 20_000) return 1500;
+  if (msInStep < 40_000) return 3000;
+  return 5000;
+}
+
 export function useIngestJob(opts: {
   jobId: string | null;
   enabled: boolean;
@@ -27,23 +38,28 @@ export function useIngestJob(opts: {
   useEffect(() => {
     if (!jobId || !enabled) return;
     let stopped = false;
+    let timer: ReturnType<typeof setTimeout>;
+    let stepKey: string | null | undefined;
+    let stepSince = Date.now();
 
-    const iv = setInterval(async () => {
+    const tick = async () => {
       try {
         const r = await fetch(`/api/ingest/${jobId}`, { cache: "no-store" });
         if (stopped) return;
-        if (r.status === 404) { stop(); onExpired.current(); return; }
+        if (r.status === 404) { onExpired.current(); return; } // terminal: no reschedule
         const job: Job = await r.json();
         if (stopped) return;
-        if (job.status === "expired") { stop(); onExpired.current(); return; }
+        if (job.status === "expired") { onExpired.current(); return; }
+        if (job.step !== stepKey) { stepKey = job.step; stepSince = Date.now(); }
         onJob.current(job);
-        if (TERMINAL_STATUSES.has(job.status)) stop();
+        if (TERMINAL_STATUSES.has(job.status)) return;         // terminal: stop
       } catch {
-        /* transient network error — keep polling */
+        /* transient network error — fall through and retry */
       }
-    }, 1500);
+      if (!stopped) timer = setTimeout(tick, pollDelay(Date.now() - stepSince));
+    };
 
-    function stop() { stopped = true; clearInterval(iv); }
-    return stop;
+    timer = setTimeout(tick, 1500);
+    return () => { stopped = true; clearTimeout(timer); };
   }, [jobId, enabled]);
 }
