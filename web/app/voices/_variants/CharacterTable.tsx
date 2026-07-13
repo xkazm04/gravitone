@@ -13,7 +13,23 @@ import { hueOf, relTime, useCharacters, useVoicePreview, patchCharacterReq, dele
 import { useAuth } from "@/lib/useAuth";
 import { CONSENT_PROMPT, recordVoiceOwnership } from "@/lib/voiceVault";
 
-type SortKey = "name" | "category" | "lang" | "coverage" | "created";
+type SortKey = "name" | "category" | "lang" | "coverage" | "demand" | "created";
+
+/** Unmet demand for a Character: total requests over its STILL-MISSING emotions
+ *  (a slot already recorded isn't unmet), plus the hottest missing slot to
+ *  record next. The backend already prunes recorded slots from `demand`; we
+ *  re-filter defensively so the number can never count a filled emotion. */
+function unmetDemand(c: Character): { total: number; hottest: string | null } {
+  let total = 0;
+  let hottest: string | null = null;
+  let max = 0;
+  for (const [emotion, n] of Object.entries(c.demand ?? {})) {
+    if (c.emotions.includes(emotion)) continue; // recorded → met, not unmet
+    total += n;
+    if (n > max) { max = n; hottest = emotion; }
+  }
+  return { total, hottest };
+}
 
 /** Run `task` over `items` with at most `limit` in flight; collects failures. */
 async function runPool<T>(items: T[], limit: number, task: (item: T) => Promise<void>): Promise<Error[]> {
@@ -98,6 +114,7 @@ export default function CharacterTable() {
       : sort.key === "category" ? c.category
       : sort.key === "lang" ? c.lang
       : sort.key === "coverage" ? c.coverage
+      : sort.key === "demand" ? unmetDemand(c).total
       : Date.parse(c.created ?? "") || 0;
     return [...f].sort((a, b) => (val(a) > val(b) ? sort.dir : val(a) < val(b) ? -sort.dir : 0));
   }, [characters, query, tagFilter, sort]);
@@ -106,7 +123,8 @@ export default function CharacterTable() {
   const allShownSelected = rows.length > 0 && rows.every((r) => selected.has(r.character_id));
 
   function toggleSort(key: SortKey) {
-    setSort((s) => (s.key === key ? { key, dir: s.dir === 1 ? -1 : 1 } : { key, dir: 1 }));
+    // Demand opens hottest-first (desc); every other column opens ascending.
+    setSort((s) => (s.key === key ? { key, dir: s.dir === 1 ? -1 : 1 } : { key, dir: key === "demand" ? -1 : 1 }));
   }
   function toggleOne(id: string) {
     setSelected((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
@@ -250,14 +268,15 @@ export default function CharacterTable() {
               <Th k="category">source</Th>
               <Th k="lang">lang</Th>
               <Th k="coverage">emotion coverage</Th>
+              <Th k="demand">demand</Th>
               <th className="px-3 py-2 text-left"><span className="font-jetbrains text-[11px] uppercase tracking-widest text-white/60">tags</span></th>
               <Th k="created">added</Th>
               <th className="w-28 px-3 py-2" />
             </tr>
           </thead>
           <tbody>
-            {loading && <tr><td colSpan={9} className="px-3 py-8 text-center text-sm text-white/60">Loading characters…</td></tr>}
-            {!loading && rows.length === 0 && <tr><td colSpan={9} className="px-3 py-8 text-center text-sm text-white/60">No characters match.</td></tr>}
+            {loading && <tr><td colSpan={10} className="px-3 py-8 text-center text-sm text-white/60">Loading characters…</td></tr>}
+            {!loading && rows.length === 0 && <tr><td colSpan={10} className="px-3 py-8 text-center text-sm text-white/60">No characters match.</td></tr>}
             {rows.map((c) => {
               const baseline = c.voices.find((v) => v.emotion === "baseline") ?? c.voices[0];
               return (
@@ -295,6 +314,21 @@ export default function CharacterTable() {
                   </td>
                   <td className="font-jetbrains px-3 py-2 text-[12px] text-white/60">{c.lang}</td>
                   <td className="px-3 py-2"><CoverageBar c={c} /></td>
+                  <td className="px-3 py-2">
+                    {(() => {
+                      const { total, hottest } = unmetDemand(c);
+                      if (total <= 0 || !hottest) return null; // zero-demand → nothing, no layout shift
+                      return (
+                        <Link
+                          href={`/voices/${c.character_id}?record=${encodeURIComponent(hottest)}`}
+                          title={`API callers requested still-missing emotions ${total}× and got baseline — record ${emotionMeta(hottest).label} next (the hottest gap)`}
+                          className="font-jetbrains inline-flex items-center gap-1 rounded bg-amber-400/10 px-1.5 py-0.5 text-[11px] text-amber-300 transition hover:bg-amber-400/20"
+                        >
+                          ▲ {total} wanted
+                        </Link>
+                      );
+                    })()}
+                  </td>
                   <td className="px-3 py-2"><TagEditor compact max={3} tags={c.tags} onChange={(tags) => patchCharacter(c.character_id, { tags })} /></td>
                   <td className="font-jetbrains px-3 py-2 text-[12px] text-white/65">{relTime(c.created)}</td>
                   <td className="px-3 py-2 text-right">
