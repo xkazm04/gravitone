@@ -102,6 +102,24 @@ Each needs a product/pricing decision or a bigger engine than the wave scoped.
   certs (exit-code friendly), but no enforcement point consumes them yet —
   wire into the enterprise install flow when a licensing decision lands.
 
+## From custom emotion packs (wave 11)
+
+- **Traced art for custom emotions** (the idea's "auto-generate via
+  /leonardo -> /motionize"): custom slots ship a *procedural sigil* derived
+  from the name (deterministic, offline, no keys). Running the real art
+  pipeline needs Leonardo/Gemini keys and an offline bake step
+  (`.claude/skills/leonardo` + `motionize` emit a PNG + a traced
+  `lib/glyphs/<name>.ts`), so it can't run per-user at request time. Path
+  to premium: a queued "commission art for this emotion" job that runs the
+  skills server-side and bakes the result into a Character Pack.
+- **Custom emotions in the guided recorder scripts**: `lib/emotionScripts`
+  has elicitation scripts for the 8 base emotions; custom slots fall back to
+  a generic "read in a strongly X tone" direction. An LLM-generated script
+  per custom emotion would close the loop.
+- **Selling packs as a premium tier**: the mechanics exist (custom palettes
+  travel in .gravichar packs), but there's still no entitlement/billing
+  layer to gate them — same blocker as the rest of the tiering work.
+
 ## From earlier waves
 
 - **Streaming synthesis** (compat matrix ❌ row): whole-utterance responses
