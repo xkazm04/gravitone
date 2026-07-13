@@ -7,7 +7,7 @@
 import { useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { Button, Eyebrow } from "@/components/ui/Primitives";
-import { EMOTIONS } from "@/lib/emotions";
+import { EMOTION_IDS, emotionMeta } from "@/lib/emotions";
 import TagEditor from "./TagEditor";
 import { hueOf, relTime, useCharacters, useVoicePreview, patchCharacterReq, deleteCharacterReq, type Character } from "../_data/characters";
 import { useAuth } from "@/lib/useAuth";
@@ -31,17 +31,21 @@ async function runPool<T>(items: T[], limit: number, task: (item: T) => Promise<
 }
 
 function CoverageBar({ c }: { c: Character }) {
+  // Pips track this Character's OWN scale (base + its custom slots), so the pip
+  // count always matches the "n/total" number even for extended palettes.
+  const scale = c.scale?.length ? c.scale : EMOTION_IDS;
   return (
     <div className="flex items-center gap-2">
       <div className="flex gap-[2px]">
-        {EMOTIONS.map((e) => {
-          const on = c.emotions.includes(e.id);
+        {scale.map((id) => {
+          const m = emotionMeta(id);
+          const on = c.emotions.includes(id);
           return (
             <span
-              key={e.id}
-              title={`${e.label}${on ? "" : " — missing (falls back to baseline)"}`}
+              key={id}
+              title={`${m.label}${on ? "" : " — missing (falls back to baseline)"}`}
               className="h-4 w-1.5 rounded-sm"
-              style={{ background: on ? `hsl(${e.hue} 80% 60%)` : "rgba(255,255,255,0.10)" }}
+              style={{ background: on ? `hsl(${m.hue} 80% 60%)` : "rgba(255,255,255,0.10)" }}
             />
           );
         })}

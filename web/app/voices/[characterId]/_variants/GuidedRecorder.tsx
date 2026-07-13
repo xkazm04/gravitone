@@ -11,7 +11,7 @@ import { Button } from "@/components/ui/Primitives";
 import { EASE } from "@/components/ui/tokens";
 import EmotionArt from "@/components/ui/EmotionArt";
 import { emotionMeta } from "@/lib/emotions";
-import { nextEmotionToRecord, scriptFor } from "@/lib/emotionScripts";
+import { CAPTURE_ORDER, scriptFor } from "@/lib/emotionScripts";
 
 const MIN_SECONDS = 8;
 const TARGET_SECONDS = 20;
@@ -19,11 +19,23 @@ const MAX_SECONDS = 45;
 
 type Phase = "idle" | "recording" | "preview" | "cloning" | "done";
 
+/** Next empty slot to record, walking the Character's FULL scale (base +
+ *  custom). Base emotions keep their curated CAPTURE_ORDER; custom slots follow
+ *  in scale order, so they're offered as "next" instead of never surfacing. */
+function nextInScale(scale: string[], filled: string[]): string | null {
+  const rank = (e: string) => {
+    const i = CAPTURE_ORDER.indexOf(e);
+    return i === -1 ? CAPTURE_ORDER.length + scale.indexOf(e) : i;
+  };
+  return [...scale].sort((a, b) => rank(a) - rank(b)).find((e) => !filled.includes(e)) ?? null;
+}
+
 export default function GuidedRecorder({
-  emotion, characterName, filledEmotions, onClone, onClose, onSwitch,
+  emotion, characterName, scale, filledEmotions, onClone, onClose, onSwitch,
 }: {
   emotion: string | null; // null = closed
   characterName: string;
+  scale: string[]; // this Character's effective palette (base + custom slots)
   filledEmotions: string[];
   onClone: (emotion: string, file: File) => Promise<void>; // throws on failure
   onClose: () => void;
@@ -110,7 +122,8 @@ export default function GuidedRecorder({
   const es = emotion ? scriptFor(emotion) : null;
   // After a successful clone this emotion is filled locally even before refresh.
   const filledNow = emotion && phase === "done" ? [...filledEmotions, emotion] : filledEmotions;
-  const next = nextEmotionToRecord(filledNow);
+  const next = nextInScale(scale, filledNow);
+  const total = scale.length;
   const tooShort = seconds > 0 && seconds < MIN_SECONDS;
 
   return createPortal(
@@ -132,7 +145,7 @@ export default function GuidedRecorder({
               </span>
               <div>
                 <div className="font-jetbrains text-[11px] uppercase tracking-widest text-cyan-300/80">
-                  guided capture · {filledNow.length}/8 recorded
+                  guided capture · {filledNow.length}/{total} recorded
                 </div>
                 <h2 className="font-instrument mt-1 text-2xl text-white">
                   {characterName} · <span style={{ color: `hsl(${meta.hue} 85% 68%)` }}>{meta.label}</span>
@@ -187,7 +200,7 @@ export default function GuidedRecorder({
                       Next: {emotionMeta(next).label} →
                     </Button>
                   ) : (
-                    <span className="font-jetbrains text-[13px] text-emerald-200">rack complete — 8/8 🎉</span>
+                    <span className="font-jetbrains text-[13px] text-emerald-200">rack complete — {total}/{total} 🎉</span>
                   )}
                   <button onClick={() => { cleanup(); onClose(); }} className="font-jetbrains cursor-pointer text-[12px] text-white/65 transition hover:text-white">
                     done for now

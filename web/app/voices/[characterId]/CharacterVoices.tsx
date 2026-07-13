@@ -110,6 +110,7 @@ export default function CharacterVoices({ characterId }: { characterId: string }
       <GuidedRecorder
         emotion={recording}
         characterName={character.name}
+        scale={slots.map((s) => s.emotion)}
         filledEmotions={slots.filter((s) => s.voice).map((s) => s.emotion)}
         onClone={cloneForRecorder}
         onClose={() => setRecording(null)}
