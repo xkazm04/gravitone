@@ -10,6 +10,10 @@ export type Partial = {
   segments_total?: number;
   segments_done?: number;
   emotion_counts?: Record<string, number>;
+  // commit phase: live per-emotion cloning progress
+  emotions_done?: number;
+  emotions_total?: number;
+  current?: string | null;
 };
 
 export type LoaderStep = { key: string; label: string; state: "pending" | "active" | "done" };

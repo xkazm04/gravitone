@@ -15,11 +15,17 @@ type Speaker = { id: string; utterances: number; seconds: number; sample_text: s
 type Stem = { emotion: string; seconds: number; segments: number; eligible: boolean; cues: string[] };
 type Result = { duration: number; speakers: string[]; target: string; utterances: number; stems: Stem[] };
 type Character = { character_id: string; name: string };
+type Created = { voice_id: string; emotion: string };
 type Job = { status: string; step: string | null; steps: LoaderStep[]; partial: PartialData;
   speakers: Speaker[] | null; duration: number; result: Result | null; error: string | null;
-  mode?: "cloud" | "sovereign" };
+  mode?: "cloud" | "sovereign"; committed?: Created[] | null };
 
-type Phase = "upload" | "processing" | "speaker" | "review" | "committing" | "complete";
+type Phase = "upload" | "processing" | "speaker" | "review" | "committing" | "complete" | "expired";
+
+// Kept in sync with the attestation label rendered in the review step; sent to
+// the backend so the consent receipt records exactly what the user agreed to.
+const CONSENT_STATEMENT =
+  "I own this voice or have the speaker's explicit consent to clone it.";
 
 export default function NewCharacterPage() {
   const { user } = useAuth();
@@ -40,8 +46,9 @@ export default function NewCharacterPage() {
   const [charName, setCharName] = useState("");
   const [extendCid, setExtendCid] = useState("");
   const [characters, setCharacters] = useState<Character[]>([]);
-  const [created, setCreated] = useState<{ voice_id: string; emotion: string }[]>([]);
+  const [created, setCreated] = useState<Created[]>([]);
   const [committedCid, setCommittedCid] = useState<string | null>(null);
+  const [pendingCommit, setPendingCommit] = useState<{ character: string; cid: string } | null>(null);
 
   const fileRef = useRef<HTMLInputElement>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -59,7 +66,9 @@ export default function NewCharacterPage() {
     const iv = setInterval(async () => {
       try {
         const r = await fetch(`/api/ingest/${jobId}`, { cache: "no-store" });
+        if (r.status === 404) { setPhase("expired"); clearInterval(iv); return; }
         const j: Job = await r.json();
+        if (j.status === "expired") { setPhase("expired"); clearInterval(iv); return; }
         setJob(j);
         if (j.status === "awaiting_speaker") setPhase("speaker");
         else if (j.status === "running") setPhase("processing");
@@ -69,6 +78,32 @@ export default function NewCharacterPage() {
     }, 1500);
     return () => clearInterval(iv);
   }, [jobId, phase]);
+
+  // poll the async commit — real per-emotion progress, terminal states
+  useEffect(() => {
+    if (!jobId || phase !== "committing") return;
+    const iv = setInterval(async () => {
+      try {
+        const r = await fetch(`/api/ingest/${jobId}`, { cache: "no-store" });
+        if (r.status === 404) { setPhase("expired"); clearInterval(iv); return; }
+        const j: Job = await r.json();
+        setJob(j);
+        if (j.status === "committed") {
+          const madeVoices = j.committed ?? [];
+          const cid = pendingCommit?.cid ?? committedCid;
+          if (user && pendingCommit && Array.isArray(madeVoices)) {
+            void recordVoiceOwnership(user, madeVoices.map((v) => ({
+              voice_id: v.voice_id, character_id: pendingCommit.cid,
+              character_name: pendingCommit.character, emotion: v.emotion,
+            })), "ingested");
+          }
+          setCreated(madeVoices); setCommittedCid(cid ?? null); setPhase("complete"); clearInterval(iv);
+        } else if (j.status === "error") { setError(j.error ?? "commit failed"); setPhase("review"); clearInterval(iv); }
+        else if (j.status === "cancelled" || j.status === "expired") { setPhase("expired"); clearInterval(iv); }
+      } catch { /* keep polling */ }
+    }, 1200);
+    return () => clearInterval(iv);
+  }, [jobId, phase, user, pendingCommit, committedCid]);
 
   async function startScan() {
     if (!file) return;
@@ -115,19 +150,27 @@ export default function NewCharacterPage() {
     const character_id = mode === "extend" ? extendCid : undefined;
     if (mode === "new" && !character) { setError("Name the character"); return; }
     if (mode === "extend" && !extendCid) { setError("Pick a character to extend"); return; }
+    const cid = character_id ?? slug(character);
+    setPendingCommit({ character, cid });
+    setJob((j) => j ? { ...j, status: "committing", partial: { emotions_done: 0, emotions_total: selected.size, current: null } } : j);
     setPhase("committing"); setError(null);
     try {
+      // async commit: the backend returns immediately; the committing poller
+      // follows per-emotion progress through to 'committed' / 'error'.
       const r = await fetch(`/api/ingest/${jobId}/commit`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ character, emotions: [...selected], character_id }) });
       const j = await r.json();
       if (!r.ok) throw new Error(j?.detail ?? "commit failed");
-      const cid = character_id ?? slug(character);
-      if (user && Array.isArray(j.created)) {
-        void recordVoiceOwnership(user, (j.created as { voice_id: string; emotion: string }[]).map((v) => ({
-          voice_id: v.voice_id, character_id: cid, character_name: character, emotion: v.emotion,
-        })), "ingested");
-      }
-      setCreated(j.created ?? []); setCommittedCid(cid); setPhase("complete");
     } catch (e) { setError(e instanceof Error ? e.message : "commit failed"); setPhase("review"); }
+  }
+
+  async function cancelCommit() {
+    try { await fetch(`/api/ingest/${jobId}`, { method: "DELETE" }); } catch { /* ignore */ }
+    setPendingCommit(null); setPhase("review");
+  }
+
+  function startOver() {
+    setFile(null); setResult(null); setJobId(null); setJob(null); setCreated([]);
+    setSelected(new Set()); setError(null); setPendingCommit(null); setPhase("upload");
   }
 
   function scanAnother() {
@@ -332,11 +375,45 @@ export default function NewCharacterPage() {
           </div>
         )}
 
-        {/* COMMITTING */}
-        {phase === "committing" && (
-          <div className="mt-16 text-center">
-            <div className="font-jetbrains text-[12px] uppercase tracking-widest text-cyan-300">cloning {selected.size} voice(s)…</div>
-            <p className="mt-2 text-sm text-white/60">Each emotion is cloned on the CPU engine (~15s each).</p>
+        {/* COMMITTING — real per-emotion progress from the async commit */}
+        {phase === "committing" && (() => {
+          const total = job?.partial?.emotions_total ?? selected.size;
+          const done = job?.partial?.emotions_done ?? 0;
+          const current = job?.partial?.current ?? null;
+          const pct = total ? Math.round((done / total) * 100) : 0;
+          return (
+            <div className="mt-16 text-center">
+              <div className="font-jetbrains text-[12px] uppercase tracking-widest text-cyan-300">
+                cloning voices · {done}/{total}
+              </div>
+              <p className="mt-2 text-sm text-white/60">
+                {current ? <>Cloning <span className="text-white">{emotionMeta(current).label}</span> on the CPU engine…</> : "Cloning on the CPU engine…"}
+              </p>
+              <div className="mx-auto mt-5 h-1.5 w-64 overflow-hidden rounded-full bg-white/10">
+                <div className="h-full rounded-full bg-cyan-300 transition-all duration-500" style={{ width: `${pct}%` }} />
+              </div>
+              <button onClick={cancelCommit}
+                className="font-jetbrains mt-6 cursor-pointer rounded-full border border-white/15 px-5 py-2 text-[13px] text-white/70 transition hover:bg-white/5">
+                Cancel
+              </button>
+            </div>
+          );
+        })()}
+
+        {/* EXPIRED — the job aged out (or was cancelled); poller stopped */}
+        {phase === "expired" && (
+          <div className="mt-10 max-w-2xl">
+            <div className="glass-panel rounded-2xl p-6">
+              <div className="font-jetbrains text-[11px] uppercase tracking-widest text-amber-300">session expired</div>
+              <h2 className="font-instrument mt-2 text-3xl text-white">This ingest session ended.</h2>
+              <p className="mt-2 text-sm text-white/60">
+                Scan sessions are held for a limited time and then cleaned up. Nothing was saved — start over with your recording.
+              </p>
+              <button onClick={startOver}
+                className="mt-6 cursor-pointer rounded-full bg-cyan-300 px-5 py-2.5 text-sm font-semibold text-slate-950 transition hover:brightness-110">
+                Start over
+              </button>
+            </div>
           </div>
         )}
 

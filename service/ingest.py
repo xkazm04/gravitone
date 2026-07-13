@@ -403,12 +403,21 @@ def scan(audio: Path, work_dir: Path, speaker: str = "auto", min_stem: float = 4
 
 
 # ── COMMIT (clone selected stems) ─────────────────────────────────────────────
-def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: str | None = None) -> list[dict]:
+def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: str | None = None,
+           *, progress: Callable[[int, str | None], None] | None = None,
+           should_cancel: Callable[[], bool] | None = None) -> list[dict]:
+    """Clone each accepted stem into a Voice. `progress(done, current)` fires
+    per emotion for live UI; `should_cancel()` is polled between emotions so an
+    async commit can stop cleanly."""
     cid = existing_cid or _slug(character)
     meta = _load_meta()
     name = meta["characters"].get(cid, {}).get("name", character) if existing_cid else character
     created: list[dict] = []
-    for emo in emotions:
+    for idx, emo in enumerate(emotions):
+        if should_cancel and should_cancel():
+            break
+        if progress:
+            progress(idx, emo)
         sw = work_dir / f"stem_{emo}.wav"
         if not sw.is_file():
             continue
@@ -429,6 +438,8 @@ def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: st
         meta["characters"].setdefault(cid, {"name": name, "tags": ["ingested"]})
         _save_meta(meta)
         created.append({"voice_id": voice_id, "emotion": emo, "seconds": seconds})
+        if progress:
+            progress(idx + 1, None)
     return created
 
 

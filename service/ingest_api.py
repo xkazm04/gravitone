@@ -243,6 +243,39 @@ def _label(job_id: str, target: str) -> None:
         _update(job, status="error", error=str(exc)[:400])
 
 
+def _commit_progress(job: dict, done: int, total: int, current: str | None) -> None:
+    with _LOCK:
+        if job.get("cancel"):
+            return
+        job["partial"] = {"emotions_done": done, "emotions_total": total, "current": current}
+        _persist(job)
+
+
+def _do_commit(job_id: str, character: str, emotions: list[str], character_id: str | None) -> None:
+    job = JOBS[job_id]
+    total = len(emotions)
+
+    def cancelled() -> bool:
+        with _LOCK:
+            return bool(job.get("cancel"))
+
+    try:
+        created = ingest.commit(
+            Path(job["work_dir"]), character, emotions, character_id,
+            progress=lambda done, cur: _commit_progress(job, done, total, cur),
+            should_cancel=cancelled)
+    except Exception as exc:  # noqa: BLE001
+        _update(job, status="error", error=f"commit failed: {str(exc)[:300]}")
+        return
+    with _LOCK:
+        if job.get("cancel"):
+            return  # DELETE already set 'cancelled' and cleaned up
+        job["committed"] = created
+        job["partial"] = {"emotions_done": total, "emotions_total": total, "current": None}
+        job["status"] = "committed"
+        _persist(job)
+
+
 # ── endpoints ─────────────────────────────────────────────────────────────────
 @router.post("/scan")
 async def start_scan(file: UploadFile = File(...), mode: str = Form("auto")) -> dict:
@@ -342,7 +375,10 @@ class CommitReq(BaseModel):
 
 
 @router.post("/{job_id}/commit")
-def commit(job_id: str, req: CommitReq) -> dict:
+def commit(job_id: str, req: CommitReq):
+    """Kick off cloning as a background phase and return immediately. Progress
+    (emotions_done / total / current) streams via `partial`; the job ends
+    'committed' or 'error'. Poll GET /{job} to follow it."""
     with _LOCK:
         job = JOBS.get(job_id)
         if not job:
@@ -352,12 +388,33 @@ def commit(job_id: str, req: CommitReq) -> dict:
             raise HTTPException(409, "scan not finished")
         if not req.character.strip() and not req.character_id:
             raise HTTPException(400, "character name required")
-    try:
-        created = ingest.commit(Path(job["work_dir"]), req.character.strip(),
-                                req.emotions, req.character_id)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(500, f"commit failed: {exc}")
-    return {"created": created}
+        job["status"] = "committing"
+        job["cancel"] = False
+        job["committed"] = None
+        job["partial"] = {"emotions_done": 0, "emotions_total": len(req.emotions), "current": None}
+        _persist(job)
+    threading.Thread(
+        target=_do_commit,
+        args=(job_id, req.character.strip(), req.emotions, req.character_id),
+        daemon=True).start()
+    return {"status": "committing"}
+
+
+@router.delete("/{job_id}")
+def cancel_job(job_id: str):
+    """Cancel a job (between emotions during commit, between phases otherwise),
+    mark it 'cancelled' and tear down its workdir."""
+    with _LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return JSONResponse({"status": "expired", "detail": "job not found or expired"},
+                                status_code=404)
+        job["cancel"] = True
+        job["status"] = "cancelled"
+        work_dir = job["work_dir"]
+        JOBS.pop(job_id, None)
+    shutil.rmtree(work_dir, ignore_errors=True)
+    return {"status": "cancelled"}
 
 
 # ── startup: rehydrate persisted jobs + launch the GC timer ───────────────────

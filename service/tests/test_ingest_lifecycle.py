@@ -136,5 +136,76 @@ class GcTests(unittest.TestCase):
             self.assertNotIn("e", ingest_api.JOBS)
 
 
+class CommitLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        self._orig_jobs = dict(ingest_api.JOBS)
+        ingest_api.JOBS.clear()
+
+    def tearDown(self):
+        ingest_api.JOBS.clear()
+        ingest_api.JOBS.update(self._orig_jobs)
+
+    def test_do_commit_streams_progress_and_marks_committed(self):
+        with TemporaryDirectory() as td:
+            job = _make_job(Path(td), "c1", "committing", time.time())
+            job["partial"] = {"emotions_done": 0, "emotions_total": 2, "current": None}
+            ingest_api.JOBS["c1"] = job
+
+            def fake_commit(work_dir, character, emotions, cid, *, progress=None, should_cancel=None):
+                out = []
+                for idx, emo in enumerate(emotions):
+                    if should_cancel and should_cancel():
+                        break
+                    if progress:
+                        progress(idx, emo)
+                    out.append({"voice_id": f"v-{emo}", "emotion": emo, "seconds": 5})
+                    if progress:
+                        progress(idx + 1, None)
+                return out
+
+            with mock.patch.object(ingest_api.ingest, "commit", side_effect=fake_commit):
+                ingest_api._do_commit("c1", "Ada", ["happy", "sad"], None)
+
+            self.assertEqual(job["status"], "committed")
+            self.assertEqual(len(job["committed"]), 2)
+            self.assertEqual(job["partial"]["emotions_done"], 2)
+            self.assertEqual(job["partial"]["current"], None)
+
+    def test_do_commit_stops_on_cancel(self):
+        with TemporaryDirectory() as td:
+            job = _make_job(Path(td), "c2", "committing", time.time())
+            ingest_api.JOBS["c2"] = job
+
+            def fake_commit(work_dir, character, emotions, cid, *, progress=None, should_cancel=None):
+                out = []
+                for idx, emo in enumerate(emotions):
+                    if should_cancel and should_cancel():
+                        break
+                    job["cancel"] = True  # cancel arrives during the first emotion
+                    out.append({"voice_id": f"v-{emo}", "emotion": emo, "seconds": 5})
+                return out
+
+            with mock.patch.object(ingest_api.ingest, "commit", side_effect=fake_commit):
+                ingest_api._do_commit("c2", "Ada", ["happy", "sad"], None)
+
+            # cancel flag set → _do_commit must not overwrite status to 'committed'
+            self.assertNotEqual(job["status"], "committed")
+
+    def test_cancel_job_cleans_workdir_and_removes(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            job = _make_job(root, "k1", "committing", time.time())
+            (Path(job["work_dir"]) / "stem_happy.wav").write_bytes(b"x")
+            ingest_api.JOBS["k1"] = job
+            resp = ingest_api.cancel_job("k1")
+            self.assertEqual(resp, {"status": "cancelled"})
+            self.assertNotIn("k1", ingest_api.JOBS)
+            self.assertFalse((root / "k1").exists())
+
+    def test_cancel_unknown_returns_expired(self):
+        resp = ingest_api.cancel_job("nope")
+        self.assertEqual(resp.status_code, 404)
+
+
 if __name__ == "__main__":
     unittest.main()
