@@ -5,7 +5,7 @@ import Link from "next/link";
 import { Eyebrow } from "@/components/ui/Primitives";
 import { EMOTION_IDS } from "@/lib/emotions";
 import { CONSENT_PROMPT } from "@/lib/voiceVault";
-import { useCharacterVoices } from "./_variants/useCharacterVoices";
+import { useCharacter } from "@/app/voices/_data/characters";
 import EmotionRack from "./_variants/EmotionRack";
 import GuidedRecorder from "./_variants/GuidedRecorder";
 import ApiPanel from "./_variants/ApiPanel";
@@ -13,7 +13,7 @@ import ApiPanel from "./_variants/ApiPanel";
 // Rack won the voice-overview round — rendered directly, no switcher.
 export default function CharacterVoices({ characterId }: { characterId: string }) {
   const { character, slots, coverage, total, loading, error, busySlot, addVoice, removeVoice,
-          addCustomEmotion, removeCustomEmotion } = useCharacterVoices(characterId);
+          addCustomEmotion, removeCustomEmotion } = useCharacter(characterId);
   const [recording, setRecording] = useState<string | null>(null);
 
   // Deep link from playground fallbacks: /voices/{id}?record=angry opens the

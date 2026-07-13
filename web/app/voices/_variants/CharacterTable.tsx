@@ -9,7 +9,7 @@ import Link from "next/link";
 import { Button, Eyebrow } from "@/components/ui/Primitives";
 import { EMOTIONS } from "@/lib/emotions";
 import TagEditor from "./TagEditor";
-import { hueOf, relTime, useCharacters, useVoicePreview, type Character } from "./data";
+import { hueOf, relTime, useCharacters, useVoicePreview, type Character } from "../_data/characters";
 import { useAuth } from "@/lib/useAuth";
 import { CONSENT_PROMPT, recordVoiceOwnership } from "@/lib/voiceVault";
 
@@ -38,7 +38,7 @@ function CoverageBar({ c }: { c: Character }) {
 
 export default function CharacterTable() {
   const { characters, loading, error, createVoice, patchCharacter, deleteCharacter, refresh } = useCharacters();
-  const { preview, playingId, busyId } = useVoicePreview();
+  const { preview, playingId, busyId, failedId } = useVoicePreview();
   const { user } = useAuth();
 
   const [query, setQuery] = useState("");
@@ -226,10 +226,16 @@ export default function CharacterTable() {
                     <input type="checkbox" checked={selected.has(c.character_id)} onChange={() => toggleOne(c.character_id)} aria-label={`Select ${c.name}`} className="accent-cyan-400" />
                   </td>
                   <td className="px-2 py-2">
-                    <button onClick={() => baseline && preview(baseline.voice_id, c.name)} disabled={!baseline || busyId === baseline?.voice_id}
-                      aria-label="Preview baseline" className="grid h-7 w-7 place-items-center rounded-full bg-cyan-300 text-[11px] text-slate-950 transition hover:brightness-110 disabled:opacity-50">
-                      {busyId === baseline?.voice_id ? "…" : playingId === baseline?.voice_id ? "⏸" : "▶"}
-                    </button>
+                    {(() => {
+                      const failed = !!baseline && failedId === baseline.voice_id;
+                      return (
+                        <button onClick={() => baseline && preview(baseline.voice_id, c.name)} disabled={!baseline || busyId === baseline?.voice_id}
+                          aria-label="Preview baseline" title={failed ? "Preview failed — try again" : "Preview baseline"}
+                          className={`grid h-7 w-7 place-items-center rounded-full text-[11px] text-slate-950 transition hover:brightness-110 disabled:opacity-50 ${failed ? "bg-rose-300" : "bg-cyan-300"}`}>
+                          {busyId === baseline?.voice_id ? "…" : failed ? "!" : playingId === baseline?.voice_id ? "⏸" : "▶"}
+                        </button>
+                      );
+                    })()}
                   </td>
                   <td className="px-3 py-2">
                     <div className="flex items-center gap-2.5">
