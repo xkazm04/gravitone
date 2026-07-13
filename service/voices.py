@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import uuid
 import wave
 from datetime import datetime, timezone
@@ -177,6 +178,29 @@ def _save_meta(meta: dict) -> None:
 # fn may itself call back into the meta helpers without deadlocking.
 _META_LOCK = threading.RLock()
 
+# ── read cache ─────────────────────────────────────────────────────────────────
+# emotion_map/list_characters/all_voices/get_voice all reduce to one assembled
+# characters list, and they sit in the synthesis hot path (every /v1/speak,
+# every emotion-addressed TTS call, once per character per /v1/performance).
+# Assembling it means a JSON parse + a VOICES_DIR glob, so we memoize it on a
+# cheap fingerprint: (meta mtime_ns, voices-dir mtime_ns, generation counter).
+# mutate_meta bumps the counter; external writers (or tests) can call
+# invalidate(). A stat-only fingerprint also catches writers that bypass
+# mutate_meta (e.g. ingest's own _save_meta) via the changed mtime.
+# Re-entrant: list_characters holds it across _build_characters, which calls
+# back into _cached_demand (also lock-guarded) on the same thread.
+_CACHE_LOCK = threading.RLock()
+_cache_generation = 0
+_chars_cache: list["Character"] | None = None
+_chars_cache_key: tuple | None = None
+
+# all_demand() is a JSON read per list too. It's telemetry decoration, so a
+# short TTL is fine — staleness never affects synthesis correctness. Cached here
+# (not in demand.py) to keep that module free of view-layer concerns.
+_DEMAND_TTL = 2.0
+_demand_cache: dict | None = None
+_demand_cache_at = 0.0
+
 
 def mutate_meta(fn):
     """Serialized, atomic registry mutation.
@@ -185,13 +209,44 @@ def mutate_meta(fn):
     mutation, then atomically save. Returns whatever ``fn`` returns. If ``fn``
     raises, the save is skipped, so the previous file is left intact (crash
     safety). This is the ONE write path every mutating endpoint must use — two
-    concurrent clones can no longer clobber each other's entries.
+    concurrent clones can no longer clobber each other's entries. On success it
+    bumps the read-cache generation so the next read reassembles.
     """
+    global _cache_generation
     with _META_LOCK:
         meta = _load_meta()
         result = fn(meta)
         _save_meta(meta)
+        _cache_generation += 1
         return result
+
+
+def invalidate() -> None:
+    """Force the next read to reassemble. For writers that don't go through
+    mutate_meta (the stat fingerprint already covers most such cases)."""
+    global _cache_generation
+    _cache_generation += 1
+
+
+def _registry_fingerprint() -> tuple:
+    def _mtime(p: Path) -> int:
+        try:
+            return p.stat().st_mtime_ns
+        except OSError:
+            return -1
+    return (_mtime(META_PATH), _mtime(VOICES_DIR), _cache_generation)
+
+
+def _cached_demand() -> dict:
+    """all_demand() behind a short TTL — telemetry, staleness is acceptable."""
+    global _demand_cache, _demand_cache_at
+    now = time.monotonic()
+    with _CACHE_LOCK:
+        if _demand_cache is not None and (now - _demand_cache_at) < _DEMAND_TTL:
+            return _demand_cache
+        _demand_cache = all_demand()
+        _demand_cache_at = now
+        return _demand_cache
 
 
 def _slug(name: str) -> str:
@@ -241,6 +296,21 @@ def character_scale(cm: dict, voices_emotions: list[str] | None = None) -> tuple
 
 
 def list_characters() -> list[Character]:
+    """Assembled characters list, memoized on the registry fingerprint.
+
+    Repeated calls with no intervening write (the synthesis hot path) reuse the
+    cached list — one JSON parse + glob amortized across every read."""
+    global _chars_cache, _chars_cache_key
+    key = _registry_fingerprint()
+    with _CACHE_LOCK:
+        if _chars_cache is not None and _chars_cache_key == key:
+            return _chars_cache
+        chars = _build_characters()
+        _chars_cache, _chars_cache_key = chars, key
+        return chars
+
+
+def _build_characters() -> list[Character]:
     meta = _load_meta()
     chars: dict[str, Character] = {}
 
@@ -264,7 +334,7 @@ def list_characters() -> list[Character]:
                           name=vid.replace("_", " ").title(), category="premade", lang=lang)],
         )
 
-    demand = all_demand()
+    demand = _cached_demand()
     for c in chars.values():
         cm = meta["characters"].get(c.character_id, {})
         scale, custom = character_scale(cm, [v.emotion for v in c.voices])
