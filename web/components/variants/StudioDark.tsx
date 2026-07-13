@@ -5,6 +5,7 @@ import { motion } from "framer-motion";
 import { BRAND, HERO, STATS, FEATURES, VOICES, SAMPLE_TEXT, API_DOCS_URL } from "@/lib/content";
 import { useAuth } from "@/lib/useAuth";
 import UserMenu from "@/components/ui/UserMenu";
+import MobileNav from "@/components/ui/MobileNav";
 import Equalizer, { usePauseOffscreen } from "@/components/ui/Equalizer";
 import SwitchKit from "./SwitchKit";
 import HeroMicDemo from "./HeroMicDemo";
@@ -47,7 +48,10 @@ export default function StudioDark() {
                 <Link key={r.href} href={r.href} className="transition hover:text-white">{r.label}</Link>
               ))}
           </div>
-          <UserMenu />
+          <div className="flex items-center gap-3">
+            {user && <MobileNav links={APP_ROUTES} />}
+            <UserMenu />
+          </div>
         </nav>
 
         {/* hero */}

@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation";
 import { Wordmark } from "./Primitives";
 import SavingsTicker from "./SavingsTicker";
 import UserMenu from "./UserMenu";
+import MobileNav from "./MobileNav";
 import { useAuth } from "@/lib/useAuth";
 
 const MODULES = [
@@ -45,6 +46,7 @@ export default function AppFrame({ children }: { children: React.ReactNode }) {
           </div>
           <div className="flex items-center gap-3">
             <SavingsTicker />
+            {(!ready || user) && <MobileNav links={MODULES} />}
             <UserMenu />
           </div>
         </nav>
