@@ -96,6 +96,25 @@ class TTSRequest(BaseModel):
     frames_after_eos: int | None = None
 
 
+async def _await_result(job):
+    """Await one engine Job's result without parking a thread.
+
+    The engine hands back a concurrent.futures.Future; asyncio.wrap_future
+    bridges it to the event loop with a done-callback — no default-executor
+    thread is blocked per in-flight request (the old run_in_executor(None,
+    future.result) parked one thread each). Raises the endpoint-shaped errors.
+    """
+    try:
+        return await asyncio.wait_for(
+            asyncio.wrap_future(job.future),
+            timeout=SETTINGS.request_timeout_s,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="synthesis timed out")
+    except Exception as exc:  # noqa: BLE001 - worker error -> 500
+        raise HTTPException(status_code=500, detail=f"synthesis failed: {exc}")
+
+
 async def _submit_and_wait(voice_id: str, text: str, overrides: dict,
                            frames_after_eos: int | None = None):
     """Submit one synthesis job and await its result (shared by the TTS,
@@ -106,16 +125,7 @@ async def _submit_and_wait(voice_id: str, text: str, overrides: dict,
                             frames_after_eos=frames_after_eos)
     except AdmissionRejected as exc:
         raise _Backpressure(str(exc))
-    loop = asyncio.get_event_loop()
-    try:
-        return await asyncio.wait_for(
-            loop.run_in_executor(None, job.future.result),
-            timeout=SETTINGS.request_timeout_s,
-        )
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="synthesis timed out")
-    except Exception as exc:  # noqa: BLE001 - worker error -> 500
-        raise HTTPException(status_code=500, detail=f"synthesis failed: {exc}")
+    return await _await_result(job)
 
 
 class _Backpressure(Exception):
@@ -373,20 +383,31 @@ async def speak(
     segments = parse_segments(req.text)
     overrides = _overrides(req.voice_settings)
 
-    wavs: list[bytes] = []
-    report: list[dict] = []
-    total_audio = 0.0
-    total_synth = 0.0
-
+    # Resolve every segment's voice, then submit them ALL before awaiting any:
+    # the pool processes them concurrently (up to WORKERS at once) instead of
+    # paying N× latency serially. Admission (429) is decided at submit time; if
+    # any segment is rejected the whole request fails with 429 (segments already
+    # submitted run to completion and are discarded — coherent backpressure).
+    resolved: list[tuple] = []
     for seg in segments:
         voice_id, used, fell_back = resolve(seg.emotion, emap)
         if fell_back:
             record_fallback(req.character_id, seg.emotion)
-        try:
-            result = await _submit_and_wait(voice_id, seg.text, overrides)
-        except _Backpressure as exc:
-            return _backpressure_response(exc)
+        resolved.append((seg, voice_id, used, fell_back))
 
+    try:
+        jobs = [ENGINE.submit(voice_id=voice_id, text=seg.text, overrides=overrides)
+                for (seg, voice_id, used, fell_back) in resolved]
+    except AdmissionRejected as exc:
+        return _backpressure_response(_Backpressure(str(exc)))
+
+    results = await asyncio.gather(*(_await_result(job) for job in jobs))
+
+    wavs: list[bytes] = []
+    report: list[dict] = []
+    total_audio = 0.0
+    total_synth = 0.0
+    for (seg, voice_id, used, fell_back), result in zip(resolved, results):
         wavs.append(result.wav_bytes)
         total_audio += result.audio_seconds
         total_synth += result.synth_seconds
@@ -442,11 +463,11 @@ async def performance(req: PerformanceRequest):
                                     detail=f"unknown character '{line.character_id}' (line {i})")
             emaps[line.character_id] = emap
 
-    wavs: list[bytes] = []
-    report: list[dict] = []
-    total_audio = 0.0
-    total_synth = 0.0
-
+    # Flatten every line into its emotion segments, resolving voices first,
+    # then submit them ALL concurrently and gather in order — an N-segment
+    # script occupies up to WORKERS at once instead of serialising. A rejected
+    # segment fails the whole request with 429 (see /v1/speak for the rationale).
+    tasks: list[tuple] = []  # (line_idx, character_id, seg, voice_id, used, fell_back)
     for i, line in enumerate(req.lines):
         emap = emaps[line.character_id]
         overrides = _overrides(line.voice_settings)
@@ -454,18 +475,29 @@ async def performance(req: PerformanceRequest):
             voice_id, used, fell_back = resolve(seg.emotion, emap)
             if fell_back:
                 record_fallback(line.character_id, seg.emotion)
-            try:
-                result = await _submit_and_wait(voice_id, seg.text, overrides)
-            except _Backpressure as exc:
-                return _backpressure_response(exc)
-            wavs.append(result.wav_bytes)
-            total_audio += result.audio_seconds
-            total_synth += result.synth_seconds
-            report.append({
-                "line": i, "character_id": line.character_id, "text": seg.text,
-                "requested": seg.emotion, "used": used, "fallback": fell_back,
-                "voice_id": voice_id, "seconds": result.audio_seconds,
-            })
+            tasks.append((i, line.character_id, seg, voice_id, used, fell_back, overrides))
+
+    try:
+        jobs = [ENGINE.submit(voice_id=t[3], text=t[2].text, overrides=t[6])
+                for t in tasks]
+    except AdmissionRejected as exc:
+        return _backpressure_response(_Backpressure(str(exc)))
+
+    results = await asyncio.gather(*(_await_result(job) for job in jobs))
+
+    wavs: list[bytes] = []
+    report: list[dict] = []
+    total_audio = 0.0
+    total_synth = 0.0
+    for (i, character_id, seg, voice_id, used, fell_back, _overr), result in zip(tasks, results):
+        wavs.append(result.wav_bytes)
+        total_audio += result.audio_seconds
+        total_synth += result.synth_seconds
+        report.append({
+            "line": i, "character_id": character_id, "text": seg.text,
+            "requested": seg.emotion, "used": used, "fallback": fell_back,
+            "voice_id": voice_id, "seconds": result.audio_seconds,
+        })
 
     body = concat_wavs(wavs)
     rtf = round(total_audio / total_synth, 3) if total_synth else 0.0
