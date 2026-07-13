@@ -90,6 +90,27 @@ class CharacterReadTests(unittest.TestCase):
         body = self.client.get("/v1/characters/ada").json()
         self.assertTrue(all(v["consent"] for v in body["voices"]))
 
+    def test_import_provenance_is_served(self) -> None:
+        # Stand in an imported voice directly in the store (a pack import stamps
+        # imported:{from,at} onto each voice's meta entry).
+        (self.root / "hero-baseline-abc123.safetensors").write_bytes(b"tensors")
+        prov = {"from": "orig-hero", "at": "2026-07-01T00:00:00+00:00"}
+        import json
+        (self.root / "_meta.json").write_text(json.dumps({
+            "voices": {"hero-baseline-abc123": {
+                "name": "Hero", "character_id": "hero", "emotion": "baseline",
+                "lang": "EN", "imported": prov}},
+            "characters": {"hero": {"name": "Hero", "tags": []}},
+        }), "utf-8")
+        vc.invalidate()
+        body = self.client.get("/v1/characters/hero").json()
+        self.assertEqual(body["imported"], prov)
+
+    def test_non_imported_character_has_null_provenance(self) -> None:
+        self._clone()
+        body = self.client.get("/v1/characters/ada").json()
+        self.assertIsNone(body["imported"])
+
 
 if __name__ == "__main__":
     unittest.main()

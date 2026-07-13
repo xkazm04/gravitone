@@ -62,6 +62,18 @@ export default function CharacterVoices({ characterId }: { characterId: string }
             Each <span className="text-white">Voice</span> is one emotion of this{" "}
             <span className="text-white">Character</span>. Empty slots fall back to baseline.
           </p>
+          {character.imported && (
+            <p
+              title="This Character was created by importing a portable .gravichar Character Pack"
+              className="font-jetbrains mt-3 inline-flex items-center gap-1.5 rounded-full border border-white/12 bg-white/[0.03] px-3 py-1 text-[11px] text-white/60"
+            >
+              ⇪ imported from <span className="text-white/80">{character.imported.from}</span>
+              {(() => {
+                const d = Date.parse(character.imported.at);
+                return Number.isNaN(d) ? null : <span>· {new Date(d).toLocaleDateString()}</span>;
+              })()}
+            </p>
+          )}
         </div>
         <span className="flex items-center gap-2">
           <span className="font-jetbrains rounded-full border border-white/12 px-3 py-1 text-[11px] text-white/60">

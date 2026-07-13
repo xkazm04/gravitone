@@ -97,6 +97,17 @@ export default function EmotionRack({
                         <EmotionArt emotion={s.emotion} size={34} dim={!filled} />
                       </span>
                       <span className="text-sm font-medium text-white">{s.label}</span>
+                      {filled && (
+                        s.voice!.consent ? (
+                          <span title="Consent receipt on file for this voice"
+                            aria-label="consent receipt on file"
+                            className="text-[13px] leading-none text-emerald-300/90">🛡</span>
+                        ) : (
+                          <span title="No receipt (pre-consent voice)"
+                            aria-label="no consent receipt"
+                            className="text-[13px] leading-none text-white/25">🛡</span>
+                        )
+                      )}
                       {s.custom && (
                         <span title="Custom emotion — glyph generated from the name"
                           className="font-jetbrains rounded-full border border-violet-400/30 bg-violet-400/10 px-1.5 py-0.5 text-[10px] text-violet-200">

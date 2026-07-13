@@ -47,6 +47,18 @@ function CoverageBar({ c }: { c: Character }) {
         })}
       </div>
       <span className="font-jetbrains text-[11px] text-white/65">{c.coverage}/{c.total}</span>
+      {c.category === "cloned" && c.voices.length > 0 && (() => {
+        const withReceipt = c.voices.filter((v) => v.consent).length;
+        const all = withReceipt === c.voices.length;
+        return (
+          <span
+            title={`${withReceipt} of ${c.voices.length} voice${c.voices.length > 1 ? "s" : ""} carry a consent receipt`}
+            className={`font-jetbrains inline-flex items-center gap-0.5 text-[11px] ${all ? "text-emerald-300/90" : withReceipt > 0 ? "text-emerald-300/60" : "text-white/25"}`}
+          >
+            🛡 {withReceipt}
+          </span>
+        );
+      })()}
     </div>
   );
 }

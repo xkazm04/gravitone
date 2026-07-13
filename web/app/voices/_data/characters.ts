@@ -23,6 +23,9 @@ export type Voice = {
   lang: string;
   created?: string | null;
   sample_seconds?: number | null;
+  // True when a consent receipt is on file for this voice (ingest / attested
+  // clone). Pre-consent and built-in voices report false.
+  consent?: boolean;
 };
 
 /** A group of Voices across the emotion scale. */
@@ -42,6 +45,8 @@ export type Character = {
   // This Character's effective palette: base scale + its custom slots.
   scale?: string[];
   custom_emotions?: string[];
+  // Pack-import provenance when this Character came from a .gravichar import.
+  imported?: { from: string; at: string } | null;
 };
 
 /** One Character's emotion scale: which slots are filled, and how to fill them. */

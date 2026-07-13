@@ -78,6 +78,9 @@ class Character(BaseModel):
     custom_emotions: list[str] = []
     # The Character's effective palette: base scale + its custom emotions.
     scale: list[str] = list(EMOTION_SCALE)
+    # Pack-import provenance, if this Character came from a .gravichar import:
+    # {"from": <source character_id>, "at": <iso timestamp>}. None otherwise.
+    imported: dict | None = None
 
 
 class VoiceList(BaseModel):
@@ -321,9 +324,13 @@ def _build_characters() -> list[Character]:
         cm = meta["characters"].get(v.character_id, {})
         c = chars.get(v.character_id)
         if c is None:
+            # Pack-import provenance is stamped on each imported voice's meta
+            # entry ({"from", "at"}); surface it at the Character level.
+            imported = meta["voices"].get(v.voice_id, {}).get("imported")
             c = Character(
                 character_id=v.character_id, name=cm.get("name", v.character_id),
                 category="cloned", tags=cm.get("tags", []), lang=v.lang, created=v.created,
+                imported=imported if isinstance(imported, dict) else None,
             )
             chars[v.character_id] = c
         c.voices.append(v)
