@@ -164,8 +164,10 @@ export default function NewCharacterPage() {
   }
 
   async function cancelCommit() {
+    // DELETE tears down the whole job server-side (workdir included), so the
+    // review ledger is gone too — the only honest place to land is upload.
     try { await fetch(`/api/ingest/${jobId}`, { method: "DELETE" }); } catch { /* ignore */ }
-    setPendingCommit(null); setPhase("review");
+    startOver();
   }
 
   function startOver() {
