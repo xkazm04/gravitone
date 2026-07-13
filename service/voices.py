@@ -10,10 +10,12 @@ is isolated from the serving workers. Metadata lives in `voices/_meta.json`.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
 import tempfile
+import threading
 import uuid
 import wave
 from datetime import datetime, timezone
@@ -147,8 +149,49 @@ def _load_meta() -> dict:
 
 
 def _save_meta(meta: dict) -> None:
+    """Atomically persist the registry.
+
+    The JSON is written to a temp file in the SAME directory and then
+    ``os.replace``d over ``_meta.json`` — an atomic rename on the local
+    filesystem (POSIX and Windows). A crash mid-write can therefore never
+    truncate the live registry: readers see either the old file or the new one,
+    never a partial. Callers should mutate through :func:`mutate_meta` so the
+    load→mutate→save cycle is serialized under ``_META_LOCK``.
+    """
     VOICES_DIR.mkdir(parents=True, exist_ok=True)
-    META_PATH.write_text(json.dumps(meta, indent=2), "utf-8")
+    data = json.dumps(meta, indent=2)
+    fd, tmp = tempfile.mkstemp(dir=str(VOICES_DIR), prefix="._meta-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data)
+        os.replace(tmp, META_PATH)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# Serializes every read-modify-write of the registry. Re-entrant so a mutation
+# fn may itself call back into the meta helpers without deadlocking.
+_META_LOCK = threading.RLock()
+
+
+def mutate_meta(fn):
+    """Serialized, atomic registry mutation.
+
+    Under ``_META_LOCK``: load the registry, hand it to ``fn`` for in-place
+    mutation, then atomically save. Returns whatever ``fn`` returns. If ``fn``
+    raises, the save is skipped, so the previous file is left intact (crash
+    safety). This is the ONE write path every mutating endpoint must use — two
+    concurrent clones can no longer clobber each other's entries.
+    """
+    with _META_LOCK:
+        meta = _load_meta()
+        result = fn(meta)
+        _save_meta(meta)
+        return result
 
 
 def _slug(name: str) -> str:
@@ -268,16 +311,17 @@ def add_custom_emotion(character_id: str, req: EmotionReq) -> Character:
     if emotion in EMOTION_SCALE:
         raise HTTPException(409, f"'{emotion}' is already on the base scale")
 
-    meta = _load_meta()
-    if not any(m.get("character_id") == character_id for m in meta["voices"].values()):
-        raise HTTPException(404, "character not found (built-ins cannot be extended)")
-    cm = meta["characters"].setdefault(character_id, {"name": character_id, "tags": []})
-    custom = list(cm.get("custom_emotions") or [])
-    if emotion in custom:
-        raise HTTPException(409, f"'{emotion}' is already in this character's palette")
-    custom.append(emotion)
-    cm["custom_emotions"] = custom
-    _save_meta(meta)
+    def _mut(meta: dict) -> None:
+        if not any(m.get("character_id") == character_id for m in meta["voices"].values()):
+            raise HTTPException(404, "character not found (built-ins cannot be extended)")
+        cm = meta["characters"].setdefault(character_id, {"name": character_id, "tags": []})
+        custom = list(cm.get("custom_emotions") or [])
+        if emotion in custom:
+            raise HTTPException(409, f"'{emotion}' is already in this character's palette")
+        custom.append(emotion)
+        cm["custom_emotions"] = custom
+
+    mutate_meta(_mut)
 
     for c in list_characters():
         if c.character_id == character_id:
@@ -292,16 +336,18 @@ def remove_custom_emotion(character_id: str, emotion: str) -> None:
     emotion = emotion.strip().lower()
     if emotion in EMOTION_SCALE:
         raise HTTPException(400, "base-scale emotions cannot be removed")
-    meta = _load_meta()
-    in_use = any(m.get("character_id") == character_id and m.get("emotion") == emotion
-                 for m in meta["voices"].values())
-    if in_use:
-        raise HTTPException(409, f"a Voice is recorded for '{emotion}' — delete it first")
-    cm = meta["characters"].get(character_id)
-    if not cm or emotion not in (cm.get("custom_emotions") or []):
-        raise HTTPException(404, "custom emotion not found")
-    cm["custom_emotions"] = [e for e in cm["custom_emotions"] if e != emotion]
-    _save_meta(meta)
+
+    def _mut(meta: dict) -> None:
+        in_use = any(m.get("character_id") == character_id and m.get("emotion") == emotion
+                     for m in meta["voices"].values())
+        if in_use:
+            raise HTTPException(409, f"a Voice is recorded for '{emotion}' — delete it first")
+        cm = meta["characters"].get(character_id)
+        if not cm or emotion not in (cm.get("custom_emotions") or []):
+            raise HTTPException(404, "custom emotion not found")
+        cm["custom_emotions"] = [e for e in cm["custom_emotions"] if e != emotion]
+
+    mutate_meta(_mut)
 
 
 @router.get("/v1/characters", response_model=list[Character])
@@ -400,7 +446,6 @@ async def create_voice(
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     cid = _slug(character)
-    meta = _load_meta()
 
     if emotion in emotion_map(cid):
         raise HTTPException(409, f"'{character}' already has a '{emotion}' voice")
@@ -432,20 +477,23 @@ async def create_voice(
             raise HTTPException(500, f"clone failed: {ex.stderr.decode(errors='ignore')[-400:]}")
 
     created = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    meta["voices"][voice_id] = {
-        "name": character.strip(), "character_id": cid, "emotion": emotion,
-        "created": created, "sample_seconds": seconds, "lang": "EN",
-    }
-    cm = meta["characters"].setdefault(cid, {"name": character.strip(), "tags": []})
-    for t in (t.strip().lower() for t in tags.split(",") if t.strip()):
-        if t not in cm["tags"]:
-            cm["tags"].append(t)
-    if emotion not in EMOTION_SCALE:  # novel emotion → custom slot on this Character
-        custom = list(cm.get("custom_emotions") or [])
-        if emotion not in custom:
-            custom.append(emotion)
-        cm["custom_emotions"] = custom
-    _save_meta(meta)
+
+    def _commit(meta: dict) -> None:
+        meta["voices"][voice_id] = {
+            "name": character.strip(), "character_id": cid, "emotion": emotion,
+            "created": created, "sample_seconds": seconds, "lang": "EN",
+        }
+        cm = meta["characters"].setdefault(cid, {"name": character.strip(), "tags": []})
+        for t in (t.strip().lower() for t in tags.split(",") if t.strip()):
+            if t not in cm["tags"]:
+                cm["tags"].append(t)
+        if emotion not in EMOTION_SCALE:  # novel emotion → custom slot on this Character
+            custom = list(cm.get("custom_emotions") or [])
+            if emotion not in custom:
+                custom.append(emotion)
+            cm["custom_emotions"] = custom
+
+    mutate_meta(_commit)
 
     return Voice(voice_id=voice_id, character_id=cid, emotion=emotion,
                  name=f"{character.strip()} · {emotion}", category="cloned",
@@ -454,19 +502,20 @@ async def create_voice(
 
 @router.patch("/v1/voices/{voice_id}", response_model=Voice)
 def patch_voice(voice_id: str, patch: VoicePatch) -> Voice:
-    meta = _load_meta()
-    entry = meta["voices"].get(voice_id)
-    if entry is None:
-        raise HTTPException(404, "voice not found")
-    if patch.emotion:
-        entry["emotion"] = patch.emotion.strip().lower()
-    if patch.name:
-        entry["name"] = patch.name.strip()
-    _save_meta(meta)
-    cname = meta["characters"].get(entry["character_id"], {}).get("name", entry["character_id"])
-    return Voice(voice_id=voice_id, character_id=entry["character_id"], emotion=entry["emotion"],
-                 name=f"{cname} · {entry['emotion']}", category="cloned",
-                 created=entry.get("created"), sample_seconds=entry.get("sample_seconds"))
+    def _mut(meta: dict) -> Voice:
+        entry = meta["voices"].get(voice_id)
+        if entry is None:
+            raise HTTPException(404, "voice not found")
+        if patch.emotion:
+            entry["emotion"] = patch.emotion.strip().lower()
+        if patch.name:
+            entry["name"] = patch.name.strip()
+        cname = meta["characters"].get(entry["character_id"], {}).get("name", entry["character_id"])
+        return Voice(voice_id=voice_id, character_id=entry["character_id"], emotion=entry["emotion"],
+                     name=f"{cname} · {entry['emotion']}", category="cloned",
+                     created=entry.get("created"), sample_seconds=entry.get("sample_seconds"))
+
+    return mutate_meta(_mut)
 
 
 @router.delete("/v1/voices/{voice_id}", status_code=204)
@@ -475,20 +524,19 @@ def delete_voice(voice_id: str) -> None:
     if not path.is_file():
         raise HTTPException(404, "cloned voice not found (built-in voices cannot be deleted)")
     path.unlink()
-    meta = _load_meta()
-    meta["voices"].pop(voice_id, None)
-    _save_meta(meta)
+    mutate_meta(lambda meta: meta["voices"].pop(voice_id, None))
 
 
 @router.patch("/v1/characters/{character_id}", response_model=Character)
 def patch_character(character_id: str, patch: CharacterPatch) -> Character:
-    meta = _load_meta()
-    cm = meta["characters"].setdefault(character_id, {"name": character_id, "tags": []})
-    if patch.name:
-        cm["name"] = patch.name.strip()
-    if patch.tags is not None:
-        cm["tags"] = [t.strip().lower() for t in patch.tags if t.strip()]
-    _save_meta(meta)
+    def _mut(meta: dict) -> None:
+        cm = meta["characters"].setdefault(character_id, {"name": character_id, "tags": []})
+        if patch.name:
+            cm["name"] = patch.name.strip()
+        if patch.tags is not None:
+            cm["tags"] = [t.strip().lower() for t in patch.tags if t.strip()]
+
+    mutate_meta(_mut)
     for c in list_characters():
         if c.character_id == character_id:
             return c
@@ -497,12 +545,13 @@ def patch_character(character_id: str, patch: CharacterPatch) -> Character:
 
 @router.delete("/v1/characters/{character_id}", status_code=204)
 def delete_character(character_id: str) -> None:
-    meta = _load_meta()
-    ids = [vid for vid, m in meta["voices"].items() if m.get("character_id") == character_id]
-    if not ids:
-        raise HTTPException(404, "character has no cloned voices (built-ins cannot be deleted)")
-    for vid in ids:
-        (VOICES_DIR / f"{vid}.safetensors").unlink(missing_ok=True)
-        meta["voices"].pop(vid, None)
-    meta["characters"].pop(character_id, None)
-    _save_meta(meta)
+    def _mut(meta: dict) -> None:
+        ids = [vid for vid, m in meta["voices"].items() if m.get("character_id") == character_id]
+        if not ids:
+            raise HTTPException(404, "character has no cloned voices (built-ins cannot be deleted)")
+        for vid in ids:
+            (VOICES_DIR / f"{vid}.safetensors").unlink(missing_ok=True)
+            meta["voices"].pop(vid, None)
+        meta["characters"].pop(character_id, None)
+
+    mutate_meta(_mut)

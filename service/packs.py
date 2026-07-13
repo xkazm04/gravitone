@@ -29,7 +29,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 
 from service.voices import (
-    VOICES_DIR, Character, _load_meta, _save_meta, _slug, list_characters,
+    VOICES_DIR, Character, _load_meta, _slug, list_characters, mutate_meta,
 )
 
 router = APIRouter(tags=["packs"])
@@ -169,22 +169,29 @@ async def import_pack(
 
     VOICES_DIR.mkdir(parents=True, exist_ok=True)
     created = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    for v, data in staged:
-        emotion = str(v.get("emotion") or "baseline").strip().lower()
-        voice_id = f"{cid}-{emotion}-{uuid.uuid4().hex[:6]}"
-        (VOICES_DIR / f"{voice_id}.safetensors").write_bytes(data)
-        meta["voices"][voice_id] = {
-            "name": name, "character_id": cid, "emotion": emotion,
-            "created": v.get("created") or created,
-            "sample_seconds": v.get("sample_seconds"), "lang": src.get("lang", "EN"),
-            "imported": {"from": src.get("character_id"), "at": created},
-        }
-    meta["characters"].setdefault(cid, {
-        "name": name,
-        "tags": list(src.get("tags") or []),
-        "custom_emotions": [e for e in (src.get("custom_emotions") or []) if isinstance(e, str)],
-    })
-    _save_meta(meta)
+
+    def _commit(meta: dict) -> None:
+        # Re-check under the registry lock: the early check above is a fast
+        # fail, but a concurrent import could have claimed the id since.
+        if cid in {m.get("character_id") for m in meta["voices"].values()}:
+            raise HTTPException(409, f"character '{cid}' already exists — pass rename=<new name>")
+        for v, data in staged:
+            emotion = str(v.get("emotion") or "baseline").strip().lower()
+            voice_id = f"{cid}-{emotion}-{uuid.uuid4().hex[:6]}"
+            (VOICES_DIR / f"{voice_id}.safetensors").write_bytes(data)
+            meta["voices"][voice_id] = {
+                "name": name, "character_id": cid, "emotion": emotion,
+                "created": v.get("created") or created,
+                "sample_seconds": v.get("sample_seconds"), "lang": src.get("lang", "EN"),
+                "imported": {"from": src.get("character_id"), "at": created},
+            }
+        meta["characters"].setdefault(cid, {
+            "name": name,
+            "tags": list(src.get("tags") or []),
+            "custom_emotions": [e for e in (src.get("custom_emotions") or []) if isinstance(e, str)],
+        })
+
+    mutate_meta(_commit)
 
     imported = next((c for c in list_characters() if c.character_id == cid), None)
     if imported is None:  # should be impossible — files were just written
