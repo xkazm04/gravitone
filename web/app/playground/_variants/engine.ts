@@ -1,6 +1,6 @@
 "use client";
 
-import { stripTags, waveHeights, type Expression, type Segment, type Take } from "./shared";
+import { stripTags, waveHeights, type Expression, type PerfLine, type Segment, type Take } from "./shared";
 
 // One module-level AudioContext shared across every peak computation. Browsers
 // cap the number of live AudioContexts (~6), so minting a fresh one per take
@@ -113,6 +113,59 @@ function decodeSegments(header: string | null): Segment[] {
 }
 
 /**
+ * Decode the X-Performance-Report header (base64 JSON, one entry per rendered
+ * segment) into Segments carrying the speaking Character + source line index,
+ * mirroring how X-Segments is decoded for solo takes.
+ */
+function decodePerformanceReport(header: string | null): Segment[] {
+  if (!header) return [];
+  try {
+    const rows = JSON.parse(atob(header)) as Array<
+      Segment & { character_id?: string; line?: number }
+    >;
+    return rows.map((r) => ({
+      text: r.text, requested: r.requested, used: r.used, fallback: r.fallback,
+      voice_id: r.voice_id, seconds: r.seconds,
+      characterId: r.character_id, line: r.line,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+/** Build a gravitone SpeakResult from a successful audio response. */
+async function gravitoneResult(res: Response, segments: Segment[], seed: number): Promise<SpeakResult> {
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const hdrSec = Number(res.headers.get("X-Audio-Seconds"));
+  const hdrRtf = Number(res.headers.get("X-Realtime-Factor"));
+  const hdrSynth = Number(res.headers.get("X-Synth-Seconds"));
+  const hdrQueue = Number(res.headers.get("X-Queue-Seconds"));
+  // Waveform extraction is best-effort — a decode hiccup on the concatenated
+  // multi-segment WAV must NOT drop us to the browser fallback. Keep the real
+  // audio; fall back to synthetic bars.
+  let peaks = waveHeights(seed, 56);
+  let duration = 0;
+  try {
+    const p = await computePeaks(blob);
+    peaks = p.peaks;
+    duration = p.duration;
+  } catch {
+    /* keep the synthetic peaks; audio still plays */
+  }
+  return {
+    mode: "gravitone", url, peaks,
+    seconds: Math.round((hdrSec || duration) * 10) / 10,
+    kb: Math.round(blob.size / 1024),
+    rtf: hdrRtf || 0,
+    synthSeconds: Number.isFinite(hdrSynth) ? hdrSynth : 0,
+    queueSeconds: Number.isFinite(hdrQueue) ? hdrQueue : 0,
+    ignoredSettings: decodeIgnored(res.headers.get("X-Ignored-Settings")),
+    segments,
+  };
+}
+
+/**
  * Speak metatagged text with one Character. Emotions the Character lacks fall
  * back to baseline; the per-segment report says what actually happened.
  * Falls back to browser speech (tags stripped) when the backend is unreachable.
@@ -143,39 +196,57 @@ export async function speak(text: string, characterId: string, expr: Expression)
       throw new EngineBusyError(parseRetryAfter(res.headers.get("Retry-After")));
     }
     if (res.ok) {
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const hdrSec = Number(res.headers.get("X-Audio-Seconds"));
-      const hdrRtf = Number(res.headers.get("X-Realtime-Factor"));
-      const hdrSynth = Number(res.headers.get("X-Synth-Seconds"));
-      const hdrQueue = Number(res.headers.get("X-Queue-Seconds"));
-      // Waveform extraction is best-effort — a decode hiccup on the concatenated
-      // multi-segment WAV must NOT drop us to the browser fallback (that was the
-      // "composition produces no audio" bug). Keep the real audio; fake the bars.
-      let peaks = waveHeights(trimmed.length * 31 + 7, 56);
-      let duration = 0;
-      try {
-        const p = await computePeaks(blob);
-        peaks = p.peaks;
-        duration = p.duration;
-      } catch {
-        /* keep the synthetic peaks; audio still plays */
-      }
-      return {
-        mode: "gravitone", url, peaks,
-        seconds: Math.round((hdrSec || duration) * 10) / 10,
-        kb: Math.round(blob.size / 1024),
-        rtf: hdrRtf || 0,
-        synthSeconds: Number.isFinite(hdrSynth) ? hdrSynth : 0,
-        queueSeconds: Number.isFinite(hdrQueue) ? hdrQueue : 0,
-        ignoredSettings: decodeIgnored(res.headers.get("X-Ignored-Settings")),
-        segments: decodeSegments(res.headers.get("X-Segments")),
-      };
+      return gravitoneResult(res, decodeSegments(res.headers.get("X-Segments")), trimmed.length * 31 + 7);
     }
     // Any other upstream failure (502/503/500) keeps the browser fallback.
   }
 
   const plain = stripTags(trimmed);
+  const seconds = Math.max(1.5, Math.round(plain.length * 0.055 * 10) / 10);
+  return {
+    mode: "browser", peaks: waveHeights(plain.length * 31 + 7, 56),
+    seconds, kb: 0, rtf: 0, synthSeconds: 0, queueSeconds: 0,
+    ignoredSettings: [], segments: [],
+  };
+}
+
+/**
+ * Render a multi-character performance script in ONE call: every line's
+ * Character speaks its (optionally metatagged) text, Voices switching per
+ * character and per emotion. Returns a single concatenated take whose segments
+ * carry who spoke what. Falls back to browser speech (whole script, tags
+ * stripped) when the backend is unreachable; 429 backpressure throws distinctly.
+ */
+export async function perform(lines: PerfLine[], expr: Expression): Promise<SpeakResult> {
+  const body = {
+    lines: lines.map((l) => ({
+      character_id: l.character_id,
+      text: l.text.trim(),
+      voice_settings: { temperature: expr.temperature, stability: expr.stability, quality: expr.quality },
+    })),
+  };
+  let res: Response | null = null;
+  try {
+    res = await fetch("/api/performance", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch {
+    res = null;
+  }
+
+  if (res) {
+    if (res.status === 429) {
+      throw new EngineBusyError(parseRetryAfter(res.headers.get("Retry-After")));
+    }
+    if (res.ok) {
+      const seed = lines.reduce((n, l) => n + l.text.length, 0) * 31 + 7;
+      return gravitoneResult(res, decodePerformanceReport(res.headers.get("X-Performance-Report")), seed);
+    }
+  }
+
+  const plain = stripTags(lines.map((l) => l.text).join(" "));
   const seconds = Math.max(1.5, Math.round(plain.length * 0.055 * 10) / 10);
   return {
     mode: "browser", peaks: waveHeights(plain.length * 31 + 7, 56),
