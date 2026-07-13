@@ -75,6 +75,8 @@ def concat_wavs(paths: list[Path], dst: Path, cap_seconds: float = 30.0) -> floa
     frames: list[bytes] = []
     params = None
     total = 0.0
+    if not paths:
+        raise RuntimeError("no speech detected in the clip")
     for p in paths:
         with wave.open(str(p), "rb") as w:
             if params is None:
@@ -392,6 +394,8 @@ def scan(audio: Path, work_dir: Path, speaker: str = "auto", min_stem: float = 4
          mode: str = "auto") -> dict:
     mode = resolve_mode(mode)
     a = (sovereign_analyze if mode == "sovereign" else analyze)(audio, work_dir, progress)
+    if not a["speakers"]:
+        raise RuntimeError("no speech detected in the clip")
     target = a["speakers"][0]["id"] if speaker == "auto" else speaker
     r = label_and_stem(work_dir, target, min_stem, limit, progress, mode=mode)
     return {"duration": a["duration"], "speakers": [s["id"] for s in a["speakers"]],

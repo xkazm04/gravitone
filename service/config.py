@@ -64,6 +64,9 @@ class Settings:
     quantize: bool = _bool("TTS_QUANTIZE", False)  # int8; ~27% faster on x86
     # Directory of pre-exported voice embeddings (*.safetensors) to preload.
     voices_dir: str = _str("TTS_VOICES_DIR", str(REPO_ROOT / "voices"))
+    # Durable working dir for ingest jobs (per-job subdir + state.json). Kept
+    # off OS tempdirs so jobs survive a restart and are GC'd on a TTL timer.
+    ingest_work_dir: str = _str("INGEST_WORK_DIR", str(REPO_ROOT / "ingest_jobs"))
     # Fallback built-in voice if a requested voice_id isn't found.
     default_voice: str = _str("TTS_DEFAULT_VOICE", "alba")
 
