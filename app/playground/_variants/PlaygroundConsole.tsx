@@ -66,15 +66,31 @@ export default function PlaygroundConsole() {
   const [codeFor, setCodeFor] = useState<string | null>(null); // take id with the code panel open
   // take id → shared state: publishing / share id / failed
   const [shares, setShares] = useState<Record<string, string | "pending" | "error">>({});
+  // client-review link: selected take ids → /r/{id}
+  const [reviewSel, setReviewSel] = useState<Set<string>>(new Set());
+  const [reviewBusy, setReviewBusy] = useState(false);
+  const [reviewUrl, setReviewUrl] = useState<string | null>(null);
+  const [reviewErr, setReviewErr] = useState<string | null>(null);
   const seq = useRef(0);
   const areaRef = useRef<HTMLTextAreaElement>(null);
 
   const { playingId, paused, progress, toggle, stop } = useAudioPlayer();
 
+  const [preferred, setPreferred] = useState<{ character_id: string | null; picks: number }>({ character_id: null, picks: 0 });
+
   useEffect(() => {
-    fetch("/api/characters", { cache: "no-store" })
-      .then((r) => (r.ok ? r.json() : []))
-      .then((cs: Character[]) => { setCharacters(cs); if (cs[0]) setCharId(cs[0].character_id); })
+    // Default to the character clients have actually approved most often —
+    // the review loop's pick data feeding back into the studio.
+    Promise.all([
+      fetch("/api/characters", { cache: "no-store" }).then((r) => (r.ok ? r.json() : [])),
+      fetch("/api/reviews/preferred", { cache: "no-store" }).then((r) => (r.ok ? r.json() : { character_id: null, picks: 0 })),
+    ])
+      .then(([cs, pref]: [Character[], { character_id: string | null; picks: number }]) => {
+        setCharacters(cs);
+        setPreferred(pref);
+        const winner = pref.character_id && cs.find((c) => c.character_id === pref.character_id);
+        setCharId((winner || cs[0])?.character_id ?? "");
+      })
       .catch(() => setCharacters([]));
   }, []);
 
@@ -126,6 +142,48 @@ export default function PlaygroundConsole() {
     }
   }
 
+  /** Publish a take if needed and return its share id (the review needs one). */
+  async function ensureShared(t: Take): Promise<string> {
+    const existing = shares[t.id];
+    if (existing && existing !== "pending" && existing !== "error") return existing;
+    if (!t.url) throw new Error("browser-fallback takes cannot be reviewed");
+    const blob = await (await fetch(t.url)).blob();
+    const fd = new FormData();
+    fd.append("file", blob, "take.wav");
+    fd.append("meta", JSON.stringify({
+      character_id: t.characterId, character_name: t.characterName,
+      text: t.text, seconds: t.seconds, rtf: t.rtf, segments: t.segments,
+    }));
+    const r = await fetch("/api/takes", { method: "POST", body: fd });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j?.detail ?? "could not publish the take");
+    const id = j.take_id as string;
+    setShares((s) => ({ ...s, [t.id]: id }));
+    return id;
+  }
+
+  /** Bundle the selected takes into a no-login client approval link. */
+  async function createReview() {
+    if (reviewSel.size < 2 || reviewBusy) return;
+    setReviewBusy(true); setReviewErr(null); setReviewUrl(null);
+    try {
+      const chosen = takes.filter((t) => reviewSel.has(t.id));
+      const ids = await Promise.all(chosen.map(ensureShared));
+      const r = await fetch("/api/reviews", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: `${chosen[0].characterName} — pick a take`, take_ids: ids }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j?.detail ?? "could not create the review");
+      const url = `${window.location.origin}/r/${j.review_id}`;
+      setReviewUrl(url);
+      setReviewSel(new Set());
+      await navigator.clipboard.writeText(url).catch(() => {});
+    } catch (e) {
+      setReviewErr(e instanceof Error ? e.message : "could not create the review");
+    } finally { setReviewBusy(false); }
+  }
+
   async function generate() {
     if (!plain || busy || !character) return;
     setBusy(true);
@@ -168,7 +226,14 @@ export default function PlaygroundConsole() {
 
       {/* character rail */}
       <div className="mt-8">
-        <div className="font-jetbrains mb-2 text-[11px] uppercase tracking-widest text-white/60">character</div>
+        <div className="font-jetbrains mb-2 flex flex-wrap items-center gap-3 text-[11px] uppercase tracking-widest text-white/60">
+          <span>character</span>
+          {preferred.character_id && preferred.picks > 0 && (
+            <span className="rounded-full border border-emerald-400/20 bg-emerald-400/5 px-2 py-0.5 normal-case tracking-normal text-emerald-200/90">
+              ✓ client-approved default · {preferred.picks} pick{preferred.picks > 1 ? "s" : ""}
+            </span>
+          )}
+        </div>
         <div className="flex flex-wrap gap-2">
           {characters.slice(0, 10).map((c) => {
             const on = c.character_id === charId;
@@ -259,9 +324,36 @@ export default function PlaygroundConsole() {
 
       {/* takes log */}
       <div className="mt-8">
-        <div className="font-jetbrains mb-3 flex items-center justify-between text-[11px] uppercase tracking-widest text-white/60">
-          <span>takes</span><span>{takes.length}</span>
+        <div className="font-jetbrains mb-3 flex flex-wrap items-center justify-between gap-3 text-[11px] uppercase tracking-widest text-white/60">
+          <span>takes</span>
+          <div className="flex flex-wrap items-center gap-3">
+            {reviewSel.size > 0 && (
+              <>
+                <span className="text-cyan-300">{reviewSel.size} selected</span>
+                <button
+                  onClick={() => void createReview()}
+                  disabled={reviewSel.size < 2 || reviewBusy}
+                  title={reviewSel.size < 2 ? "Select at least 2 takes to compare" : "Create a no-login link where a client picks the winner"}
+                  className="cursor-pointer rounded-full border border-cyan-400/30 bg-cyan-400/10 px-3 py-1 text-[11px] normal-case tracking-normal text-cyan-200 transition hover:bg-cyan-400/20 disabled:opacity-40"
+                >
+                  {reviewBusy ? "creating…" : "→ client review link"}
+                </button>
+              </>
+            )}
+            <span>{takes.length}</span>
+          </div>
         </div>
+
+        {reviewUrl && (
+          <p className="font-jetbrains mb-3 rounded-lg border border-emerald-400/25 bg-emerald-400/5 px-4 py-2 text-[11px] text-emerald-200/90">
+            ✓ review link copied —{" "}
+            <a href={reviewUrl} target="_blank" rel="noreferrer" className="underline underline-offset-2">{reviewUrl}</a>{" "}
+            (no login; the client picks one take)
+          </p>
+        )}
+        {reviewErr && (
+          <p className="font-jetbrains mb-3 rounded-lg border border-amber-400/25 bg-amber-400/5 px-4 py-2 text-[11px] text-amber-200/90">{reviewErr}</p>
+        )}
 
         {takes.length === 0 && !busy && (
           <div className="rounded-2xl border border-dashed border-white/10 px-5 py-10 text-center text-sm text-white/60">
@@ -288,6 +380,22 @@ export default function PlaygroundConsole() {
               <motion.div key={t.id} layout initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }}
                 transition={{ duration: 0.4, ease: EASE }} className="glass-panel mb-2 rounded-xl px-5 py-4">
                 <div className="flex items-center gap-3">
+                  {/* compare selector — 2+ takes become a client review link */}
+                  <input
+                    type="checkbox"
+                    checked={reviewSel.has(t.id)}
+                    disabled={t.mode === "browser"}
+                    onChange={(e) =>
+                      setReviewSel((s) => {
+                        const n = new Set(s);
+                        if (e.target.checked) { if (n.size < 6) n.add(t.id); } else n.delete(t.id);
+                        return n;
+                      })
+                    }
+                    title={t.mode === "browser" ? "Browser-fallback take — cannot be reviewed" : "Select for a client review link (max 6)"}
+                    aria-label="Select take for client review"
+                    className="h-4 w-4 shrink-0 accent-cyan-300 disabled:opacity-30"
+                  />
                   <button onClick={() => toggle(t)} aria-label={isCurrent && !paused ? "Pause" : "Play"}
                     className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-cyan-300 text-slate-950 transition hover:brightness-110">
                     {isCurrent && !paused ? "⏸" : "▶"}
