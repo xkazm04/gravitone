@@ -277,6 +277,49 @@ async def _one(client, url, voice, text, fmt, results):
         results["errors"] += 1
 
 
+# ---------------------------------------------------------------------------
+# Direction 2 — streaming TTFB (time-to-first-chunk on the /stream route)
+# ---------------------------------------------------------------------------
+async def _measure_stream_timing(aiter, t0, clock=time.perf_counter):
+    """Consume a streaming body, returning ``(ttfb, total)``.
+
+    ``ttfb`` is the time from ``t0`` to the FIRST non-empty chunk — the headline
+    "first audio in Nms" number — or ``None`` if the stream produced no bytes.
+    ``total`` is the time to drain the whole stream. Pure over any async byte
+    iterator, so the first-chunk timing is unit-testable without a live server.
+    """
+    ttfb = None
+    async for chunk in aiter:
+        if chunk and ttfb is None:
+            ttfb = clock() - t0
+    return ttfb, clock() - t0
+
+
+async def _one_stream(client, url, voice, text, fmt, results):
+    t0 = time.perf_counter()
+    try:
+        async with client.stream(
+            "POST", f"{url}/v1/text-to-speech/{voice}/stream",
+            params={"output_format": fmt},
+            json={"text": text, "model_id": "pocket_tts"},
+            timeout=300,
+        ) as r:
+            if r.status_code == 200:
+                ttfb, total = await _measure_stream_timing(r.aiter_bytes(), t0)
+                results["lat"].append(total)
+                if ttfb is not None:
+                    results["ttfb"].append(ttfb)
+            elif r.status_code == 429:
+                results["rejected"] += 1
+            elif r.status_code == 501:
+                # The stream route 501s mp3 (transcoding needs the whole clip).
+                results["unsupported"] += 1
+            else:
+                results["errors"] += 1
+    except Exception:  # noqa: BLE001
+        results["errors"] += 1
+
+
 async def _sample_resources(stop_evt, samples):
     if psutil is None:
         return
@@ -290,19 +333,22 @@ async def _sample_resources(stop_evt, samples):
         samples["mem"].append(psutil.virtual_memory().percent)
 
 
-async def run_level(url, voice, text, fmt, concurrency, n_requests):
-    results = {"lat": [], "rtf": [], "audio": [], "rejected": 0, "errors": 0}
+async def run_level(url, voice, text, fmt, concurrency, n_requests, route="synth"):
+    results = {"lat": [], "ttfb": [], "rtf": [], "audio": [],
+               "rejected": 0, "errors": 0, "unsupported": 0}
     samples = {"cpu": [], "mem": []}
     stop_evt = asyncio.Event()
     sampler = asyncio.create_task(_sample_resources(stop_evt, samples))
 
+    # In stream mode we time to first CHUNK; in synth mode we time full responses.
+    one = _one_stream if route == "stream" else _one
     sem = asyncio.Semaphore(concurrency)
     limits = httpx.Limits(max_connections=concurrency + 4, max_keepalive_connections=concurrency + 4)
     wall0 = time.perf_counter()
     async with httpx.AsyncClient(limits=limits) as client:
         async def bounded():
             async with sem:
-                await _one(client, url, voice, text, fmt, results)
+                await one(client, url, voice, text, fmt, results)
         await asyncio.gather(*[bounded() for _ in range(n_requests)])
     wall = time.perf_counter() - wall0
 
@@ -312,7 +358,7 @@ async def run_level(url, voice, text, fmt, concurrency, n_requests):
     ok = len(results["lat"])
     audio_total = sum(results["audio"])
     rtfs = [x for x in results["rtf"] if x == x]  # drop nan
-    return {
+    row = {
         "concurrency": concurrency,
         "requests": n_requests,
         "ok": ok,
@@ -329,6 +375,14 @@ async def run_level(url, voice, text, fmt, concurrency, n_requests):
         "cpu_max_pct": round(max(samples["cpu"]), 1) if samples["cpu"] else None,
         "mem_max_pct": round(max(samples["mem"]), 1) if samples["mem"] else None,
     }
+    if route == "stream":
+        # lat_* above ARE the total-response percentiles; add first-chunk (TTFB)
+        # percentiles — the "first audio in Nms" headline — and the 501 tally.
+        row["ttfb_p50_s"] = pct(results["ttfb"], 50)
+        row["ttfb_p95_s"] = pct(results["ttfb"], 95)
+        row["ttfb_p99_s"] = pct(results["ttfb"], 99)
+        row["unsupported_501"] = results["unsupported"]
+    return row
 
 
 async def warmup(url, voice, text, fmt, n):
@@ -411,23 +465,43 @@ async def run_ramp(args, levels, n_per_level, *, scrape=None):
     per_level_metrics: list = []
     baseline_p95 = None
     knee = None
+    route = getattr(args, "route", "synth")
 
-    hdr = (f"{'conc':>4} {'ok':>4} {'429':>4} {'err':>4} {'p50_s':>7} {'p95_s':>7} "
-           f"{'thr/s':>6} {'aud/s':>6} {'srtf':>5} {'cpu%':>5} {'mem%':>5}")
+    if route == "stream":
+        # Stream mode leads with TTFB (first-chunk latency), the headline number;
+        # the /stream route emits no timing headers so srtf/aud/s are dropped.
+        hdr = (f"{'conc':>4} {'ok':>4} {'429':>4} {'err':>4} {'501':>4} "
+               f"{'tfb50':>7} {'tfb95':>7} {'tot50':>7} {'tot95':>7} "
+               f"{'thr/s':>6} {'cpu%':>5} {'mem%':>5}")
+    else:
+        hdr = (f"{'conc':>4} {'ok':>4} {'429':>4} {'err':>4} {'p50_s':>7} {'p95_s':>7} "
+               f"{'thr/s':>6} {'aud/s':>6} {'srtf':>5} {'cpu%':>5} {'mem%':>5}")
     print("\n" + hdr)
     print("-" * len(hdr))
 
     for c in levels:
         before = await scrape() if scrape is not None else None
-        row = await run_level(args.url, args.voice, args.text, args.format, c, n_per_level)
+        row = await run_level(args.url, args.voice, args.text, args.format, c,
+                              n_per_level, route=route)
         after = await scrape() if scrape is not None else None
         mark_low_confidence(row)
         rows.append(row)
-        print(f"{row['concurrency']:>4} {row['ok']:>4} {row['rejected_429']:>4} "
-              f"{row['errors']:>4} {str(row['lat_p50_s']):>7} {str(row['lat_p95_s']):>7} "
-              f"{str(row['throughput_req_s']):>6} {str(row['audio_s_per_wall_s']):>6} "
-              f"{str(row['server_rtf_mean']):>5} {str(row['cpu_mean_pct']):>5} "
-              f"{str(row['mem_max_pct']):>5}")
+        if route == "stream":
+            print(f"{row['concurrency']:>4} {row['ok']:>4} {row['rejected_429']:>4} "
+                  f"{row['errors']:>4} {row['unsupported_501']:>4} "
+                  f"{str(row['ttfb_p50_s']):>7} {str(row['ttfb_p95_s']):>7} "
+                  f"{str(row['lat_p50_s']):>7} {str(row['lat_p95_s']):>7} "
+                  f"{str(row['throughput_req_s']):>6} {str(row['cpu_mean_pct']):>5} "
+                  f"{str(row['mem_max_pct']):>5}")
+            if row["unsupported_501"]:
+                print(f"     ^ {row['unsupported_501']} request(s) got 501: mp3 is not "
+                      f"streamable — use pcm_24000/wav_24000 for --route stream")
+        else:
+            print(f"{row['concurrency']:>4} {row['ok']:>4} {row['rejected_429']:>4} "
+                  f"{row['errors']:>4} {str(row['lat_p50_s']):>7} {str(row['lat_p95_s']):>7} "
+                  f"{str(row['throughput_req_s']):>6} {str(row['audio_s_per_wall_s']):>6} "
+                  f"{str(row['server_rtf_mean']):>5} {str(row['cpu_mean_pct']):>5} "
+                  f"{str(row['mem_max_pct']):>5}")
         if row.get("low_confidence"):
             print(f"     ^ low confidence: only {row['ok']} sample(s) < {LOW_CONFIDENCE_N}; "
                   f"treat p95/p99 as indicative, not exact")
@@ -516,7 +590,7 @@ async def run_replicas_mode(args, levels, n_per_level) -> None:
 
         result = build_result(
             rows, knee, recommended,
-            route="synth", fmt=args.format, corpus=args.text,
+            route=args.route, fmt=args.format, corpus=args.text,
             service_config=service_config, meta=runtime_metadata(),
             extra={"topology": topology_block("replicas", args.replicas, per_level)})
         _write_result(args, result)
@@ -531,6 +605,9 @@ async def main():
     ap.add_argument("--voice", default="step4")
     ap.add_argument("--text", default=TEXT_DEFAULT)
     ap.add_argument("--format", default="wav_24000")
+    ap.add_argument("--route", choices=("synth", "stream"), default="synth",
+                    help="synth = full-response latency (default); stream = the "
+                         "/stream route, measuring time-to-first-chunk (TTFB)")
     ap.add_argument("--levels", default="1,2,3,4,6,8",
                     help="comma-separated concurrency levels to ramp through")
     ap.add_argument("--requests", type=int, default=12,
@@ -560,6 +637,11 @@ async def main():
         except FileNotFoundError:
             print(f"{args.out} not found — run the load test first")
         return
+
+    if args.route == "stream" and args.format.startswith("mp3"):
+        print("!! --route stream cannot use an mp3 format (the /stream route 501s "
+              "mp3 — transcoding needs the whole clip). Use pcm_24000 or wav_24000.")
+        print("   Proceeding will record every request as a 501 under unsupported_501.")
 
     levels = [int(x) for x in args.levels.split(",") if x.strip()]
     # Equal sample size across every level so their percentile populations are
@@ -591,7 +673,7 @@ async def main():
     rows, knee, recommended, _ = await run_ramp(args, levels, n_per_level)
     result = build_result(
         rows, knee, recommended,
-        route="synth", fmt=args.format, corpus=args.text,
+        route=args.route, fmt=args.format, corpus=args.text,
         service_config=service_config, meta=runtime_metadata(),
         extra={"topology": topology_block("single", 1, [])})
     _write_result(args, result)

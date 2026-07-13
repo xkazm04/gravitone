@@ -144,5 +144,91 @@ class ScrapePoolTotalsTests(unittest.TestCase):
         self.assertEqual(totals, {})
 
 
+# ---------------------------------------------------------------------------
+# Direction 2 — streaming TTFB (time-to-first-chunk)
+# ---------------------------------------------------------------------------
+class StreamTimingTests(unittest.TestCase):
+    def _drive(self, chunks):
+        """Feed (delay, bytes) pairs through a fake async byte iterator using a
+        virtual clock, so timing is deterministic (no real sleeps)."""
+        import asyncio
+
+        clock = {"t": 0.0}
+
+        async def aiter():
+            for delay, data in chunks:
+                clock["t"] += delay
+                yield data
+
+        return asyncio.run(
+            lt._measure_stream_timing(aiter(), t0=0.0, clock=lambda: clock["t"]))
+
+    def test_ttfb_is_time_to_first_nonempty_chunk(self) -> None:
+        # header flush is empty, then first audio at t=0.05, tail chunks later
+        ttfb, total = self._drive(
+            [(0.02, b""), (0.03, b"AUDIO0"), (0.40, b"AUDIO1"), (0.40, b"AUDIO2")])
+        # first NON-EMPTY chunk lands at 0.02 + 0.03 = 0.05
+        self.assertAlmostEqual(ttfb, 0.05, places=6)
+        # total drains the whole stream (0.85), far past first chunk
+        self.assertAlmostEqual(total, 0.85, places=6)
+        self.assertLess(ttfb, total)
+
+    def test_ttfb_none_when_no_bytes(self) -> None:
+        ttfb, total = self._drive([(0.1, b""), (0.1, b"")])
+        self.assertIsNone(ttfb)          # nothing to time to
+        self.assertAlmostEqual(total, 0.2, places=6)
+
+
+class StreamRequestTests(unittest.TestCase):
+    """_one_stream classifies status codes and records TTFB via a fake client."""
+
+    class _FakeStreamResp:
+        def __init__(self, status, chunks=()):
+            self.status_code = status
+            self._chunks = chunks
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def aiter_bytes(self):
+            for c in self._chunks:
+                yield c
+
+    class _FakeClient:
+        def __init__(self, resp):
+            self._resp = resp
+
+        def stream(self, *a, **k):
+            return self._resp
+
+    def _run(self, status, chunks=()):
+        import asyncio
+        results = {"lat": [], "ttfb": [], "rtf": [], "audio": [],
+                   "rejected": 0, "errors": 0, "unsupported": 0}
+        client = self._FakeClient(self._FakeStreamResp(status, chunks))
+        asyncio.run(lt._one_stream(client, "http://x", "v", "hi", "wav_24000", results))
+        return results
+
+    def test_200_records_ttfb_and_total(self) -> None:
+        r = self._run(200, chunks=[b"", b"AUDIO", b"MORE"])
+        self.assertEqual(len(r["lat"]), 1)
+        self.assertEqual(len(r["ttfb"]), 1)   # a first chunk was timed
+        self.assertEqual(r["errors"], 0)
+
+    def test_501_is_surfaced_as_unsupported_not_error(self) -> None:
+        r = self._run(501)
+        self.assertEqual(r["unsupported"], 1)  # mp3-on-stream, clearly flagged
+        self.assertEqual(r["errors"], 0)
+        self.assertEqual(len(r["lat"]), 0)
+
+    def test_429_counts_as_rejected(self) -> None:
+        r = self._run(429)
+        self.assertEqual(r["rejected"], 1)
+        self.assertEqual(r["errors"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
