@@ -1,13 +1,12 @@
-# Pocket Voice — a CPU-only, Arm-native cloud TTS service with voice cloning
+# Gravitone — a CPU-only, Arm-native cloud TTS service with voice cloning
 
-> **Arm AI Optimization Challenge — Track 2: Cloud AI submission draft.**
-> This document is the hackathon-facing description. Move it to the root
-> `README.md` of your **own public repository** before submitting (see
-> "Licensing & attribution" at the bottom).
+> **Arm AI Optimization Challenge — Track 2: Cloud AI.**
+> Built on Kyutai [Pocket TTS](https://github.com/kyutai-labs/pocket-tts) (MIT)
+> — see "Licensing & attribution" at the bottom.
 
 ## Project Overview
 
-**Pocket Voice** turns Kyutai's [Pocket TTS](https://github.com/kyutai-labs/pocket-tts)
+**Gravitone** turns Kyutai's [Pocket TTS](https://github.com/kyutai-labs/pocket-tts)
 (a 100M-parameter, CPU-only text-to-speech model with zero-shot voice
 cloning) into a **production-shaped, ElevenLabs-compatible HTTP service** that
 runs entirely on **Arm CPUs** — no GPU, no cloud AI API, no per-character
@@ -218,7 +217,7 @@ paths, same auth header, same body shape. What maps where:
 | Emotion addressing | ✅➕ Gravitone extension | `/v1/text-to-speech/{character}:{emotion}` (or `?emotion=`), baseline fallback reported in `X-Emotion-*` headers |
 | Multi-character scripts | ✅➕ `POST /v1/performance` | one call, many Characters, inline `[emotion]` metatags; needs the `performance` key scope |
 | Character capability manifest | ✅➕ `GET /v1/characters/{id}/manifest` | which emotions a Character performs natively vs falls back |
-| Streaming endpoint (`/stream`) | ❌ not yet | whole-utterance responses; ~realtime on Arm |
+| Streaming endpoint (`/stream`) | ✅ `POST /v1/text-to-speech/{voice_id}/stream` | sentence-chunked: first sentence streams while the rest renders. `pcm_*`/`wav_*` stream; `mp3_*` → **501** (transcode needs the whole clip). No per-synthesis timing headers (see "Scaling on Arm" for the throughput story) |
 | Usage accounting | ✅ `X-Audio-Seconds` header + `audio_seconds_total` in `/metrics` | feeds the studio's "you'd have paid $X at ElevenLabs" ticker |
 
 ### Characters, not voices — the emotion-addressable API
@@ -253,6 +252,17 @@ curl -X POST "localhost:8080/v1/performance" \
 # Check what a Character can perform before directing it:
 curl -s -H "xi-api-key: $KEY" localhost:8080/v1/characters/sarah/manifest
 ```
+
+### Consent receipts — every clone is on the record
+
+Cloning is gated on an ownership attestation, and the **exact** statement the
+user agreed to is stored *verbatim* with the voice as a **consent receipt**
+(`{consented_at, clip_sha256, statement}` in the Voice's metadata) on **every**
+clone path: studio ingestion (`service/ingest.py`), the direct `POST /v1/voices`
+upload (`service/voices.py`), and the landing's hero mic demo. One canonical
+statement is the single source of truth (`web/lib/consent.ts`), so the record
+always reflects what was actually agreed — and `GET /v1/voices` reports whether
+a voice carries a receipt.
 
 ## The full studio — two products, one repo
 

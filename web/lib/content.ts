@@ -21,24 +21,34 @@ export const STATS = [
 
 export const FEATURES = [
   {
-    key: "clone",
-    title: "Zero-shot voice cloning",
-    body: "Upload 15–30 seconds of clean speech and get a reusable voice in seconds. Own your library.",
+    key: "characters",
+    title: "Emotion-addressable Characters",
+    body: "One speaker, many moods. Address a Character by emotion — sarah:excited — and missing emotions fall back to the nearest on a fixed chain, reported in the response headers.",
+  },
+  {
+    key: "performance",
+    title: "Multi-character performances",
+    body: "POST /v1/performance renders a whole script — many Characters, inline [emotion] metatags — in one call. Compose it in the playground.",
+  },
+  {
+    key: "stream",
+    title: "Streaming first-audio",
+    body: "The streaming endpoint returns audio sentence by sentence — the first line plays while the rest still renders. pcm and wav stream; mp3 uses the standard route.",
+  },
+  {
+    key: "consent",
+    title: "Consent receipts on every clone",
+    body: "Every cloned voice stores the exact ownership attestation the speaker agreed to — ingest, direct upload, or studio. The receipt travels with the voice.",
   },
   {
     key: "api",
-    title: "ElevenLabs-compatible API",
-    body: "POST /v1/text-to-speech/{voice}. Point existing client code at your own endpoint — swap a base URL.",
+    title: "ElevenLabs drop-in",
+    body: "Same paths, same xi-api-key, same output_format grammar. Point existing client code at your own endpoint — swap a base URL.",
   },
   {
-    key: "cpu",
-    title: "Runs on Arm silicon",
-    body: "oneDNN + Arm Compute Library on Graviton / Axion / Ampere. Streaming, ~200 ms first chunk, no GPU.",
-  },
-  {
-    key: "queue",
-    title: "Built-in queue & scaling",
-    body: "Bounded worker pool with 429 backpressure, and process-level scaling that uses every core you pay for.",
+    key: "scale",
+    title: "Arm-native replica scaling",
+    body: "Run N single-worker replicas with one command — python -m service.replicas — using every Arm core you pay for. No GPU. No per-character bill.",
   },
 ];
 

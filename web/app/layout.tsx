@@ -20,7 +20,7 @@ const shantell = Shantell_Sans({ subsets: ["latin"], variable: "--font-shantell"
 export const metadata: Metadata = {
   title: "Gravitone — voice AI that runs on a CPU",
   description:
-    "Clone any voice and generate speech through an ElevenLabs-compatible API — CPU-native, Arm-ready, self-hostable. This is the studio front-end design exploration.",
+    "Clone any voice and generate expressive speech through an ElevenLabs-compatible API — CPU-native, Arm-ready, self-hostable. Emotion-addressable Characters, multi-character performances, and sentence-streaming synthesis, with a consent receipt on every clone.",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

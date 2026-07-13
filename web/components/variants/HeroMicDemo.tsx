@@ -188,7 +188,7 @@ export default function HeroMicDemo() {
         <div className="mt-6 rounded-2xl border border-white/8 bg-black/30 p-5">
           <Equalizer bars={40} className="h-16" />
           <p className="font-jetbrains mt-4 text-[12px] text-cyan-300">
-            {phase === "cloning" ? "cloning your voice on the CPU (~20s)…" : "rendering your line…"}
+            {phase === "cloning" ? "cloning your voice on the CPU…" : "rendering your line…"}
           </p>
           <p className="font-jetbrains mt-1 text-[11px] text-white/50">no GPU involved — this is the whole pitch</p>
         </div>
