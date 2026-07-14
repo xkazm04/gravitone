@@ -523,6 +523,20 @@ def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: st
         [sys.executable, "-m", "service.export_stems", str(spec_path)],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
+    # Drain stderr on a separate thread. The child imports torch + pocket_tts
+    # and can emit far more than the OS pipe buffer (~64 KB) to stderr while we
+    # are blocked reading stdout — with no concurrent stderr reader, both sides
+    # wedge (classic two-pipe deadlock). Collect it for the failure message.
+    _stderr_chunks: list[str] = []
+
+    def _drain_stderr() -> None:
+        if proc.stderr is not None:
+            for chunk in proc.stderr:
+                _stderr_chunks.append(chunk)
+
+    _stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    _stderr_thread.start()
+
     def _terminate() -> None:
         proc.terminate()
         try:
@@ -574,8 +588,9 @@ def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: st
         if progress and done < len(plan):
             progress(done, plan[done]["emotion"])
     ret = proc.wait()
+    _stderr_thread.join(timeout=5)
     if not cancelled and ret != 0 and len(created) < len(plan):
-        err = (proc.stderr.read() if proc.stderr else "")[-200:]
+        err = "".join(_stderr_chunks)[-200:]
         raise RuntimeError(f"clone failed: {err or 'export_stems exited nonzero'}")
     return created
 
