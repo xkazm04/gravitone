@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 /** Inline tag chips with add/remove. Shared by Gallery + Table variants. */
 export default function TagEditor({
@@ -16,11 +16,15 @@ export default function TagEditor({
 }) {
   const [adding, setAdding] = useState(false);
   const [draft, setDraft] = useState("");
+  const cancelRef = useRef(false); // Escape sets this so the unmount's onBlur doesn't commit
 
   const shown = max ? tags.slice(0, max) : tags;
   const overflow = max ? tags.length - shown.length : 0;
 
   const commit = () => {
+    // Escape unmounts the input, which fires onBlur={commit}; bail so pressing
+    // Escape cancels instead of adding the half-typed tag.
+    if (cancelRef.current) { cancelRef.current = false; setDraft(""); setAdding(false); return; }
     const t = draft.trim().toLowerCase();
     if (t && !tags.includes(t)) onChange([...tags, t]);
     setDraft("");
@@ -60,7 +64,7 @@ export default function TagEditor({
           onBlur={commit}
           onKeyDown={(e) => {
             if (e.key === "Enter") commit();
-            if (e.key === "Escape") { setDraft(""); setAdding(false); }
+            if (e.key === "Escape") { cancelRef.current = true; setDraft(""); setAdding(false); }
           }}
           placeholder="tag…"
           className={`font-jetbrains w-20 rounded-full border border-cyan-400/40 bg-transparent px-2 text-cyan-200 placeholder:text-white/50 focus:outline-none ${

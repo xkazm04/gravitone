@@ -99,6 +99,7 @@ export default function CharacterTable() {
   const [importing, setImporting] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const packRef = useRef<HTMLInputElement>(null);
+  const cancelRename = useRef(false); // Escape sets this so the unmount's onBlur doesn't commit
 
   const allTags = useMemo(() => Array.from(new Set(characters.flatMap((c) => c.tags))).sort(), [characters]);
 
@@ -233,7 +234,7 @@ export default function CharacterTable() {
           {importing ? "importing…" : "⇪ import pack"}
         </button>
         <input ref={fileRef} type="file" accept="audio/*,video/mp4" hidden
-          onChange={(e) => { const f = e.target.files?.[0]; if (f) void onFile(f); }} />
+          onChange={(e) => { const f = e.target.files?.[0]; if (f) void onFile(f); e.target.value = ""; }} />
         <button onClick={() => fileRef.current?.click()} disabled={cloning}
           className="font-jetbrains rounded-full border border-white/12 px-3 py-2 text-[12px] text-white/70 transition hover:text-white disabled:opacity-50">
           {cloning ? "cloning…" : "quick clone"}
@@ -301,8 +302,13 @@ export default function CharacterTable() {
                       <span className="h-6 w-6 shrink-0 rounded-full" style={{ background: `radial-gradient(circle at 30% 30%, hsl(${hueOf(c.character_id)} 90% 70%), hsl(${hueOf(c.character_id)} 80% 45%))` }} />
                       {renaming === c.character_id ? (
                         <input autoFocus defaultValue={c.name}
-                          onBlur={(e) => { patchCharacter(c.character_id, { name: e.target.value.trim() || c.name }); setRenaming(null); }}
-                          onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); if (e.key === "Escape") setRenaming(null); }}
+                          onBlur={(e) => {
+                            // Escape unmounts the input, which fires this blur — bail out
+                            // of committing so "cancel" doesn't save the half-typed name.
+                            if (cancelRename.current) { cancelRename.current = false; setRenaming(null); return; }
+                            patchCharacter(c.character_id, { name: e.target.value.trim() || c.name }); setRenaming(null);
+                          }}
+                          onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); if (e.key === "Escape") { cancelRename.current = true; setRenaming(null); } }}
                           className="w-40 rounded border border-cyan-400/40 bg-transparent px-1.5 py-0.5 text-sm text-white focus:outline-none" />
                       ) : (
                         <button onDoubleClick={() => setRenaming(c.character_id)} title="Double-click to rename" className="truncate text-left text-sm font-medium text-white">{c.name}</button>
