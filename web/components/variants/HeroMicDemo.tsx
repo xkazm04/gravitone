@@ -31,6 +31,7 @@ export default function HeroMicDemo() {
   const recRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<BlobPart[]>([]);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   const cleanupMic = useCallback(() => {
     if (timerRef.current) clearInterval(timerRef.current);
@@ -49,6 +50,8 @@ export default function HeroMicDemo() {
     // of demoName — the client and server slug rules differ, so a reconstructed
     // id can silently miss and leave the cloned (biometric) demo voice behind.
     let createdCid: string | null = null;
+    const controller = new AbortController();
+    abortRef.current = controller;
     try {
       setPhase("cloning");
       const ext = blob.type.includes("mp4") ? "mp4" : "webm";
@@ -59,7 +62,7 @@ export default function HeroMicDemo() {
       // The visitor is recording their own voice live — self-attestation.
       fd.append("attested", "true");
       fd.append("statement", CONSENT_STATEMENT);
-      const cr = await fetch("/api/voices", { method: "POST", body: fd });
+      const cr = await fetch("/api/voices", { method: "POST", body: fd, signal: controller.signal });
       const voice = await cr.json().catch(() => ({}));
       if (!cr.ok) throw new Error(voice?.detail ?? "clone failed");
       // A 200 with no voice_id would otherwise fall through to /api/tts, which
@@ -73,6 +76,7 @@ export default function HeroMicDemo() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text: SAMPLE_TEXT, voiceId: voice.voice_id }),
+        signal: controller.signal,
       });
       if (!tr.ok) throw new Error("synthesis failed");
       const wav = await tr.arrayBuffer();
@@ -82,7 +86,11 @@ export default function HeroMicDemo() {
       });
       setPhase("ready");
     } catch (e) {
-      fail(e instanceof Error ? e.message : "demo failed — the backend may be offline");
+      // A user-initiated cancel aborts both fetches; stay quietly on idle
+      // (cancel() already set the phase) rather than showing an error.
+      if (!controller.signal.aborted) {
+        fail(e instanceof Error ? e.message : "demo failed — the backend may be offline");
+      }
     } finally {
       // The demo never keeps data: delete the throwaway character by its real
       // id. Nothing to delete if the clone never returned one.
@@ -90,6 +98,14 @@ export default function HeroMicDemo() {
         void fetch(`/api/characters/${encodeURIComponent(createdCid)}`, { method: "DELETE" }).catch(() => {});
       }
     }
+  }, []);
+
+  // Escape hatch while cloning/rendering: abort the in-flight fetches (a
+  // stalled CPU backend can hold the demo ~5 min otherwise) and return to idle.
+  const cancel = useCallback(() => {
+    abortRef.current?.abort();
+    setError(null);
+    setPhase("idle");
   }, []);
 
   const startRecording = useCallback(async () => {
@@ -189,6 +205,10 @@ export default function HeroMicDemo() {
             {phase === "cloning" ? "cloning your voice on the CPU…" : "rendering your line…"}
           </p>
           <p className="font-jetbrains mt-1 text-[11px] text-white/50">no GPU involved — this is the whole pitch</p>
+          <button onClick={cancel}
+            className="font-jetbrains mt-4 cursor-pointer rounded-full border border-white/15 px-4 py-1.5 text-[12px] text-white/70 transition hover:bg-white/5">
+            Cancel
+          </button>
         </div>
       )}
 
