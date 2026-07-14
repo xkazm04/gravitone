@@ -222,6 +222,19 @@ export default function PlaygroundConsole() {
     setMode(m);
   }
 
+  // Coalesce concurrent uploads of the SAME take: share() and ensureShared()
+  // share this map, so clicking "share" and then "client review link" before
+  // the first upload settles reuses the one in-flight upload instead of minting
+  // two /t/{id} pages for one take.
+  const inflightUploads = useRef<Map<string, Promise<string>>>(new Map());
+  function uploadOnce(t: Take): Promise<string> {
+    const existing = inflightUploads.current.get(t.id);
+    if (existing) return existing;
+    const p = uploadTake(t).finally(() => { inflightUploads.current.delete(t.id); });
+    inflightUploads.current.set(t.id, p);
+    return p;
+  }
+
   /** Persist a take server-side, mint its /t/{id} page, copy the link. */
   async function share(t: Take) {
     const existing = shares[t.id];
@@ -233,7 +246,7 @@ export default function PlaygroundConsole() {
     if (!t.url || existing === "pending") return;
     setShares((s) => ({ ...s, [t.id]: "pending" }));
     try {
-      const id = await uploadTake(t);
+      const id = await uploadOnce(t);
       setShares((s) => ({ ...s, [t.id]: id }));
       await navigator.clipboard.writeText(`${window.location.origin}/t/${id}`).catch(() => {});
     } catch {
@@ -246,7 +259,9 @@ export default function PlaygroundConsole() {
   async function ensureShared(t: Take): Promise<string> {
     const existing = shares[t.id];
     if (existing && existing !== "pending" && existing !== "error") return existing;
-    const id = await uploadTake(t);
+    // "pending" falls through to uploadOnce, which returns the in-flight
+    // share() upload rather than starting a duplicate one.
+    const id = await uploadOnce(t);
     setShares((s) => ({ ...s, [t.id]: id }));
     return id;
   }
