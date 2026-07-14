@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { Eyebrow } from "@/components/ui/Primitives";
 import { EMOTION_IDS } from "@/lib/emotions";
@@ -17,12 +17,20 @@ export default function CharacterVoices({ characterId }: { characterId: string }
   const [recording, setRecording] = useState<string | null>(null);
 
   // Deep link from playground fallbacks: /voices/{id}?record=angry opens the
-  // guided recorder. Read via window.location so no Suspense boundary needed.
-  // Accepts custom slots too — validated against the character's own scale.
+  // guided recorder ONCE. It reads `character` (to validate custom slots) so it
+  // must wait for the load, but it's a one-time mount intent — gate it with a
+  // ref and strip the param, or every addVoice→refresh() (which replaces
+  // `character`) would replay it and yank the user back to the URL emotion.
+  const deepLinkUsed = useRef(false);
   useEffect(() => {
+    if (deepLinkUsed.current || !character) return;
+    deepLinkUsed.current = true;
     const wanted = new URLSearchParams(window.location.search).get("record");
     if (!wanted) return;
-    if (EMOTION_IDS.includes(wanted) || character?.scale?.includes(wanted)) setRecording(wanted);
+    if (EMOTION_IDS.includes(wanted) || character.scale?.includes(wanted)) setRecording(wanted);
+    const url = new URL(window.location.href);
+    url.searchParams.delete("record");
+    window.history.replaceState(null, "", url.toString());
   }, [character]);
 
   // GuidedRecorder needs a throwing clone (it drives its own state machine).
