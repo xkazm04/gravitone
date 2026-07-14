@@ -45,7 +45,10 @@ export default function HeroMicDemo() {
   /** clone the recording → synthesize SAMPLE_TEXT with it → delete the demo character */
   const runPipeline = useCallback(async (blob: Blob) => {
     const demoName = `Demo visitor ${Math.random().toString(16).slice(2, 6)}`;
-    const cid = demoName.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+    // The id to delete comes from the backend's clone response, NOT a re-slug
+    // of demoName — the client and server slug rules differ, so a reconstructed
+    // id can silently miss and leave the cloned (biometric) demo voice behind.
+    let createdCid: string | null = null;
     try {
       setPhase("cloning");
       const ext = blob.type.includes("mp4") ? "mp4" : "webm";
@@ -59,6 +62,11 @@ export default function HeroMicDemo() {
       const cr = await fetch("/api/voices", { method: "POST", body: fd });
       const voice = await cr.json().catch(() => ({}));
       if (!cr.ok) throw new Error(voice?.detail ?? "clone failed");
+      // A 200 with no voice_id would otherwise fall through to /api/tts, which
+      // defaults to a stock voice — playing a stranger's voice as "yours,
+      // cloned." Fail loudly instead of faking the core demo.
+      if (!voice.voice_id) throw new Error("clone returned no voice — please try again");
+      createdCid = voice.character_id ?? null;
 
       setPhase("rendering");
       const tr = await fetch("/api/tts", {
@@ -76,8 +84,11 @@ export default function HeroMicDemo() {
     } catch (e) {
       fail(e instanceof Error ? e.message : "demo failed — the backend may be offline");
     } finally {
-      // The demo never keeps data: delete the throwaway character either way.
-      void fetch(`/api/characters/${encodeURIComponent(cid)}`, { method: "DELETE" }).catch(() => {});
+      // The demo never keeps data: delete the throwaway character by its real
+      // id. Nothing to delete if the clone never returned one.
+      if (createdCid) {
+        void fetch(`/api/characters/${encodeURIComponent(createdCid)}`, { method: "DELETE" }).catch(() => {});
+      }
     }
   }, []);
 
