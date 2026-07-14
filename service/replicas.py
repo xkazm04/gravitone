@@ -229,6 +229,16 @@ class ReplicaSupervisor:
         r.proc = self._spawn(cmd, **kwargs)
         r.started_at = self._clock()
         r.next_restart_at = 0.0
+        # The child inherited its OWN copy of the listening fd (pass_fds) and
+        # serves on it, so the parent no longer needs to hold the socket. Drop
+        # the parent's reference now: if it stays open, a crashed child leaves
+        # this socket alive-but-unserved in the SO_REUSEPORT group, and the
+        # kernel keeps load-balancing ~1/N of new connections into an accept
+        # queue nothing drains (clients hang, then RST) for the whole backoff
+        # window. Closing it means the socket dies with the child.
+        if r.sock is not None:
+            r.sock.close()
+            r.sock = None
 
     def start(self) -> None:
         mode = ("shared port %d via SO_REUSEPORT" % self.port if self.reuse_port
