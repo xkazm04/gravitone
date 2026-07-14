@@ -1,6 +1,6 @@
 import { NextRequest } from "next/server";
 
-import { backendFetch } from "@/lib/backend";
+import { backendFetch, jsonError } from "@/lib/backend";
 
 export async function GET(_req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
@@ -9,7 +9,7 @@ export async function GET(_req: NextRequest, ctx: { params: Promise<{ id: string
     if (!r.ok) return new Response(await r.text(), { status: r.status, headers: { "Content-Type": "application/json" } });
     return new Response(await r.text(), { status: 200, headers: { "Content-Type": "application/json" } });
   } catch {
-    return new Response("backend unreachable", { status: 503 });
+    return jsonError("backend unreachable", 503);
   }
 }
 
@@ -26,7 +26,7 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: strin
       headers: { "Content-Type": "application/json" },
     });
   } catch {
-    return new Response("backend unreachable", { status: 503 });
+    return jsonError("backend unreachable", 503);
   }
 }
 
@@ -36,6 +36,6 @@ export async function DELETE(_req: NextRequest, ctx: { params: Promise<{ id: str
     const r = await backendFetch(`/v1/characters/${encodeURIComponent(id)}`, { method: "DELETE" });
     return new Response(null, { status: r.status });
   } catch {
-    return new Response("backend unreachable", { status: 503 });
+    return jsonError("backend unreachable", 503);
   }
 }

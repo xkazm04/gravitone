@@ -25,6 +25,16 @@ export const MAX_SYNTH_BODY_BYTES = 128 * 1024;
 // so they fail fast into the existing unreachable branch (503 / notFound).
 export const READ_TIMEOUT_MS = 15_000;
 
+/** Consistent JSON error body for the proxy routes. The backend speaks JSON
+ *  ({detail: …}); returning a plain-text error from a route breaks a
+ *  JSON-parsing (ElevenLabs drop-in) client that reads every response as JSON. */
+export function jsonError(detail: string, status: number): Response {
+  return new Response(JSON.stringify({ detail }), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
 /** Read a request body as text, rejecting oversize payloads early with a 413.
  *  Returns the body string, or a Response the caller should return as-is. */
 export async function readCappedText(
