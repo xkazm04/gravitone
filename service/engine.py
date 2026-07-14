@@ -427,6 +427,10 @@ class TtsEngine:
         self._max_inflight = SETTINGS.workers + SETTINGS.queue_max
         self._admit = threading.Semaphore(self._max_inflight)
         self._stopping = False
+        # Serializes the _stopping flip in stop() against the enqueue in submit()
+        # so a job can't land on the queue AFTER the final drain sweep (which
+        # would leave its future unresolved and leak an admission permit).
+        self._enqueue_lock = threading.Lock()
         self._workers = [_Worker(i, self) for i in range(SETTINGS.workers)]
 
     def start(self):
@@ -447,7 +451,12 @@ class TtsEngine:
         Every pending future is resolved (result or exception) before this
         returns, so no caller hangs waiting on the request timeout.
         """
-        self._stopping = True
+        # Flip the flag under the enqueue lock so it is ordered against submit():
+        # either submit enqueues before we stop (the drain below resolves it), or
+        # it sees _stopping under the lock and refuses cleanly. No job can slip
+        # onto the queue after the final drain sweep.
+        with self._enqueue_lock:
+            self._stopping = True
         # Fail queued jobs before we hand out sentinels so callers unblock now.
         self._drain_queue()
         for _ in self._workers:
@@ -502,8 +511,15 @@ class TtsEngine:
             max_tokens=max_tokens or SETTINGS.max_tokens,
             frames_after_eos=frames_after_eos,
         )
-        self.metrics.on_enqueue()
-        self._queue.put(job)
+        # Re-check _stopping while enqueuing so this can't race the shutdown
+        # drain: if stop() won the flag, release the permit and refuse cleanly
+        # instead of putting a job no worker will ever dequeue.
+        with self._enqueue_lock:
+            if self._stopping:
+                self._admit.release()
+                raise ShuttingDown("server shutting down")
+            self.metrics.on_enqueue()
+            self._queue.put(job)
         return job
 
     def config(self) -> dict:
