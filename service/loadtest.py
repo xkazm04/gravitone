@@ -386,6 +386,13 @@ def _stop_launcher(proc, grace_s: float = 10.0) -> None:
             pass
 
 
+def _safe_float(v, default: float) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
 async def _one(client, url, voice, text, fmt, results):
     t0 = time.perf_counter()
     try:
@@ -399,8 +406,13 @@ async def _one(client, url, voice, text, fmt, results):
         bucket = classify_response(r.status_code)
         if bucket == "ok":
             results["lat"].append(dt)
-            results["rtf"].append(float(r.headers.get("X-Realtime-Factor", "nan")))
-            results["audio"].append(float(r.headers.get("X-Audio-Seconds", "0")))
+            # Parse the timing headers defensively: a malformed X-Realtime-Factor
+            # / X-Audio-Seconds must NOT raise here — that would drop this
+            # already-successful request into the `except` below, recording its
+            # latency AND re-counting it as an error, which falsely trips level
+            # degradation and corrupts the computed knee / deployment cap.
+            results["rtf"].append(_safe_float(r.headers.get("X-Realtime-Factor"), float("nan")))
+            results["audio"].append(_safe_float(r.headers.get("X-Audio-Seconds"), 0.0))
         elif bucket == "rejected":
             results["rejected"] += 1
         elif bucket == "timeout":
