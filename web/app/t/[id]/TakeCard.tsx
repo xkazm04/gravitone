@@ -55,7 +55,10 @@ export default function TakeCard({ take, compact = false }: { take: SharedTake; 
         if (!r.ok) return;
         const blob = await r.blob();
         url = URL.createObjectURL(blob);
-        if (!alive) return;
+        // If we unmounted while the fetch was in flight, the cleanup already
+        // ran (when url was still null), so revoke the URL we just minted here
+        // — otherwise this decoded-wav blob leaks until the tab closes.
+        if (!alive) { URL.revokeObjectURL(url); return; }
         const a = new Audio(url);
         a.ontimeupdate = () => setProgress(a.duration ? a.currentTime / a.duration : 0);
         a.onended = () => { setPlaying(false); setProgress(0); };

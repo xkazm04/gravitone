@@ -323,15 +323,21 @@ export function useCharacter(characterId: string) {
  *  A failed preview surfaces briefly as `failedId` (no longer swallowed). */
 export function useVoicePreview() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const urlRef = useRef<string | null>(null); // current preview blob URL, so it can be revoked
   const failTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [playingId, setPlayingId] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [failedId, setFailedId] = useState<string | null>(null);
 
+  const revokeUrl = useCallback(() => {
+    if (urlRef.current) { URL.revokeObjectURL(urlRef.current); urlRef.current = null; }
+  }, []);
+
   const stop = useCallback(() => {
     audioRef.current?.pause();
+    revokeUrl();
     setPlayingId(null);
-  }, []);
+  }, [revokeUrl]);
 
   const preview = useCallback(
     async (voiceId: string, label: string, line?: string) => {
@@ -350,8 +356,10 @@ export function useVoicePreview() {
         const url = URL.createObjectURL(await r.blob());
         if (!audioRef.current) audioRef.current = new Audio();
         const a = audioRef.current;
+        revokeUrl(); // free any prior preview URL before replacing the source
+        urlRef.current = url;
         a.src = url;
-        a.onended = () => setPlayingId(null);
+        a.onended = () => { revokeUrl(); setPlayingId(null); };
         await a.play();
         setPlayingId(voiceId);
       } catch {
@@ -363,12 +371,13 @@ export function useVoicePreview() {
         setBusyId(null);
       }
     },
-    [playingId, stop],
+    [playingId, stop, revokeUrl],
   );
 
   useEffect(() => () => {
     audioRef.current?.pause();
     if (failTimer.current) clearTimeout(failTimer.current);
+    if (urlRef.current) URL.revokeObjectURL(urlRef.current);
   }, []);
 
   return { preview, stop, playingId, busyId, failedId };
