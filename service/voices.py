@@ -583,6 +583,16 @@ async def create_voice(
     created = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     def _commit(meta: dict) -> None:
+        # Re-check the emotion slot UNDER the registry lock. The check at the top
+        # of create_voice is a fast fail, but the multi-second clone subprocess
+        # widens the window — a concurrent clone of the same character+emotion
+        # could have committed since, and without this re-check both would write
+        # (duplicate/orphaned embeddings for one slot). Mirrors import_pack.
+        for existing in meta["voices"].values():
+            if existing.get("character_id") == cid and existing.get("emotion") == emotion:
+                # Drop the embedding we just cloned but will not register.
+                out_path.unlink(missing_ok=True)
+                raise HTTPException(409, f"'{character}' already has a '{emotion}' voice")
         meta["voices"][voice_id] = {
             "name": character.strip(), "character_id": cid, "emotion": emotion,
             "created": created, "sample_seconds": seconds, "lang": "EN",
