@@ -17,7 +17,7 @@ import {
 } from "firebase/auth";
 import { doc, getDoc, serverTimestamp, setDoc, updateDoc } from "firebase/firestore";
 import { auth, db, firebaseReady, googleProvider } from "./firebase";
-import { mintDefaultKey } from "./mintKey";
+import { clearStoredKey, mintDefaultKey } from "./mintKey";
 
 // Popup can fail (blocked, closed, COOP, internal-error) — fall back to a
 // full-page redirect, which always works. getRedirectResult (on mount) then
@@ -44,7 +44,8 @@ type AuthState = {
   user: User | null;
   profile: Profile | null;
   loading: boolean;
-  ready: boolean;
+  ready: boolean;         // Firebase config is present (NOT "auth resolved")
+  authResolved: boolean;  // onAuthStateChanged has fired at least once (or config is absent)
   signIn: () => Promise<void>;
   signOut: () => Promise<void>;
   updateProfile: (patch: Partial<Profile>) => Promise<void>;
@@ -57,10 +58,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
   const [loading, setLoading] = useState(true);
+  const [authResolved, setAuthResolved] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!firebaseReady) { setLoading(false); return; }
+    // No Firebase config: auth is definitively unresolvable, so treat it as
+    // resolved-and-signed-out. Consumers that gate on authResolved then fail
+    // CLOSED (bounce to the landing) instead of rendering the studio to all.
+    if (!firebaseReady) { setLoading(false); setAuthResolved(true); return; }
     // Complete a redirect-based sign-in if we came back from one.
     getRedirectResult(auth).catch((e) => setError(e instanceof Error ? e.message : "sign-in failed"));
     return onAuthStateChanged(auth, async (u) => {
@@ -90,6 +95,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setProfile(null);
       }
       setLoading(false);
+      setAuthResolved(true);
     });
   }, []);
 
@@ -110,7 +116,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
-  const signOut = useCallback(async () => { await fbSignOut(auth); }, []);
+  const signOut = useCallback(async () => {
+    // Purge the copy-once secret BEFORE signing out (currentUser is null after),
+    // so a plaintext credential never lingers for the next user of a shared box.
+    const uid = auth.currentUser?.uid;
+    if (uid) clearStoredKey(uid);
+    await fbSignOut(auth);
+  }, []);
 
   const updateProfile = useCallback(async (patch: Partial<Profile>) => {
     if (!user) return;
@@ -119,7 +131,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [user]);
 
   return (
-    <Ctx.Provider value={{ user, profile, loading, ready: firebaseReady, signIn, signOut, updateProfile, error }}>
+    <Ctx.Provider value={{ user, profile, loading, ready: firebaseReady, authResolved, signIn, signOut, updateProfile, error }}>
       {children}
     </Ctx.Provider>
   );

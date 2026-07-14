@@ -18,16 +18,19 @@ const MODULES = [
 /** Obsidian app shell: aurora atmosphere + top nav. Wrap every module route.
  *  Gated: unauthenticated visitors are bounced to the landing page. */
 export default function AppFrame({ children }: { children: React.ReactNode }) {
-  const { user, loading, ready } = useAuth();
+  const { user, loading, authResolved } = useAuth();
   const router = useRouter();
 
-  // Redirect signed-out users to the landing (only once auth state is known).
+  // Gate on authResolved ("onAuthStateChanged has fired", or config is absent),
+  // NOT on `ready` (which only means Firebase config is present). Otherwise a
+  // misconfigured deploy leaves `ready` false, collapses every gate, and renders
+  // the studio to everyone — a fail-open auth gate.
   useEffect(() => {
-    if (ready && !loading && !user) router.replace("/");
-  }, [ready, loading, user, router]);
+    if (authResolved && !loading && !user) router.replace("/");
+  }, [authResolved, loading, user, router]);
 
-  const resolving = ready && loading;
-  const blocked = ready && !loading && !user; // redirecting
+  const resolving = !authResolved || loading;
+  const blocked = authResolved && !loading && !user; // redirecting
 
   return (
     <div className="font-hanken relative min-h-screen overflow-hidden bg-[#080a10] text-slate-200 grain">
@@ -37,7 +40,7 @@ export default function AppFrame({ children }: { children: React.ReactNode }) {
         <nav className="flex items-center justify-between py-6">
           <Link href="/" aria-label="Gravitone home"><Wordmark /></Link>
           <div className="font-jetbrains hidden items-center gap-7 text-[13px] text-white/70 md:flex">
-            {(!ready || user) &&
+            {user &&
               MODULES.map((m) => (
                 <Link key={m.href} href={m.href} className="transition hover:text-white">
                   {m.label}
@@ -46,7 +49,7 @@ export default function AppFrame({ children }: { children: React.ReactNode }) {
           </div>
           <div className="flex items-center gap-3">
             <SavingsTicker />
-            {(!ready || user) && <MobileNav links={MODULES} />}
+            {user && <MobileNav links={MODULES} />}
             <UserMenu />
           </div>
         </nav>
