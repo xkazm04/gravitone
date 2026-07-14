@@ -88,9 +88,16 @@ def wav_bytes_to_mp3(wav_bytes: bytes, bitrate: str = "128k",
     if sample_rate is not None:
         cmd += ["-ar", str(sample_rate)]
     cmd.append("pipe:1")
-    proc = subprocess.run(
-        cmd, input=wav_bytes, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
+    try:
+        proc = subprocess.run(
+            cmd, input=wav_bytes, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            # Bound the external encoder: a wedged ffmpeg (pathological input,
+            # stalled binary) would otherwise pin the calling worker thread
+            # forever with no request-timeout escape. Killed on timeout.
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("ffmpeg mp3 encode timed out") from exc
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg mp3 encode failed: {proc.stderr.decode(errors='ignore')[:300]}")
     return proc.stdout
