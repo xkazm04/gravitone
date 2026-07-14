@@ -19,6 +19,7 @@ a marketing surface, not an archive.
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -161,6 +162,7 @@ def create_review(req: ReviewReq) -> dict:
     metas = sorted(REVIEWS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime)
     for old in metas[: max(0, len(metas) - MAX_REVIEWS + 1)]:
         old.unlink(missing_ok=True)
+        old.with_suffix(".pick").unlink(missing_ok=True)  # drop its decision sentinel
     _review_path(review_id).write_text(json.dumps(record), "utf-8")
     return {"review_id": review_id}
 
@@ -217,12 +219,28 @@ def pick_take(review_id: str, req: PickReq) -> dict:
     if take_meta.is_file():
         character_id = json.loads(take_meta.read_text("utf-8")).get("character_id", "")
 
-    review["pick"] = {
+    pick = {
         "take_id": req.take_id,
         "character_id": character_id,
         "reviewer": req.reviewer.strip()[:80],
         "note": req.note.strip()[:500],
         "picked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
-    _review_path(review_id).write_text(json.dumps(review), "utf-8")
-    return review["pick"]
+
+    # First pick wins ATOMICALLY across threads AND replica processes: the read
+    # check above is only a fast reject, and two near-simultaneous picks would
+    # both pass it and the second write would clobber the first. The winner is
+    # whoever creates the .pick sentinel with O_CREAT|O_EXCL (an atomic
+    # create-if-absent); everyone else gets a clean 409.
+    lock = REVIEWS_DIR / f"{review_id}.pick"
+    try:
+        os.close(os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+    except FileExistsError:
+        raise HTTPException(409, "this review has already been decided")
+    try:
+        review["pick"] = pick
+        _review_path(review_id).write_text(json.dumps(review), "utf-8")
+    except Exception:
+        lock.unlink(missing_ok=True)  # let a transient write failure be retried
+        raise
+    return pick
