@@ -72,10 +72,25 @@ export function useKeys() {
   }, [refresh]);
 
   const deleteKey = useCallback(async (id: string) => {
+    // Optimistically hide the row, but keep a snapshot: if the DELETE doesn't
+    // actually revoke the key, restore it so the user is not told a still-live
+    // (possibly leaked) key is gone. 404 = already absent, treat as success.
+    const snapshot = keys;
     setKeys((ks) => ks.filter((k) => k.id !== id));
-    const r = await fetch(`/api/keys/${encodeURIComponent(id)}`, { method: "DELETE" });
-    if (!r.ok) await refresh();
-  }, [refresh]);
+    try {
+      const r = await fetch(`/api/keys/${encodeURIComponent(id)}`, { method: "DELETE" });
+      if (!r.ok && r.status !== 404) {
+        setKeys(snapshot);
+        setError(`revoke failed (${r.status}) — the key is still active`);
+        return;
+      }
+      setError(null);
+      await refresh();
+    } catch {
+      setKeys(snapshot);
+      setError("revoke failed — the key is still active");
+    }
+  }, [keys, refresh]);
 
   return { keys, loading, error, refresh, createKey, rotateKey, deleteKey };
 }
