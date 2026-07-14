@@ -196,17 +196,26 @@ export default function PlaygroundConsole() {
     setScript((s) => [...s, newLine(cid)]);
   }
   function removeLine(idx: number) {
+    if (script.length <= 1) return;
     setScript((s) => (s.length <= 1 ? s : s.filter((_, i) => i !== idx)));
-    setActiveLine((a) => Math.max(0, Math.min(a, script.length - 2)));
+    // Removing a line ABOVE the active one shifts the active row down by one;
+    // plain clamping (the old code) left activeLine pointing at a DIFFERENT
+    // line, so emotion tags landed on a row the user wasn't editing.
+    setActiveLine((a) => {
+      const shifted = idx < a ? a - 1 : a;
+      return Math.max(0, Math.min(shifted, script.length - 2));
+    });
   }
   function moveLine(idx: number, dir: -1 | 1) {
+    const j = idx + dir;
+    if (j < 0 || j >= script.length) return;
     setScript((s) => {
-      const j = idx + dir;
-      if (j < 0 || j >= s.length) return s;
       const n = [...s];
       [n[idx], n[j]] = [n[j], n[idx]];
       return n;
     });
+    // Follow the active row through the swap so tags keep targeting it.
+    setActiveLine((a) => (a === idx ? j : a === j ? idx : a));
   }
   /** Switch composer mode, seeding a starter two-character script on first use. */
   function switchMode(m: "solo" | "script") {
