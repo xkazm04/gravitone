@@ -133,9 +133,14 @@ async def import_pack(
     if manifest.get("format") != FORMAT:
         raise HTTPException(400, f"unsupported pack format (want {FORMAT})")
 
-    # Authenticity — enforced only when both sides use a shared secret.
+    # Authenticity — when a secret is configured, a valid signature is REQUIRED.
     sig = manifest.get("signature")
-    if PACK_SECRET and sig:
+    if PACK_SECRET:
+        # Gating on "sig present" instead of "sig required" is a downgrade path:
+        # an attacker just strips the signature field to bypass the check. Fail
+        # closed. Unsigned packs stay allowed only when no secret is configured.
+        if not sig:
+            raise HTTPException(400, "unsigned pack rejected — this instance requires a signed pack (TTS_PACK_SECRET)")
         want = hmac.new(PACK_SECRET.encode(), _canonical(manifest), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(want, str(sig.get("value", ""))):
             raise HTTPException(400, "pack signature does not match this instance's TTS_PACK_SECRET")
@@ -155,13 +160,24 @@ async def import_pack(
 
     # Verify every hash BEFORE writing anything; never trust member paths.
     staged: list[tuple[dict, bytes]] = []
+    total_bytes = 0
     for v in voices:
         arcname = str(v.get("file", ""))
         try:
-            data = z.read(arcname)
+            info = z.getinfo(arcname)
         except KeyError:
             raise HTTPException(400, f"pack is missing {arcname}")
-        if len(data) > MAX_VOICE_BYTES:
+        # Reject on the ZIP directory's DECLARED uncompressed size before we
+        # decompress: a crafted deflate member can expand to many GB from a tiny
+        # compressed blob (zip bomb), and reading it first would OOM-kill the
+        # service before any len() check runs.
+        if info.file_size > MAX_VOICE_BYTES:
+            raise HTTPException(400, f"{arcname} exceeds the {MAX_VOICE_BYTES // 2**20} MB limit")
+        total_bytes += info.file_size
+        if total_bytes > MAX_VOICES * MAX_VOICE_BYTES:
+            raise HTTPException(400, "pack total uncompressed size exceeds the allowed budget")
+        data = z.read(arcname)
+        if len(data) > MAX_VOICE_BYTES:  # defense in depth: actual vs. declared size
             raise HTTPException(400, f"{arcname} exceeds the {MAX_VOICE_BYTES // 2**20} MB limit")
         if hashlib.sha256(data).hexdigest() != v.get("sha256"):
             raise HTTPException(400, f"integrity check failed for {arcname} — pack is corrupted or tampered")
