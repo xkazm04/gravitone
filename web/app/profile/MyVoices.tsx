@@ -19,6 +19,7 @@ const METHOD_LABEL: Record<string, string> = {
 export default function MyVoices({ uid }: { uid: string }) {
   const [entries, setEntries] = useState<VaultEntry[] | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
   const { preview, playingId, busyId } = useVoicePreview();
 
   const refresh = useCallback(async () => {
@@ -29,10 +30,23 @@ export default function MyVoices({ uid }: { uid: string }) {
   const revoke = useCallback(async (e: VaultEntry) => {
     if (!window.confirm(`Revoke "${e.character_name} · ${e.emotion}"? The voice embedding is deleted; the consent record is kept.`)) return;
     setBusy(e.voice_id);
+    setErr(null);
     try {
-      await fetch(`/api/voices/${encodeURIComponent(e.voice_id)}`, { method: "DELETE" });
-      await markRevoked(uid, e.voice_id);
+      // The engine delete MUST succeed before we tell the user the voice is
+      // gone — fetch resolves on any HTTP status, so check r.ok. A 404 means
+      // the engine already has no such voice, which we treat as deleted.
+      const r = await fetch(`/api/voices/${encodeURIComponent(e.voice_id)}`, { method: "DELETE" });
+      if (!r.ok && r.status !== 404) {
+        throw new Error(`the voice could not be deleted (${r.status}) — it is still usable`);
+      }
+      const marked = await markRevoked(uid, e.voice_id);
+      if (!marked) {
+        throw new Error("the voice was deleted, but the vault record could not be updated — reload and retry");
+      }
       await refresh();
+    } catch (e2) {
+      setErr(e2 instanceof Error ? e2.message : "revoke failed");
+      await refresh(); // reconcile the list with the real state
     } finally { setBusy(null); }
   }, [uid, refresh]);
 
@@ -50,6 +64,12 @@ export default function MyVoices({ uid }: { uid: string }) {
           {entries.filter((e) => !e.revoked).length} active · consent-logged
         </span>
       </div>
+
+      {err && (
+        <p className="font-jetbrains mt-3 rounded-lg border border-rose-400/25 bg-rose-400/5 px-3 py-2 text-[11px] text-rose-200">
+          {err}
+        </p>
+      )}
 
       {entries.length === 0 ? (
         <p className="mt-3 text-sm text-white/60">
