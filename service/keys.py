@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import secrets
 import threading
 import time
@@ -19,7 +20,10 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from service.atomicio import atomic_write_text
 from service.config import SETTINGS
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1/keys", tags=["keys"])
 
@@ -64,13 +68,20 @@ def _load() -> dict:
         try:
             return json.loads(KEYS_PATH.read_text("utf-8"))
         except json.JSONDecodeError:
+            # Atomic writes (below) prevent our own writes from ever truncating
+            # this file, so a corrupt store means external damage. Log LOUDLY —
+            # returning {} silently would let the next create_key overwrite the
+            # (recoverable) file and permanently erase every surviving key.
+            logger.error("api_keys.json is corrupt and could not be parsed; "
+                         "treating as empty — inspect/restore %s before issuing keys", KEYS_PATH)
             return {}
     return {}
 
 
 def _save(data: dict) -> None:
-    KEYS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    KEYS_PATH.write_text(json.dumps(data, indent=2), "utf-8")
+    # Atomic temp-file + os.replace: a crash or an interleaved replica write can
+    # no longer truncate api_keys.json (which _load would then read as {}).
+    atomic_write_text(KEYS_PATH, json.dumps(data, indent=2))
 
 
 def _hash(secret: str) -> str:
