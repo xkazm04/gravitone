@@ -15,6 +15,8 @@ the load-test harness keep working without ceremony.
 """
 from __future__ import annotations
 
+import secrets
+
 from fastapi import Header, HTTPException, Request
 
 from service.config import SETTINGS
@@ -32,7 +34,9 @@ def _extract_secret(xi_api_key: str | None, authorization: str | None) -> str | 
 def _authorize(secret: str | None, scope: str) -> None:
     if not SETTINGS.api_key:
         return  # open mode — no root key configured
-    if secret == SETTINGS.api_key:
+    # Constant-time compare: the root key is the crown-jewel credential, so a
+    # short-circuiting `==` would leak it byte-by-byte via response timing.
+    if secret is not None and secrets.compare_digest(secret.encode(), SETTINGS.api_key.encode()):
         return  # root key — unlimited
     if scope != "admin" and validate_key(secret, scope):
         return  # managed key with the required scope

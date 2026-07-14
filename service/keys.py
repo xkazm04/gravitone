@@ -164,7 +164,10 @@ def validate_key(secret: str | None, scope: str = "tts") -> bool:
     with _STORE_LOCK:
         data = _load()
         for kid, k in data.items():
-            if k.get("hash") == h and not k.get("revoked") and scope in k.get("scopes", []):
+            # Constant-time hash compare — same timing-side-channel reasoning as
+            # the root-key check in service/auth.py.
+            if (secrets.compare_digest(str(k.get("hash") or ""), h)
+                    and not k.get("revoked") and scope in k.get("scopes", [])):
                 _LAST_USED[kid] = now_iso  # in-memory view is always current
                 k["last_used"] = now_iso
                 last = _LAST_PERSIST.get(kid)
