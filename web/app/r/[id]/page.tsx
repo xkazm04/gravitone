@@ -4,12 +4,12 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { Wordmark } from "@/components/ui/Primitives";
-import { backendFetch } from "@/lib/backend";
+import { backendFetch, READ_TIMEOUT_MS } from "@/lib/backend";
 import ReviewPicker, { type Review } from "./ReviewPicker";
 
 async function loadReview(id: string): Promise<Review | null> {
   try {
-    const r = await backendFetch(`/v1/reviews/${encodeURIComponent(id)}`, { cache: "no-store" });
+    const r = await backendFetch(`/v1/reviews/${encodeURIComponent(id)}`, { cache: "no-store", signal: AbortSignal.timeout(READ_TIMEOUT_MS) });
     return r.ok ? ((await r.json()) as Review) : null;
   } catch {
     return null;

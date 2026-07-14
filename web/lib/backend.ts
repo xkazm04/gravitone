@@ -19,6 +19,12 @@ export function backendFetch(path: string, init: RequestInit = {}): Promise<Resp
 // oversized payload. ~128k chars of script is far beyond any real use.
 export const MAX_SYNTH_BODY_BYTES = 128 * 1024;
 
+// Read/SSR timeout. A backend that accepts the TCP connection but never answers
+// (overloaded synth queue, half-open socket) would otherwise pin an SSR worker
+// or route handler open until the platform's hard timeout. Bound the read GETs
+// so they fail fast into the existing unreachable branch (503 / notFound).
+export const READ_TIMEOUT_MS = 15_000;
+
 /** Read a request body as text, rejecting oversize payloads early with a 413.
  *  Returns the body string, or a Response the caller should return as-is. */
 export async function readCappedText(
