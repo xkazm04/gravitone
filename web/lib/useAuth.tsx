@@ -3,7 +3,7 @@
 // Auth + profile context. Google sign-in via Firebase popup; on sign-in we
 // upsert a user profile in Firestore (users/{uid}) and keep it in sync.
 
-import { createContext, useCallback, useContext, useEffect, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import {
   browserLocalPersistence,
   getRedirectResult,
@@ -60,6 +60,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [loading, setLoading] = useState(true);
   const [authResolved, setAuthResolved] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // uids whose first-run provisioning has started this session — guards a
+  // re-entrant onAuthStateChanged from minting a second key / clobbering the doc.
+  const provisioning = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     // No Firebase config: auth is definitively unresolvable, so treat it as
@@ -79,8 +82,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         if (snap.exists()) {
           await updateDoc(ref, { lastLogin: serverTimestamp() });
           setProfile({ ...(snap.data() as Profile), ...base });
-        } else {
-          await setDoc(ref, { ...base, plan: "free", createdAt: serverTimestamp(), lastLogin: serverTimestamp() });
+        } else if (!provisioning.current.has(u.uid)) {
+          // Guard first-run provisioning against a re-entrant onAuthStateChanged
+          // for the same new user (redirect completion + immediate token emit),
+          // which would otherwise mint two keys and clobber the user doc. The
+          // check+add is synchronous, so only one callback enters this branch.
+          provisioning.current.add(u.uid);
+          // merge:true so a racing write can't overwrite plan/createdAt.
+          await setDoc(ref, { ...base, plan: "free", createdAt: serverTimestamp(), lastLogin: serverTimestamp() }, { merge: true });
           setProfile({ ...base, plan: "free" });
           // First sign-in: auto-provision a tts-scoped API key and land the
           // user on the profile panel with a ready-to-run migration snippet.
