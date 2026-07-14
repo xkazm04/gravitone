@@ -6,7 +6,7 @@
 // are forwarded, and 429 backpressure is preserved (never flattened away).
 import { NextRequest } from "next/server";
 
-import { backendFetch } from "@/lib/backend";
+import { backendFetch, readCappedText } from "@/lib/backend";
 
 const FORWARD_HEADERS = [
   "X-Audio-Seconds",
@@ -18,12 +18,15 @@ const FORWARD_HEADERS = [
 ] as const;
 
 export async function POST(req: NextRequest) {
+  const body = await readCappedText(req);
+  if (body instanceof Response) return body;
+
   let upstream: Response;
   try {
     upstream = await backendFetch(`/v1/performance`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: await req.text(),
+      body,
       signal: AbortSignal.timeout(180_000),
     });
   } catch {

@@ -12,3 +12,26 @@ export function backendFetch(path: string, init: RequestInit = {}): Promise<Resp
   if (key && !headers.has("xi-api-key")) headers.set("xi-api-key", key);
   return fetch(`${BASE}${path}`, { ...init, headers });
 }
+
+// The synthesis relays (/api/speak, /api/performance, /api/tts) are the app's
+// unauthenticated compute surface: each call can tie up a synth slot for up to
+// ~3 minutes. Cap the request body so a single caller can't hand the backend an
+// oversized payload. ~128k chars of script is far beyond any real use.
+export const MAX_SYNTH_BODY_BYTES = 128 * 1024;
+
+/** Read a request body as text, rejecting oversize payloads early with a 413.
+ *  Returns the body string, or a Response the caller should return as-is. */
+export async function readCappedText(
+  req: Request,
+  maxBytes: number = MAX_SYNTH_BODY_BYTES,
+): Promise<string | Response> {
+  const declared = req.headers.get("content-length");
+  if (declared && Number(declared) > maxBytes) {
+    return new Response("request body too large", { status: 413 });
+  }
+  const body = await req.text();
+  if (new TextEncoder().encode(body).length > maxBytes) {
+    return new Response("request body too large", { status: 413 });
+  }
+  return body;
+}

@@ -5,7 +5,7 @@
 // failure into one browser-voice fallback.
 import { NextRequest } from "next/server";
 
-import { backendFetch } from "@/lib/backend";
+import { backendFetch, readCappedText } from "@/lib/backend";
 
 // Upstream response headers we surface to the browser. Timing (synth/queue),
 // realtime factor, the base64 per-segment report, and any accepted-but-inert
@@ -20,12 +20,15 @@ const FORWARD_HEADERS = [
 ] as const;
 
 export async function POST(req: NextRequest) {
+  const body = await readCappedText(req);
+  if (body instanceof Response) return body;
+
   let upstream: Response;
   try {
     upstream = await backendFetch(`/v1/speak`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: await req.text(),
+      body,
       signal: AbortSignal.timeout(180_000),
     });
   } catch {
