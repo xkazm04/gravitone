@@ -36,6 +36,7 @@ export default function NewCharacterPage() {
 
   const fileRef = useRef<HTMLInputElement>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const submitting = useRef(false); // re-entrancy guard for scan/speaker/commit
   const [playing, setPlaying] = useState<string | null>(null);
 
   // Cloneable characters change rarely; fetch on mount — plus once more when a
@@ -58,16 +59,21 @@ export default function NewCharacterPage() {
 
   // Record Voice Vault ownership exactly once, when the commit completes.
   const recorded = useRef(false);
+  const [vaultWarn, setVaultWarn] = useState(false);
   useEffect(() => {
-    if (phase === "upload") { recorded.current = false; return; }
+    if (phase === "upload") { recorded.current = false; setVaultWarn(false); return; }
     if (phase !== "complete" || recorded.current) return;
-    recorded.current = true;
     const pending = state.pendingCommit;
+    // Only consume the one-shot once we actually have BOTH the auth'd user and
+    // the committed voices. A "complete" render that lands before Firebase's
+    // onAuthStateChanged resolves `user` must not latch, or the consent record
+    // is dropped; the effect re-runs when `user` populates and completes it.
     if (user && pending && created.length) {
+      recorded.current = true;
       void recordVoiceOwnership(user, created.map((v) => ({
         voice_id: v.voice_id, character_id: pending.cid,
         character_name: pending.character, emotion: v.emotion,
-      })), "ingested");
+      })), "ingested").then((res) => { if (res.failed > 0) setVaultWarn(true); });
     }
   }, [phase, user, created, state.pendingCommit]);
 
@@ -80,7 +86,8 @@ export default function NewCharacterPage() {
   }
 
   async function startScan() {
-    if (!file) return;
+    if (!file || submitting.current) return; // guard the double-click window
+    submitting.current = true;
     const fd = new FormData();
     fd.append("file", file, file.name);
     fd.append("mode", ingestMode);
@@ -91,13 +98,31 @@ export default function NewCharacterPage() {
       dispatch({ type: "SCAN_STARTED", jobId: j.job_id });
     } catch (e) {
       dispatch({ type: "SET_ERROR", error: e instanceof Error ? e.message : "scan failed" });
+    } finally {
+      submitting.current = false;
     }
   }
 
   async function chooseSpeaker(sid: string) {
+    if (submitting.current) return;
     audioRef.current?.pause(); setPlaying(null);
-    await fetch(`/api/ingest/${jobId}/speaker`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ speaker_id: sid }) });
-    dispatch({ type: "SPEAKER_CHOSEN" });
+    submitting.current = true;
+    try {
+      // Verify the backend accepted the speaker before advancing the state
+      // machine — an expired/rejected job would otherwise spin the Waveform Lab
+      // while the server is still awaiting_speaker (or gone), with no error.
+      const r = await fetch(`/api/ingest/${jobId}/speaker`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ speaker_id: sid }) });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        dispatch({ type: "SET_ERROR", error: j?.detail ?? "couldn't select that speaker — the session may have expired" });
+        return;
+      }
+      dispatch({ type: "SPEAKER_CHOSEN" });
+    } catch {
+      dispatch({ type: "SET_ERROR", error: "couldn't select that speaker — the backend may be offline" });
+    } finally {
+      submitting.current = false;
+    }
   }
 
   function playClip(url: string, id: string) {
@@ -109,12 +134,13 @@ export default function NewCharacterPage() {
   }
 
   async function commit() {
-    if (selected.size === 0) return;
+    if (selected.size === 0 || submitting.current) return; // guard the double-click window
     const character = mode === "new" ? charName.trim() : (characters.find((c) => c.character_id === extendCid)?.name ?? "");
     const character_id = mode === "extend" ? extendCid : undefined;
     if (mode === "new" && !character) { dispatch({ type: "SET_ERROR", error: "Name the character" }); return; }
     if (mode === "extend" && !extendCid) { dispatch({ type: "SET_ERROR", error: "Pick a character to extend" }); return; }
     const cid = character_id ?? slug(character);
+    submitting.current = true;
     dispatch({ type: "COMMIT_STARTED", character, cid, total: selected.size });
     try {
       // async commit: the backend returns immediately; the poller follows
@@ -124,6 +150,8 @@ export default function NewCharacterPage() {
       if (!r.ok) throw new Error(j?.detail ?? "commit failed");
     } catch (e) {
       dispatch({ type: "COMMIT_FAILED", error: e instanceof Error ? e.message : "commit failed" });
+    } finally {
+      submitting.current = false;
     }
   }
 
@@ -399,6 +427,11 @@ export default function NewCharacterPage() {
             <div className="glass-panel rounded-2xl p-6">
               <div className="font-jetbrains text-[11px] uppercase tracking-widest text-emerald-300">character ready</div>
               <h2 className="font-instrument mt-2 text-3xl text-white">{created.length} voices cloned.</h2>
+              {vaultWarn && (
+                <p className="font-jetbrains mt-3 rounded-lg border border-amber-400/25 bg-amber-400/5 px-3 py-2 text-[11px] text-amber-200/85">
+                  Voices cloned, but the consent receipt couldn’t be saved to your vault. Reload “My Voices” — if they’re missing, re-open the character to re-record ownership.
+                </p>
+              )}
               <div className="mt-4 flex flex-wrap gap-2">
                 {created.map((c) => {
                   const m = emotionMeta(c.emotion);
