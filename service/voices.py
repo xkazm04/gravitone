@@ -359,12 +359,28 @@ def _build_characters() -> list[Character]:
     return sorted(chars.values(), key=lambda c: (c.category != "cloned", c.name.lower()))
 
 
+def find_character(character_id: str) -> Character | None:
+    """One assembled Character by id, or None.
+
+    The single lookup over the roster. Every endpoint used to hand-roll this
+    linear scan (~8 copies), so lookup semantics and the 404 message drifted
+    between them; change it here instead.
+    """
+    return next((c for c in list_characters() if c.character_id == character_id), None)
+
+
+def get_character_or_404(character_id: str) -> Character:
+    """find_character, raising the canonical 404 when it's absent."""
+    c = find_character(character_id)
+    if c is None:
+        raise HTTPException(404, "character not found")
+    return c
+
+
 def emotion_map(character_id: str) -> dict[str, str]:
     """emotion -> voice_id for one Character (used by /v1/speak)."""
-    for c in list_characters():
-        if c.character_id == character_id:
-            return {v.emotion: v.voice_id for v in c.voices}
-    return {}
+    c = find_character(character_id)
+    return {v.emotion: v.voice_id for v in c.voices} if c else {}
 
 
 # ── endpoints ─────────────────────────────────────────────────────────────────
@@ -373,10 +389,7 @@ def get_scale(character_id: str | None = None) -> list[str]:
     """The base scale, or one Character's effective palette (base + custom)."""
     if not character_id:
         return EMOTION_SCALE
-    for c in list_characters():
-        if c.character_id == character_id:
-            return c.scale
-    raise HTTPException(404, "character not found")
+    return get_character_or_404(character_id).scale
 
 
 @router.post("/v1/characters/{character_id}/emotions", response_model=Character, status_code=201)
@@ -403,10 +416,7 @@ def add_custom_emotion(character_id: str, req: EmotionReq) -> Character:
 
     mutate_meta(_mut)
 
-    for c in list_characters():
-        if c.character_id == character_id:
-            return c
-    raise HTTPException(404, "character not found")
+    return get_character_or_404(character_id)
 
 
 @router.delete("/v1/characters/{character_id}/emotions/{emotion}", status_code=204)
@@ -439,10 +449,7 @@ def get_characters() -> list[Character]:
 def get_character(character_id: str) -> Character:
     """One assembled Character by id. Lets the studio's detail page fetch a
     single character instead of downloading the whole roster to `.find()` one."""
-    for c in list_characters():
-        if c.character_id == character_id:
-            return c
-    raise HTTPException(404, "character not found")
+    return get_character_or_404(character_id)
 
 
 def all_voices() -> list[Voice]:
@@ -493,35 +500,32 @@ def character_manifest(character_id: str) -> dict:
     """Validated performance manifest: exactly which emotions this Character
     can perform natively, and what every other request will fall back to.
     Clients check this before directing a script (/v1/performance)."""
-    for c in list_characters():
-        if c.character_id != character_id:
-            continue
-        native = {
-            v.emotion: {"voice_id": v.voice_id, "sample_seconds": v.sample_seconds,
-                        "consent": v.consent}
-            for v in c.voices
-        }
-        # Same deterministic pick resolve() uses, so the manifest can never
-        # advertise a fallback the synthesis path wouldn't actually choose.
-        fallback = deterministic_fallback(native)
-        return {
-            "character_id": c.character_id,
-            "name": c.name,
-            "category": c.category,
-            "emotion_scale": c.scale,          # base + this Character's custom slots
-            "custom_emotions": c.custom_emotions,
-            "performable": native,
-            "missing": [e for e in c.scale if e not in native],
-            "fallback": fallback,
-            "coverage": f"{c.coverage}/{c.total}",
-            "demand": c.demand,  # unmet requests per missing emotion
-            "addressing": {
-                "tts": f"POST /v1/text-to-speech/{c.character_id}:{{emotion}}",
-                "speak": "POST /v1/speak with [emotion]...[/emotion] metatags",
-                "performance": "POST /v1/performance with lines[].character_id",
-            },
-        }
-    raise HTTPException(404, "character not found")
+    c = get_character_or_404(character_id)
+    native = {
+        v.emotion: {"voice_id": v.voice_id, "sample_seconds": v.sample_seconds,
+                    "consent": v.consent}
+        for v in c.voices
+    }
+    # Same deterministic pick resolve() uses, so the manifest can never
+    # advertise a fallback the synthesis path wouldn't actually choose.
+    fallback = deterministic_fallback(native)
+    return {
+        "character_id": c.character_id,
+        "name": c.name,
+        "category": c.category,
+        "emotion_scale": c.scale,          # base + this Character's custom slots
+        "custom_emotions": c.custom_emotions,
+        "performable": native,
+        "missing": [e for e in c.scale if e not in native],
+        "fallback": fallback,
+        "coverage": f"{c.coverage}/{c.total}",
+        "demand": c.demand,  # unmet requests per missing emotion
+        "addressing": {
+            "tts": f"POST /v1/text-to-speech/{c.character_id}:{{emotion}}",
+            "speak": "POST /v1/speak with [emotion]...[/emotion] metatags",
+            "performance": "POST /v1/performance with lines[].character_id",
+        },
+    }
 
 
 @router.post("/v1/voices", response_model=Voice, status_code=201)
@@ -655,10 +659,7 @@ def patch_character(character_id: str, patch: CharacterPatch) -> Character:
             cm["tags"] = [t.strip().lower() for t in patch.tags if t.strip()]
 
     mutate_meta(_mut)
-    for c in list_characters():
-        if c.character_id == character_id:
-            return c
-    raise HTTPException(404, "character not found")
+    return get_character_or_404(character_id)
 
 
 @router.delete("/v1/characters/{character_id}", status_code=204)

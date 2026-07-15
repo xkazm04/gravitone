@@ -29,7 +29,8 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 
 from service.voices import (
-    VOICES_DIR, Character, _load_meta, _slug, list_characters, mutate_meta,
+    VOICES_DIR, Character, _load_meta, _slug, find_character,
+    get_character_or_404, mutate_meta,
 )
 
 router = APIRouter(tags=["packs"])
@@ -58,9 +59,7 @@ def _sign(manifest: dict) -> dict:
 @router.get("/v1/characters/{character_id}/pack")
 def export_pack(character_id: str) -> Response:
     """Bundle one cloned Character into a downloadable .gravichar pack."""
-    character = next((c for c in list_characters() if c.character_id == character_id), None)
-    if character is None:
-        raise HTTPException(404, "character not found")
+    character = get_character_or_404(character_id)
     if character.category != "cloned":
         raise HTTPException(400, "built-in characters cannot be exported (no embedding files)")
 
@@ -209,7 +208,7 @@ async def import_pack(
 
     mutate_meta(_commit)
 
-    imported = next((c for c in list_characters() if c.character_id == cid), None)
+    imported = find_character(cid)
     if imported is None:  # should be impossible — files were just written
         raise HTTPException(500, "import wrote files but the character did not materialize")
     return imported
