@@ -123,8 +123,12 @@ class FormatRouteTests(_Base):
     def test_mp3_bitrate_reaches_ffmpeg(self) -> None:
         captured = {}
 
-        def fake_run(cmd, input=None, stdout=None, stderr=None):
+        # **kw so the stub mirrors subprocess.run's tolerance: a rigid signature
+        # here breaks the moment production passes a new kwarg (it did — the
+        # ffmpeg timeout), turning a source improvement into a fake test failure.
+        def fake_run(cmd, input=None, stdout=None, stderr=None, **kw):
             captured["cmd"] = cmd
+            captured["kw"] = kw
             import types as _t
             return _t.SimpleNamespace(returncode=0, stdout=b"MP3DATA", stderr=b"")
 
@@ -142,12 +146,16 @@ class FormatRouteTests(_Base):
         self.assertEqual(cmd[cmd.index("-b:a") + 1], "192k")
         # native rate (24000) -> no ffmpeg resample
         self.assertNotIn("-ar", cmd)
+        # The encoder MUST be wall-clock bounded: an unbounded ffmpeg pins the
+        # worker thread forever with no request-timeout escape.
+        self.assertTrue(captured["kw"].get("timeout"), "ffmpeg must be given a timeout")
 
     def test_mp3_non_native_rate_sets_ar(self) -> None:
         captured = {}
 
-        def fake_run(cmd, input=None, stdout=None, stderr=None):
+        def fake_run(cmd, input=None, stdout=None, stderr=None, **kw):
             captured["cmd"] = cmd
+            captured["kw"] = kw
             import types as _t
             return _t.SimpleNamespace(returncode=0, stdout=b"MP3DATA", stderr=b"")
 
