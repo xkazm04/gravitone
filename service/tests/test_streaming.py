@@ -50,9 +50,18 @@ class StreamingTests(unittest.TestCase):
         ttfb, total, count = asyncio.run(_drive())
         self.assertEqual(count, 3)
         self.assertIsNotNone(ttfb)
-        # First chunk well before the slow tail could be done.
-        self.assertLess(ttfb, 0.30)
-        self.assertLess(ttfb, total - 0.10)
+        # ORDERING, not absolute wall-clock. The contract is "the first chunk is
+        # yielded long before the whole clip is synthesized" — that's what a
+        # RELATIVE bound expresses. The old `ttfb < 0.30` measured real thread
+        # scheduling: on a CPU-throttled container, under GC/GIL contention, or
+        # with Windows wake-up jitter, the 0.05s first chunk is observed past
+        # 0.30s and the test goes red with no code change. A proportional bound
+        # stretches with the machine (a uniform slowdown scales ttfb AND total),
+        # so it stays honest without flaking.
+        self.assertLess(
+            ttfb, total * 0.5,
+            f"first chunk should arrive early in the stream "
+            f"(ttfb={ttfb:.3f}s of total={total:.3f}s)")
 
     def test_pcm_has_no_wav_header(self) -> None:
         appmod.ENGINE = fake_engine.FakeEngine(workers=2, delay=0.02)
