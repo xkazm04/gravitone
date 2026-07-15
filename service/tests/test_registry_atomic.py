@@ -95,6 +95,36 @@ class AtomicCrashSafetyTests(unittest.TestCase):
                 leftovers = list(Path(td).glob("._meta-*.tmp"))
                 self.assertEqual(leftovers, [], f"atomic write left temp files: {leftovers}")
 
+    def test_crash_inside_save_meta_keeps_registry_and_cleans_tmp(self) -> None:
+        """The REAL atomicity guarantee — a failure DURING the write.
+
+        The two tests above raise inside the mutation `fn`, but mutate_meta runs
+        `fn` BEFORE `_save_meta`, so those never create a temp file, never call
+        os.replace, and never enter the unlink-on-failure branch: they prove only
+        the ordering guarantee (a failed fn skips the save) while their names
+        claim atomicity. This one injects the failure inside `_save_meta` itself,
+        so the mkstemp -> write -> os.replace -> unlink path is actually
+        exercised: a broken atomic replace (writing in place, or dropping the
+        temp cleanup) would ship green without it.
+        """
+        with TemporaryDirectory() as td:
+            with _Registry(Path(td)):
+                vc.mutate_meta(lambda m: m["voices"].update({"keep": {"emotion": "baseline"}}))
+                before = (Path(td) / "_meta.json").read_bytes()
+
+                # The temp file is written, then the atomic swap fails.
+                with mock.patch.object(vc.os, "replace", side_effect=OSError("disk gone")):
+                    with self.assertRaises(OSError):
+                        vc.mutate_meta(lambda m: m["voices"].update({"ghost": {"emotion": "sad"}}))
+
+                after = (Path(td) / "_meta.json").read_bytes()
+                self.assertEqual(before, after,
+                                 "a failed atomic write mutated the live registry")
+                self.assertNotIn("ghost", json.loads(after)["voices"])
+                leftovers = list(Path(td).glob("._meta-*.tmp"))
+                self.assertEqual(leftovers, [],
+                                 f"failed write orphaned temp files: {leftovers}")
+
 
 class ContractTests(unittest.TestCase):
     def test_mutate_meta_returns_fn_result(self) -> None:
