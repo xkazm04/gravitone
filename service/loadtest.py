@@ -95,16 +95,29 @@ def level_degraded(row: dict, baseline_p95, degrade_factor: float,
                    cpu_ceiling: float) -> bool:
     """Whether a level trips the degradation bar (pure, so it is unit-testable).
 
-    ANY 429, 504 timeout, or error degrades the level (a timeout is treated
-    exactly like an error/429 — the caller gave up waiting). Otherwise a p95
-    blow-up vs the baseline, or CPU-saturated-and-slower-than-realtime, trips it.
+    ANY 429, 504 timeout, error, or 501-unsupported degrades the level (a
+    timeout is treated exactly like an error/429 — the caller gave up waiting;
+    a 501 means the route served nothing at all). Otherwise a p95 blow-up vs the
+    baseline, or CPU-saturated-and-slower-than-realtime, trips it.
     """
-    if row.get("rejected_429") or row.get("errors") or row.get("timeouts"):
+    # unsupported_501 is a distinct outcome bucket, but a level where every
+    # request 501s served ZERO audio — without counting it, an all-501 run
+    # (e.g. --route stream on a build without it) has no errors and no p95, so
+    # it looks identical to a perfectly healthy level and the tool reports
+    # "no degradation" plus a bogus cap over total failure.
+    if (row.get("rejected_429") or row.get("errors") or row.get("timeouts")
+            or row.get("unsupported_501")):
         return True
     p95 = row.get("lat_p95_s")
     if baseline_p95 and p95 and p95 > degrade_factor * baseline_p95:
         return True
-    cpu = row.get("cpu_mean_pct")
+    # Prefer the server-only CPU when the honest split is available: the
+    # whole-host figure double-counts a co-located load generator, so the
+    # driver's own CPU could trip the ceiling and blame the server for
+    # saturation it didn't cause (a false knee, understating real capacity).
+    cpu = row.get("server_cpu_mean_pct")
+    if cpu is None:
+        cpu = row.get("cpu_mean_pct")
     srtf = row.get("server_rtf_mean")
     if cpu and cpu >= cpu_ceiling and srtf is not None and srtf < 1.0:
         return True
@@ -598,15 +611,23 @@ def print_plan(result: dict) -> None:
     process/replica, not in-process workers (the model is GIL-bound): the
     safe cap becomes the number of single-worker processes to run.
     """
-    import os
-
     rows = result.get("levels") or []
     if not rows:
         print("no levels in result -- run the load test first")
         return
     knee = result.get("knee")
-    cap = result.get("recommended_cap") or rows[-1]["concurrency"]
-    at_cap = next((r for r in rows if r["concurrency"] == cap), rows[-1])
+    cap = result.get("recommended_cap")
+    if not cap:
+        # No safe cap exists — the baseline level itself degraded. Falling back
+        # to rows[-1] (the old behaviour) would advise the operator to run the
+        # HIGHEST, most degraded concurrency measured: the exact opposite of
+        # safe, in the one scenario this tool exists to catch. Fail closed to
+        # the smallest measured level and say so out loud.
+        cap = rows[0]["concurrency"]
+        print("WARNING: no healthy level found -- the baseline concurrency already "
+              "degraded. Sizing from the SMALLEST measured level; treat the numbers "
+              "below as a floor, not a validated cap, and re-run on an idle box.")
+    at_cap = next((r for r in rows if r["concurrency"] == cap), rows[0])
     cores = os.cpu_count() or cap
     threads = max(1, cores // cap)
     queue_max = max(8, 4 * cap)
