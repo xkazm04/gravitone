@@ -9,6 +9,7 @@ Read this before the next Phase 4.1 to avoid re-discovering them.
 - **2026-07-14** — The Vibeman context map is stale: it uses pre-subtree-merge `gravitone-web/…` paths (real files are under `web/…`) and covers only 78 of 136 source files. Remap `gravitone-web/X` → `web/X` and add ad-hoc units for the uncovered service modules (`auth`, `certify`, `demand`, `export_stems`, `packs`, `replicas`, `takes`), the 14 `service/tests/` files, and ~37 `web/` files before any scan. **Refresh the map** (`update_context`) when convenient.
 - **2026-07-14** — `mutate_meta(fn)` in `service/voices.py` runs `fn` under `_META_LOCK`; use it for any read-modify-write of the voice registry, and re-check invariants *inside* `fn` (see `import_pack` / the create_voice fix).
 - **2026-07-14** — Cross-process atomic "first writer wins" over the filesystem = an `os.open(path, O_CREAT|O_EXCL|O_WRONLY)` sentinel (see `takes.pick_take`). The service runs N replica *processes* (`replicas.py`), so a `threading.Lock` alone is not enough for shared-file state (`api_keys.json`, `emotion_demand.json`, review picks).
+- **2026-07-14 (CORRECTION)** — `voices._save_meta` was **already atomic** (mkstemp → write → `os.replace`, with `except BaseException: os.unlink(tmp)`) — an earlier note claiming the registry used a plain `write_text` was wrong. The gap was that its crash path was never *tested*; `test_registry_atomic` now injects a failure inside `_save_meta`. `service/atomicio.py::atomic_write_text` (added for `keys.py`/`demand.py`) is the same pattern for the other single-file stores; `takes.py` still uses plain `write_text` and is the remaining adoption candidate.
 
 ## Conventions enforced
 
@@ -22,7 +23,9 @@ Read this before the next Phase 4.1 to avoid re-discovering them.
 
 ## Testing / environment
 
-- **2026-07-14** — **The Python service is NOT fully testable on this Windows box**: `torch` + `pocket-tts` are aarch64-Linux-only wheels, so any module that imports the engine (`app.py`, `engine.py`, `voices.py`, `ingest.py` transitively) can't be imported here. Gate service fixes with `python -m py_compile`, targeted smoke tests, and the unittest files that *don't* pull torch: `test_keys`, `test_replicas`, `test_ingest_lifecycle`, `test_ingest_pipeline` all run clean (they stub the engine/subprocess). Full pytest needs a Linux ARM box. `pytest` itself isn't installed — use `python -m unittest service.tests.<mod>`.
+- **2026-07-14 (CORRECTED)** — **The whole service suite DOES run on this Windows box** — 163 tests across all 17 `service/tests/*` modules, no torch needed. `service/tests/fake_engine.py` installs dependency shims (a fake `pocket_tts`/`scipy`) on import, and every suite imports it early, so `app.py`/`engine.py`/`voices.py` load fine *under test*. (Importing them OUTSIDE the test harness still fails — that's why ad-hoc `python -c "import service.app"` breaks.) Run: `python -m unittest service.tests.<mod>`. `pytest` is not installed.
+- **2026-07-14** — ⚠ **Run the FULL suite before calling a wave green, not a subset.** Wave 4 added `timeout=60` to `wav_bytes_to_mp3` and broke two `test_compat` stubs (rigid `fake_run(cmd, input, stdout, stderr)` → `TypeError` on the new kwarg). Only `test_ingest_*`/`test_replicas` were re-run, so the wave was reported green while `test_compat` was red for 4 waves. Loop all 17 modules.
+- **2026-07-14** — Test doubles should mirror the real callee's tolerance (`**kw` on a `subprocess.run` stub), or a legitimate source-side kwarg addition manufactures a fake test failure.
 - **2026-07-14** — Test output with non-ASCII needs `PYTHONIOENCODING=utf-8` on Windows (cp1252 console).
 
 ## Repo gotchas
