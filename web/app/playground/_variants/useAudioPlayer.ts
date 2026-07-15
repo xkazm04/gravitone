@@ -82,6 +82,11 @@ export function useAudioPlayer() {
         const synth = window.speechSynthesis;
         const u = new SpeechSynthesisUtterance(stripTags(take.text));
         u.onend = () => {
+          // speechSynthesis.cancel() (fired by stop() when switching takes)
+          // asynchronously delivers THIS utterance's onend after play(next) has
+          // already set the new current take. Ignore it unless we're still the
+          // current take, or it would null out the newly-playing take's state.
+          if (currentRef.current !== take) return;
           clearTimer();
           elapsedRef.current = 0;
           setPlayingId(null);

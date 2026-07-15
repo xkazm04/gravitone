@@ -25,6 +25,16 @@ export function getStoredKey(uid: string): StoredKey | null {
   }
 }
 
+/** Drop the stored copy-once secret for a uid. Called on sign-out so the
+ *  plaintext credential does not outlive the session on a shared browser. */
+export function clearStoredKey(uid: string): void {
+  try {
+    localStorage.removeItem(slot(uid));
+  } catch {
+    /* storage unavailable — nothing to clear */
+  }
+}
+
 export async function mintDefaultKey(uid: string, email: string | null): Promise<MintedKey | null> {
   try {
     const r = await fetch("/api/keys", {

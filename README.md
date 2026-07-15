@@ -1,13 +1,12 @@
-# Pocket Voice — a CPU-only, Arm-native cloud TTS service with voice cloning
+# Gravitone — a CPU-only, Arm-native cloud TTS service with voice cloning
 
-> **Arm AI Optimization Challenge — Track 2: Cloud AI submission draft.**
-> This document is the hackathon-facing description. Move it to the root
-> `README.md` of your **own public repository** before submitting (see
-> "Licensing & attribution" at the bottom).
+> **Arm AI Optimization Challenge — Track 2: Cloud AI.**
+> Built on Kyutai [Pocket TTS](https://github.com/kyutai-labs/pocket-tts) (MIT)
+> — see "Licensing & attribution" at the bottom.
 
 ## Project Overview
 
-**Pocket Voice** turns Kyutai's [Pocket TTS](https://github.com/kyutai-labs/pocket-tts)
+**Gravitone** turns Kyutai's [Pocket TTS](https://github.com/kyutai-labs/pocket-tts)
 (a 100M-parameter, CPU-only text-to-speech model with zero-shot voice
 cloning) into a **production-shaped, ElevenLabs-compatible HTTP service** that
 runs entirely on **Arm CPUs** — no GPU, no cloud AI API, no per-character
@@ -51,6 +50,17 @@ study**:
 4. **Load-test harness** (`service/loadtest.py`) — ramps concurrency, reports
    latency percentiles / throughput / server RTF / CPU / RAM, and the
    recommended safe cap. Emits `loadtest_result.json`.
+
+**Canonical audio cleanup.** Pocket TTS reproduces the *acoustic quality* of the
+reference clip, so every clone path conditions audio through **one** shared
+ffmpeg filter chain — `CLEANUP_FILTER` in `service/ingest.py`:
+`highpass=f=80,afftdn=nf=-25,loudnorm` (drop sub-80 Hz rumble → spectral denoise
+→ loudness-normalize) into 24 kHz mono. The ingest pipeline (sovereign local
+isolation **and** cloud post-isolation), the direct `POST /v1/voices` upload
+(`service.ingest.clean_audio`), and `clone_test.sh` all use this exact string, so
+a voice sounds the same however it was cloned. Change it in one place. Commit
+also enforces a **4 s minimum** per stem (`MIN_STEM_SECONDS`): shorter stems
+clone poorly, so they are skipped and reported rather than turned into a bad Voice.
 
 ### Measured performance — three Arm variants (all bf16, CPU-index ARM torch)
 
@@ -156,6 +166,40 @@ python -m service.loadtest \
   --voice alba --levels 1,2,3,4,6,8 --requests 8
 ```
 
+### Scaling on Arm — the replica launcher
+
+The model is **GIL/serialization-bound**, so the way to use all your cores is to
+run **N single-worker processes**, not one N-worker process (the load-test and
+certification harnesses both recommend exactly this). `service/replicas.py` is
+the supervisor that runs that topology:
+
+```bash
+# Run 4 single-worker replicas on one box (deploy target: Arm Linux).
+python -m service.replicas --replicas 4 --port 8000
+```
+
+What it does:
+- **Spawns N uvicorn single-worker replicas** and pins each one's thread budget
+  (`TTS_WORKERS=1`, plus `TTS_TORCH_THREADS` / `OMP_NUM_THREADS` /
+  `OPENBLAS_NUM_THREADS` / `MKL_NUM_THREADS = max(1, cores // replicas)`) **before**
+  each process starts, so the replicas don't oversubscribe the CPU.
+- **Shares one client-facing port** via `SO_REUSEPORT` on **Arm Linux** — the
+  kernel load-balances connections across replicas, so clients hit a single
+  `:8000`. On non-Linux dev boxes that kernel feature isn't available, so it
+  **falls back to sequential ports** `8000, 8001, … 8000+N-1` (logged at start-up).
+- **Supervises** the replicas: restarts a dead one with bounded exponential
+  backoff, fans `SIGTERM` out to all children on shutdown, and waits for them.
+- **Aggregated metrics**: a stdlib HTTP endpoint on `--metrics-port` (default
+  `--port + 1000`, e.g. `:9000`) fans `GET /metrics` out to every replica and
+  returns `{"replicas": [...], "totals": {received, completed, rejected_429,
+  errored, timeouts, abandoned, in_flight, queued}}`. Per-replica totals are
+  exact in the sequential-port mode; under `SO_REUSEPORT` the replicas answer on
+  one shared port and aren't individually addressable (documented trade-off —
+  use `--no-reuse-port` if you need per-replica accuracy).
+
+`python -m service.certify` prints the recommended replica count for your box
+and the exact `service.replicas` command to run it.
+
 ### ElevenLabs compatibility matrix (drop-in switch kit)
 
 Migrating an existing ElevenLabs integration is a **base-URL change** — same
@@ -173,7 +217,7 @@ paths, same auth header, same body shape. What maps where:
 | Emotion addressing | ✅➕ Gravitone extension | `/v1/text-to-speech/{character}:{emotion}` (or `?emotion=`), baseline fallback reported in `X-Emotion-*` headers |
 | Multi-character scripts | ✅➕ `POST /v1/performance` | one call, many Characters, inline `[emotion]` metatags; needs the `performance` key scope |
 | Character capability manifest | ✅➕ `GET /v1/characters/{id}/manifest` | which emotions a Character performs natively vs falls back |
-| Streaming endpoint (`/stream`) | ❌ not yet | whole-utterance responses; ~realtime on Arm |
+| Streaming endpoint (`/stream`) | ✅ `POST /v1/text-to-speech/{voice_id}/stream` | sentence-chunked: first sentence streams while the rest renders. `pcm_*`/`wav_*` stream; `mp3_*` → **501** (transcode needs the whole clip). No per-synthesis timing headers (see "Scaling on Arm" for the throughput story) |
 | Usage accounting | ✅ `X-Audio-Seconds` header + `audio_seconds_total` in `/metrics` | feeds the studio's "you'd have paid $X at ElevenLabs" ticker |
 
 ### Characters, not voices — the emotion-addressable API
@@ -208,6 +252,17 @@ curl -X POST "localhost:8080/v1/performance" \
 # Check what a Character can perform before directing it:
 curl -s -H "xi-api-key: $KEY" localhost:8080/v1/characters/sarah/manifest
 ```
+
+### Consent receipts — every clone is on the record
+
+Cloning is gated on an ownership attestation, and the **exact** statement the
+user agreed to is stored *verbatim* with the voice as a **consent receipt**
+(`{consented_at, clip_sha256, statement}` in the Voice's metadata) on **every**
+clone path: studio ingestion (`service/ingest.py`), the direct `POST /v1/voices`
+upload (`service/voices.py`), and the landing's hero mic demo. One canonical
+statement is the single source of truth (`web/lib/consent.ts`), so the record
+always reflects what was actually agreed — and `GET /v1/voices` reports whether
+a voice carries a receipt.
 
 ## The full studio — two products, one repo
 

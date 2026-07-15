@@ -32,7 +32,50 @@ export const ARM_BOXES: ArmBox[] = [
   { name: "Graviton c7g.xlarge (4 vCPU)", usdPerHour: 0.145, aggregateRtf: 4.0 },
 ];
 
-const HOURS_PER_MONTH = 730;
+export const HOURS_PER_MONTH = 730;
+
+/** The cheapest ElevenLabs tier that covers `chars` (top tier if none does). */
+export function elTierFor(chars: number): ElTier {
+  return (
+    ELEVENLABS_TIERS.find((t) => t.charsPerMonth >= chars) ??
+    ELEVENLABS_TIERS[ELEVENLABS_TIERS.length - 1]
+  );
+}
+
+/** What `chars` of MONTHLY volume costs at ElevenLabs: the cheapest covering
+ *  tier, extrapolated at the top tier's $/char beyond it. Single source of
+ *  truth — the SwitchKit estimator and the /benchmarks planner must not each
+ *  re-derive this (they had already drifted). */
+export function elCostForChars(chars: number): number {
+  const tier = elTierFor(chars);
+  return chars <= tier.charsPerMonth
+    ? tier.usdPerMonth
+    : (chars / tier.charsPerMonth) * tier.usdPerMonth;
+}
+
+/** Marginal $/char at the largest published tier. */
+export const EL_MARGINAL_USD_PER_CHAR =
+  ELEVENLABS_TIERS[ELEVENLABS_TIERS.length - 1].usdPerMonth /
+  ELEVENLABS_TIERS[ELEVENLABS_TIERS.length - 1].charsPerMonth;
+
+/** What a CUMULATIVE (lifetime) volume would have cost at ElevenLabs, priced at
+ *  the marginal per-character rate.
+ *
+ *  Do NOT price a lifetime counter with estimateMonthly/elCostForChars: those
+ *  return ONE MONTH of subscription for that volume, so a growing lifetime total
+ *  climbs the monthly tiers ($5 → $22 → $99 → $330 …) and compares two different
+ *  time spans. */
+export function elCostForLifetimeAudioMinutes(minutes: number): number {
+  return minutes * CHARS_PER_AUDIO_MINUTE * EL_MARGINAL_USD_PER_CHAR;
+}
+
+/** Monthly char volume at which an always-on box starts beating ElevenLabs:
+ *  the cheapest tier priced above the box's 24/7 cost. null if it never does
+ *  within the published tiers. */
+export function breakEvenChars(box: ArmBox = ARM_BOXES[0]): number | null {
+  const boxUsd = box.usdPerHour * HOURS_PER_MONTH;
+  return ELEVENLABS_TIERS.find((t) => t.usdPerMonth > boxUsd)?.charsPerMonth ?? null;
+}
 
 export type Estimate = {
   chars: number;
@@ -49,17 +92,14 @@ export type Estimate = {
 
 export function estimateMonthly(chars: number, box: ArmBox = ARM_BOXES[0]): Estimate {
   const audioMinutes = chars / CHARS_PER_AUDIO_MINUTE;
-  const elTier =
-    ELEVENLABS_TIERS.find((t) => t.charsPerMonth >= chars) ??
-    ELEVENLABS_TIERS[ELEVENLABS_TIERS.length - 1];
-  // Past the largest tier, extrapolate at the Business $/char rate.
-  const elUsd =
-    chars <= elTier.charsPerMonth
-      ? elTier.usdPerMonth
-      : (chars / elTier.charsPerMonth) * elTier.usdPerMonth;
+  const elTier = elTierFor(chars);
+  const elUsd = elCostForChars(chars);
   const boxUsd = box.usdPerHour * HOURS_PER_MONTH;
   const boxCapacityMinutes = box.aggregateRtf * 60 * HOURS_PER_MONTH;
-  const savingsUsd = Math.max(0, elUsd - boxUsd);
+  // NOT clamped at 0. Below the crossover an always-on box costs MORE than the
+  // ElevenLabs tier; clamping let the UI render an emerald "you keep $0.00"
+  // while the user would actually be paying more. Callers render the sign.
+  const savingsUsd = elUsd - boxUsd;
   return {
     chars,
     audioMinutes,

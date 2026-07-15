@@ -5,10 +5,8 @@
 // practical; every slot is visible at once with no scrolling or spatial hunting.
 
 import { useState } from "react";
-import { useVoicePreview } from "@/app/voices/_variants/data";
-import { relTime } from "@/app/voices/_variants/data";
+import { useVoicePreview, relTime, pickAudio, type Slot } from "@/app/voices/_data/characters";
 import EmotionArt from "@/components/ui/EmotionArt";
-import { pickAudio, type Slot } from "./useCharacterVoices";
 
 export default function EmotionRack({
   name, slots, coverage, total, busySlot, addVoice, removeVoice, onRecord,
@@ -20,7 +18,7 @@ export default function EmotionRack({
   addCustomEmotion: (name: string) => Promise<void>;
   removeCustomEmotion: (emotion: string) => Promise<void>;
 }) {
-  const { preview, playingId, busyId } = useVoicePreview();
+  const { preview, playingId, busyId, failedId } = useVoicePreview();
   const [custom, setCustom] = useState("");
   const [minting, setMinting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -75,6 +73,7 @@ export default function EmotionRack({
               const filled = !!s.voice;
               const isPlaying = filled && playingId === s.voice!.voice_id;
               const isBusy = busySlot === s.emotion || (filled && busyId === s.voice!.voice_id);
+              const previewFailed = filled && failedId === s.voice!.voice_id;
 
               return (
                 <tr key={s.emotion} className={`border-b border-white/5 transition hover:bg-white/[0.03] ${!filled ? "opacity-70" : ""}`}>
@@ -98,6 +97,17 @@ export default function EmotionRack({
                         <EmotionArt emotion={s.emotion} size={34} dim={!filled} />
                       </span>
                       <span className="text-sm font-medium text-white">{s.label}</span>
+                      {filled && (
+                        s.voice!.consent ? (
+                          <span title="Consent receipt on file for this voice"
+                            aria-label="consent receipt on file"
+                            className="text-[13px] leading-none text-emerald-300/90">🛡</span>
+                        ) : (
+                          <span title="No receipt (pre-consent voice)"
+                            aria-label="no consent receipt"
+                            className="text-[13px] leading-none text-white/25">🛡</span>
+                        )
+                      )}
                       {s.custom && (
                         <span title="Custom emotion — glyph generated from the name"
                           className="font-jetbrains rounded-full border border-violet-400/30 bg-violet-400/10 px-1.5 py-0.5 text-[10px] text-violet-200">
@@ -109,7 +119,13 @@ export default function EmotionRack({
 
                   <td className="px-3 py-2">
                     {filled ? (
-                      <span className="font-jetbrains rounded bg-cyan-400/10 px-1.5 py-0.5 text-[11px] text-cyan-300">recorded</span>
+                      <span className="flex items-center gap-2">
+                        <span className="font-jetbrains rounded bg-cyan-400/10 px-1.5 py-0.5 text-[11px] text-cyan-300">recorded</span>
+                        {previewFailed && (
+                          <span title="The preview could not be synthesized — try again."
+                            className="font-jetbrains rounded bg-rose-400/10 px-1.5 py-0.5 text-[11px] text-rose-300">preview failed</span>
+                        )}
+                      </span>
                     ) : s.demand > 0 ? (
                       <span
                         className="font-jetbrains rounded bg-amber-400/10 px-1.5 py-0.5 text-[11px] text-amber-300"
@@ -128,13 +144,8 @@ export default function EmotionRack({
 
                   <td className="px-3 py-2 text-right">
                     {filled ? (
-                      <>
-                        <button onClick={() => pickAudio((f) => addVoice(s.emotion, f))} disabled
-                          title="Remove first, then re-record this slot"
-                          className="font-jetbrains text-[11px] text-white/15">replace</button>
-                        <button onClick={() => removeVoice(s.voice!.voice_id)}
-                          className="font-jetbrains ml-3 text-[11px] text-white/55 transition hover:text-rose-300">remove</button>
-                      </>
+                      <button onClick={() => removeVoice(s.voice!.voice_id)}
+                        className="font-jetbrains text-[11px] text-white/55 transition hover:text-rose-300">remove</button>
                     ) : (
                       <>
                         <button onClick={() => onRecord(s.emotion)} disabled={isBusy}

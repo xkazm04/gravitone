@@ -29,13 +29,20 @@ export default function WaveformLab({ data }: { data: LoaderData }) {
   const stemming = stateOf(data, "stem") !== "pending";
   const colors = barColors(labeling ? p.emotion_counts : undefined);
 
-  const headline = stemming
-    ? "Assembling stems"
-    : labeling
-    ? `Detecting emotions · ${p.segments_done ?? 0}/${p.segments_total ?? "…"}`
-    : stateOf(data, "isolate") !== "pending"
-    ? "Isolating the voice"
-    : `Transcribing${p.words ? ` · ${p.words} words` : "…"}`;
+  // Headline copy comes from the SERVER's own step labels — never fabricated
+  // here — so a sovereign scan reads its true local steps ("Detect speech",
+  // "Group segments") and never the cloud "Detect emotions" label. Until the
+  // first poll delivers steps, show a neutral placeholder.
+  const active =
+    data.steps.find((s) => s.state === "active") ??
+    [...data.steps].reverse().find((s) => s.state === "done");
+  const base = data.steps.length === 0 ? "Starting…" : active?.label ?? "Starting…";
+  const headline =
+    active?.key === "label"
+      ? `${base} · ${p.segments_done ?? 0}/${p.segments_total ?? "…"}`
+      : active?.key === "transcribe" && p.words
+      ? `${base} · ${p.words} words`
+      : base;
 
   // stemming groups the bars into a few clusters (gaps between groups)
   const grouped = stemming;
@@ -78,6 +85,11 @@ export default function WaveformLab({ data }: { data: LoaderData }) {
         ) : null}
         {p.transcript && !p.emotion_counts && (
           <p className="mx-auto mt-3 line-clamp-2 max-w-lg text-center text-[12px] italic text-white/45">“{p.transcript}”</p>
+        )}
+        {(p.label_errors ?? 0) > 0 && (
+          <p className="font-jetbrains mt-3 text-center text-[11px] text-amber-200/70">
+            {p.label_errors} segment{p.label_errors === 1 ? "" : "s"} couldn’t be classified — falling back to baseline
+          </p>
         )}
       </div>
     </div>

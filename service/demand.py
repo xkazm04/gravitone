@@ -14,11 +14,15 @@ undercount (last-writer-wins), which is acceptable for a demand *signal*.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import threading
 from pathlib import Path
 
+from service.atomicio import atomic_write_text
 from service.config import SETTINGS
+
+logger = logging.getLogger(__name__)
 
 DEMAND_PATH = Path(SETTINGS.voices_dir).parent / "emotion_demand.json"
 _LOCK = threading.Lock()
@@ -32,6 +36,10 @@ def _load() -> dict:
         data = json.loads(DEMAND_PATH.read_text("utf-8"))
         return data if isinstance(data, dict) else {}
     except json.JSONDecodeError:
+        # With atomic writes below, a torn file no longer happens from our own
+        # (even multi-replica) writes; if it's still corrupt, don't silently
+        # zero the whole demand history — surface it.
+        logger.warning("emotion_demand.json is corrupt; treating as empty (%s)", DEMAND_PATH)
         return {}
 
 
@@ -46,8 +54,10 @@ def record_fallback(character_id: str, requested_emotion: str) -> None:
             data = _load()
             char = data.setdefault(character_id, {})
             char[emotion] = int(char.get(emotion, 0)) + 1
-            DEMAND_PATH.parent.mkdir(parents=True, exist_ok=True)
-            DEMAND_PATH.write_text(json.dumps(data, indent=2), "utf-8")
+            # Atomic write: two replica processes' per-process locks don't
+            # exclude each other, but os.replace can't tear the file, so the
+            # worst case is a lost increment (documented), never total loss.
+            atomic_write_text(DEMAND_PATH, json.dumps(data, indent=2))
     except OSError:
         pass
 

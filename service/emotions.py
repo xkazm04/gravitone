@@ -92,16 +92,59 @@ def parse_segments(text: str) -> list[Segment]:
     return segments or [Segment(text=text.strip(), emotion=BASELINE)]
 
 
+# Nearest-emotion fallback. When a Character lacks the requested emotion we no
+# longer collapse straight to baseline — we first try acoustically adjacent
+# emotions (an [excited] line on a Character that only has `happy` should read
+# happy, not neutral). Each entry lists a requested emotion's neighbours in
+# preference order; resolve() tries them, then baseline, then a deterministic
+# scale-ordered pick. Custom emotions have no entry and fall through to that
+# baseline/deterministic tail. Keep chains short and one-directional per pair so
+# a walk can't loop.
+FALLBACK_CHAIN: dict[str, list[str]] = {
+    "excited": ["happy"],       # high-arousal positive → its calmer sibling
+    "happy": ["excited"],       # positive → its higher-energy sibling
+    "sad": ["calm"],            # low-arousal negative → the nearest low-arousal read
+    "calm": ["baseline"],       # calm is already close to neutral
+    "angry": ["excited"],       # share high arousal; excited is the nearest energy match
+    "whisper": ["calm"],        # quiet, low-energy delivery
+    "confused": ["calm"],       # hesitant/soft → calm before neutral
+}
+
+
+def deterministic_fallback(available: dict[str, object]) -> str | None:
+    """The emotion to fall back to when nothing better matches.
+
+    The available emotion earliest in ``EMOTION_SCALE`` order (so ``baseline``
+    wins when present); unknown/custom emotions sort last, then alphabetically.
+    Fully deterministic — no reliance on dict iteration order. ``available`` may
+    be any mapping keyed by emotion. Returns the chosen emotion, or None when
+    empty. Shared by :func:`resolve` and voices.character_manifest so the two
+    can never disagree.
+    """
+    if not available:
+        return None
+    order = {e: i for i, e in enumerate(EMOTION_SCALE)}
+    return min(available, key=lambda e: (order.get(e, len(EMOTION_SCALE)), e))
+
+
 def resolve(emotion: str, available: dict[str, str]) -> tuple[str, str, bool]:
     """Map a requested emotion to an actual voice_id.
 
-    Returns (voice_id, used_emotion, fell_back).
-    `available` maps emotion -> voice_id for one Character.
+    Returns (voice_id, used_emotion, fell_back). ``available`` maps emotion ->
+    voice_id for one Character. On a miss the walk is: adjacent emotions (in
+    FALLBACK_CHAIN order) → baseline → deterministic scale-first voice. The
+    second element is the TRUE emotion used; ``fell_back`` is True whenever it
+    differs from what was requested.
     """
     if emotion in available:
         return available[emotion], emotion, False
-    baseline = available.get(BASELINE)
-    if baseline is None:  # character with no baseline: take any voice
-        any_emotion, any_id = next(iter(available.items()))
-        return any_id, any_emotion, True
-    return baseline, BASELINE, True
+    for neighbour in FALLBACK_CHAIN.get(emotion, ()):
+        if neighbour in available:
+            return available[neighbour], neighbour, True
+    # baseline is index 0 of EMOTION_SCALE, so deterministic_fallback returns it
+    # when present and otherwise the earliest available slot — one code path for
+    # both the "baseline" and "deterministic first" steps.
+    used = deterministic_fallback(available)
+    if used is None:  # no voices at all — callers guard this, so it's unreachable
+        raise KeyError(emotion)
+    return available[used], used, True

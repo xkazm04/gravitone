@@ -5,17 +5,8 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { Wordmark } from "@/components/ui/Primitives";
-import { backendFetch } from "@/lib/backend";
-import TakeCard, { type SharedTake } from "./TakeCard";
-
-async function loadTake(id: string): Promise<SharedTake | null> {
-  try {
-    const r = await backendFetch(`/v1/takes/${encodeURIComponent(id)}`, { cache: "no-store" });
-    return r.ok ? ((await r.json()) as SharedTake) : null;
-  } catch {
-    return null;
-  }
-}
+import { loadTake } from "@/lib/takes";
+import TakeCard from "./TakeCard";
 
 export async function generateMetadata({ params }: { params: Promise<{ id: string }> }): Promise<Metadata> {
   const { id } = await params;

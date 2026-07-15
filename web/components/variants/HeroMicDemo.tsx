@@ -12,26 +12,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import { HERO_DEMO, SAMPLE_TEXT } from "@/lib/content";
 import { useAuth } from "@/lib/useAuth";
+import { CONSENT_STATEMENT } from "@/lib/consent";
+import Equalizer from "@/components/ui/Equalizer";
 
 const MIN_SECONDS = 8;
 const MAX_SECONDS = 20;
 const ease = [0.22, 1, 0.36, 1] as const;
 
 type Phase = "idle" | "recording" | "cloning" | "rendering" | "ready" | "error";
-
-function Equalizer({ bars = 28, className = "" }: { bars?: number; className?: string }) {
-  return (
-    <div className={`flex items-end gap-[3px] ${className}`} aria-hidden>
-      {Array.from({ length: bars }).map((_, i) => (
-        <span
-          key={i}
-          className="eq-bar w-[3px] rounded-full bg-gradient-to-t from-cyan-400/40 to-cyan-200"
-          style={{ height: 40, animationDelay: `${(i % 9) * 0.09}s`, animationDuration: `${0.9 + (i % 5) * 0.12}s` }}
-        />
-      ))}
-    </div>
-  );
-}
 
 export default function HeroMicDemo() {
   const { ready, signIn } = useAuth();
@@ -43,6 +31,7 @@ export default function HeroMicDemo() {
   const recRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<BlobPart[]>([]);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   const cleanupMic = useCallback(() => {
     if (timerRef.current) clearInterval(timerRef.current);
@@ -57,7 +46,12 @@ export default function HeroMicDemo() {
   /** clone the recording → synthesize SAMPLE_TEXT with it → delete the demo character */
   const runPipeline = useCallback(async (blob: Blob) => {
     const demoName = `Demo visitor ${Math.random().toString(16).slice(2, 6)}`;
-    const cid = demoName.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+    // The id to delete comes from the backend's clone response, NOT a re-slug
+    // of demoName — the client and server slug rules differ, so a reconstructed
+    // id can silently miss and leave the cloned (biometric) demo voice behind.
+    let createdCid: string | null = null;
+    const controller = new AbortController();
+    abortRef.current = controller;
     try {
       setPhase("cloning");
       const ext = blob.type.includes("mp4") ? "mp4" : "webm";
@@ -65,15 +59,24 @@ export default function HeroMicDemo() {
       fd.append("file", new File([blob], `hero-demo.${ext}`, { type: blob.type }));
       fd.append("character", demoName);
       fd.append("emotion", "baseline");
-      const cr = await fetch("/api/voices", { method: "POST", body: fd });
+      // The visitor is recording their own voice live — self-attestation.
+      fd.append("attested", "true");
+      fd.append("statement", CONSENT_STATEMENT);
+      const cr = await fetch("/api/voices", { method: "POST", body: fd, signal: controller.signal });
       const voice = await cr.json().catch(() => ({}));
       if (!cr.ok) throw new Error(voice?.detail ?? "clone failed");
+      // A 200 with no voice_id would otherwise fall through to /api/tts, which
+      // defaults to a stock voice — playing a stranger's voice as "yours,
+      // cloned." Fail loudly instead of faking the core demo.
+      if (!voice.voice_id) throw new Error("clone returned no voice — please try again");
+      createdCid = voice.character_id ?? null;
 
       setPhase("rendering");
       const tr = await fetch("/api/tts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text: SAMPLE_TEXT, voiceId: voice.voice_id }),
+        signal: controller.signal,
       });
       if (!tr.ok) throw new Error("synthesis failed");
       const wav = await tr.arrayBuffer();
@@ -83,11 +86,26 @@ export default function HeroMicDemo() {
       });
       setPhase("ready");
     } catch (e) {
-      fail(e instanceof Error ? e.message : "demo failed — the backend may be offline");
+      // A user-initiated cancel aborts both fetches; stay quietly on idle
+      // (cancel() already set the phase) rather than showing an error.
+      if (!controller.signal.aborted) {
+        fail(e instanceof Error ? e.message : "demo failed — the backend may be offline");
+      }
     } finally {
-      // The demo never keeps data: delete the throwaway character either way.
-      void fetch(`/api/characters/${encodeURIComponent(cid)}`, { method: "DELETE" }).catch(() => {});
+      // The demo never keeps data: delete the throwaway character by its real
+      // id. Nothing to delete if the clone never returned one.
+      if (createdCid) {
+        void fetch(`/api/characters/${encodeURIComponent(createdCid)}`, { method: "DELETE" }).catch(() => {});
+      }
     }
+  }, []);
+
+  // Escape hatch while cloning/rendering: abort the in-flight fetches (a
+  // stalled CPU backend can hold the demo ~5 min otherwise) and return to idle.
+  const cancel = useCallback(() => {
+    abortRef.current?.abort();
+    setError(null);
+    setPhase("idle");
   }, []);
 
   const startRecording = useCallback(async () => {
@@ -184,9 +202,13 @@ export default function HeroMicDemo() {
         <div className="mt-6 rounded-2xl border border-white/8 bg-black/30 p-5">
           <Equalizer bars={40} className="h-16" />
           <p className="font-jetbrains mt-4 text-[12px] text-cyan-300">
-            {phase === "cloning" ? "cloning your voice on the CPU (~20s)…" : "rendering your line…"}
+            {phase === "cloning" ? "cloning your voice on the CPU…" : "rendering your line…"}
           </p>
           <p className="font-jetbrains mt-1 text-[11px] text-white/50">no GPU involved — this is the whole pitch</p>
+          <button onClick={cancel}
+            className="font-jetbrains mt-4 cursor-pointer rounded-full border border-white/15 px-4 py-1.5 text-[12px] text-white/70 transition hover:bg-white/5">
+            Cancel
+          </button>
         </div>
       )}
 

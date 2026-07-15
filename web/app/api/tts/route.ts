@@ -2,15 +2,21 @@
 // CORS issues and hides the endpoint. Set GRAVITONE_URL to point at a running
 // service (local :8080 by default, or your deployed Arm instance).
 import { NextRequest } from "next/server";
-import { backendFetch } from "@/lib/backend";
+import { backendFetch, readCappedText } from "@/lib/backend";
 
 // playground voice-id → backend voice-id (cloned demo voice lives as step4)
 const VOICE_MAP: Record<string, string> = { mine: "step4" };
 
+// A single utterance — far smaller than a multi-line performance script.
+const MAX_TTS_BODY_BYTES = 64 * 1024;
+
 export async function POST(req: NextRequest) {
+  const raw = await readCappedText(req, MAX_TTS_BODY_BYTES);
+  if (raw instanceof Response) return raw;
+
   let body: { text?: string; voiceId?: string };
   try {
-    body = await req.json();
+    body = JSON.parse(raw);
   } catch {
     return new Response("bad request", { status: 400 });
   }

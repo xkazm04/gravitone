@@ -8,7 +8,14 @@ export type Segment = {
   fallback: boolean;
   voice_id: string;
   seconds: number;
+  // Performance takes only: which Character spoke this segment and its source
+  // line index in the script (absent for solo takes — one Character throughout).
+  characterId?: string;
+  line?: number;
 };
+
+/** One directed line of a multi-character performance script. */
+export type PerfLine = { character_id: string; text: string };
 
 export type Take = {
   id: string;
@@ -21,10 +28,21 @@ export type Take = {
   seconds: number;
   kb: number;
   rtf: number;
+  // Honest timing (server-side synthesis time + queue wait, seconds) and any
+  // accepted-but-inert voice settings the backend reported ignoring.
+  synthSeconds: number;
+  queueSeconds: number;
+  ignoredSettings: string[];
   segments: Segment[];
   // The expression knobs this take was rendered with — together with text +
   // characterId this is the exact reproduction recipe for the code export.
   expr: Expression;
+  // Epoch ms the take was rendered — the sort key for session restore.
+  createdAt: number;
+  // Performance takes only: the directed script that produced this take. Drives
+  // the /v1/performance code export and survives session restore. Absent (undefined)
+  // for solo takes.
+  lines?: PerfLine[];
 };
 
 /** Expression controls. Pocket TTS has no emotion/speed parameter — these are

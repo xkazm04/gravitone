@@ -137,7 +137,14 @@ def verify_certificate(cert: dict, secret: str = "") -> bool:
     if cert.get("sha256") != hashlib.sha256(_canonical(cert)).hexdigest():
         return False
     sig = cert.get("signature")
-    if secret and sig:
+    if secret:
+        # A configured secret means the HMAC signature is REQUIRED. An unsigned
+        # (or signature-stripped) certificate must NOT be trusted: the sha256
+        # above is an unkeyed integrity hint over attacker-controllable data,
+        # not a security control, so accepting a missing signature would let
+        # anyone mint a passing certificate. Fail closed instead.
+        if not sig:
+            return False
         want = hmac.new(secret.encode(), _canonical(cert), hashlib.sha256).hexdigest()
         return hmac.compare_digest(want, str(sig.get("value", "")))
     return True
@@ -172,6 +179,9 @@ def main() -> None:
     rc = cert["recommended_config"]
     print(f"Config: {rc['replicas']} replicas x TTS_TORCH_THREADS={rc['TTS_TORCH_THREADS']}, "
           f"TTS_QUEUE_MAX={rc['TTS_QUEUE_MAX']}")
+    # The launcher pins TTS_WORKERS=1 and the per-replica thread budget itself;
+    # this is the exact command that runs the recommended topology.
+    print(f"Run it: python -m service.replicas --replicas {rc['replicas']} --port 8000")
     print(f"wrote {a.out}")
     if cert["verdict"] == "certified":
         print("Add your box to the matrix: PR this file per docs/SUPPORTED_HARDWARE.md")

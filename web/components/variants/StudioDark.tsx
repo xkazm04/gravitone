@@ -2,9 +2,11 @@
 
 import Link from "next/link";
 import { motion } from "framer-motion";
-import { BRAND, HERO, STATS, FEATURES, VOICES, SAMPLE_TEXT } from "@/lib/content";
+import { BRAND, HERO, STATS, FEATURES, VOICES, SAMPLE_TEXT, API_DOCS_URL } from "@/lib/content";
 import { useAuth } from "@/lib/useAuth";
 import UserMenu from "@/components/ui/UserMenu";
+import MobileNav from "@/components/ui/MobileNav";
+import Equalizer, { usePauseOffscreen } from "@/components/ui/Equalizer";
 import SwitchKit from "./SwitchKit";
 import HeroMicDemo from "./HeroMicDemo";
 
@@ -20,26 +22,13 @@ const rise = {
   show: (i = 0) => ({ opacity: 1, y: 0, transition: { duration: 0.7, ease, delay: i * 0.08 } }),
 };
 
-function Equalizer({ bars = 28, className = "" }: { bars?: number; className?: string }) {
-  return (
-    <div className={`flex items-end gap-[3px] ${className}`} aria-hidden>
-      {Array.from({ length: bars }).map((_, i) => (
-        <span
-          key={i}
-          className="eq-bar w-[3px] rounded-full bg-gradient-to-t from-cyan-400/40 to-cyan-200"
-          style={{ height: 40, animationDelay: `${(i % 9) * 0.09}s`, animationDuration: `${0.9 + (i % 5) * 0.12}s` }}
-        />
-      ))}
-    </div>
-  );
-}
-
 export default function StudioDark() {
   const { user } = useAuth();
+  const aurora = usePauseOffscreen<HTMLDivElement>();
   return (
     <div className="font-hanken relative min-h-screen overflow-hidden bg-[#080a10] text-slate-200 grain">
-      {/* atmosphere */}
-      <div className="pointer-events-none absolute inset-0 aurora" />
+      {/* atmosphere — aurora drift pauses once scrolled past */}
+      <div ref={aurora.ref} className={`pointer-events-none absolute inset-0 aurora ${aurora.paused ? "anim-paused" : ""}`} />
       <div className="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-cyan-400/40 to-transparent" />
 
       <div className="relative mx-auto max-w-6xl px-6">
@@ -59,7 +48,10 @@ export default function StudioDark() {
                 <Link key={r.href} href={r.href} className="transition hover:text-white">{r.label}</Link>
               ))}
           </div>
-          <UserMenu />
+          <div className="flex items-center gap-3">
+            {user && <MobileNav links={APP_ROUTES} />}
+            <UserMenu />
+          </div>
         </nav>
 
         {/* hero */}
@@ -89,10 +81,10 @@ export default function StudioDark() {
             </motion.p>
 
             <motion.div variants={rise} initial="hidden" animate="show" custom={3} className="mt-8 flex flex-wrap items-center gap-3">
-              <a href="#playground" className="cta-glow rounded-full bg-gradient-to-r from-cyan-300 to-cyan-200 px-6 py-3 text-sm font-semibold text-slate-950 transition hover:brightness-110">
+              <Link href="/playground" className="cta-glow rounded-full bg-gradient-to-r from-cyan-300 to-cyan-200 px-6 py-3 text-sm font-semibold text-slate-950 transition hover:brightness-110">
                 {HERO.primaryCta} →
-              </a>
-              <a href="#api" className="font-jetbrains rounded-full border border-white/15 px-6 py-3 text-sm text-white/85 transition hover:bg-white/5">
+              </Link>
+              <a href={API_DOCS_URL} target="_blank" rel="noreferrer" className="font-jetbrains rounded-full border border-white/15 px-6 py-3 text-sm text-white/85 transition hover:bg-white/5">
                 {HERO.secondaryCta}
               </a>
             </motion.div>
@@ -162,7 +154,12 @@ export default function StudioDark() {
                   <p className="text-sm text-white/80">{SAMPLE_TEXT}</p>
                   <div className="mt-4 flex items-center justify-between">
                     <Equalizer bars={20} className="h-8" />
-                    <button className="cta-glow rounded-full bg-cyan-300 px-5 py-2 text-sm font-semibold text-slate-950">Generate</button>
+                    <Link
+                      href={`/playground?text=${encodeURIComponent(SAMPLE_TEXT)}`}
+                      className="cta-glow rounded-full bg-cyan-300 px-5 py-2 text-sm font-semibold text-slate-950 transition hover:brightness-110"
+                    >
+                      Generate
+                    </Link>
                   </div>
                 </div>
               </div>

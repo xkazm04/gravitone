@@ -13,17 +13,25 @@ import { getStoredKey } from "@/lib/mintKey";
 import { DEFAULT_BASE_URL, KEY_PLACEHOLDER, SNIPPET_LANGS, type SnippetLang } from "@/lib/switchkit";
 import type { Take } from "./shared";
 
+const voiceSettings = (t: Take) => ({
+  temperature: t.expr.temperature,
+  stability: t.expr.stability,
+  quality: t.expr.quality,
+});
+
 function speakBody(t: Take): string {
   return JSON.stringify(
-    {
-      character_id: t.characterId,
-      text: t.text,
-      voice_settings: {
-        temperature: t.expr.temperature,
-        stability: t.expr.stability,
-        quality: t.expr.quality,
-      },
-    },
+    { character_id: t.characterId, text: t.text, voice_settings: voiceSettings(t) },
+    null,
+    2,
+  );
+}
+
+// Performance takes replay through /v1/performance — the directed multi-line
+// script the take carries, each line's voice_settings mirroring the take's knobs.
+function performanceBody(t: Take): string {
+  return JSON.stringify(
+    { lines: (t.lines ?? []).map((l) => ({ ...l, voice_settings: voiceSettings(t) })) },
     null,
     2,
   );
@@ -31,22 +39,27 @@ function speakBody(t: Take): string {
 
 function buildSnippet(lang: SnippetLang, t: Take, apiKey: string): string {
   const base = DEFAULT_BASE_URL;
-  const body = speakBody(t);
+  const isPerf = !!t.lines?.length;
+  const path = isPerf ? "/v1/performance" : "/v1/speak";
+  const body = isPerf ? performanceBody(t) : speakBody(t);
+  const reportComment = isPerf
+    ? `# per-line/segment report: X-Performance-Report header (base64 JSON)`
+    : `# per-segment emotion report: X-Segments header (base64 JSON)`;
   switch (lang) {
     case "curl":
       return [
-        `curl -X POST "${base}/v1/speak" \\`,
+        `curl -X POST "${base}${path}" \\`,
         `  -H "xi-api-key: ${apiKey}" -H "Content-Type: application/json" \\`,
         `  -d '${body.replace(/'/g, "'\\''")}' \\`,
         `  --output take.wav`,
-        `# per-segment emotion report: X-Segments header (base64 JSON)`,
+        reportComment,
       ].join("\n");
     case "python":
       return [
         `import requests`,
         ``,
         `r = requests.post(`,
-        `    "${base}/v1/speak",`,
+        `    "${base}${path}",`,
         `    headers={"xi-api-key": "${apiKey}"},`,
         `    json=${body.replace(/\n/g, "\n    ")},`,
         `)`,
@@ -54,7 +67,7 @@ function buildSnippet(lang: SnippetLang, t: Take, apiKey: string): string {
       ].join("\n");
     case "javascript":
       return [
-        `const res = await fetch("${base}/v1/speak", {`,
+        `const res = await fetch("${base}${path}", {`,
         `  method: "POST",`,
         `  headers: { "xi-api-key": "${apiKey}", "Content-Type": "application/json" },`,
         `  body: JSON.stringify(${body.replace(/\n/g, "\n  ")}),`,

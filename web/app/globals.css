@@ -5,9 +5,6 @@
 .font-instrument { font-family: var(--font-instrument), Georgia, serif; }
 .font-hanken     { font-family: var(--font-hanken), system-ui, sans-serif; }
 .font-jetbrains  { font-family: var(--font-jetbrains), ui-monospace, monospace; }
-.font-bricolage  { font-family: var(--font-bricolage), system-ui, sans-serif; }
-.font-gabarito   { font-family: var(--font-gabarito), system-ui, sans-serif; }
-.font-shantell   { font-family: var(--font-shantell), "Comic Sans MS", cursive; }
 
 * { -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
 html { scroll-behavior: smooth; }
@@ -47,6 +44,10 @@ body { margin: 0; }
   0%,100% { transform: scaleY(0.25); } 50% { transform: scaleY(1); }
 }
 .eq-bar { transform-origin: bottom; animation: eq 1.1s ease-in-out infinite; }
+
+/* Off-viewport pause: toggled by usePauseOffscreen so background loops
+   (aurora, equalizer) stop when scrolled out of view. */
+.anim-paused, .anim-paused * { animation-play-state: paused !important; }
 
 /* switch-kit volume slider (landing bill calculator) */
 .switch-slider {

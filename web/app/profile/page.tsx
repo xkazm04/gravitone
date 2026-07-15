@@ -14,6 +14,7 @@ export default function ProfilePage() {
   const [name, setName] = useState("");
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [saveErr, setSaveErr] = useState<string | null>(null);
   const [storedKey, setStoredKey] = useState<StoredKey | null>(null);
   const [minting, setMinting] = useState(false);
   const [lang, setLang] = useState<SnippetLang>("curl");
@@ -39,10 +40,19 @@ export default function ProfilePage() {
   }
 
   async function save() {
-    setSaving(true); setSaved(false);
-    await updateProfile({ displayName: name.trim() || null });
-    setSaving(false); setSaved(true);
-    setTimeout(() => setSaved(false), 1500);
+    setSaving(true); setSaved(false); setSaveErr(null);
+    try {
+      // updateProfile can reject (offline, Firestore rule/quota). Without a
+      // finally, setSaving(false) would never run — the button hangs on
+      // "Saving…" forever and the edit is silently lost.
+      await updateProfile({ displayName: name.trim() || null });
+      setSaved(true);
+      setTimeout(() => setSaved(false), 1500);
+    } catch (e) {
+      setSaveErr(e instanceof Error ? e.message : "couldn't save — try again");
+    } finally {
+      setSaving(false);
+    }
   }
 
   return (
@@ -89,6 +99,7 @@ export default function ProfilePage() {
               <div className="mt-4 flex items-center gap-3">
                 <Button onClick={save} disabled={saving} className="cursor-pointer">{saving ? "Saving…" : "Save"}</Button>
                 {saved && <span className="font-jetbrains text-[12px] text-emerald-300">✓ saved to Firestore</span>}
+                {saveErr && <span className="font-jetbrains text-[12px] text-rose-300">{saveErr}</span>}
               </div>
             </div>
 

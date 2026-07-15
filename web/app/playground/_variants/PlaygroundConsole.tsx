@@ -14,8 +14,9 @@ import { Button, Eyebrow } from "@/components/ui/Primitives";
 import { EASE } from "@/components/ui/tokens";
 import { EMOTION_IDS, emotionMeta, wrapWithTag } from "@/lib/emotions";
 import EmotionArt from "@/components/ui/EmotionArt";
-import { DEFAULT_EXPRESSION, DEFAULT_TEXT, stripTags, type Expression, type Take } from "./shared";
-import { speak } from "./engine";
+import { DEFAULT_EXPRESSION, DEFAULT_TEXT, stripTags, type Expression, type PerfLine, type Take } from "./shared";
+import { speak, perform, uploadTake, EngineBusyError } from "./engine";
+import { putTake, getRecentTakes, deleteTake } from "@/lib/takeStore";
 import { useAudioPlayer } from "./useAudioPlayer";
 import EmotionPicker from "./EmotionPicker";
 import TakeCode from "./TakeCode";
@@ -55,12 +56,27 @@ function Slider({ label, hint, value, min, max, step, onChange, format }: {
   );
 }
 
+// One directed line in the Script composer (stable id for keys + reordering).
+type ScriptLine = { id: string; characterId: string; text: string };
+
 export default function PlaygroundConsole() {
   const [text, setText] = useState(DEFAULT_TEXT);
   const [characters, setCharacters] = useState<Character[]>([]);
   const [charId, setCharId] = useState<string>("");
   const [expr, setExpr] = useState<Expression>(DEFAULT_EXPRESSION);
+  // Composer mode: Solo = one Character throughout (current flow); Script = a
+  // multi-character performance rendered as one take via /v1/performance.
+  const [mode, setMode] = useState<"solo" | "script">("solo");
+  const [script, setScript] = useState<ScriptLine[]>([]);
+  const [activeLine, setActiveLine] = useState(0); // emotion tags target this line
+  const lineRefs = useRef<Array<HTMLTextAreaElement | null>>([]);
+  const scriptSeq = useRef(0);
   const [busy, setBusy] = useState(false);
+  // Backpressure (429): engine is up but busy — offer a retry, never fall to
+  // the browser voice. null = no pending backpressure.
+  const [busyNotice, setBusyNotice] = useState<{ retryAfterSec: number } | null>(null);
+  // Transient error surface so generation failures are never silent.
+  const [toast, setToast] = useState<string | null>(null);
   const [takes, setTakes] = useState<Take[]>([]);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [codeFor, setCodeFor] = useState<string | null>(null); // take id with the code panel open
@@ -94,7 +110,42 @@ export default function PlaygroundConsole() {
       .catch(() => setCharacters([]));
   }, []);
 
-  const character = useMemo(() => characters.find((c) => c.character_id === charId), [characters, charId]);
+  // Restore the most recent session takes from IndexedDB on mount so a refresh
+  // no longer destroys the log. Each restored take carries a fresh object URL.
+  useEffect(() => {
+    let cancelled = false;
+    getRecentTakes(20)
+      .then((restored) => {
+        if (cancelled || restored.length === 0) {
+          // Unmounted before restore landed — revoke the URLs we just minted.
+          if (cancelled) for (const t of restored) if (t.url) URL.revokeObjectURL(t.url);
+          return;
+        }
+        setTakes((current) => {
+          const known = new Set(current.map((t) => t.id));
+          return [...current, ...restored.filter((t) => !known.has(t.id))];
+        });
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
+  // Revoke every take's object URL on unmount so navigating away doesn't leak
+  // them (object URLs outlive component teardown in an SPA).
+  const takesRef = useRef<Take[]>([]);
+  useEffect(() => { takesRef.current = takes; }, [takes]);
+  useEffect(() => () => {
+    for (const t of takesRef.current) if (t.url) URL.revokeObjectURL(t.url);
+  }, []);
+
+  // In Script mode the emotion palette follows the line being edited (each line
+  // may name a different Character); in Solo mode it follows the character rail.
+  const activeCharId = mode === "script" ? (script[activeLine]?.characterId ?? charId) : charId;
+  const character = useMemo(
+    () => characters.find((c) => c.character_id === activeCharId),
+    [characters, activeCharId],
+  );
+  const charName = (id: string) => characters.find((c) => c.character_id === id)?.name ?? id;
   // The active Character's palette: base scale + its custom slots.
   const scale = useMemo(
     () => (character?.scale?.length ? character.scale : EMOTION_IDS),
@@ -102,9 +153,28 @@ export default function PlaygroundConsole() {
   );
   const plain = stripTags(text);
   const estSec = Math.max(1.5, Math.round(plain.length * 0.055 * 10) / 10);
+  // Script mode: the non-empty lines that will actually be synthesized.
+  const scriptLines = useMemo(
+    () => script.filter((l) => stripTags(l.text).trim() && l.characterId),
+    [script],
+  );
+  const scriptChars = scriptLines.reduce((n, l) => n + stripTags(l.text).length, 0);
+  const canGenerate = mode === "script" ? scriptLines.length > 0 : (!!plain && !!character);
   const usingFallback = takes.some((t) => t.mode === "browser");
 
   function insertEmotion(emotion: string) {
+    if (mode === "script") {
+      const idx = activeLine;
+      const cur = script[idx];
+      if (!cur) return;
+      const el = lineRefs.current[idx];
+      const start = el?.selectionStart ?? cur.text.length;
+      const end = el?.selectionEnd ?? cur.text.length;
+      const { next, caret } = wrapWithTag(cur.text, start, end, emotion);
+      updateLine(idx, { text: next });
+      requestAnimationFrame(() => { el?.focus(); el?.setSelectionRange(caret, caret); });
+      return;
+    }
     const el = areaRef.current;
     const start = el?.selectionStart ?? text.length;
     const end = el?.selectionEnd ?? text.length;
@@ -113,29 +183,81 @@ export default function PlaygroundConsole() {
     requestAnimationFrame(() => { el?.focus(); el?.setSelectionRange(caret, caret); });
   }
 
+  // --- Script composer helpers ---------------------------------------------
+  function newLine(characterId: string, lineText = ""): ScriptLine {
+    scriptSeq.current += 1;
+    return { id: `line-${scriptSeq.current}`, characterId, text: lineText };
+  }
+  function updateLine(idx: number, patch: Partial<ScriptLine>) {
+    setScript((s) => s.map((l, i) => (i === idx ? { ...l, ...patch } : l)));
+  }
+  function addLine() {
+    const cid = script[script.length - 1]?.characterId || charId || characters[0]?.character_id || "";
+    setScript((s) => [...s, newLine(cid)]);
+  }
+  function removeLine(idx: number) {
+    if (script.length <= 1) return;
+    setScript((s) => (s.length <= 1 ? s : s.filter((_, i) => i !== idx)));
+    // Removing a line ABOVE the active one shifts the active row down by one;
+    // plain clamping (the old code) left activeLine pointing at a DIFFERENT
+    // line, so emotion tags landed on a row the user wasn't editing.
+    setActiveLine((a) => {
+      const shifted = idx < a ? a - 1 : a;
+      return Math.max(0, Math.min(shifted, script.length - 2));
+    });
+  }
+  function moveLine(idx: number, dir: -1 | 1) {
+    const j = idx + dir;
+    if (j < 0 || j >= script.length) return;
+    setScript((s) => {
+      const n = [...s];
+      [n[idx], n[j]] = [n[j], n[idx]];
+      return n;
+    });
+    // Follow the active row through the swap so tags keep targeting it.
+    setActiveLine((a) => (a === idx ? j : a === j ? idx : a));
+  }
+  /** Switch composer mode, seeding a starter two-character script on first use. */
+  function switchMode(m: "solo" | "script") {
+    if (m === "script" && script.length === 0) {
+      const first = charId || characters[0]?.character_id || "";
+      const second = characters.find((c) => c.character_id !== first)?.character_id || first;
+      setScript([
+        newLine(first, "Hello there."),
+        newLine(second, "[excited]Great to finally meet you![/excited]"),
+      ]);
+      setActiveLine(0);
+    }
+    setMode(m);
+  }
+
+  // Coalesce concurrent uploads of the SAME take: share() and ensureShared()
+  // share this map, so clicking "share" and then "client review link" before
+  // the first upload settles reuses the one in-flight upload instead of minting
+  // two /t/{id} pages for one take.
+  const inflightUploads = useRef<Map<string, Promise<string>>>(new Map());
+  function uploadOnce(t: Take): Promise<string> {
+    const existing = inflightUploads.current.get(t.id);
+    if (existing) return existing;
+    const p = uploadTake(t).finally(() => { inflightUploads.current.delete(t.id); });
+    inflightUploads.current.set(t.id, p);
+    return p;
+  }
+
   /** Persist a take server-side, mint its /t/{id} page, copy the link. */
   async function share(t: Take) {
-    if (!t.url || shares[t.id]) {
-      const existing = shares[t.id];
-      if (existing && existing !== "pending" && existing !== "error") {
-        await navigator.clipboard.writeText(`${window.location.origin}/t/${existing}`).catch(() => {});
-      }
+    const existing = shares[t.id];
+    if (existing && existing !== "pending" && existing !== "error") {
+      // Already published — clicking again just re-copies the link.
+      await navigator.clipboard.writeText(`${window.location.origin}/t/${existing}`).catch(() => {});
       return;
     }
+    if (!t.url || existing === "pending") return;
     setShares((s) => ({ ...s, [t.id]: "pending" }));
     try {
-      const blob = await (await fetch(t.url)).blob();
-      const fd = new FormData();
-      fd.append("file", blob, "take.wav");
-      fd.append("meta", JSON.stringify({
-        character_id: t.characterId, character_name: t.characterName,
-        text: t.text, seconds: t.seconds, rtf: t.rtf, segments: t.segments,
-      }));
-      const r = await fetch("/api/takes", { method: "POST", body: fd });
-      const j = await r.json().catch(() => ({}));
-      if (!r.ok) throw new Error(j?.detail ?? "share failed");
-      setShares((s) => ({ ...s, [t.id]: j.take_id as string }));
-      await navigator.clipboard.writeText(`${window.location.origin}/t/${j.take_id}`).catch(() => {});
+      const id = await uploadOnce(t);
+      setShares((s) => ({ ...s, [t.id]: id }));
+      await navigator.clipboard.writeText(`${window.location.origin}/t/${id}`).catch(() => {});
     } catch {
       setShares((s) => ({ ...s, [t.id]: "error" }));
       setTimeout(() => setShares((s) => { const { [t.id]: _, ...rest } = s; return rest; }), 2000);
@@ -146,18 +268,9 @@ export default function PlaygroundConsole() {
   async function ensureShared(t: Take): Promise<string> {
     const existing = shares[t.id];
     if (existing && existing !== "pending" && existing !== "error") return existing;
-    if (!t.url) throw new Error("browser-fallback takes cannot be reviewed");
-    const blob = await (await fetch(t.url)).blob();
-    const fd = new FormData();
-    fd.append("file", blob, "take.wav");
-    fd.append("meta", JSON.stringify({
-      character_id: t.characterId, character_name: t.characterName,
-      text: t.text, seconds: t.seconds, rtf: t.rtf, segments: t.segments,
-    }));
-    const r = await fetch("/api/takes", { method: "POST", body: fd });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(j?.detail ?? "could not publish the take");
-    const id = j.take_id as string;
+    // "pending" falls through to uploadOnce, which returns the in-flight
+    // share() upload rather than starting a duplicate one.
+    const id = await uploadOnce(t);
     setShares((s) => ({ ...s, [t.id]: id }));
     return id;
   }
@@ -184,18 +297,89 @@ export default function PlaygroundConsole() {
     } finally { setReviewBusy(false); }
   }
 
-  async function generate() {
+  /** Persist a take (audio blob + metadata) so it survives a refresh. */
+  async function persistTake(t: Take) {
+    try {
+      const blob = t.url ? await (await fetch(t.url)).blob() : null;
+      await putTake(t, blob);
+    } catch { /* best-effort — the take still lives in state */ }
+  }
+
+  /** Delete a take: revoke its object URL, drop it from the store + all state. */
+  function removeTake(id: string) {
+    setTakes((list) => {
+      const t = list.find((x) => x.id === id);
+      if (t?.url) URL.revokeObjectURL(t.url);
+      return list.filter((x) => x.id !== id);
+    });
+    setReviewSel((s) => { const n = new Set(s); n.delete(id); return n; });
+    setCodeFor((c) => (c === id ? null : c));
+    setShares((s) => { const { [id]: _, ...rest } = s; return rest; });
+    void deleteTake(id);
+  }
+
+  /** Dispatch to the active composer mode; wired to ⌘↵ and the retry button. */
+  function generate() {
+    if (mode === "script") void generateScript();
+    else void generateSolo();
+  }
+
+  async function generateScript() {
+    if (busy || scriptLines.length === 0) return;
+    setBusy(true);
+    setBusyNotice(null);
+    setToast(null);
+    const lines: PerfLine[] = scriptLines.map((l) => ({ character_id: l.characterId, text: l.text.trim() }));
+    try {
+      const r = await perform(lines, expr);
+      seq.current += 1;
+      const distinct = [...new Set(lines.map((l) => l.character_id))];
+      const label = distinct.length === 1 ? charName(distinct[0]) : `Ensemble · ${distinct.length} voices`;
+      const transcript = lines.map((l) => `${charName(l.character_id)}: ${stripTags(l.text)}`).join("  ·  ");
+      const take: Take = {
+        id: `take-${Date.now()}-${seq.current}`, text: transcript,
+        characterId: lines[0].character_id, characterName: label,
+        mode: r.mode, url: r.url, peaks: r.peaks, seconds: r.seconds, kb: r.kb, rtf: r.rtf,
+        synthSeconds: r.synthSeconds, queueSeconds: r.queueSeconds,
+        ignoredSettings: r.ignoredSettings, segments: r.segments, expr: { ...expr },
+        createdAt: Date.now(), lines,
+      };
+      setTakes((t) => [take, ...t]);
+      void persistTake(take);
+    } catch (e) {
+      if (e instanceof EngineBusyError) setBusyNotice({ retryAfterSec: e.retryAfterSec });
+      else setToast("Generation failed — the backend returned an error. Please try again.");
+    } finally { setBusy(false); }
+  }
+
+  async function generateSolo() {
     if (!plain || busy || !character) return;
     setBusy(true);
+    setBusyNotice(null);
+    setToast(null);
     try {
       const r = await speak(text, character.character_id, expr);
       seq.current += 1;
-      setTakes((t) => [{
-        id: `take-${seq.current}`, text: text.trim(),
+      // Timestamped id so restored takes (which keep their stored ids) never
+      // collide with freshly generated ones.
+      const take: Take = {
+        id: `take-${Date.now()}-${seq.current}`, text: text.trim(),
         characterId: character.character_id, characterName: character.name,
         mode: r.mode, url: r.url, peaks: r.peaks, seconds: r.seconds, kb: r.kb, rtf: r.rtf,
-        segments: r.segments, expr: { ...expr },
-      }, ...t]);
+        synthSeconds: r.synthSeconds, queueSeconds: r.queueSeconds,
+        ignoredSettings: r.ignoredSettings, segments: r.segments, expr: { ...expr },
+        createdAt: Date.now(),
+      };
+      setTakes((t) => [take, ...t]);
+      void persistTake(take);
+    } catch (e) {
+      // Backpressure keeps the engine reachable — offer a retry. Anything else
+      // is a genuine failure that must be visible, not swallowed.
+      if (e instanceof EngineBusyError) {
+        setBusyNotice({ retryAfterSec: e.retryAfterSec });
+      } else {
+        setToast("Generation failed — the backend returned an error. Please try again.");
+      }
     } finally { setBusy(false); }
   }
 
@@ -222,6 +406,26 @@ export default function PlaygroundConsole() {
         <p className="font-jetbrains mt-4 rounded-lg border border-amber-400/25 bg-amber-400/5 px-4 py-2 text-[11px] text-amber-200/90">
           Gravitone backend unreachable — speaking with your browser voice (metatags ignored).
         </p>
+      )}
+
+      {busyNotice && (
+        <div className="font-jetbrains mt-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-400/30 bg-amber-400/5 px-4 py-2 text-[11px] text-amber-200/90">
+          <span>Engine busy — the render queue is full. Retry in a moment{busyNotice.retryAfterSec > 0 ? ` (~${busyNotice.retryAfterSec}s)` : ""}.</span>
+          <button
+            onClick={() => void generate()}
+            disabled={busy}
+            className="rounded-full border border-amber-400/40 bg-amber-400/10 px-3 py-1 text-amber-100 transition hover:bg-amber-400/20 disabled:opacity-40"
+          >
+            {busy ? "retrying…" : "↻ retry"}
+          </button>
+        </div>
+      )}
+
+      {toast && (
+        <div className="font-jetbrains mt-4 flex items-center justify-between gap-3 rounded-lg border border-rose-400/30 bg-rose-400/5 px-4 py-2 text-[11px] text-rose-200/90">
+          <span>{toast}</span>
+          <button onClick={() => setToast(null)} aria-label="Dismiss" className="text-rose-200/70 transition hover:text-rose-100">✕</button>
+        </div>
       )}
 
       {/* character rail */}
@@ -255,13 +459,69 @@ export default function PlaygroundConsole() {
         {/* compose bay */}
         <div className="glass-panel rounded-2xl">
           <div className="font-jetbrains flex items-center justify-between border-b border-white/8 px-5 py-2.5 text-[11px] uppercase tracking-widest text-white/60">
-            <span>compose</span><span>{plain.length} chars · ~{estSec}s audio</span>
+            <div className="flex items-center gap-1">
+              {(["solo", "script"] as const).map((m) => (
+                <button key={m} onClick={() => switchMode(m)} aria-pressed={mode === m}
+                  title={m === "solo" ? "One Character throughout" : "A multi-character performance in one take"}
+                  className={`rounded-full border px-2.5 py-0.5 transition ${mode === m ? "border-cyan-400/30 bg-cyan-400/10 text-cyan-200" : "border-transparent text-white/50 hover:text-white/80"}`}>
+                  {m}
+                </button>
+              ))}
+            </div>
+            <span>
+              {mode === "script"
+                ? `${scriptChars} chars · ${scriptLines.length} line${scriptLines.length === 1 ? "" : "s"}`
+                : `${plain.length} chars · ~${estSec}s audio`}
+            </span>
           </div>
 
-          <textarea ref={areaRef} value={text} onChange={(e) => setText(e.target.value)}
-            onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") generate(); }}
-            rows={5} placeholder="Type something. Select words, then click an emotion to tag them…"
-            className="font-hanken w-full resize-none bg-transparent px-5 py-4 text-base leading-relaxed text-white placeholder:text-white/55 focus:outline-none" />
+          {mode === "solo" ? (
+            <textarea ref={areaRef} value={text} onChange={(e) => setText(e.target.value)}
+              onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") generate(); }}
+              rows={5} placeholder="Type something. Select words, then click an emotion to tag them…"
+              className="font-hanken w-full resize-none bg-transparent px-5 py-4 text-base leading-relaxed text-white placeholder:text-white/55 focus:outline-none" />
+          ) : (
+            <div className="space-y-2 px-5 py-4">
+              {script.map((line, i) => (
+                <div key={line.id}
+                  className={`rounded-xl border p-3 transition ${activeLine === i ? "border-cyan-400/25 bg-cyan-400/[0.03]" : "border-white/10 bg-white/[0.02]"}`}>
+                  <div className="mb-2 flex items-center gap-2">
+                    <span className="font-jetbrains w-4 shrink-0 text-[11px] text-white/40">{i + 1}</span>
+                    <span className="h-5 w-5 shrink-0 rounded-full" style={{ background: `radial-gradient(circle at 30% 30%, hsl(${(line.characterId.length * 47) % 360} 90% 70%), hsl(${(line.characterId.length * 47) % 360} 80% 45%))` }} />
+                    <select value={line.characterId} onFocus={() => setActiveLine(i)}
+                      onChange={(e) => updateLine(i, { characterId: e.target.value })}
+                      aria-label={`Character for line ${i + 1}`}
+                      className="font-jetbrains min-w-0 flex-1 rounded-lg border border-white/15 bg-black/40 px-2 py-1 text-[12px] text-white/85 transition focus:border-cyan-400/40 focus:outline-none">
+                      {characters.map((c) => (
+                        <option key={c.character_id} value={c.character_id} className="bg-slate-900 text-white">{c.name}</option>
+                      ))}
+                    </select>
+                    <div className="flex shrink-0 items-center gap-1">
+                      <button onClick={() => moveLine(i, -1)} disabled={i === 0} aria-label="Move line up"
+                        className="grid h-6 w-6 place-items-center rounded-md border border-white/12 text-[11px] text-white/60 transition enabled:hover:bg-white/5 disabled:opacity-25">↑</button>
+                      <button onClick={() => moveLine(i, 1)} disabled={i === script.length - 1} aria-label="Move line down"
+                        className="grid h-6 w-6 place-items-center rounded-md border border-white/12 text-[11px] text-white/60 transition enabled:hover:bg-white/5 disabled:opacity-25">↓</button>
+                      <button onClick={() => removeLine(i)} disabled={script.length <= 1} aria-label="Remove line"
+                        className="grid h-6 w-6 place-items-center rounded-md border border-white/12 text-[11px] text-white/60 transition enabled:hover:border-rose-400/40 enabled:hover:text-rose-200 disabled:opacity-25">✕</button>
+                    </div>
+                  </div>
+                  <textarea
+                    ref={(el) => { lineRefs.current[i] = el; }}
+                    value={line.text}
+                    onFocus={() => setActiveLine(i)}
+                    onChange={(e) => updateLine(i, { text: e.target.value })}
+                    onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") generate(); }}
+                    rows={2}
+                    placeholder="Line text… tag with [emotion]…[/emotion] to switch this Character's Voices"
+                    className="font-hanken w-full resize-none bg-transparent text-sm leading-relaxed text-white placeholder:text-white/40 focus:outline-none" />
+                </div>
+              ))}
+              <button onClick={addLine}
+                className="font-jetbrains w-full rounded-xl border border-dashed border-white/15 py-2 text-[11px] text-white/60 transition hover:border-cyan-400/40 hover:text-cyan-200">
+                + add line
+              </button>
+            </div>
+          )}
 
           {/* emotion chips + wheel */}
           <div className="border-t border-white/8 px-5 py-4">
@@ -296,8 +556,10 @@ export default function PlaygroundConsole() {
           </div>
 
           <div className="flex items-center justify-between border-t border-white/8 px-5 py-3">
-            <span className="font-jetbrains text-[11px] text-white/60">⌘↵ to generate · exports 24kHz wav</span>
-            <Button onClick={generate} disabled={busy || !plain || !character}>{busy ? "Rendering…" : "Generate ▶"}</Button>
+            <span className="font-jetbrains text-[11px] text-white/60">
+              {mode === "script" ? "⌘↵ · one take from the whole script · 24kHz wav" : "⌘↵ to generate · exports 24kHz wav"}
+            </span>
+            <Button onClick={generate} disabled={busy || !canGenerate}>{busy ? "Rendering…" : "Generate ▶"}</Button>
           </div>
         </div>
 
@@ -408,6 +670,8 @@ export default function PlaygroundConsole() {
                   <div className="font-jetbrains hidden shrink-0 items-center gap-4 text-[11px] text-white/65 sm:flex">
                     <span className="text-white/80">{t.characterName}</span>
                     <span>{t.seconds}s</span>
+                    {t.synthSeconds > 0 && <span title="server-side synthesis time">{t.synthSeconds}s synth</span>}
+                    {t.queueSeconds > 0 && <span title="time spent waiting in the render queue">{t.queueSeconds}s queue</span>}
                     {t.rtf > 0 && <span className="text-cyan-300">{t.rtf}× rt</span>}
                     {t.kb > 0 && <span>{t.kb} kb</span>}
                   </div>
@@ -443,6 +707,14 @@ export default function PlaygroundConsole() {
                     <span title="Connect a Gravitone endpoint to export WAV"
                       className="font-jetbrains shrink-0 cursor-not-allowed rounded-lg border border-white/10 px-3 py-1.5 text-[11px] text-white/50">↓ wav</span>
                   )}
+                  <button
+                    onClick={() => removeTake(t.id)}
+                    title="Delete this take from the log"
+                    aria-label="Delete take"
+                    className="font-jetbrains shrink-0 rounded-lg border border-white/15 px-3 py-1.5 text-[11px] text-white/60 transition hover:border-rose-400/40 hover:text-rose-200"
+                  >
+                    ✕
+                  </button>
                 </div>
 
                 {codeFor === t.id && t.mode === "gravitone" && <TakeCode take={t} />}
@@ -452,9 +724,14 @@ export default function PlaygroundConsole() {
                   <div className="mt-3 flex flex-wrap items-center gap-1.5">
                     {t.segments.map((s, i) => {
                       const m = emotionMeta(s.used);
+                      // Performance segments carry who spoke; solo takes don't.
+                      const segCharId = s.characterId ?? t.characterId;
+                      const segCharName = s.characterId ? charName(s.characterId) : null;
                       return (
                         <span key={i} title={s.text}
                           className="font-jetbrains inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/[0.04] px-2 py-0.5 text-[11px] text-white/70">
+                          {segCharName && <span className="text-white/80">{segCharName}</span>}
+                          {segCharName && <span className="text-white/30">·</span>}
                           <span className="h-1.5 w-1.5 rounded-full" style={{ background: `hsl(${m.hue} 80% 62%)` }} />
                           {s.fallback ? (
                             <><span className="text-amber-300/80 line-through">{s.requested}</span><span className="text-white/55">→</span><span>{s.used}</span></>
@@ -465,8 +742,8 @@ export default function PlaygroundConsole() {
                           {/* fallback chips upsell the guided recorder */}
                           {s.fallback && EMOTION_IDS.includes(s.requested) && (
                             <Link
-                              href={`/voices/${encodeURIComponent(t.characterId)}?record=${s.requested}`}
-                              title={`${t.characterName} has no ${s.requested} voice — record it and re-render this take`}
+                              href={`/voices/${encodeURIComponent(segCharId)}?record=${s.requested}`}
+                              title={`${segCharName ?? t.characterName} has no ${s.requested} voice — record it and re-render this take`}
                               className="text-amber-300/90 underline-offset-2 transition hover:text-amber-200 hover:underline"
                             >
                               record →
@@ -476,6 +753,13 @@ export default function PlaygroundConsole() {
                       );
                     })}
                   </div>
+                )}
+
+                {t.ignoredSettings.length > 0 && (
+                  <p className="font-jetbrains mt-3 inline-flex flex-wrap items-center gap-1.5 rounded-lg border border-amber-400/20 bg-amber-400/5 px-2.5 py-1 text-[11px] text-amber-200/85">
+                    <span aria-hidden>⚠</span>
+                    {t.ignoredSettings.join(", ")} ignored — not a Pocket TTS knob.
+                  </p>
                 )}
 
                 <p className="mt-2 line-clamp-1 text-sm text-white/65">{t.text}</p>

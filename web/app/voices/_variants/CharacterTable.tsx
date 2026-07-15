@@ -6,39 +6,86 @@
 
 import { useMemo, useRef, useState } from "react";
 import Link from "next/link";
-import { Button, Eyebrow } from "@/components/ui/Primitives";
-import { EMOTIONS } from "@/lib/emotions";
+import { Eyebrow } from "@/components/ui/Primitives";
+import { EMOTION_IDS, emotionMeta } from "@/lib/emotions";
 import TagEditor from "./TagEditor";
-import { hueOf, relTime, useCharacters, useVoicePreview, type Character } from "./data";
+import { hueOf, relTime, useCharacters, useVoicePreview, patchCharacterReq, deleteCharacterReq, type Character } from "../_data/characters";
 import { useAuth } from "@/lib/useAuth";
 import { CONSENT_PROMPT, recordVoiceOwnership } from "@/lib/voiceVault";
 
-type SortKey = "name" | "category" | "lang" | "coverage" | "created";
+type SortKey = "name" | "category" | "lang" | "coverage" | "demand" | "created";
+
+/** Unmet demand for a Character: total requests over its STILL-MISSING emotions
+ *  (a slot already recorded isn't unmet), plus the hottest missing slot to
+ *  record next. The backend already prunes recorded slots from `demand`; we
+ *  re-filter defensively so the number can never count a filled emotion. */
+function unmetDemand(c: Character): { total: number; hottest: string | null } {
+  let total = 0;
+  let hottest: string | null = null;
+  let max = 0;
+  for (const [emotion, n] of Object.entries(c.demand ?? {})) {
+    if (c.emotions.includes(emotion)) continue; // recorded → met, not unmet
+    total += n;
+    if (n > max) { max = n; hottest = emotion; }
+  }
+  return { total, hottest };
+}
+
+/** Run `task` over `items` with at most `limit` in flight; collects failures. */
+async function runPool<T>(items: T[], limit: number, task: (item: T) => Promise<void>): Promise<Error[]> {
+  const errors: Error[] = [];
+  let i = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (i < items.length) {
+      const item = items[i++];
+      try { await task(item); }
+      catch (e) { errors.push(e instanceof Error ? e : new Error(String(e))); }
+    }
+  });
+  await Promise.all(workers);
+  return errors;
+}
 
 function CoverageBar({ c }: { c: Character }) {
+  // Pips track this Character's OWN scale (base + its custom slots), so the pip
+  // count always matches the "n/total" number even for extended palettes.
+  const scale = c.scale?.length ? c.scale : EMOTION_IDS;
   return (
     <div className="flex items-center gap-2">
       <div className="flex gap-[2px]">
-        {EMOTIONS.map((e) => {
-          const on = c.emotions.includes(e.id);
+        {scale.map((id) => {
+          const m = emotionMeta(id);
+          const on = c.emotions.includes(id);
           return (
             <span
-              key={e.id}
-              title={`${e.label}${on ? "" : " — missing (falls back to baseline)"}`}
+              key={id}
+              title={`${m.label}${on ? "" : " — missing (falls back to baseline)"}`}
               className="h-4 w-1.5 rounded-sm"
-              style={{ background: on ? `hsl(${e.hue} 80% 60%)` : "rgba(255,255,255,0.10)" }}
+              style={{ background: on ? `hsl(${m.hue} 80% 60%)` : "rgba(255,255,255,0.10)" }}
             />
           );
         })}
       </div>
       <span className="font-jetbrains text-[11px] text-white/65">{c.coverage}/{c.total}</span>
+      {c.category === "cloned" && c.voices.length > 0 && (() => {
+        const withReceipt = c.voices.filter((v) => v.consent).length;
+        const all = withReceipt === c.voices.length;
+        return (
+          <span
+            title={`${withReceipt} of ${c.voices.length} voice${c.voices.length > 1 ? "s" : ""} carry a consent receipt`}
+            className={`font-jetbrains inline-flex items-center gap-0.5 text-[11px] ${all ? "text-emerald-300/90" : withReceipt > 0 ? "text-emerald-300/60" : "text-white/25"}`}
+          >
+            🛡 {withReceipt}
+          </span>
+        );
+      })()}
     </div>
   );
 }
 
 export default function CharacterTable() {
   const { characters, loading, error, createVoice, patchCharacter, deleteCharacter, refresh } = useCharacters();
-  const { preview, playingId, busyId } = useVoicePreview();
+  const { preview, playingId, busyId, failedId } = useVoicePreview();
   const { user } = useAuth();
 
   const [query, setQuery] = useState("");
@@ -52,6 +99,7 @@ export default function CharacterTable() {
   const [importing, setImporting] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const packRef = useRef<HTMLInputElement>(null);
+  const cancelRename = useRef(false); // Escape sets this so the unmount's onBlur doesn't commit
 
   const allTags = useMemo(() => Array.from(new Set(characters.flatMap((c) => c.tags))).sort(), [characters]);
 
@@ -67,6 +115,7 @@ export default function CharacterTable() {
       : sort.key === "category" ? c.category
       : sort.key === "lang" ? c.lang
       : sort.key === "coverage" ? c.coverage
+      : sort.key === "demand" ? unmetDemand(c).total
       : Date.parse(c.created ?? "") || 0;
     return [...f].sort((a, b) => (val(a) > val(b) ? sort.dir : val(a) < val(b) ? -sort.dir : 0));
   }, [characters, query, tagFilter, sort]);
@@ -75,7 +124,8 @@ export default function CharacterTable() {
   const allShownSelected = rows.length > 0 && rows.every((r) => selected.has(r.character_id));
 
   function toggleSort(key: SortKey) {
-    setSort((s) => (s.key === key ? { key, dir: s.dir === 1 ? -1 : 1 } : { key, dir: 1 }));
+    // Demand opens hottest-first (desc); every other column opens ascending.
+    setSort((s) => (s.key === key ? { key, dir: s.dir === 1 ? -1 : 1 } : { key, dir: key === "demand" ? -1 : 1 }));
   }
   function toggleOne(id: string) {
     setSelected((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
@@ -83,15 +133,24 @@ export default function CharacterTable() {
   async function applyBulkTag() {
     const t = bulkTag.trim().toLowerCase();
     if (!t) return;
-    for (const id of selected) {
-      const c = characters.find((x) => x.character_id === id);
-      if (c && !c.tags.includes(t)) await patchCharacter(id, { tags: [...c.tags, t] });
-    }
+    const targets = [...selected]
+      .map((id) => characters.find((x) => x.character_id === id))
+      .filter((c): c is Character => !!c && !c.tags.includes(t));
+    setCloneErr(null);
+    // Bounded parallel (≤6 in flight) + one refresh at the end, instead of N
+    // serial round-trips each triggering their own re-sync.
+    const errs = await runPool(targets, 6, async (c) => { await patchCharacterReq(c.character_id, { tags: [...c.tags, t] }); });
     setBulkTag("");
+    await refresh();
+    if (errs.length) setCloneErr(`${errs.length} tag update${errs.length > 1 ? "s" : ""} failed: ${errs[0].message}`);
   }
   async function bulkDelete() {
-    for (const id of clonedSelected) await deleteCharacter(id);
+    const ids = clonedSelected;
+    setCloneErr(null);
+    const errs = await runPool(ids, 6, (id) => deleteCharacterReq(id));
     setSelected(new Set());
+    await refresh();
+    if (errs.length) setCloneErr(`${errs.length} delete${errs.length > 1 ? "s" : ""} failed: ${errs[0].message}`);
   }
   async function onFile(f: File) {
     if (!window.confirm(CONSENT_PROMPT)) return; // Voice Vault attestation gate
@@ -175,7 +234,7 @@ export default function CharacterTable() {
           {importing ? "importing…" : "⇪ import pack"}
         </button>
         <input ref={fileRef} type="file" accept="audio/*,video/mp4" hidden
-          onChange={(e) => { const f = e.target.files?.[0]; if (f) void onFile(f); }} />
+          onChange={(e) => { const f = e.target.files?.[0]; if (f) void onFile(f); e.target.value = ""; }} />
         <button onClick={() => fileRef.current?.click()} disabled={cloning}
           className="font-jetbrains rounded-full border border-white/12 px-3 py-2 text-[12px] text-white/70 transition hover:text-white disabled:opacity-50">
           {cloning ? "cloning…" : "quick clone"}
@@ -210,14 +269,15 @@ export default function CharacterTable() {
               <Th k="category">source</Th>
               <Th k="lang">lang</Th>
               <Th k="coverage">emotion coverage</Th>
+              <Th k="demand">demand</Th>
               <th className="px-3 py-2 text-left"><span className="font-jetbrains text-[11px] uppercase tracking-widest text-white/60">tags</span></th>
               <Th k="created">added</Th>
               <th className="w-28 px-3 py-2" />
             </tr>
           </thead>
           <tbody>
-            {loading && <tr><td colSpan={9} className="px-3 py-8 text-center text-sm text-white/60">Loading characters…</td></tr>}
-            {!loading && rows.length === 0 && <tr><td colSpan={9} className="px-3 py-8 text-center text-sm text-white/60">No characters match.</td></tr>}
+            {loading && <tr><td colSpan={10} className="px-3 py-8 text-center text-sm text-white/60">Loading characters…</td></tr>}
+            {!loading && rows.length === 0 && <tr><td colSpan={10} className="px-3 py-8 text-center text-sm text-white/60">No characters match.</td></tr>}
             {rows.map((c) => {
               const baseline = c.voices.find((v) => v.emotion === "baseline") ?? c.voices[0];
               return (
@@ -226,18 +286,29 @@ export default function CharacterTable() {
                     <input type="checkbox" checked={selected.has(c.character_id)} onChange={() => toggleOne(c.character_id)} aria-label={`Select ${c.name}`} className="accent-cyan-400" />
                   </td>
                   <td className="px-2 py-2">
-                    <button onClick={() => baseline && preview(baseline.voice_id, c.name)} disabled={!baseline || busyId === baseline?.voice_id}
-                      aria-label="Preview baseline" className="grid h-7 w-7 place-items-center rounded-full bg-cyan-300 text-[11px] text-slate-950 transition hover:brightness-110 disabled:opacity-50">
-                      {busyId === baseline?.voice_id ? "…" : playingId === baseline?.voice_id ? "⏸" : "▶"}
-                    </button>
+                    {(() => {
+                      const failed = !!baseline && failedId === baseline.voice_id;
+                      return (
+                        <button onClick={() => baseline && preview(baseline.voice_id, c.name)} disabled={!baseline || busyId === baseline?.voice_id}
+                          aria-label="Preview baseline" title={failed ? "Preview failed — try again" : "Preview baseline"}
+                          className={`grid h-7 w-7 place-items-center rounded-full text-[11px] text-slate-950 transition hover:brightness-110 disabled:opacity-50 ${failed ? "bg-rose-300" : "bg-cyan-300"}`}>
+                          {busyId === baseline?.voice_id ? "…" : failed ? "!" : playingId === baseline?.voice_id ? "⏸" : "▶"}
+                        </button>
+                      );
+                    })()}
                   </td>
                   <td className="px-3 py-2">
                     <div className="flex items-center gap-2.5">
                       <span className="h-6 w-6 shrink-0 rounded-full" style={{ background: `radial-gradient(circle at 30% 30%, hsl(${hueOf(c.character_id)} 90% 70%), hsl(${hueOf(c.character_id)} 80% 45%))` }} />
                       {renaming === c.character_id ? (
                         <input autoFocus defaultValue={c.name}
-                          onBlur={(e) => { patchCharacter(c.character_id, { name: e.target.value.trim() || c.name }); setRenaming(null); }}
-                          onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); if (e.key === "Escape") setRenaming(null); }}
+                          onBlur={(e) => {
+                            // Escape unmounts the input, which fires this blur — bail out
+                            // of committing so "cancel" doesn't save the half-typed name.
+                            if (cancelRename.current) { cancelRename.current = false; setRenaming(null); return; }
+                            patchCharacter(c.character_id, { name: e.target.value.trim() || c.name }); setRenaming(null);
+                          }}
+                          onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); if (e.key === "Escape") { cancelRename.current = true; setRenaming(null); } }}
                           className="w-40 rounded border border-cyan-400/40 bg-transparent px-1.5 py-0.5 text-sm text-white focus:outline-none" />
                       ) : (
                         <button onDoubleClick={() => setRenaming(c.character_id)} title="Double-click to rename" className="truncate text-left text-sm font-medium text-white">{c.name}</button>
@@ -249,6 +320,21 @@ export default function CharacterTable() {
                   </td>
                   <td className="font-jetbrains px-3 py-2 text-[12px] text-white/60">{c.lang}</td>
                   <td className="px-3 py-2"><CoverageBar c={c} /></td>
+                  <td className="px-3 py-2">
+                    {(() => {
+                      const { total, hottest } = unmetDemand(c);
+                      if (total <= 0 || !hottest) return null; // zero-demand → nothing, no layout shift
+                      return (
+                        <Link
+                          href={`/voices/${c.character_id}?record=${encodeURIComponent(hottest)}`}
+                          title={`API callers requested still-missing emotions ${total}× and got baseline — record ${emotionMeta(hottest).label} next (the hottest gap)`}
+                          className="font-jetbrains inline-flex items-center gap-1 rounded bg-amber-400/10 px-1.5 py-0.5 text-[11px] text-amber-300 transition hover:bg-amber-400/20"
+                        >
+                          ▲ {total} wanted
+                        </Link>
+                      );
+                    })()}
+                  </td>
                   <td className="px-3 py-2"><TagEditor compact max={3} tags={c.tags} onChange={(tags) => patchCharacter(c.character_id, { tags })} /></td>
                   <td className="font-jetbrains px-3 py-2 text-[12px] text-white/65">{relTime(c.created)}</td>
                   <td className="px-3 py-2 text-right">

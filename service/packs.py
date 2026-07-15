@@ -29,7 +29,8 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 
 from service.voices import (
-    VOICES_DIR, Character, _load_meta, _save_meta, _slug, list_characters,
+    VOICES_DIR, Character, _load_meta, _slug, find_character,
+    get_character_or_404, mutate_meta,
 )
 
 router = APIRouter(tags=["packs"])
@@ -58,9 +59,7 @@ def _sign(manifest: dict) -> dict:
 @router.get("/v1/characters/{character_id}/pack")
 def export_pack(character_id: str) -> Response:
     """Bundle one cloned Character into a downloadable .gravichar pack."""
-    character = next((c for c in list_characters() if c.character_id == character_id), None)
-    if character is None:
-        raise HTTPException(404, "character not found")
+    character = get_character_or_404(character_id)
     if character.category != "cloned":
         raise HTTPException(400, "built-in characters cannot be exported (no embedding files)")
 
@@ -133,9 +132,14 @@ async def import_pack(
     if manifest.get("format") != FORMAT:
         raise HTTPException(400, f"unsupported pack format (want {FORMAT})")
 
-    # Authenticity — enforced only when both sides use a shared secret.
+    # Authenticity — when a secret is configured, a valid signature is REQUIRED.
     sig = manifest.get("signature")
-    if PACK_SECRET and sig:
+    if PACK_SECRET:
+        # Gating on "sig present" instead of "sig required" is a downgrade path:
+        # an attacker just strips the signature field to bypass the check. Fail
+        # closed. Unsigned packs stay allowed only when no secret is configured.
+        if not sig:
+            raise HTTPException(400, "unsigned pack rejected — this instance requires a signed pack (TTS_PACK_SECRET)")
         want = hmac.new(PACK_SECRET.encode(), _canonical(manifest), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(want, str(sig.get("value", ""))):
             raise HTTPException(400, "pack signature does not match this instance's TTS_PACK_SECRET")
@@ -155,13 +159,24 @@ async def import_pack(
 
     # Verify every hash BEFORE writing anything; never trust member paths.
     staged: list[tuple[dict, bytes]] = []
+    total_bytes = 0
     for v in voices:
         arcname = str(v.get("file", ""))
         try:
-            data = z.read(arcname)
+            info = z.getinfo(arcname)
         except KeyError:
             raise HTTPException(400, f"pack is missing {arcname}")
-        if len(data) > MAX_VOICE_BYTES:
+        # Reject on the ZIP directory's DECLARED uncompressed size before we
+        # decompress: a crafted deflate member can expand to many GB from a tiny
+        # compressed blob (zip bomb), and reading it first would OOM-kill the
+        # service before any len() check runs.
+        if info.file_size > MAX_VOICE_BYTES:
+            raise HTTPException(400, f"{arcname} exceeds the {MAX_VOICE_BYTES // 2**20} MB limit")
+        total_bytes += info.file_size
+        if total_bytes > MAX_VOICES * MAX_VOICE_BYTES:
+            raise HTTPException(400, "pack total uncompressed size exceeds the allowed budget")
+        data = z.read(arcname)
+        if len(data) > MAX_VOICE_BYTES:  # defense in depth: actual vs. declared size
             raise HTTPException(400, f"{arcname} exceeds the {MAX_VOICE_BYTES // 2**20} MB limit")
         if hashlib.sha256(data).hexdigest() != v.get("sha256"):
             raise HTTPException(400, f"integrity check failed for {arcname} — pack is corrupted or tampered")
@@ -169,24 +184,31 @@ async def import_pack(
 
     VOICES_DIR.mkdir(parents=True, exist_ok=True)
     created = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    for v, data in staged:
-        emotion = str(v.get("emotion") or "baseline").strip().lower()
-        voice_id = f"{cid}-{emotion}-{uuid.uuid4().hex[:6]}"
-        (VOICES_DIR / f"{voice_id}.safetensors").write_bytes(data)
-        meta["voices"][voice_id] = {
-            "name": name, "character_id": cid, "emotion": emotion,
-            "created": v.get("created") or created,
-            "sample_seconds": v.get("sample_seconds"), "lang": src.get("lang", "EN"),
-            "imported": {"from": src.get("character_id"), "at": created},
-        }
-    meta["characters"].setdefault(cid, {
-        "name": name,
-        "tags": list(src.get("tags") or []),
-        "custom_emotions": [e for e in (src.get("custom_emotions") or []) if isinstance(e, str)],
-    })
-    _save_meta(meta)
 
-    imported = next((c for c in list_characters() if c.character_id == cid), None)
+    def _commit(meta: dict) -> None:
+        # Re-check under the registry lock: the early check above is a fast
+        # fail, but a concurrent import could have claimed the id since.
+        if cid in {m.get("character_id") for m in meta["voices"].values()}:
+            raise HTTPException(409, f"character '{cid}' already exists — pass rename=<new name>")
+        for v, data in staged:
+            emotion = str(v.get("emotion") or "baseline").strip().lower()
+            voice_id = f"{cid}-{emotion}-{uuid.uuid4().hex[:6]}"
+            (VOICES_DIR / f"{voice_id}.safetensors").write_bytes(data)
+            meta["voices"][voice_id] = {
+                "name": name, "character_id": cid, "emotion": emotion,
+                "created": v.get("created") or created,
+                "sample_seconds": v.get("sample_seconds"), "lang": src.get("lang", "EN"),
+                "imported": {"from": src.get("character_id"), "at": created},
+            }
+        meta["characters"].setdefault(cid, {
+            "name": name,
+            "tags": list(src.get("tags") or []),
+            "custom_emotions": [e for e in (src.get("custom_emotions") or []) if isinstance(e, str)],
+        })
+
+    mutate_meta(_commit)
+
+    imported = find_character(cid)
     if imported is None:  # should be impossible — files were just written
         raise HTTPException(500, "import wrote files but the character did not materialize")
     return imported

@@ -15,3 +15,5 @@ api_keys.json
 emotion_demand.json
 takes/
 reviews/
+.worktrees/
+ingest_jobs/

@@ -1,7 +1,7 @@
 "use client";
 
 import { motion } from "framer-motion";
-import { EMOTIONS, emotionMeta } from "@/lib/emotions";
+import { EMOTIONS } from "@/lib/emotions";
 
 export type Partial = {
   words?: number;
@@ -10,6 +10,12 @@ export type Partial = {
   segments_total?: number;
   segments_done?: number;
   emotion_counts?: Record<string, number>;
+  // segments whose classification failed and fell back to the baseline stem
+  label_errors?: number;
+  // commit phase: live per-emotion cloning progress
+  emotions_done?: number;
+  emotions_total?: number;
+  current?: string | null;
 };
 
 export type LoaderStep = { key: string; label: string; state: "pending" | "active" | "done" };
@@ -50,5 +56,3 @@ export function EmotionTally({ counts }: { counts: Record<string, number> }) {
     </div>
   );
 }
-
-export { emotionMeta };
