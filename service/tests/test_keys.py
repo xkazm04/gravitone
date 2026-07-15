@@ -57,6 +57,25 @@ class KeyStoreTests(unittest.TestCase):
         _, secret = self._make_key()
 
         errors: list[Exception] = []
+        writes: list[int] = []
+
+        # validate_key DEBOUNCES its last_used persist (60s). Left at the
+        # default, the first validate writes and the other ~399 skip _save
+        # entirely — exactly ONE write happens, under the lock, so this test
+        # would pass even with NO locking at all and proves nothing about the
+        # concurrent read-modify-write it advertises. Disable the debounce so
+        # every validate performs a real write, and count them to prove it.
+        orig_debounce = keys._LAST_USED_DEBOUNCE_S
+        orig_save = keys._save
+
+        def counting_save(data):
+            writes.append(1)
+            orig_save(data)
+
+        keys._LAST_USED_DEBOUNCE_S = -1.0  # elapsed is always > -1 -> never debounced
+        keys._save = counting_save
+        self.addCleanup(setattr, keys, "_LAST_USED_DEBOUNCE_S", orig_debounce)
+        self.addCleanup(setattr, keys, "_save", orig_save)
 
         def hammer():
             try:
@@ -72,6 +91,10 @@ class KeyStoreTests(unittest.TestCase):
             t.join()
 
         self.assertEqual(errors, [])
+        # Real concurrent writers actually ran — without this the assertion
+        # below is satisfied by a single serialized write.
+        self.assertGreater(len(writes), 100,
+                           "debounce still suppressing writes — the test proves nothing")
         # The file survived concurrent read-modify-write intact.
         data = json.loads(keys.KEYS_PATH.read_text("utf-8"))
         self.assertEqual(len(data), 1)
