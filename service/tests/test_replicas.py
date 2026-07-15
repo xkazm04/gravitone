@@ -253,5 +253,45 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(len(spawn.calls), 3)  # no restart during shutdown
 
 
+class AggKeysContractTests(unittest.TestCase):
+    """replicas.AGG_KEYS hand-copies the engine's additive counter names.
+
+    That copy is deliberate — the supervisor is stdlib-only and must never
+    import service.engine (it would drag torch + scipy into the launcher
+    process). But nothing at runtime notices when the two drift: a renamed or
+    added engine counter would just silently stop being summed into the pool's
+    /metrics, with no error. The TEST env can import both sides, so pin the
+    contract here.
+    """
+
+    # Integer snapshot fields that are GAUGES, not additive counters: summing
+    # them across replicas would be meaningless, so they are deliberately absent
+    # from AGG_KEYS. Anything new must be classified on purpose — that's the
+    # point of this test, not an exemption list to grow thoughtlessly.
+    NON_ADDITIVE_INTS = {"window_size"}  # length of the latency sample window
+
+    def test_agg_keys_match_engine_metrics_snapshot(self) -> None:
+        from service.tests import fake_engine  # noqa: F401  (installs dep shims)
+        from service.engine import Metrics
+
+        snap = Metrics().snapshot()
+        int_fields = {k for k, v in snap.items()
+                      if isinstance(v, int) and not isinstance(v, bool)}
+
+        unclassified = int_fields - set(rep.AGG_KEYS) - self.NON_ADDITIVE_INTS
+        self.assertEqual(
+            unclassified, set(),
+            f"engine.Metrics.snapshot() emits integer field(s) {sorted(unclassified)} that "
+            f"replicas.AGG_KEYS does not sum, so the aggregated pool /metrics silently "
+            f"under-reports them. Either add them to AGG_KEYS (it cannot import engine — "
+            f"stdlib-only supervisor) or list them in NON_ADDITIVE_INTS if they are gauges.")
+
+        stale = set(rep.AGG_KEYS) - set(snap)
+        self.assertEqual(
+            stale, set(),
+            f"replicas.AGG_KEYS sums {sorted(stale)}, which engine.Metrics.snapshot() no "
+            f"longer emits — renamed or removed upstream. Update AGG_KEYS.")
+
+
 if __name__ == "__main__":
     unittest.main()

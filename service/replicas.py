@@ -46,7 +46,19 @@ logger = logging.getLogger("gravitone.replicas")
 
 IS_LINUX = sys.platform.startswith("linux")
 
-# Counter keys summed into pool totals (mirrors the engine Metrics snapshot).
+# Counter keys summed into pool totals — the additive subset of the engine's
+# Metrics.snapshot().
+#
+# DELIBERATELY hand-copied, not imported from service.engine: this module is the
+# SUPERVISOR. It spawns the replica processes and serves the aggregated /metrics
+# using nothing but the stdlib, so it must never import engine — that would pull
+# torch + scipy into the launcher process (heavy, and fatal on a box where the
+# parent can't import them). Keep this list stdlib-local.
+#
+# The drift risk that buys (a renamed/added engine counter silently vanishing
+# from pool totals) is covered by test_replicas.test_agg_keys_match_engine_metrics,
+# which CAN import both sides. If you rename a counter in engine.Metrics, that
+# test fails — update this tuple.
 AGG_KEYS = (
     "received", "completed", "rejected_429", "errored", "timeouts",
     "abandoned", "in_flight", "queued",
