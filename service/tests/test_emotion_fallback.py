@@ -95,6 +95,22 @@ class ManifestAgreementTests(unittest.TestCase):
         native = {e: {"voice_id": f"{e}-id"} for e in native_emotions}
         return vc.deterministic_fallback(native)
 
+    def test_voices_reuses_the_canonical_fallback_function(self) -> None:
+        """The real invariant behind the agreement tests below.
+
+        The historical bug was voices.py computing its fallback INDEPENDENTLY,
+        so the manifest could advertise a different emotion than resolve() picks.
+        But voices.py imports deterministic_fallback straight from emotions, and
+        resolve() calls that same object — so the agreement tests compare a
+        function to ITSELF and would still pass if someone reintroduced a
+        separate copy in voices.py (exactly the regression they guard against).
+        Assert the shared identity explicitly, which actually detects it.
+        """
+        import service.voices as vc
+        self.assertIs(vc.deterministic_fallback, em.deterministic_fallback,
+                      "voices.py must reuse the canonical emotions.deterministic_fallback, "
+                      "not re-implement it (the manifest/resolve divergence bug)")
+
     def test_manifest_agrees_with_resolve_no_baseline(self) -> None:
         native = ["sad", "happy", "calm"]
         manifest_fb = self._manifest_fallback(native)
