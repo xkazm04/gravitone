@@ -9,6 +9,7 @@ import Link from "next/link";
 import { motion } from "framer-motion";
 import {
   ARM_BOXES,
+  breakEvenChars,
   CHARS_PER_AUDIO_MINUTE,
   estimateMonthly,
   fmtUsd,
@@ -31,6 +32,7 @@ export default function SwitchKit() {
   const [copied, setCopied] = useState(false);
 
   const chars = sliderToChars(t);
+  const breakEven = useMemo(() => breakEvenChars(), []);
   const est = useMemo(() => {
     const base = estimateMonthly(chars);
     return base.overCapacity ? estimateMonthly(chars, ARM_BOXES[1]) : base;
@@ -88,12 +90,28 @@ export default function SwitchKit() {
               </div>
             </div>
 
-            <div className="mt-4 flex items-baseline justify-between rounded-xl border border-emerald-400/20 bg-emerald-400/5 px-4 py-3">
-              <span className="font-jetbrains text-[11px] uppercase tracking-wider text-emerald-200/80">you keep</span>
-              <span className="font-instrument text-2xl text-emerald-200">
-                {fmtUsd(est.savingsUsd)}/mo · {fmtUsd(est.savingsYearUsd)}/yr
-              </span>
-            </div>
+            {est.savingsUsd >= 0 ? (
+              <div className="mt-4 flex items-baseline justify-between rounded-xl border border-emerald-400/20 bg-emerald-400/5 px-4 py-3">
+                <span className="font-jetbrains text-[11px] uppercase tracking-wider text-emerald-200/80">you keep</span>
+                <span className="font-instrument text-2xl text-emerald-200">
+                  {fmtUsd(est.savingsUsd)}/mo · {fmtUsd(est.savingsYearUsd)}/yr
+                </span>
+              </div>
+            ) : (
+              /* Below the crossover an always-on box costs MORE than the tier —
+                 say so instead of rendering an emerald "you keep $0.00". */
+              <div className="mt-4 flex items-baseline justify-between gap-3 rounded-xl border border-amber-400/25 bg-amber-400/5 px-4 py-3">
+                <span className="font-jetbrains text-[11px] uppercase tracking-wider text-amber-200/80">costs more at this volume</span>
+                <span className="font-instrument text-2xl text-amber-200">+{fmtUsd(-est.savingsUsd)}/mo</span>
+              </div>
+            )}
+            {est.savingsUsd < 0 && breakEven !== null && (
+              <p className="font-jetbrains mt-2 text-[11px] text-amber-200/70">
+                An always-on box pays off above ~{breakEven.toLocaleString("en-US")} chars/mo
+                (≈{Math.round(breakEven / CHARS_PER_AUDIO_MINUTE).toLocaleString("en-US")} audio-min).
+                Below that, ElevenLabs&apos; metered tier is cheaper — the box only wins once you use it.
+              </p>
+            )}
             <p className="font-jetbrains mt-3 text-[11px] leading-relaxed text-white/45">
               Arm box priced 24/7 on-demand; it serves up to {Math.round(est.boxCapacityMinutes).toLocaleString("en-US")} audio-min/mo.
               ElevenLabs list prices, ~{CHARS_PER_AUDIO_MINUTE.toLocaleString("en-US")} chars per audio minute.{" "}
