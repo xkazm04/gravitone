@@ -35,6 +35,73 @@ export function jsonError(detail: string, status: number): Response {
   });
 }
 
+/** POST a JSON body to a synthesis endpoint and return its WAV.
+ *
+ *  Shared by /api/speak and /api/performance, which were byte-identical apart
+ *  from the upstream path and their forwarded-header allowlist. Handles the
+ *  body cap, the 503 on an unreachable backend, the upstream-status passthrough
+ *  (so a 429 stays a 429 and carries Retry-After for the client's backoff), and
+ *  the header allowlist on success. Any hardening applied here now reaches both.
+ */
+export async function proxyWavPost(
+  req: Request,
+  backendPath: string,
+  forwardHeaders: readonly string[],
+): Promise<Response> {
+  const body = await readCappedText(req);
+  if (body instanceof Response) return body;
+
+  let upstream: Response;
+  try {
+    upstream = await backendFetch(backendPath, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+      signal: AbortSignal.timeout(180_000),
+    });
+  } catch {
+    return new Response("backend unreachable", { status: 503 });
+  }
+
+  if (!upstream.ok) {
+    const headers = new Headers();
+    const retryAfter = upstream.headers.get("Retry-After");
+    if (retryAfter) headers.set("Retry-After", retryAfter);
+    return new Response(await upstream.text(), { status: upstream.status, headers });
+  }
+
+  const headers = new Headers({ "Content-Type": "audio/wav" });
+  for (const h of forwardHeaders) {
+    const v = upstream.headers.get(h);
+    if (v) headers.set(h, v);
+  }
+  return new Response(await upstream.arrayBuffer(), { status: 200, headers });
+}
+
+/** Stream an immutable ingest audio asset (a stem or speaker preview) through.
+ *
+ *  Shared by the two ingest preview routes, which differed only in their
+ *  upstream path segment. Streams the body rather than buffering it, and caches:
+ *  these wavs are written once and never change.
+ */
+export async function streamIngestAsset(upstreamPath: string): Promise<Response> {
+  try {
+    const r = await backendFetch(upstreamPath, {
+      signal: AbortSignal.timeout(READ_TIMEOUT_MS),
+    });
+    if (!r.ok) return new Response("not found", { status: r.status });
+    return new Response(r.body, {
+      status: 200,
+      headers: {
+        "Content-Type": "audio/wav",
+        "Cache-Control": "private, max-age=3600, immutable",
+      },
+    });
+  } catch {
+    return new Response("backend unreachable", { status: 503 });
+  }
+}
+
 /** Read a request body as text, rejecting oversize payloads early with a 413.
  *  Returns the body string, or a Response the caller should return as-is. */
 export async function readCappedText(

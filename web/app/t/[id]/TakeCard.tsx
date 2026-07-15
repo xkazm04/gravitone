@@ -11,16 +11,10 @@ import EmotionArt from "@/components/ui/EmotionArt";
 import { emotionMeta } from "@/lib/emotions";
 import { computePeaks } from "@/app/playground/_variants/engine";
 
-export type SharedTake = {
-  id: string;
-  character_id: string;
-  character_name: string;
-  text: string;
-  seconds: number;
-  rtf: number;
-  segments: { text: string; requested: string; used: string; fallback: boolean; seconds: number }[];
-  created: string;
-};
+// The take payload shape lives with its loader in lib/takes; re-exported here
+// so the existing `import TakeCard, { type SharedTake }` call sites keep working.
+import type { SharedTake } from "@/lib/takes";
+export type { SharedTake };
 
 export default function TakeCard({ take, compact = false }: { take: SharedTake; compact?: boolean }) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
