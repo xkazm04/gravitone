@@ -82,11 +82,18 @@ def make_wav(marker: int, frames: int = 240, sample_rate: int = 24000) -> bytes:
 class _FakeMetrics:
     """Just enough surface for the backpressure/metrics responses."""
 
-    def __init__(self) -> None:
+    def __init__(self, engine: "FakeEngine | None" = None) -> None:
         self.timeouts = 0
+        self._engine = engine
 
     def snapshot(self) -> dict:
-        return {"in_flight": 0, "queued": 0, "timeouts": self.timeouts}
+        # Report the LIVE counters. Hardcoded zeros made a busy engine
+        # indistinguishable from an idle one, so any metrics assertion against
+        # this fake was vacuous.
+        eng = self._engine
+        in_flight = eng._cur if eng is not None else 0
+        queued = max(0, eng._admitted - eng._cur) if eng is not None else 0
+        return {"in_flight": in_flight, "queued": queued, "timeouts": self.timeouts}
 
     def on_timeout(self) -> None:
         self.timeouts += 1
@@ -107,14 +114,18 @@ class FakeEngine:
     ``submit`` returns immediately with a job whose future resolves after a
     per-segment delay, executed on a bounded pool of ``workers`` threads — so
     the engine's true parallelism ceiling (and thus concurrent occupancy) is
-    faithfully modelled. ``capacity`` caps admitted jobs; the next ``submit``
-    raises ``AdmissionRejected`` (the 429 path).
+    faithfully modelled. ``capacity`` caps jobs IN FLIGHT; the next ``submit``
+    raises ``AdmissionRejected`` (the 429 path). Like the real engine, the slot
+    is released when the job finishes — so ``capacity`` is backpressure, not a
+    lifetime quota.
+
+    Call ``close()`` when done (the test's tearDown) to shut the worker pool.
     """
 
     def __init__(self, workers: int = 2, delay: float = 0.15,
                  capacity: int = 1000, delays: dict[str, float] | None = None,
                  error: str | None = None):
-        self.metrics = _FakeMetrics()
+        self.metrics = _FakeMetrics(self)
         self.workers = workers
         self.delay = delay
         self.delays = delays or {}
@@ -157,9 +168,21 @@ class FakeEngine:
             finally:
                 with self._lock:
                     self._cur -= 1
+                    # Release the admission slot, mirroring the real engine
+                    # (TtsEngine releases its semaphore permit on completion).
+                    # Without this, `capacity` was a LIFETIME counter: N jobs
+                    # submitted SEQUENTIALLY — each fully completing — still
+                    # 429'd on N+1, so any backpressure test written against
+                    # this fake asserted a contract the real engine doesn't have.
+                    self._admitted -= 1
 
         self._pool.submit(_work)
         return _FakeJob(future, text, voice_id)
+
+    def close(self) -> None:
+        """Shut the worker pool. Tests must call this in tearDown — otherwise
+        every FakeEngine leaks a ThreadPoolExecutor for the run's lifetime."""
+        self._pool.shutdown(wait=False)
 
     def config(self) -> dict:
         return {"workers": self.workers}

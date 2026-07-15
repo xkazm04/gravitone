@@ -31,6 +31,13 @@ class _Base(unittest.TestCase):
         scipy.signal.resample_poly.calls.clear()
 
     def tearDown(self) -> None:
+        # Shut the fake's ThreadPoolExecutor: swapping the module reference and
+        # dropping the object leaked one pool (2 threads) PER TEST CASE for the
+        # whole run, and leaked workers could still be mutating the shared
+        # resample_poly.calls list during a later test.
+        eng = appmod.ENGINE
+        if isinstance(eng, fake_engine.FakeEngine):
+            eng.close()
         appmod.ENGINE = self._orig
 
 

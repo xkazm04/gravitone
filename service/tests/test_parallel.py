@@ -33,6 +33,9 @@ class ParallelSpeakTests(unittest.TestCase):
         self.client = TestClient(appmod.app)
 
     def tearDown(self) -> None:
+        eng = appmod.ENGINE
+        if isinstance(eng, fake_engine.FakeEngine):
+            eng.close()  # don't leak the fake's worker pool
         appmod.ENGINE = self._orig_engine
         appmod.emotion_map = self._orig_emap
 
@@ -74,6 +77,9 @@ class ParallelPerformanceTests(unittest.TestCase):
         self.client = TestClient(appmod.app)
 
     def tearDown(self) -> None:
+        eng = appmod.ENGINE
+        if isinstance(eng, fake_engine.FakeEngine):
+            eng.close()  # don't leak the fake's worker pool
         appmod.ENGINE = self._orig_engine
         appmod.emotion_map = self._orig_emap
 
