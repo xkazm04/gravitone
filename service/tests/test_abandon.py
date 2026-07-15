@@ -143,7 +143,15 @@ class AbandonSkipTests(unittest.TestCase):
         self.assertEqual(self.eng.metrics.errored, 0)
         self.assertEqual(self.eng.metrics.completed, 1)
         # Both admission permits released -> semaphore fully restored.
-        self.assertEqual(self.eng._admit._value, self.eng._max_inflight)
+        # The worker cancels the future BEFORE releasing the permit, so
+        # future.done() is NOT a happens-before edge for the release: asserting
+        # on the instant races the worker (flaky "permit leak" that isn't real).
+        # Poll to a deadline, and read it through the public accessor.
+        deadline = time.time() + 5
+        while (self.eng.available_permits() < self.eng._max_inflight
+               and time.time() < deadline):
+            time.sleep(0.01)
+        self.assertEqual(self.eng.available_permits(), self.eng._max_inflight)
         # Snapshot exposes the new counter alongside timeouts.
         snap = self.eng.metrics.snapshot()
         self.assertIn("abandoned", snap)

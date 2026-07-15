@@ -123,7 +123,8 @@ class DrainShutdownTests(unittest.TestCase):
 
         # Accounting stays clean: queue drained to zero, all permits returned.
         self.assertEqual(self.eng.metrics.queued, 0)
-        self.assertEqual(self.eng._admit._value, self.eng._max_inflight)
+        # Public accessor, not threading.Semaphore's private _value.
+        self.assertEqual(self.eng.available_permits(), self.eng._max_inflight)
 
     def test_submit_after_stop_is_refused(self) -> None:
         self.model.gate.set()  # nothing should block

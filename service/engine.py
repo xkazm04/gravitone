@@ -498,6 +498,15 @@ class TtsEngine:
     def ready(self) -> bool:
         return all(w.ready.is_set() for w in self._workers)
 
+    def available_permits(self) -> int:
+        """Admission permits currently free (max_inflight when fully idle).
+
+        Public accessor so callers/tests don't reach into threading.Semaphore's
+        private `_value`, which is an undocumented CPython detail that a stdlib
+        change — or swapping in a BoundedSemaphore — would silently break.
+        """
+        return self._admit._value
+
     def submit(self, voice_id: str, text: str, overrides: Optional[dict] = None,
                max_tokens: Optional[int] = None,
                frames_after_eos: Optional[int] = None) -> Job:
