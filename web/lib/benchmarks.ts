@@ -10,7 +10,9 @@
 // GIL-bound. So a box's capacity is its multi-process aud/s, and the
 // recommended config is N single-worker processes with vCPU/N torch threads.
 
-import { ELEVENLABS_TIERS, CHARS_PER_AUDIO_MINUTE } from "./switchkit";
+import {
+  ELEVENLABS_TIERS, CHARS_PER_AUDIO_MINUTE, HOURS_PER_MONTH, elCostForChars,
+} from "./switchkit";
 
 export type BenchmarkEntry = {
   id: string;
@@ -101,13 +103,13 @@ export type Plan = {
   box: BenchmarkEntry;
   replicas: number; // single-worker processes across the fleet
   instances: number; // boxes to rent
+  processesPerBox: number;
   perProcess: { workers: number; torchThreads: number; queueMax: number };
   monthlyUsd: number;
   headroomPct: number; // capacity above the requirement
   elMonthlyUsd: number | null; // same volume at the cheapest covering EL tier
 };
 
-const HOURS_PER_MONTH = 730;
 // Traffic is bursty: provision for 4× the day's average arrival rate.
 const PEAK_FACTOR = 4;
 
@@ -116,35 +118,43 @@ export function planCapacity(concurrentStreams: number, dailyAudioMinutes: numbe
   // Each live stream consumes 1 audio-second per second to stay realtime.
   const need = Math.max(concurrentStreams, avgAudPerS * PEAK_FACTOR, 0.1);
 
-  // Smallest purchasable box that covers the need in one instance wins;
-  // otherwise scale the production box horizontally.
+  // Pick the box + instance-count with the LOWEST TOTAL MONTHLY COST.
+  //
+  // The old rule was "cheapest box that covers `need` in ONE instance, else
+  // scale the biggest box" — it never compared a horizontal fleet of a cheap
+  // box against a single pricey one, so at need=4 it chose 1× c8g.2xlarge
+  // ($212/mo) over 4× t4g.small ($49/mo), contradicting the leaderboard on the
+  // same page that ranks t4g.small as cheaper per audio-hour.
   const buyable = BENCHMARKS.filter((b) => b.instance && b.usdPerHour != null);
-  const single = buyable
-    .filter((b) => boxCapacityAudPerS(b) >= need)
-    .sort((a, b) => (a.usdPerHour! - b.usdPerHour!))[0];
-  const box = single ?? buyable.sort((a, b) => boxCapacityAudPerS(b) - boxCapacityAudPerS(a))[0];
+  const options = buyable
+    .map((b) => {
+      const instances = Math.max(1, Math.ceil(need / boxCapacityAudPerS(b)));
+      return { box: b, instances, monthlyUsd: instances * b.usdPerHour! * HOURS_PER_MONTH };
+    })
+    .sort((a, b) => a.monthlyUsd - b.monthlyUsd || a.instances - b.instances);
+  const { box, instances, monthlyUsd } = options[0];
 
-  const instances = Math.max(1, Math.ceil(need / boxCapacityAudPerS(box)));
-  const processesPerBox = box.processes ?? 1;
-  const torchThreads = Math.max(1, Math.floor(box.vcpu / processesPerBox));
+  // Boxes whose process-scaling was measured use it. For an unmeasured box,
+  // assume one single-worker process per ~2 vCPU with ONE torch thread each —
+  // never collapse to 1 process and hand the spare vCPU to torch threads, which
+  // contradicts this page's own law (the model is GIL-bound, so in-process
+  // threads buy ~nothing).
+  const processesPerBox = box.processes ?? Math.max(1, Math.floor(box.vcpu / 2));
+  const torchThreads = box.processes
+    ? Math.max(1, Math.floor(box.vcpu / box.processes))
+    : 1;
 
   const capacity = instances * boxCapacityAudPerS(box);
-  const monthlyUsd = instances * box.usdPerHour! * HOURS_PER_MONTH;
 
   const monthlyChars = dailyAudioMinutes * 30 * CHARS_PER_AUDIO_MINUTE;
-  const elTier = ELEVENLABS_TIERS.find((t) => t.charsPerMonth >= monthlyChars);
-  const last = ELEVENLABS_TIERS[ELEVENLABS_TIERS.length - 1];
-  const elMonthlyUsd = monthlyChars <= 0
-    ? null
-    : elTier
-      ? elTier.usdPerMonth
-      : (monthlyChars / last.charsPerMonth) * last.usdPerMonth;
+  const elMonthlyUsd = monthlyChars <= 0 ? null : elCostForChars(monthlyChars);
 
   return {
     need: { audPerS: need, concurrentStreams, dailyAudioMinutes },
     box,
     replicas: instances * processesPerBox,
     instances,
+    processesPerBox,
     perProcess: { workers: 1, torchThreads, queueMax: 32 },
     monthlyUsd,
     headroomPct: Math.round((capacity / need - 1) * 100),
@@ -154,13 +164,13 @@ export function planCapacity(concurrentStreams: number, dailyAudioMinutes: numbe
 
 /** The exact env vars the plan translates to — copyable, CLI-parity output. */
 export function planEnvBlock(p: Plan): string {
-  const procs = p.box.processes ?? 1;
+  const procs = p.processesPerBox;
   return [
-    `# ${p.instances}× ${p.box.instance} (${p.box.platform}, ${p.box.vcpu} vCPU) — ${p.replicas} single-worker processes`,
+    `# ${p.instances}× ${p.box.instance} (${p.box.platform}, ${p.box.vcpu} vCPU) — ${p.replicas} single-worker process${p.replicas === 1 ? "" : "es"}`,
     `TTS_WORKERS=${p.perProcess.workers}`,
     `TTS_TORCH_THREADS=${p.perProcess.torchThreads}`,
     `TTS_QUEUE_MAX=${p.perProcess.queueMax}`,
-    `# run ${procs} processes per box (ports 8080-${8079 + procs}) behind a load balancer;`,
+    `# run ${procs} process${procs === 1 ? "" : "es"} per box (port${procs === 1 ? "" : "s"} 8080${procs === 1 ? "" : `-${8079 + procs}`}) behind a load balancer;`,
     `# scale by process/replica, not in-process workers — the model is GIL-bound.`,
   ].join("\n");
 }
