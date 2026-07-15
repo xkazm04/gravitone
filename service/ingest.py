@@ -294,13 +294,6 @@ def build_segments(words: list[dict], min_gap: float = 0.6, min_dur: float = 1.2
     return segs
 
 
-def pick_speaker(segs: list[dict]) -> str:
-    totals: dict[str, float] = {}
-    for s in segs:
-        totals[s["speaker"]] = totals.get(s["speaker"], 0) + (s["end"] - s["start"])
-    return max(totals, key=totals.get) if totals else "speaker_0"
-
-
 # ── ANALYZE (transcribe + isolate; stop for speaker pick) ─────────────────────
 def analyze(audio: Path, work_dir: Path,
             progress: Callable[[str, str], None] | None = None,

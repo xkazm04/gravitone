@@ -1,7 +1,7 @@
 "use client";
 
 import { motion } from "framer-motion";
-import { EMOTIONS, emotionMeta } from "@/lib/emotions";
+import { EMOTIONS } from "@/lib/emotions";
 
 export type Partial = {
   words?: number;
@@ -56,5 +56,3 @@ export function EmotionTally({ counts }: { counts: Record<string, number> }) {
     </div>
   );
 }
-
-export { emotionMeta };

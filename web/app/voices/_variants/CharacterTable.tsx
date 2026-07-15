@@ -6,7 +6,7 @@
 
 import { useMemo, useRef, useState } from "react";
 import Link from "next/link";
-import { Button, Eyebrow } from "@/components/ui/Primitives";
+import { Eyebrow } from "@/components/ui/Primitives";
 import { EMOTION_IDS, emotionMeta } from "@/lib/emotions";
 import TagEditor from "./TagEditor";
 import { hueOf, relTime, useCharacters, useVoicePreview, patchCharacterReq, deleteCharacterReq, type Character } from "../_data/characters";
