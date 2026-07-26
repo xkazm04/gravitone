@@ -32,6 +32,7 @@ import base64
 import json
 
 from service.auth import require_read_write, require_scope
+from service import errors
 from service.config import SETTINGS
 from service.demand import record_fallback
 from service.emotions import parse_segments, resolve
@@ -63,6 +64,10 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Pocket TTS Service", version="1.0.0", lifespan=lifespan)
+
+# Unhandled exceptions keep the {"detail"} JSON contract (sanitized request-id
+# body) instead of escaping to Starlette's plain-text page.
+errors.install_catch_all(app)
 
 
 @app.exception_handler(ShuttingDown)
@@ -179,13 +184,7 @@ async def _await_result(job):
     except Exception as exc:  # noqa: BLE001 - worker error -> sanitized 500
         # Never leak the raw worker exception to the client: log it server-side
         # against a short request id and hand the caller only that id.
-        request_id = uuid.uuid4().hex[:8]
-        logger.error("synthesis failed [request %s]: %s", request_id, exc,
-                     exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"synthesis failed (request {request_id})",
-        )
+        raise errors.sanitized_500("synthesis", exc)
 
 
 async def _submit_and_wait(voice_id: str, text: str, overrides: dict,

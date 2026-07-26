@@ -58,5 +58,68 @@ class SanitizeErrorTests(unittest.TestCase):
         self.assertEqual(eng.metrics.timeouts, 1)
 
 
+class CatchAllContractTests(unittest.TestCase):
+    """Unhandled exceptions must keep the {"detail"} JSON contract (sanitized
+    request-id body) instead of Starlette's plain-text 'Internal Server Error'.
+    """
+
+    def setUp(self) -> None:
+        self._orig_engine = appmod.ENGINE
+        from fastapi.testclient import TestClient
+        self.client = TestClient(appmod.app, raise_server_exceptions=False)
+
+    def tearDown(self) -> None:
+        appmod.ENGINE = self._orig_engine
+
+    def test_unhandled_exception_returns_sanitized_json(self) -> None:
+        secret = "SECRET_internal_state_boom"
+
+        class _ExplodingEngine:
+            metrics = fake_engine._FakeMetrics()
+
+            def submit(self, *a, **k):
+                raise ValueError(secret)  # not AdmissionRejected — unhandled
+
+        appmod.ENGINE = _ExplodingEngine()
+        with self.assertLogs("gravitone", level="ERROR") as logs:
+            resp = self.client.post(
+                "/v1/text-to-speech/v",
+                params={"output_format": "wav_24000"},
+                json={"text": "hello"},
+            )
+        self.assertEqual(resp.status_code, 500)
+        detail = resp.json()["detail"]  # would raise on a plain-text body
+        self.assertTrue(detail.startswith("internal error (request "))
+        self.assertNotIn(secret, detail)
+        self.assertTrue(any(secret in r.getMessage() for r in logs.records))
+
+
+class JobExpiredShapeTests(unittest.TestCase):
+    """Every unknown/expired-job response uses the ONE canonical shape from
+    service.errors.job_expired — previously the same condition had two schemas
+    in the same file (ingest_api.py)."""
+
+    def test_all_job_routes_return_the_canonical_shape(self) -> None:
+        from fastapi.testclient import TestClient
+        client = TestClient(appmod.app, raise_server_exceptions=False)
+        requests = [
+            ("GET", "/v1/ingest/nope", {}),
+            ("GET", "/v1/ingest/nope/speaker-preview/s1", {}),
+            ("POST", "/v1/ingest/nope/speaker", {"json": {"speaker_id": "s1"}}),
+            ("GET", "/v1/ingest/nope/preview/happy", {}),
+            ("POST", "/v1/ingest/nope/commit",
+             {"json": {"character": "X", "emotions": ["happy"],
+                       "attested": True, "statement": "mine"}}),
+            ("DELETE", "/v1/ingest/nope", {}),
+        ]
+        for method, url, kwargs in requests:
+            with self.subTest(route=f"{method} {url}"):
+                resp = client.request(method, url, **kwargs)
+                self.assertEqual(resp.status_code, 404)
+                body = resp.json()
+                self.assertEqual(body["status"], "expired")
+                self.assertEqual(body["detail"], "job not found or expired")
+
+
 if __name__ == "__main__":
     unittest.main()

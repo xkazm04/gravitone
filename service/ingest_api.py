@@ -28,11 +28,12 @@ import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from service import ingest
 from service.config import SETTINGS
+from service.errors import job_expired
 
 router = APIRouter(prefix="/v1/ingest", tags=["ingest"])
 
@@ -324,16 +325,15 @@ def get_job(job_id: str):
     with _LOCK:
         job = JOBS.get(job_id)
         if not job:
-            return JSONResponse({"status": "expired", "detail": "job not found or expired"},
-                                status_code=404)
+            return job_expired()
         return {k: job.get(k) for k in _PUBLIC_KEYS}
 
 
 @router.get("/{job_id}/speaker-preview/{sid}")
-def speaker_preview(job_id: str, sid: str) -> FileResponse:
+def speaker_preview(job_id: str, sid: str):
     job = JOBS.get(job_id)
     if not job:
-        raise HTTPException(404, "job not found")
+        return job_expired()
     p = Path(job["work_dir"]) / f"speaker_{sid}.wav"
     if not p.is_file():
         raise HTTPException(404, "preview not found")
@@ -349,7 +349,7 @@ def choose_speaker(job_id: str, req: SpeakerReq) -> dict:
     with _LOCK:
         job = JOBS.get(job_id)
         if not job:
-            raise HTTPException(404, "job not found or expired")
+            return job_expired()
         if job["status"] != "awaiting_speaker":
             raise HTTPException(409, "not awaiting speaker")
         job["status"] = "running"
@@ -360,10 +360,10 @@ def choose_speaker(job_id: str, req: SpeakerReq) -> dict:
 
 
 @router.get("/{job_id}/preview/{emotion}")
-def preview(job_id: str, emotion: str) -> FileResponse:
+def preview(job_id: str, emotion: str):
     job = JOBS.get(job_id)
     if not job:
-        raise HTTPException(404, "job not found")
+        return job_expired()
     stem = Path(job["work_dir"]) / f"stem_{emotion}.wav"
     if not stem.is_file():
         raise HTTPException(404, "stem not found")
@@ -388,8 +388,7 @@ def commit(job_id: str, req: CommitReq):
     with _LOCK:
         job = JOBS.get(job_id)
         if not job:
-            return JSONResponse({"status": "expired", "detail": "job not found or expired"},
-                                status_code=404)
+            return job_expired()
         if job["status"] != "done":
             raise HTTPException(409, "scan not finished")
         if not req.character.strip() and not req.character_id:
@@ -416,8 +415,7 @@ def cancel_job(job_id: str):
     with _LOCK:
         job = JOBS.get(job_id)
         if not job:
-            return JSONResponse({"status": "expired", "detail": "job not found or expired"},
-                                status_code=404)
+            return job_expired()
         job["cancel"] = True
         job["status"] = "cancelled"
         work_dir = job["work_dir"]

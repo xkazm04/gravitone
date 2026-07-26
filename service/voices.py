@@ -26,6 +26,7 @@ from pathlib import Path
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
+from service import errors
 from service.config import SETTINGS
 from service.demand import all_demand, demand_for
 from service.emotions import (
@@ -582,7 +583,10 @@ async def create_voice(
             [sys.executable, "-m", "pocket_tts", "export-voice", str(clean), str(out_path)],
             capture_output=True)
         if ex.returncode != 0 or not out_path.is_file():
-            raise HTTPException(500, f"clone failed: {ex.stderr.decode(errors='ignore')[-400:]}")
+            # Subprocess stderr is server internals — log it, hand the caller a
+            # request id (same leak posture as the synthesis 500 in app.py).
+            raise errors.sanitized_500(
+                "clone", errors.tail(ex.stderr.decode(errors="ignore")))
 
     created = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
