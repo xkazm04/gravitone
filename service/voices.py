@@ -27,6 +27,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from service import errors
+from service.atomicio import file_lock
 from service.config import SETTINGS
 from service.demand import all_demand, demand_for
 from service.emotions import (
@@ -182,8 +183,10 @@ def _save_meta(meta: dict) -> None:
 
 
 # Serializes every read-modify-write of the registry. Re-entrant so a mutation
-# fn may itself call back into the meta helpers without deadlocking.
+# fn may itself call back into the meta helpers without deadlocking. This is
+# per-PROCESS; _META_LOCK_PATH below extends the exclusion across replicas.
 _META_LOCK = threading.RLock()
+_META_LOCK_PATH = VOICES_DIR / "._meta.lock"
 
 # ── read cache ─────────────────────────────────────────────────────────────────
 # emotion_map/list_characters/all_voices/get_voice all reduce to one assembled
@@ -212,15 +215,23 @@ _demand_cache_at = 0.0
 def mutate_meta(fn):
     """Serialized, atomic registry mutation.
 
-    Under ``_META_LOCK``: load the registry, hand it to ``fn`` for in-place
-    mutation, then atomically save. Returns whatever ``fn`` returns. If ``fn``
-    raises, the save is skipped, so the previous file is left intact (crash
-    safety). This is the ONE write path every mutating endpoint must use — two
-    concurrent clones can no longer clobber each other's entries. On success it
-    bumps the read-cache generation so the next read reassembles.
+    Two layers of exclusion, because this service is deployed as N single-worker
+    PROCESSES (service/replicas.py):
+      * ``_META_LOCK`` serializes threads inside one process (and is re-entrant
+        so a mutation fn may call back into the meta helpers).
+      * ``file_lock(_META_LOCK_PATH)`` serializes the processes. Without it two
+        replicas could load the same registry, each add a voice, and each save —
+        ``os.replace`` keeps the file intact but one entry is silently lost.
+        Same primitive as takes.py's ``.pick`` sentinel.
+
+    Load the registry, hand it to ``fn`` for in-place mutation, then atomically
+    save. Returns whatever ``fn`` returns. If ``fn`` raises, the save is skipped,
+    so the previous file is left intact (crash safety). This is the ONE write
+    path every mutating endpoint must use. On success it bumps the read-cache
+    generation so the next read reassembles.
     """
     global _cache_generation
-    with _META_LOCK:
+    with _META_LOCK, file_lock(_META_LOCK_PATH):
         meta = _load_meta()
         result = fn(meta)
         _save_meta(meta)
