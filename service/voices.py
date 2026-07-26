@@ -529,8 +529,12 @@ def character_manifest(character_id: str) -> dict:
     }
 
 
+# NOT async: this handler runs ffmpeg and a `pocket_tts export-voice`
+# subprocess (seconds). On the event loop that froze every concurrent
+# synthesis response and stream; as a `def` handler FastAPI runs it in the
+# anyio threadpool where blocking is correct.
 @router.post("/v1/voices", response_model=Voice, status_code=201)
-async def create_voice(
+def create_voice(
     file: UploadFile = File(...),
     character: str = Form(...),
     emotion: str = Form(BASELINE),
@@ -564,7 +568,7 @@ async def create_voice(
     with tempfile.TemporaryDirectory(prefix="gravitone-clone-") as td:
         tmp = Path(td)
         raw = tmp / f"raw-{file.filename or 'upload'}"
-        raw_bytes = await file.read()
+        raw_bytes = file.file.read()  # sync read — we're on the threadpool
         clip_sha256 = hashlib.sha256(raw_bytes).hexdigest()
         raw.write_bytes(raw_bytes)
         # Same canonical cleanup chain (denoise + loudnorm) as the ingest

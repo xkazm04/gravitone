@@ -49,9 +49,14 @@ def _authorize(secret: str | None, scope: str) -> None:
 
 def require_scope(scope: str):
     """Dependency: the caller must present the root key or a managed key
-    holding `scope`. Use scope="admin" for root-key-only surfaces."""
+    holding `scope`. Use scope="admin" for root-key-only surfaces.
 
-    async def dep(
+    NOT async: validate_key reads (and debounce-rewrites) api_keys.json under a
+    lock. As a coroutine dependency that file I/O ran on the event loop for
+    EVERY authenticated request; `def` puts it on the anyio threadpool.
+    """
+
+    def dep(
         xi_api_key: str | None = Header(default=None, alias="xi-api-key"),
         authorization: str | None = Header(default=None),
     ) -> None:
@@ -63,9 +68,12 @@ def require_scope(scope: str):
 def require_read_write(read_scope: str, write_scope: str):
     """Dependency: GET/HEAD/OPTIONS need `read_scope`, everything else needs
     `write_scope`. Lets a tts-scoped key list voices (ElevenLabs drop-in
-    clients do this) without granting it voice management."""
+    clients do this) without granting it voice management.
 
-    async def dep(
+    NOT async — same reason as require_scope.
+    """
+
+    def dep(
         request: Request,
         xi_api_key: str | None = Header(default=None, alias="xi-api-key"),
         authorization: str | None = Header(default=None),

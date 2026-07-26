@@ -49,8 +49,9 @@ def _evict_oldest() -> None:
         p.unlink(missing_ok=True)
 
 
+# NOT async: writes up to 25 MB and globs/stats the whole takes dir to evict.
 @router.post("", status_code=201)
-async def create_take(
+def create_take(
     file: UploadFile = File(...),
     meta: str = Form(...),
 ) -> dict:
@@ -65,7 +66,7 @@ async def create_take(
     if not text or not isinstance(segments, list) or len(segments) > MAX_SEGMENTS:
         raise HTTPException(400, "meta needs text and a segments list")
 
-    audio = await file.read()
+    audio = file.file.read()  # sync read — we're on the threadpool
     if not audio or len(audio) > MAX_AUDIO_BYTES:
         raise HTTPException(400, f"audio must be 1 byte to {MAX_AUDIO_BYTES // 2**20} MB")
     if audio[:4] != b"RIFF":

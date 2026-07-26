@@ -255,6 +255,18 @@ async def _gather_results(jobs: list):
         raise
 
 
+async def _offload(fn, *args):
+    """Run blocking CPU/disk work off the event loop.
+
+    The same treatment `resample_wav_bytes` and the mp3 encoder already get.
+    Used for `concat_wavs` (N× wave parse + re-write, linear in script length)
+    and `record_fallback` (JSON read + atomic rewrite per fallback segment) —
+    both were running inline on the loop in the synthesis hot path, where a
+    stall delays every one of the queued waiters.
+    """
+    return await asyncio.get_event_loop().run_in_executor(None, fn, *args)
+
+
 class _Backpressure(Exception):
     """Queue full — translated to the 429 + Retry-After response."""
 
@@ -284,7 +296,18 @@ def _require_known_voice(voice_id: str) -> None:
     raise HTTPException(status_code=404, detail=f"unknown voice '{voice_id}'")
 
 
-def _resolve_emotion_address(voice_id: str, emotion: str | None) -> tuple[str, dict[str, str]]:
+def _record_fallbacks(pairs: list[tuple[str, str]]) -> None:
+    """Record a whole request's emotion fallbacks in ONE executor hop.
+
+    Each `record_fallback` is a JSON read + atomic rewrite; doing them
+    per-segment on the event loop meant a disk round-trip per fallback in the
+    hot path. Batched here and offloaded by the callers via `_offload`.
+    """
+    for character_id, requested in pairs:
+        record_fallback(character_id, requested)
+
+
+async def _resolve_emotion_address(voice_id: str, emotion: str | None) -> tuple[str, dict[str, str]]:
     """Emotion-addressable voices — the Gravitone extension to the
     ElevenLabs-compatible endpoint.
 
@@ -303,7 +326,7 @@ def _resolve_emotion_address(voice_id: str, emotion: str | None) -> tuple[str, d
         raise HTTPException(status_code=404, detail=f"unknown character '{character_id}'")
     resolved_id, used, fell_back = resolve(requested, emap)
     if fell_back:
-        record_fallback(character_id, requested)
+        await _offload(_record_fallbacks, [(character_id, requested)])
     return resolved_id, {
         "X-Character": character_id,
         "X-Emotion-Requested": requested,
@@ -432,7 +455,7 @@ async def text_to_speech(
 ):
     assert ENGINE is not None
     fmt = _parse_format(output_format)  # 400s early on an unsupported format
-    voice_id, emotion_headers = _resolve_emotion_address(voice_id, emotion)
+    voice_id, emotion_headers = await _resolve_emotion_address(voice_id, emotion)
 
     try:
         result = await _submit_and_wait(voice_id, req.text, _overrides(req.voice_settings),
@@ -519,7 +542,7 @@ async def text_to_speech_stream(
                    "needs the complete clip); use output_format=pcm_24000 or "
                    "wav_24000 to stream, or the non-streaming route for mp3",
         )
-    voice_id, emotion_headers = _resolve_emotion_address(voice_id, emotion)
+    voice_id, emotion_headers = await _resolve_emotion_address(voice_id, emotion)
 
     sentences = _split_sentences(req.text)
     overrides = _overrides(req.voice_settings)
@@ -654,11 +677,14 @@ async def speak(
     # already submitted are abandoned (see _submit_batch) rather than burning
     # worker slots for a response that will never be sent.
     resolved: list[tuple] = []
+    fallbacks: list[tuple[str, str]] = []
     for seg in segments:
         voice_id, used, fell_back = resolve(seg.emotion, emap)
         if fell_back:
-            record_fallback(req.character_id, seg.emotion)
+            fallbacks.append((req.character_id, seg.emotion))
         resolved.append((seg, voice_id, used, fell_back))
+    if fallbacks:  # one executor hop, not one disk write per segment
+        await _offload(_record_fallbacks, fallbacks)
 
     try:
         jobs = _submit_batch([(voice_id, seg.text, overrides)
@@ -681,7 +707,7 @@ async def speak(
             "fallback": fell_back, "voice_id": voice_id, "seconds": result.audio_seconds,
         })
 
-    body = concat_wavs(wavs)
+    body = await _offload(concat_wavs, wavs)
     rtf = round(total_audio / total_synth, 3) if total_synth else 0.0
     return Response(
         content=body, media_type="audio/wav",
@@ -737,14 +763,17 @@ async def performance(req: PerformanceRequest):
     # script occupies up to WORKERS at once instead of serialising. A rejected
     # segment fails the whole request with 429 (see /v1/speak for the rationale).
     tasks: list[tuple] = []  # (line_idx, character_id, seg, voice_id, used, fell_back)
+    fallbacks: list[tuple[str, str]] = []
     for i, line in enumerate(req.lines):
         emap = emaps[line.character_id]
         overrides = _overrides(line.voice_settings)
         for seg in parse_segments(line.text):
             voice_id, used, fell_back = resolve(seg.emotion, emap)
             if fell_back:
-                record_fallback(line.character_id, seg.emotion)
+                fallbacks.append((line.character_id, seg.emotion))
             tasks.append((i, line.character_id, seg, voice_id, used, fell_back, overrides))
+    if fallbacks:  # one executor hop, not one disk write per segment
+        await _offload(_record_fallbacks, fallbacks)
 
     try:
         jobs = _submit_batch([(t[3], t[2].text, t[6]) for t in tasks])
@@ -767,7 +796,7 @@ async def performance(req: PerformanceRequest):
             "voice_id": voice_id, "seconds": result.audio_seconds,
         })
 
-    body = concat_wavs(wavs)
+    body = await _offload(concat_wavs, wavs)
     rtf = round(total_audio / total_synth, 3) if total_synth else 0.0
     return Response(
         content=body, media_type="audio/wav",

@@ -112,8 +112,11 @@ def export_pack(character_id: str) -> Response:
     )
 
 
+# NOT async: decompresses and hashes attacker-sized blobs (up to MAX_VOICES ×
+# MAX_VOICE_BYTES) and writes each one — mirror of export_pack, which is
+# already a threadpool `def`.
 @router.post("/v1/characters/import", response_model=Character, status_code=201)
-async def import_pack(
+def import_pack(
     file: UploadFile = File(...),
     rename: str = Form(""),
 ) -> Character:
@@ -121,7 +124,7 @@ async def import_pack(
     collisions); pass `rename` to import under a different character name
     when the id is already taken."""
     try:
-        z = zipfile.ZipFile(io.BytesIO(await file.read()))
+        z = zipfile.ZipFile(io.BytesIO(file.file.read()))
     except zipfile.BadZipFile:
         raise HTTPException(400, "not a valid .gravichar pack (bad zip)")
 

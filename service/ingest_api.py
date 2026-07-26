@@ -281,10 +281,13 @@ def _do_commit(job_id: str, character: str, emotions: list[str], character_id: s
 
 # ── endpoints ─────────────────────────────────────────────────────────────────
 @router.post("/scan")
-async def start_scan(file: UploadFile = File(...), mode: str = Form("auto")) -> dict:
+def start_scan(file: UploadFile = File(...), mode: str = Form("auto")) -> dict:
+    # NOT async: the prologue writes up to 50 MB, runs ffprobe and hashes the
+    # clip before handing off to the phase thread — all of that belongs on the
+    # threadpool, not the event loop (every other route in this file is `def`).
     if mode not in ("auto", "cloud", "sovereign"):
         raise HTTPException(400, "mode must be auto, cloud or sovereign")
-    data = await file.read()
+    data = file.file.read()  # sync read — we're on the threadpool
     err = validate_upload_bytes(data, file.filename or "")
     if err:
         raise HTTPException(400, err)
