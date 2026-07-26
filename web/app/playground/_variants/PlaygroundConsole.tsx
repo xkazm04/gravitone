@@ -83,6 +83,9 @@ export default function PlaygroundConsole() {
   const [codeFor, setCodeFor] = useState<string | null>(null); // take id with the code panel open
   // take id → shared state: publishing / share id / failed
   const [shares, setShares] = useState<Record<string, string | "pending" | "error">>({});
+  // take id → the clipboard refused (permission denied / insecure context).
+  // Published is not the same as copied; the button must not claim otherwise.
+  const [copyFailed, setCopyFailed] = useState<Record<string, boolean>>({});
   // client-review link: selected take ids → /r/{id}
   const [reviewSel, setReviewSel] = useState<Set<string>>(new Set());
   const [reviewBusy, setReviewBusy] = useState(false);
@@ -245,12 +248,23 @@ export default function PlaygroundConsole() {
     return p;
   }
 
+  /** Copy a share link, recording whether the clipboard actually accepted it.
+   *  The button used to claim "✓ link copied" after a denied permission. */
+  async function copyShareLink(takeId: string, shareId: string) {
+    try {
+      await navigator.clipboard.writeText(`${window.location.origin}/t/${shareId}`);
+      setCopyFailed((s) => { const { [takeId]: _, ...rest } = s; return rest; });
+    } catch {
+      setCopyFailed((s) => ({ ...s, [takeId]: true }));
+    }
+  }
+
   /** Persist a take server-side, mint its /t/{id} page, copy the link. */
   async function share(t: Take) {
     const existing = shares[t.id];
     if (existing && existing !== "pending" && existing !== "error") {
       // Already published — clicking again just re-copies the link.
-      await navigator.clipboard.writeText(`${window.location.origin}/t/${existing}`).catch(() => {});
+      await copyShareLink(t.id, existing);
       return;
     }
     if (!t.url || existing === "pending") return;
@@ -258,7 +272,7 @@ export default function PlaygroundConsole() {
     try {
       const id = await uploadOnce(t);
       setShares((s) => ({ ...s, [t.id]: id }));
-      await navigator.clipboard.writeText(`${window.location.origin}/t/${id}`).catch(() => {});
+      await copyShareLink(t.id, id);
     } catch {
       setShares((s) => ({ ...s, [t.id]: "error" }));
       setTimeout(() => setShares((s) => { const { [t.id]: _, ...rest } = s; return rest; }), 2000);
@@ -683,6 +697,7 @@ export default function PlaygroundConsole() {
                   >
                     {shares[t.id] === "pending" ? "sharing…"
                       : shares[t.id] === "error" ? "✗ failed"
+                      : shares[t.id] && copyFailed[t.id] ? "published — copy failed"
                       : shares[t.id] ? "✓ link copied"
                       : "↗ share"}
                   </button>

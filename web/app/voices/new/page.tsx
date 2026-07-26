@@ -136,7 +136,10 @@ export default function NewCharacterPage() {
     audioRef.current?.pause();
     const a = audioRef.current ?? (audioRef.current = new Audio());
     a.src = url; a.onended = () => setPlaying(null);
-    void a.play(); setPlaying(id);
+    setPlaying(id);
+    // Reset on rejection (missing/expired preview, autoplay block) instead of
+    // leaving the row stuck showing "playing".
+    void a.play().catch(() => setPlaying((cur) => (cur === id ? null : cur)));
   }
 
   async function commit() {

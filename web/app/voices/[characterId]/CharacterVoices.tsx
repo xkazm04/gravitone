@@ -13,8 +13,8 @@ import ApiPanel from "./_variants/ApiPanel";
 
 // Rack won the voice-overview round — rendered directly, no switcher.
 export default function CharacterVoices({ characterId }: { characterId: string }) {
-  const { character, slots, coverage, total, loading, error, busySlot, addVoice, removeVoice,
-          addCustomEmotion, removeCustomEmotion } = useCharacter(characterId);
+  const { character, slots, coverage, total, loading, error, busySlot, vaultWarning,
+          addVoice, removeVoice, addCustomEmotion, removeCustomEmotion } = useCharacter(characterId);
   const [recording, setRecording] = useState<string | null>(null);
 
   // Deep link from playground fallbacks: /voices/{id}?record=angry opens the
@@ -102,6 +102,7 @@ export default function CharacterVoices({ characterId }: { characterId: string }
       </div>
 
       {error && <ErrorBanner>{error}</ErrorBanner>}
+      {vaultWarning && <ErrorBanner severity="warning">{vaultWarning}</ErrorBanner>}
 
       <div className="mt-8">
         <EmotionRack

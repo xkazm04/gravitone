@@ -83,7 +83,15 @@ export default function TakeCard({ take, compact = false }: { take: SharedTake; 
     const a = audioRef.current;
     if (!a) return;
     if (playing) { a.pause(); setPlaying(false); }
-    else { void a.play(); setPlaying(true); }
+    else {
+      // Await the rejection: an unplayable source used to leave the card
+      // showing ⏸ with the glow on and progress frozen at 0, forever.
+      setPlaying(true);
+      void a.play().catch(() => {
+        setPlaying(false);
+        setAudioErr("this take could not be played");
+      });
+    }
   }, [playing]);
 
   const copy = useCallback(async (what: "link" | "embed") => {

@@ -223,6 +223,9 @@ export function useCharacter(characterId: string) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [busySlot, setBusySlot] = useState<string | null>(null);
+  // Consent-receipt failures are a WARNING, not a clone failure: the voice
+  // exists, its provenance record doesn't.
+  const [vaultWarning, setVaultWarning] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -276,10 +279,16 @@ export function useCharacter(characterId: string) {
       try {
         const v = await cloneVoice(character.name, emotion, file, { filename: file.name });
         if (user) {
-          void recordVoiceOwnership(user, [{
+          // recordVoiceOwnership RETURNS {saved, failed} precisely so the
+          // caller can say "consent receipt not saved" — dropping it meant a
+          // clone succeeded, its provenance record didn't, and nobody knew.
+          const res = await recordVoiceOwnership(user, [{
             voice_id: v.voice_id, character_id: v.character_id,
             character_name: character.name, emotion: v.emotion,
           }], opts.consent ?? "uploaded");
+          setVaultWarning(res.failed > 0
+            ? "voice cloned, but its consent receipt could not be saved to your vault"
+            : null);
         }
         await refresh();
       } catch (e) {
@@ -308,7 +317,8 @@ export function useCharacter(characterId: string) {
   const coverage = slots.filter((s) => s.voice).length;
 
   return { character, slots, coverage, total: slots.length, loading, error, busySlot,
-           addVoice, removeVoice, addCustomEmotion, removeCustomEmotion, refresh };
+           vaultWarning, addVoice, removeVoice, addCustomEmotion,
+           removeCustomEmotion, refresh };
 }
 
 // ── preview hook ────────────────────────────────────────────────────────────
@@ -318,6 +328,7 @@ export function useVoicePreview() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const urlRef = useRef<string | null>(null); // current preview blob URL, so it can be revoked
   const failTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const mounted = useRef(true);
   const [playingId, setPlayingId] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [failedId, setFailedId] = useState<string | null>(null);
@@ -347,6 +358,10 @@ export function useVoicePreview() {
         });
         if (!r.ok) throw new Error("preview failed");
         const url = URL.createObjectURL(await r.blob());
+        // The unmount cleanup already ran if we got here after teardown, so it
+        // will never see this URL — revoke it now or it leaks for the tab's
+        // lifetime (and the setState calls below would fire on a dead hook).
+        if (!mounted.current) { URL.revokeObjectURL(url); return; }
         if (!audioRef.current) audioRef.current = new Audio();
         const a = audioRef.current;
         revokeUrl(); // free any prior preview URL before replacing the source
@@ -354,8 +369,10 @@ export function useVoicePreview() {
         a.src = url;
         a.onended = () => { revokeUrl(); setPlayingId(null); };
         await a.play();
+        if (!mounted.current) { revokeUrl(); return; }
         setPlayingId(voiceId);
       } catch {
+        if (!mounted.current) return;
         setPlayingId(null);
         // Surface a brief "preview failed" pip; auto-clear so it stays quiet.
         setFailedId(voiceId);
@@ -368,6 +385,7 @@ export function useVoicePreview() {
   );
 
   useEffect(() => () => {
+    mounted.current = false;
     audioRef.current?.pause();
     if (failTimer.current) clearTimeout(failTimer.current);
     if (urlRef.current) URL.revokeObjectURL(urlRef.current);

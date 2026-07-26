@@ -16,6 +16,7 @@ export default function KeysLedger() {
   const [busy, setBusy] = useState(false);
   const [reveal, setReveal] = useState<ApiKeyWithSecret | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [rotating, setRotating] = useState<string | null>(null);
 
   const toggleScope = (s: string) => setScopes((cur) => (cur.includes(s) ? cur.filter((x) => x !== s) : [...cur, s]));
 
@@ -94,14 +95,23 @@ export default function KeysLedger() {
                 <td className="font-jetbrains px-3 py-2.5 text-[12px] text-white/60">{relTime(k.last_used)}</td>
                 <td className="px-3 py-2.5 text-right">
                   <button
+                    disabled={rotating === k.id}
                     onClick={async () => {
-                      // rotateKey throws (e.g. "cannot rotate a revoked key");
-                      // unhandled it was an invisible rejection — no banner,
-                      // no state change, a button that did nothing.
-                      try { setErr(null); setReveal(await rotateKey(k.id)); }
+                      // In-flight guard: a double-click used to fire two
+                      // rotations, minting two secrets where the second
+                      // invalidates the first and the reveal shows whichever
+                      // resolved last. rotateKey also throws (e.g. "cannot
+                      // rotate a revoked key") — unhandled that was an
+                      // invisible rejection.
+                      if (rotating) return;
+                      setRotating(k.id); setErr(null);
+                      try { setReveal(await rotateKey(k.id)); }
                       catch (e) { setErr(e instanceof Error ? e.message : "rotate failed"); }
+                      finally { setRotating(null); }
                     }}
-                    className="font-jetbrains text-[11px] text-cyan-300/80 transition hover:text-cyan-200">rotate</button>
+                    className="font-jetbrains text-[11px] text-cyan-300/80 transition hover:text-cyan-200 disabled:cursor-not-allowed disabled:text-white/30">
+                    {rotating === k.id ? "rotating…" : "rotate"}
+                  </button>
                   <button onClick={() => deleteKey(k.id)} className="font-jetbrains ml-3 text-[11px] text-white/45 transition hover:text-rose-300">revoke</button>
                 </td>
               </tr>

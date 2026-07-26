@@ -97,6 +97,7 @@ export default function CharacterTable() {
   const [bulkTag, setBulkTag] = useState("");
   const [cloning, setCloning] = useState(false);
   const [cloneErr, setCloneErr] = useState<string | null>(null);
+  const [vaultWarn, setVaultWarn] = useState<string | null>(null);
   const [importing, setImporting] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const packRef = useRef<HTMLInputElement>(null);
@@ -160,10 +161,15 @@ export default function CharacterTable() {
       const name = f.name.replace(/\.[^.]+$/, "");
       const v = await createVoice(f, name, "baseline", [], f.name);
       if (user) {
-        void recordVoiceOwnership(user, [{
+        // Consume the {saved, failed} result — a dropped consent receipt is a
+        // compliance-visible loss, not something to discover later.
+        const res = await recordVoiceOwnership(user, [{
           voice_id: v.voice_id, character_id: v.character_id,
           character_name: name, emotion: v.emotion,
         }], "uploaded");
+        setVaultWarn(res.failed > 0
+          ? "voice cloned, but its consent receipt could not be saved to your vault"
+          : null);
       }
     } catch (e) {
       setCloneErr(e instanceof Error ? e.message : "clone failed");
@@ -209,6 +215,7 @@ export default function CharacterTable() {
       </p>
 
       {(error || cloneErr) && <ErrorBanner>{error ?? cloneErr}</ErrorBanner>}
+      {vaultWarn && <ErrorBanner severity="warning">{vaultWarn}</ErrorBanner>}
 
       {/* toolbar */}
       <div className="mt-8 flex flex-wrap items-center gap-3">
