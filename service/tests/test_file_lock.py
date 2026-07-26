@@ -84,17 +84,29 @@ class FileLockTests(unittest.TestCase):
 class MutateMetaUsesTheCrossProcessLockTests(unittest.TestCase):
     def test_mutate_meta_holds_the_lock_file(self) -> None:
         import service.voices as voices
+        from unittest import mock
 
         seen: list[bool] = []
 
-        def _mutation(meta: dict) -> None:
-            # While the mutation runs, the lock file must exist on disk — that
-            # is what another REPLICA would contend on.
-            seen.append(voices._META_LOCK_PATH.exists())
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            # Redirect the WHOLE registry into a temp dir: mutate_meta writes
+            # _meta.json for real, and a test must never touch the repo's
+            # voices/ directory.
+            with mock.patch.object(voices, "VOICES_DIR", root), \
+                 mock.patch.object(voices, "META_PATH", root / "_meta.json"), \
+                 mock.patch.object(voices, "_META_LOCK_PATH", root / "._meta.lock"):
 
-        voices.mutate_meta(_mutation)
-        self.assertEqual(seen, [True])
-        self.assertFalse(voices._META_LOCK_PATH.exists(), "lock must be released")
+                def _mutation(meta: dict) -> None:
+                    # While the mutation runs the lock file must exist on disk —
+                    # that is what another REPLICA would contend on.
+                    seen.append(voices._META_LOCK_PATH.exists())
+
+                voices.mutate_meta(_mutation)
+                self.assertEqual(seen, [True])
+                self.assertFalse(voices._META_LOCK_PATH.exists(),
+                                 "lock must be released")
+                self.assertTrue((root / "_meta.json").is_file())
 
 
 if __name__ == "__main__":
