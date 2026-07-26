@@ -100,12 +100,15 @@ class _FakeMetrics:
 
 
 class _FakeJob:
-    __slots__ = ("future", "text", "voice_id")
+    __slots__ = ("future", "text", "voice_id", "abandoned")
 
     def __init__(self, future: Future, text: str, voice_id: str) -> None:
         self.future = future
         self.text = text
         self.voice_id = voice_id
+        # The real engine's Job carries an Event the streaming route sets on
+        # jobs it will never consume (app.py `_audio_stream` finally block).
+        self.abandoned = threading.Event()
 
 
 class FakeEngine:
@@ -124,13 +127,16 @@ class FakeEngine:
 
     def __init__(self, workers: int = 2, delay: float = 0.15,
                  capacity: int = 1000, delays: dict[str, float] | None = None,
-                 error: str | None = None):
+                 error: str | None = None,
+                 errors: dict[str, str] | None = None):
         self.metrics = _FakeMetrics(self)
         self.workers = workers
         self.delay = delay
         self.delays = delays or {}
         self.capacity = capacity
         self.error = error  # if set, the worker future raises RuntimeError(error)
+        self.errors = errors or {}  # per-segment: {text: message} raises for that text only
+        self.jobs: list[_FakeJob] = []  # every job ever submitted, in order
         self._pool = ThreadPoolExecutor(max_workers=workers)
         self._lock = threading.Lock()
         self._admitted = 0
@@ -157,6 +163,8 @@ class FakeEngine:
                 time.sleep(delay)
                 if self.error is not None:
                     raise RuntimeError(self.error)
+                if text in self.errors:
+                    raise RuntimeError(self.errors[text])
                 marker = (len(self.submit_order) + hash(text)) & 0x7FFF
                 future.set_result(SynthResult(
                     wav_bytes=make_wav(marker),
@@ -177,7 +185,9 @@ class FakeEngine:
                     self._admitted -= 1
 
         self._pool.submit(_work)
-        return _FakeJob(future, text, voice_id)
+        job = _FakeJob(future, text, voice_id)
+        self.jobs.append(job)
+        return job
 
     def close(self) -> None:
         """Shut the worker pool. Tests must call this in tearDown — otherwise

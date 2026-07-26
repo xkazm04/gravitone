@@ -7,6 +7,7 @@ byte-for-byte behaviour of the non-stream route.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import time
 import unittest
 
@@ -98,6 +99,70 @@ class StreamingTests(unittest.TestCase):
         )
         self.assertEqual(resp.status_code, 501)
         self.assertIn("mp3", resp.json()["detail"].lower())
+
+    def test_midstream_failure_truncates_logs_and_abandons(self) -> None:
+        # Segment 2 of 3 fails after segment 1 has already been yielded: the
+        # stream must truncate (status is committed — no other signal exists),
+        # the failure must be LOGGED with a request id (it was a fully silent
+        # swallow before), and the never-consumed tail job must be marked
+        # abandoned so workers skip it un-run (the `jobs[consumed:]` cleanup,
+        # previously unverified for consumed > 0).
+        eng = fake_engine.FakeEngine(
+            workers=1, delay=0.02, errors={"Two.": "segment exploded"})
+        appmod.ENGINE = eng
+
+        async def _drive():
+            resp = await appmod.text_to_speech_stream(
+                "test-voice", TTSRequest(text="One. Two. Three."),
+                output_format="pcm_24000", emotion=None)
+            chunks = []
+            async for chunk in resp.body_iterator:
+                if chunk:
+                    chunks.append(chunk)
+            return chunks
+
+        with self.assertLogs("gravitone", level="ERROR") as captured:
+            chunks = asyncio.run(_drive())
+        eng.close()
+
+        self.assertEqual(len(chunks), 1)  # seg 1 delivered, then truncation
+        self.assertEqual(len(chunks[0]), 480)
+        joined = "\n".join(captured.output)
+        self.assertIn("stream segment 2/3 failed [request ", joined)
+        self.assertIn("segment exploded", joined)
+        # consumed == 1, so jobs[1:] (the failed job and the never-read tail)
+        # must both be abandoned; the delivered one must not.
+        self.assertFalse(eng.jobs[0].abandoned.is_set())
+        self.assertTrue(eng.jobs[1].abandoned.is_set())
+        self.assertTrue(eng.jobs[2].abandoned.is_set())
+
+    def test_midstream_timeout_counts_and_truncates(self) -> None:
+        # A segment that outlives request_timeout_s mid-stream must increment
+        # the same timeout metric the non-stream path counts (it was skipped
+        # entirely before) and truncate the stream.
+        eng = fake_engine.FakeEngine(
+            workers=1, delays={"One.": 0.01, "Two.": 0.6, "Three.": 0.01})
+        appmod.ENGINE = eng
+        orig_settings = appmod.SETTINGS  # frozen dataclass — swap a copy in
+        appmod.SETTINGS = dataclasses.replace(orig_settings,
+                                              request_timeout_s=0.15)
+
+        async def _drive():
+            resp = await appmod.text_to_speech_stream(
+                "test-voice", TTSRequest(text="One. Two. Three."),
+                output_format="pcm_24000", emotion=None)
+            return [c async for c in resp.body_iterator if c]
+
+        try:
+            with self.assertLogs("gravitone", level="ERROR") as captured:
+                chunks = asyncio.run(_drive())
+        finally:
+            appmod.SETTINGS = orig_settings
+            eng.close()
+
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(eng.metrics.timeouts, 1)
+        self.assertIn("stream segment 2/3 timed out", "\n".join(captured.output))
 
     def test_backpressure_returns_429_before_streaming(self) -> None:
         # capacity 1 but two sentences -> the second submit is rejected up front.

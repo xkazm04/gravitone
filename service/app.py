@@ -475,9 +475,23 @@ async def text_to_speech_stream(
                         asyncio.wrap_future(job.future),
                         timeout=SETTINGS.request_timeout_s,
                     )
-                except (asyncio.TimeoutError, Exception):
-                    # Status is already sent; the only signal left is closing the
-                    # stream. The client sees a short clip / reset connection.
+                except asyncio.TimeoutError:
+                    # Status is already sent; the only client signal left is
+                    # closing the stream (short clip / reset connection).
+                    if ENGINE is not None:
+                        ENGINE.metrics.on_timeout()
+                    logger.error("stream segment %d/%d timed out; truncating "
+                                 "stream", consumed + 1, len(jobs))
+                    return
+                except ShuttingDown:
+                    logger.info("stream truncated by graceful shutdown at "
+                                "segment %d/%d", consumed + 1, len(jobs))
+                    return
+                except Exception as exc:  # noqa: BLE001 - status already sent
+                    request_id = uuid.uuid4().hex[:8]
+                    logger.error("stream segment %d/%d failed [request %s]: %s",
+                                 consumed + 1, len(jobs), request_id, exc,
+                                 exc_info=True)
                     return
                 consumed += 1
                 native_rate = result.sample_rate
