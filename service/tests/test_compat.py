@@ -124,7 +124,7 @@ class ResampleHelperTests(unittest.TestCase):
 class FormatRouteTests(_Base):
     def _post(self, output_format: str, **kw):
         return self.client.post(
-            "/v1/text-to-speech/v", params={"output_format": output_format},
+            "/v1/text-to-speech/alba", params={"output_format": output_format},
             json={"text": "Hello world.", **kw})
 
     def test_mp3_bitrate_reaches_ffmpeg(self) -> None:
@@ -216,14 +216,14 @@ class FormatRouteTests(_Base):
 class IgnoredSettingsTests(_Base):
     def test_similarity_boost_and_style_surfaced(self) -> None:
         r = self.client.post(
-            "/v1/text-to-speech/v", params={"output_format": "wav_24000"},
+            "/v1/text-to-speech/alba", params={"output_format": "wav_24000"},
             json={"text": "Hi.", "voice_settings": {"similarity_boost": 0.5, "style": 0.3}})
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.headers["x-ignored-settings"], "similarity_boost,style")
 
     def test_no_header_when_not_sent(self) -> None:
         r = self.client.post(
-            "/v1/text-to-speech/v", params={"output_format": "wav_24000"},
+            "/v1/text-to-speech/alba", params={"output_format": "wav_24000"},
             json={"text": "Hi.", "voice_settings": {"temperature": 0.7}})
         self.assertEqual(r.status_code, 200)
         self.assertNotIn("x-ignored-settings", r.headers)
@@ -234,7 +234,7 @@ class StreamResampleTests(_Base):
         import scipy.signal
         scipy.signal.resample_poly.calls.clear()
         with self.client.stream(
-            "POST", "/v1/text-to-speech/v/stream",
+            "POST", "/v1/text-to-speech/alba/stream",
             params={"output_format": "pcm_16000"},
             json={"text": "One. Two."},
         ) as resp:

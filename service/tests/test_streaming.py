@@ -36,7 +36,7 @@ class StreamingTests(unittest.TestCase):
 
         async def _drive():
             resp = await appmod.text_to_speech_stream(
-                "test-voice", TTSRequest(text="One. Two. Three."),
+                "alba", TTSRequest(text="One. Two. Three."),
                 output_format="pcm_24000", emotion=None)
             self.assertEqual(resp.headers["x-stream-segments"], "3")
             start = time.perf_counter()
@@ -67,7 +67,7 @@ class StreamingTests(unittest.TestCase):
     def test_pcm_has_no_wav_header(self) -> None:
         appmod.ENGINE = fake_engine.FakeEngine(workers=2, delay=0.02)
         with self.client.stream(
-            "POST", "/v1/text-to-speech/v/stream",
+            "POST", "/v1/text-to-speech/alba/stream",
             params={"output_format": "pcm_24000"},
             json={"text": "Hello world. Second sentence."},
         ) as resp:
@@ -79,7 +79,7 @@ class StreamingTests(unittest.TestCase):
     def test_wav_is_single_header_then_samples(self) -> None:
         appmod.ENGINE = fake_engine.FakeEngine(workers=2, delay=0.02)
         with self.client.stream(
-            "POST", "/v1/text-to-speech/v/stream",
+            "POST", "/v1/text-to-speech/alba/stream",
             params={"output_format": "wav_24000"},
             json={"text": "Alpha. Beta. Gamma."},
         ) as resp:
@@ -93,7 +93,7 @@ class StreamingTests(unittest.TestCase):
     def test_mp3_stream_returns_501(self) -> None:
         appmod.ENGINE = fake_engine.FakeEngine()
         resp = self.client.post(
-            "/v1/text-to-speech/v/stream",
+            "/v1/text-to-speech/alba/stream",
             params={"output_format": "mp3_24000_128"},
             json={"text": "Anything."},
         )
@@ -113,7 +113,7 @@ class StreamingTests(unittest.TestCase):
 
         async def _drive():
             resp = await appmod.text_to_speech_stream(
-                "test-voice", TTSRequest(text="One. Two. Three."),
+                "alba", TTSRequest(text="One. Two. Three."),
                 output_format="pcm_24000", emotion=None)
             chunks = []
             async for chunk in resp.body_iterator:
@@ -149,7 +149,7 @@ class StreamingTests(unittest.TestCase):
 
         async def _drive():
             resp = await appmod.text_to_speech_stream(
-                "test-voice", TTSRequest(text="One. Two. Three."),
+                "alba", TTSRequest(text="One. Two. Three."),
                 output_format="pcm_24000", emotion=None)
             return [c async for c in resp.body_iterator if c]
 
@@ -168,7 +168,7 @@ class StreamingTests(unittest.TestCase):
         # capacity 1 but two sentences -> the second submit is rejected up front.
         appmod.ENGINE = fake_engine.FakeEngine(workers=2, delay=0.02, capacity=1)
         resp = self.client.post(
-            "/v1/text-to-speech/v/stream",
+            "/v1/text-to-speech/alba/stream",
             params={"output_format": "pcm_24000"},
             json={"text": "First one. Second one."},
         )

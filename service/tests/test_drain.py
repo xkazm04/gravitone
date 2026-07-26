@@ -155,7 +155,7 @@ class ShuttingDownHttpMappingTests(unittest.TestCase):
 
         self.appmod.ENGINE = _DrainingEngine()
         resp = self.client.post(
-            "/v1/text-to-speech/v",
+            "/v1/text-to-speech/alba",
             params={"output_format": "wav_24000"},
             json={"text": "hello"},
         )

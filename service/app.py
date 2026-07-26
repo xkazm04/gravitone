@@ -40,7 +40,7 @@ from service.engine import (
     AdmissionRejected, ShuttingDown, TtsEngine, concat_wavs,
     resample_pcm16, resample_wav_bytes, wav_bytes_to_mp3,
 )
-from service.voices import emotion_map, router as voices_router
+from service.voices import BUILTIN, emotion_map, router as voices_router
 from service.keys import router as keys_router
 from service.ingest_api import router as ingest_router
 from service.packs import router as packs_router
@@ -211,6 +211,24 @@ def _backpressure_response(exc: _Backpressure) -> JSONResponse:
                         headers={"Retry-After": "1"})
 
 
+def _require_known_voice(voice_id: str) -> None:
+    """A typo'd voice id must be the caller's 404, not a sanitized 500.
+
+    Mirrors the worker's lookup order (engine._Worker._voice_state): exported
+    embedding in the voices dir, a raw local file path (operator convenience),
+    or a builtin name. Anything else would fall through to a model load whose
+    exception surfaces as `synthesis failed (request <id>)` — and, uncached,
+    every client retry would re-enter the model load.
+    """
+    if (Path(SETTINGS.voices_dir) / f"{voice_id}.safetensors").is_file():
+        return
+    if Path(voice_id).is_file():
+        return
+    if any(vid == voice_id for vid, _lang in BUILTIN):
+        return
+    raise HTTPException(status_code=404, detail=f"unknown voice '{voice_id}'")
+
+
 def _resolve_emotion_address(voice_id: str, emotion: str | None) -> tuple[str, dict[str, str]]:
     """Emotion-addressable voices — the Gravitone extension to the
     ElevenLabs-compatible endpoint.
@@ -221,6 +239,7 @@ def _resolve_emotion_address(voice_id: str, emotion: str | None) -> tuple[str, d
     Plain voice_ids pass through untouched.
     """
     if not emotion and ":" not in voice_id:
+        _require_known_voice(voice_id)
         return voice_id, {}
     character_id, _, path_emotion = voice_id.partition(":")
     requested = (emotion or path_emotion).strip().lower()

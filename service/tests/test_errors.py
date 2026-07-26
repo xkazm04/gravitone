@@ -6,8 +6,8 @@ timeouts increment the engine `timeouts` metric behind a 504.
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
-import types
 import unittest
 
 from service.tests import fake_engine  # installs shims — must precede app import
@@ -32,7 +32,7 @@ class SanitizeErrorTests(unittest.TestCase):
                                                error=secret_trace)
         with self.assertLogs("gravitone", level="ERROR") as logs:
             resp = self.client.post(
-                "/v1/text-to-speech/v",
+                "/v1/text-to-speech/alba",
                 params={"output_format": "wav_24000"},
                 json={"text": "hello"},
             )
@@ -46,11 +46,14 @@ class SanitizeErrorTests(unittest.TestCase):
 
     def test_timeout_increments_metric_and_returns_504(self) -> None:
         # Timeout shorter than the fake synthesis delay -> 504 + counted.
-        appmod.SETTINGS = types.SimpleNamespace(request_timeout_s=0.05)
+        # replace(), not SimpleNamespace: routes read other SETTINGS fields
+        # (e.g. voices_dir in the known-voice check) on the way to submit.
+        appmod.SETTINGS = dataclasses.replace(appmod.SETTINGS,
+                                              request_timeout_s=0.05)
         eng = fake_engine.FakeEngine(workers=2, delay=0.5)
         appmod.ENGINE = eng
         resp = self.client.post(
-            "/v1/text-to-speech/v",
+            "/v1/text-to-speech/alba",
             params={"output_format": "wav_24000"},
             json={"text": "hello"},
         )
@@ -83,7 +86,7 @@ class CatchAllContractTests(unittest.TestCase):
         appmod.ENGINE = _ExplodingEngine()
         with self.assertLogs("gravitone", level="ERROR") as logs:
             resp = self.client.post(
-                "/v1/text-to-speech/v",
+                "/v1/text-to-speech/alba",
                 params={"output_format": "wav_24000"},
                 json={"text": "hello"},
             )
@@ -92,6 +95,47 @@ class CatchAllContractTests(unittest.TestCase):
         self.assertTrue(detail.startswith("internal error (request "))
         self.assertNotIn(secret, detail)
         self.assertTrue(any(secret in r.getMessage() for r in logs.records))
+
+
+class UnknownVoiceTests(unittest.TestCase):
+    """A typo'd voice id is the caller's 404, not a sanitized 500 (previously
+    it fell through to a model load whose exception read 'synthesis failed')."""
+
+    def setUp(self) -> None:
+        self._orig_engine = appmod.ENGINE
+        self.engine = fake_engine.FakeEngine(workers=1, delay=0.01)
+        appmod.ENGINE = self.engine
+        from fastapi.testclient import TestClient
+        self.client = TestClient(appmod.app, raise_server_exceptions=False)
+
+    def tearDown(self) -> None:
+        appmod.ENGINE = self._orig_engine
+        self.engine.close()
+
+    def test_unknown_voice_id_is_404(self) -> None:
+        resp = self.client.post(
+            "/v1/text-to-speech/definitely-not-a-voice",
+            params={"output_format": "wav_24000"},
+            json={"text": "hello"},
+        )
+        self.assertEqual(resp.status_code, 404)
+        self.assertIn("unknown voice", resp.json()["detail"])
+
+    def test_unknown_voice_id_is_404_on_stream(self) -> None:
+        resp = self.client.post(
+            "/v1/text-to-speech/definitely-not-a-voice/stream",
+            params={"output_format": "pcm_24000"},
+            json={"text": "hello"},
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_builtin_voice_still_synthesizes(self) -> None:
+        resp = self.client.post(
+            "/v1/text-to-speech/alba",
+            params={"output_format": "wav_24000"},
+            json={"text": "hello"},
+        )
+        self.assertEqual(resp.status_code, 200)
 
 
 class JobExpiredShapeTests(unittest.TestCase):
