@@ -4,6 +4,7 @@
 // prefix / scopes / created / last-used / rotate / revoke. Practical, scales.
 
 import { useState } from "react";
+import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { Button, Eyebrow } from "@/components/ui/Primitives";
 import SecretReveal from "./SecretReveal";
 import { SCOPES, relTime, useKeys, type ApiKeyWithSecret } from "./data";
@@ -39,9 +40,7 @@ export default function KeysLedger() {
         clients already send, so a new key plus a base-URL swap is a complete migration. Secrets are shown once.
       </p>
 
-      {(error || err) && (
-        <p className="font-jetbrains mt-4 rounded-lg border border-amber-400/25 bg-amber-400/5 px-4 py-2 text-[11px] text-amber-200/90">{error ?? err}</p>
-      )}
+      {(error || err) && <ErrorBanner>{error ?? err}</ErrorBanner>}
 
       {/* create bar */}
       <div className="glass-panel mt-8 rounded-2xl p-4">

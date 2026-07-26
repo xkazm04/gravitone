@@ -5,6 +5,7 @@
 // engine's embedding AND marks the vault entry revoked — the provenance
 // record itself is never deleted).
 
+import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { useVoicePreview, relTime } from "@/app/voices/_variants/data";
@@ -65,11 +66,7 @@ export default function MyVoices({ uid }: { uid: string }) {
         </span>
       </div>
 
-      {err && (
-        <p className="font-jetbrains mt-3 rounded-lg border border-rose-400/25 bg-rose-400/5 px-3 py-2 text-[11px] text-rose-200">
-          {err}
-        </p>
-      )}
+      {err && <ErrorBanner className="mt-3">{err}</ErrorBanner>}
 
       {entries.length === 0 ? (
         <p className="mt-3 text-sm text-white/60">

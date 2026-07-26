@@ -4,6 +4,7 @@
 // per emotion slot: status, sample, voice id, added, actions. Space-efficient and
 // practical; every slot is visible at once with no scrolling or spatial hunting.
 
+import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { useState } from "react";
 import { useVoicePreview, relTime, pickAudio, type Slot } from "@/app/voices/_data/characters";
 import EmotionArt from "@/components/ui/EmotionArt";
@@ -51,9 +52,7 @@ export default function EmotionRack({
         </span>
       </div>
 
-      {err && (
-        <p className="font-jetbrains mb-3 rounded-lg border border-amber-400/25 bg-amber-400/5 px-3 py-2 text-[11px] text-amber-200/90">{err}</p>
-      )}
+      {err && <ErrorBanner className="mb-3">{err}</ErrorBanner>}
 
       <div className="glass-panel overflow-x-auto rounded-xl">
         <table className="w-full min-w-[760px] border-collapse text-sm">

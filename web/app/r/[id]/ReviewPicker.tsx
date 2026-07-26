@@ -5,6 +5,7 @@
 // The reviewer hears each take, picks the winner, optionally signs the
 // decision. First pick is final.
 
+import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { useState } from "react";
 import Link from "next/link";
 import TakeCard, { type SharedTake } from "@/app/t/[id]/TakeCard";
@@ -97,9 +98,7 @@ export default function ReviewPicker({ review }: { review: Review }) {
         </div>
       )}
 
-      {error && (
-        <p className="font-jetbrains mt-4 rounded-lg border border-amber-400/25 bg-amber-400/5 px-3 py-2 text-[11px] text-amber-200/90">{error}</p>
-      )}
+      {error && <ErrorBanner>{error}</ErrorBanner>}
 
       {!decided && (
         <div className="glass-panel mt-5 rounded-2xl p-5">

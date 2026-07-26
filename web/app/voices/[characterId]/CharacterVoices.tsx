@@ -1,5 +1,6 @@
 "use client";
 
+import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { Eyebrow } from "@/components/ui/Primitives";
@@ -100,11 +101,7 @@ export default function CharacterVoices({ characterId }: { characterId: string }
         </span>
       </div>
 
-      {error && (
-        <p className="font-jetbrains mt-4 rounded-lg border border-amber-400/25 bg-amber-400/5 px-4 py-2 text-[11px] text-amber-200/90">
-          {error}
-        </p>
-      )}
+      {error && <ErrorBanner>{error}</ErrorBanner>}
 
       <div className="mt-8">
         <EmotionRack

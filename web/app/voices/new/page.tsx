@@ -1,10 +1,12 @@
 "use client";
 
+import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { useEffect, useReducer, useRef, useState } from "react";
 import Link from "next/link";
 import AppFrame from "@/components/ui/AppFrame";
 import { Button, Eyebrow } from "@/components/ui/Primitives";
 import EmotionArt from "@/components/ui/EmotionArt";
+import { readDetail } from "@/lib/apiFetch";
 import { EMOTION_IDS, emotionMeta } from "@/lib/emotions";
 import { useAuth } from "@/lib/useAuth";
 import { recordVoiceOwnership } from "@/lib/voiceVault";
@@ -93,8 +95,8 @@ export default function NewCharacterPage() {
     fd.append("mode", ingestMode);
     try {
       const r = await fetch("/api/ingest/scan", { method: "POST", body: fd });
+      if (!r.ok) throw new Error((await readDetail(r)) ?? "scan failed to start");
       const j = await r.json();
-      if (!r.ok) throw new Error(j?.detail ?? "scan failed to start");
       dispatch({ type: "SCAN_STARTED", jobId: j.job_id });
     } catch (e) {
       dispatch({ type: "SET_ERROR", error: e instanceof Error ? e.message : "scan failed" });
@@ -146,8 +148,9 @@ export default function NewCharacterPage() {
       // async commit: the backend returns immediately; the poller follows
       // per-emotion progress through to 'committed' / 'error'.
       const r = await fetch(`/api/ingest/${jobId}/commit`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ character, emotions: [...selected], character_id, attested: consented, statement: CONSENT_STATEMENT }) });
-      const j = await r.json();
-      if (!r.ok) throw new Error(j?.detail ?? "commit failed");
+      // ok-check BEFORE parsing: an unguarded r.json() here once surfaced a raw
+      // SyntaxError to the user when the proxy answered with a non-JSON body.
+      if (!r.ok) throw new Error((await readDetail(r)) ?? "commit failed");
     } catch (e) {
       dispatch({ type: "COMMIT_FAILED", error: e instanceof Error ? e.message : "commit failed" });
     } finally {
@@ -185,7 +188,7 @@ export default function NewCharacterPage() {
           detect emotions, and propose a set of emotion Voices to assign into a Character.
         </p>
 
-        {error && <p className="font-jetbrains mt-4 rounded-lg border border-rose-400/25 bg-rose-400/5 px-4 py-2 text-[12px] text-rose-200">{error}</p>}
+        {error && <ErrorBanner>{error}</ErrorBanner>}
 
         {/* UPLOAD */}
         {phase === "upload" && (

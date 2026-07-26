@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useState } from "react";
 
+import { apiJson, throwDetail } from "@/lib/apiFetch";
+
 export type ApiKey = {
   id: string;
   name: string;
@@ -39,9 +41,8 @@ export function useKeys() {
 
   const refresh = useCallback(async () => {
     try {
-      const r = await fetch("/api/keys", { cache: "no-store" });
-      if (!r.ok) throw new Error(r.status === 503 ? "Gravitone backend unreachable" : `error ${r.status}`);
-      setKeys((await r.json()) as ApiKey[]);
+      setKeys(await apiJson<ApiKey[]>("/api/keys", { cache: "no-store" },
+        "failed to load keys"));
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : "failed to load keys");
@@ -57,18 +58,20 @@ export function useKeys() {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name, scopes }),
     });
-    const body = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(body?.detail ?? `create failed (${r.status})`);
+    if (!r.ok) return throwDetail(r, `create failed (${r.status})`);
+    const body = (await r.json()) as ApiKeyWithSecret;
     await refresh();
-    return body as ApiKeyWithSecret;
+    return body;
   }, [refresh]);
 
   const rotateKey = useCallback(async (id: string) => {
+    // The backend's detail matters here: "cannot rotate a revoked key" is a
+    // different user action than a transport failure.
     const r = await fetch(`/api/keys/${encodeURIComponent(id)}`, { method: "POST" });
-    const body = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error("rotate failed");
+    if (!r.ok) return throwDetail(r, `rotate failed (${r.status})`);
+    const body = (await r.json()) as ApiKeyWithSecret;
     await refresh();
-    return body as ApiKeyWithSecret;
+    return body;
   }, [refresh]);
 
   const deleteKey = useCallback(async (id: string) => {

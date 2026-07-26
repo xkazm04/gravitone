@@ -4,6 +4,7 @@
 // A Character groups Voices across the emotion scale; this table is the roster.
 // Drill into a row to work with that Character's individual emotion Voices.
 
+import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { Eyebrow } from "@/components/ui/Primitives";
@@ -207,11 +208,7 @@ export default function CharacterTable() {
         <span className="text-white">Voices</span> is one emotion. Missing emotions fall back to baseline.
       </p>
 
-      {(error || cloneErr) && (
-        <p className="font-jetbrains mt-4 rounded-lg border border-amber-400/25 bg-amber-400/5 px-4 py-2 text-[11px] text-amber-200/90">
-          {error ?? cloneErr}
-        </p>
-      )}
+      {(error || cloneErr) && <ErrorBanner>{error ?? cloneErr}</ErrorBanner>}
 
       {/* toolbar */}
       <div className="mt-8 flex flex-wrap items-center gap-3">

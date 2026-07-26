@@ -7,6 +7,7 @@
 //     in the reference audio, which is why emotions are Voices, not sliders.
 //   * Missing emotions fall back to baseline; the take shows what actually ran.
 
+import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { AnimatePresence, motion } from "framer-motion";
@@ -613,9 +614,7 @@ export default function PlaygroundConsole() {
             (no login; the client picks one take)
           </p>
         )}
-        {reviewErr && (
-          <p className="font-jetbrains mb-3 rounded-lg border border-amber-400/25 bg-amber-400/5 px-4 py-2 text-[11px] text-amber-200/90">{reviewErr}</p>
-        )}
+        {reviewErr && <ErrorBanner className="mb-3">{reviewErr}</ErrorBanner>}
 
         {takes.length === 0 && !busy && (
           <div className="rounded-2xl border border-dashed border-white/10 px-5 py-10 text-center text-sm text-white/60">

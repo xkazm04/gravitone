@@ -8,6 +8,7 @@
 // their failures to callers; nothing is swallowed.
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { apiJson, throwDetail } from "@/lib/apiFetch";
 import { CONSENT_STATEMENT } from "@/lib/consent";
 import { EMOTIONS, emotionMeta, isBaseEmotion } from "@/lib/emotions";
 import { useAuth } from "@/lib/useAuth";
@@ -78,20 +79,12 @@ export function relTime(iso?: string | null): string {
 }
 
 // ── request helpers ───────────────────────────────────────────────────────────
-// One place that turns a non-OK proxy response into an Error carrying the
-// backend's `detail` (or a sensible fallback). Every mutation below routes its
-// failures through here so callers get a real message to show, never silence.
-async function throwDetail(r: Response, fallback: string): Promise<never> {
-  const body = await r.json().catch(() => ({} as { detail?: string }));
-  throw new Error(
-    body?.detail ?? (r.status === 503 ? "Gravitone backend unreachable" : fallback),
-  );
-}
-
+// Failure→message conversion lives in lib/apiFetch (shared with every data
+// layer); every mutation below routes through it so callers get a real message
+// to show, never silence.
 async function fetchRoster(): Promise<Character[]> {
-  const r = await fetch("/api/characters", { cache: "no-store" });
-  if (!r.ok) throw new Error(r.status === 503 ? "Gravitone backend unreachable" : `error ${r.status}`);
-  return (await r.json()) as Character[];
+  return apiJson<Character[]>("/api/characters", { cache: "no-store" },
+    "failed to load characters");
 }
 
 /** Fetch ONE Character (the detail page). Returns null on 404 so the page can
@@ -100,7 +93,7 @@ async function fetchRoster(): Promise<Character[]> {
 async function fetchCharacter(id: string): Promise<Character | null> {
   const r = await fetch(`/api/characters/${encodeURIComponent(id)}`, { cache: "no-store" });
   if (r.status === 404) return null;
-  if (!r.ok) throw new Error(r.status === 503 ? "Gravitone backend unreachable" : `error ${r.status}`);
+  if (!r.ok) return throwDetail(r, `error ${r.status}`);
   return (await r.json()) as Character;
 }
 

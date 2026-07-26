@@ -4,6 +4,7 @@
 // next empty slot. Replaces file-hunting with a one-sitting coverage session.
 // MediaRecorder output (webm/mp4) is fine — the backend ffmpeg-normalizes it.
 
+import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { AnimatePresence, motion } from "framer-motion";
@@ -161,9 +162,7 @@ export default function GuidedRecorder({
               aim for {TARGET_SECONDS}s+ (minimum {MIN_SECONDS}s, cuts at {MAX_SECONDS}s) — expression lives in this recording
             </p>
 
-            {error && (
-              <p className="font-jetbrains mt-3 rounded-lg border border-amber-400/25 bg-amber-400/5 px-3 py-2 text-[11px] text-amber-200/90">{error}</p>
-            )}
+            {error && <ErrorBanner className="mt-3">{error}</ErrorBanner>}
 
             <div className="mt-5 flex flex-wrap items-center gap-3">
               {phase === "idle" && (
