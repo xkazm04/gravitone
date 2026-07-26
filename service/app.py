@@ -177,6 +177,15 @@ async def _await_result(job):
         if abandoned is not None:
             abandoned.set()
         raise HTTPException(status_code=504, detail="synthesis timed out")
+    except asyncio.CancelledError:
+        # The caller hung up (Starlette cancels the handler task) — same deal as
+        # a timeout: a job still queued is skipped un-run instead of burning a
+        # generation nobody will read. This is the "client disconnect" half of
+        # the abandon contract engine.Job.abandoned documents.
+        abandoned = getattr(job, "abandoned", None)
+        if abandoned is not None:
+            abandoned.set()
+        raise
     except ShuttingDown:
         # The job was drained by a graceful shutdown — tell the caller to retry
         # elsewhere rather than logging it as an internal synthesis failure.
@@ -198,6 +207,52 @@ async def _submit_and_wait(voice_id: str, text: str, overrides: dict,
     except AdmissionRejected as exc:
         raise _Backpressure(str(exc))
     return await _await_result(job)
+
+
+def _abandon_all(jobs) -> None:
+    """Mark every job in a batch abandoned so workers skip the un-started ones.
+
+    Setting the flag on a job that already ran is a no-op (the worker only
+    checks it before synthesis), so callers can sweep the whole batch.
+    """
+    for job in jobs:
+        abandoned = getattr(job, "abandoned", None)
+        if abandoned is not None:
+            abandoned.set()
+
+
+def _submit_batch(specs: list[tuple[str, str, dict]]) -> list:
+    """Submit a whole batch up front (concurrency, not N× serial latency).
+
+    Admission is decided here, so a mid-list rejection means the request fails
+    with 429 — but the jobs already submitted must be ABANDONED rather than left
+    to synthesize into a response that will never be sent.
+    """
+    jobs = []
+    try:
+        for voice_id, text, overrides in specs:
+            jobs.append(ENGINE.submit(voice_id=voice_id, text=text,
+                                      overrides=overrides))
+    except AdmissionRejected:
+        _abandon_all(jobs)
+        raise
+    return jobs
+
+
+async def _gather_results(jobs: list):
+    """Await a whole batch, abandoning every job if any of them fails.
+
+    `asyncio.gather` cancels the sibling *coroutines* on the first exception,
+    but the underlying worker futures keep running — without this the pool
+    burns full generations for a response that already failed. The
+    `BaseException` arm also covers `CancelledError`, i.e. the client hanging
+    up mid-request. Always re-raises.
+    """
+    try:
+        return await asyncio.gather(*(_await_result(job) for job in jobs))
+    except BaseException:
+        _abandon_all(jobs)
+        raise
 
 
 class _Backpressure(Exception):
@@ -595,8 +650,9 @@ async def speak(
     # Resolve every segment's voice, then submit them ALL before awaiting any:
     # the pool processes them concurrently (up to WORKERS at once) instead of
     # paying N× latency serially. Admission (429) is decided at submit time; if
-    # any segment is rejected the whole request fails with 429 (segments already
-    # submitted run to completion and are discarded — coherent backpressure).
+    # any segment is rejected the whole request fails with 429 and the segments
+    # already submitted are abandoned (see _submit_batch) rather than burning
+    # worker slots for a response that will never be sent.
     resolved: list[tuple] = []
     for seg in segments:
         voice_id, used, fell_back = resolve(seg.emotion, emap)
@@ -605,12 +661,12 @@ async def speak(
         resolved.append((seg, voice_id, used, fell_back))
 
     try:
-        jobs = [ENGINE.submit(voice_id=voice_id, text=seg.text, overrides=overrides)
-                for (seg, voice_id, used, fell_back) in resolved]
+        jobs = _submit_batch([(voice_id, seg.text, overrides)
+                              for (seg, voice_id, used, fell_back) in resolved])
     except AdmissionRejected as exc:
         return _backpressure_response(_Backpressure(str(exc)))
 
-    results = await asyncio.gather(*(_await_result(job) for job in jobs))
+    results = await _gather_results(jobs)
 
     wavs: list[bytes] = []
     report: list[dict] = []
@@ -691,12 +747,11 @@ async def performance(req: PerformanceRequest):
             tasks.append((i, line.character_id, seg, voice_id, used, fell_back, overrides))
 
     try:
-        jobs = [ENGINE.submit(voice_id=t[3], text=t[2].text, overrides=t[6])
-                for t in tasks]
+        jobs = _submit_batch([(t[3], t[2].text, t[6]) for t in tasks])
     except AdmissionRejected as exc:
         return _backpressure_response(_Backpressure(str(exc)))
 
-    results = await asyncio.gather(*(_await_result(job) for job in jobs))
+    results = await _gather_results(jobs)
 
     wavs: list[bytes] = []
     report: list[dict] = []

@@ -67,6 +67,38 @@ class ParallelSpeakTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 429)
         self.assertEqual(resp.headers["retry-after"], "1")
 
+    def test_rejected_batch_abandons_already_submitted_segments(self) -> None:
+        # Same 429 path: segment 1 was accepted before segment 2 was refused.
+        # It must be ABANDONED, not left to synthesize into a response that
+        # will never be sent (the pool would burn a slot for nothing).
+        eng = fake_engine.FakeEngine(workers=2, delay=0.02, capacity=1)
+        appmod.ENGINE = eng
+        resp = self.client.post(
+            "/v1/speak",
+            json={"character_id": "sarah",
+                  "text": "[happy]Hello[/happy] [sad]World"},
+        )
+        self.assertEqual(resp.status_code, 429)
+        self.assertEqual(len(eng.jobs), 1)  # only the first got in
+        self.assertTrue(eng.jobs[0].abandoned.is_set())
+
+    def test_failed_segment_abandons_its_siblings(self) -> None:
+        # Segment 2 of 3 raises. gather cancels the sibling coroutines, but the
+        # worker futures keep running unless we abandon them — that waste is
+        # what this pins.
+        eng = fake_engine.FakeEngine(workers=1, delay=0.02,
+                                     errors={"World": "segment exploded"})
+        appmod.ENGINE = eng
+        resp = self.client.post(
+            "/v1/speak",
+            json={"character_id": "sarah",
+                  "text": "[happy]Hello[/happy] [sad]World[/sad] [happy]Third"},
+        )
+        self.assertEqual(resp.status_code, 500)
+        self.assertEqual(len(eng.jobs), 3)
+        for i, job in enumerate(eng.jobs):
+            self.assertTrue(job.abandoned.is_set(), f"job {i} not abandoned")
+
 
 class ParallelPerformanceTests(unittest.TestCase):
     def setUp(self) -> None:
