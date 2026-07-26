@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import AppFrame from "@/components/ui/AppFrame";
+import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { Button, Eyebrow } from "@/components/ui/Primitives";
 import { useAuth } from "@/lib/useAuth";
 import { getStoredKey, mintDefaultKey, type StoredKey } from "@/lib/mintKey";
@@ -17,6 +18,7 @@ export default function ProfilePage() {
   const [saveErr, setSaveErr] = useState<string | null>(null);
   const [storedKey, setStoredKey] = useState<StoredKey | null>(null);
   const [minting, setMinting] = useState(false);
+  const [mintErr, setMintErr] = useState<string | null>(null);
   const [lang, setLang] = useState<SnippetLang>("curl");
   const [copied, setCopied] = useState<"key" | "snippet" | null>(null);
 
@@ -26,8 +28,12 @@ export default function ProfilePage() {
   async function mint() {
     if (!user || minting) return;
     setMinting(true);
+    setMintErr(null);
     const k = await mintDefaultKey(user.uid, user.email);
+    // mintDefaultKey returns null on ANY failure — without this the button
+    // silently flipped back to "Mint my API key" with zero feedback.
     if (k) setStoredKey({ secret: k.secret, prefix: k.prefix });
+    else setMintErr("couldn't mint a key — the Gravitone backend may be offline. Try again, or manage keys directly.");
     setMinting(false);
   }
 
@@ -154,6 +160,7 @@ export default function ProfilePage() {
                   <Button onClick={() => void mint()} disabled={minting} className="mt-3 cursor-pointer">
                     {minting ? "Minting…" : "Mint my API key"}
                   </Button>
+                  {mintErr && <ErrorBanner className="mt-3">{mintErr}</ErrorBanner>}
                 </div>
               )}
             </div>

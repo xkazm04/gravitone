@@ -24,7 +24,14 @@ export default function MyVoices({ uid }: { uid: string }) {
   const { preview, playingId, busyId } = useVoicePreview();
 
   const refresh = useCallback(async () => {
-    try { setEntries(await listVault(uid)); } catch { setEntries([]); }
+    try {
+      setEntries(await listVault(uid));
+    } catch {
+      // A vault read failure must NOT render the "No cloned voices yet" empty
+      // state — that would tell the user their consent-logged voices are gone.
+      setEntries([]);
+      setErr("couldn't load your voice vault — reload to retry (your voices are safe)");
+    }
   }, [uid]);
   useEffect(() => { void refresh(); }, [refresh]);
 

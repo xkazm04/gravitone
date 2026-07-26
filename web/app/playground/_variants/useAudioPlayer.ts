@@ -31,6 +31,13 @@ export function useAudioPlayer() {
         setPaused(false);
         setProgress(0);
       });
+      a.addEventListener("error", () => {
+        // A dead/expired object URL fired no event at all before, leaving the
+        // row stuck on the pause glyph at 0 progress indefinitely.
+        setPlayingId(null);
+        setPaused(false);
+        setProgress(0);
+      });
       audioRef.current = a;
     }
     return audioRef.current;
@@ -77,7 +84,14 @@ export function useAudioPlayer() {
       if (take.mode === "gravitone" && take.url) {
         const a = getAudio();
         a.src = take.url;
-        try { await a.play(); } catch { /* autoplay blocked */ }
+        try {
+          await a.play();
+        } catch {
+          // autoplay blocked / source unplayable — reset instead of leaving
+          // the row frozen in a fake "playing" state
+          setPlayingId(null);
+          setProgress(0);
+        }
       } else {
         const synth = window.speechSynthesis;
         const u = new SpeechSynthesisUtterance(stripTags(take.text));

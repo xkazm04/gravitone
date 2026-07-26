@@ -22,6 +22,9 @@ export default function TakeCard({ take, compact = false }: { take: SharedTake; 
   const [playing, setPlaying] = useState(false);
   const [progress, setProgress] = useState(0); // 0..1
   const [copied, setCopied] = useState<"link" | "embed" | null>(null);
+  // Audio fetch/decode failure — previously swallowed, leaving a play button
+  // that rendered enabled and did nothing, forever.
+  const [audioErr, setAudioErr] = useState<string | null>(null);
 
   // Cumulative segment boundaries (seconds) → active segment during playback.
   const bounds = useMemo(() => {
@@ -46,7 +49,10 @@ export default function TakeCard({ take, compact = false }: { take: SharedTake; 
     (async () => {
       try {
         const r = await fetch(`/api/takes/${take.id}/audio`);
-        if (!r.ok) return;
+        if (!r.ok) {
+          if (alive) setAudioErr("audio unavailable — shares are evicted oldest-first");
+          return;
+        }
         const blob = await r.blob();
         url = URL.createObjectURL(blob);
         // If we unmounted while the fetch was in flight, the cleanup already
@@ -61,7 +67,10 @@ export default function TakeCard({ take, compact = false }: { take: SharedTake; 
           const { peaks: p } = await computePeaks(blob, compact ? 40 : 64);
           if (alive) setPeaks(p);
         } catch { /* waveform is decoration */ }
-      } catch { /* audio missing — card still renders */ }
+      } catch {
+        // card still renders — but say the player is dead instead of hiding it
+        if (alive) setAudioErr("audio unavailable — couldn't reach the studio");
+      }
     })();
     return () => {
       alive = false;
@@ -94,16 +103,18 @@ export default function TakeCard({ take, compact = false }: { take: SharedTake; 
       style={{ boxShadow: playing ? `0 0 60px hsl(${meta.hue} 85% 60% / .25)` : undefined }}
     >
       <div className="flex items-center justify-between">
-        <span className="font-jetbrains text-[11px] uppercase tracking-widest" style={{ color: `hsl(${meta.hue} 85% 70%)` }}>
-          {playing ? `● ${meta.label.toLowerCase()}` : "voice card"}
+        <span className="font-jetbrains text-[11px] uppercase tracking-widest"
+          style={{ color: audioErr ? "rgb(253 164 175 / 0.8)" : `hsl(${meta.hue} 85% 70%)` }}>
+          {audioErr ?? (playing ? `● ${meta.label.toLowerCase()}` : "voice card")}
         </span>
         <span className="font-jetbrains text-[11px] text-white/55">{take.seconds}s · 24kHz · cpu</span>
       </div>
 
       <div className="mt-4 flex items-center gap-4">
         {/* the glyph IS the playhead: it morphs with the active segment */}
-        <button onClick={toggle} aria-label={playing ? "Pause" : "Play"}
-          className="group relative grid h-20 w-20 shrink-0 cursor-pointer place-items-center overflow-hidden rounded-2xl border bg-black/50 transition"
+        <button onClick={toggle} disabled={!!audioErr} title={audioErr ?? undefined}
+          aria-label={audioErr ?? (playing ? "Pause" : "Play")}
+          className="group relative grid h-20 w-20 shrink-0 cursor-pointer place-items-center overflow-hidden rounded-2xl border bg-black/50 transition disabled:cursor-not-allowed disabled:opacity-40"
           style={{ borderColor: `hsl(${meta.hue} 85% 60% / ${playing ? 0.7 : 0.3})` }}>
           <span aria-hidden className="pointer-events-none absolute inset-0 transition-opacity duration-500"
             style={{ opacity: playing ? 1 : 0, boxShadow: `inset 0 0 30px hsl(${meta.hue} 90% 60% / .4)` }} />

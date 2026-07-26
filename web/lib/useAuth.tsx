@@ -73,38 +73,47 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     getRedirectResult(auth).catch((e) => setError(e instanceof Error ? e.message : "sign-in failed"));
     return onAuthStateChanged(auth, async (u) => {
       setUser(u);
-      if (u) {
-        const ref = doc(db, "users", u.uid);
-        const snap = await getDoc(ref);
-        const base: Profile = {
-          uid: u.uid, displayName: u.displayName, email: u.email, photoURL: u.photoURL,
-        };
-        if (snap.exists()) {
-          await updateDoc(ref, { lastLogin: serverTimestamp() });
-          setProfile({ ...(snap.data() as Profile), ...base });
-        } else if (!provisioning.current.has(u.uid)) {
-          // Guard first-run provisioning against a re-entrant onAuthStateChanged
-          // for the same new user (redirect completion + immediate token emit),
-          // which would otherwise mint two keys and clobber the user doc. The
-          // check+add is synchronous, so only one callback enters this branch.
-          provisioning.current.add(u.uid);
-          // merge:true so a racing write can't overwrite plan/createdAt.
-          await setDoc(ref, { ...base, plan: "free", createdAt: serverTimestamp(), lastLogin: serverTimestamp() }, { merge: true });
-          setProfile({ ...base, plan: "free" });
-          // First sign-in: auto-provision a tts-scoped API key and land the
-          // user on the profile panel with a ready-to-run migration snippet.
-          // Best-effort — a down backend must never break sign-in.
-          void mintDefaultKey(u.uid, u.email).then((k) => {
-            if (!k) return;
-            void updateDoc(ref, { keyId: k.id, keyPrefix: k.prefix }).catch(() => {});
-            if (window.location.pathname !== "/profile") window.location.assign("/profile");
-          });
+      try {
+        if (u) {
+          const ref = doc(db, "users", u.uid);
+          const snap = await getDoc(ref);
+          const base: Profile = {
+            uid: u.uid, displayName: u.displayName, email: u.email, photoURL: u.photoURL,
+          };
+          if (snap.exists()) {
+            await updateDoc(ref, { lastLogin: serverTimestamp() });
+            setProfile({ ...(snap.data() as Profile), ...base });
+          } else if (!provisioning.current.has(u.uid)) {
+            // Guard first-run provisioning against a re-entrant onAuthStateChanged
+            // for the same new user (redirect completion + immediate token emit),
+            // which would otherwise mint two keys and clobber the user doc. The
+            // check+add is synchronous, so only one callback enters this branch.
+            provisioning.current.add(u.uid);
+            // merge:true so a racing write can't overwrite plan/createdAt.
+            await setDoc(ref, { ...base, plan: "free", createdAt: serverTimestamp(), lastLogin: serverTimestamp() }, { merge: true });
+            setProfile({ ...base, plan: "free" });
+            // First sign-in: auto-provision a tts-scoped API key and land the
+            // user on the profile panel with a ready-to-run migration snippet.
+            // Best-effort — a down backend must never break sign-in.
+            void mintDefaultKey(u.uid, u.email).then((k) => {
+              if (!k) return;
+              void updateDoc(ref, { keyId: k.id, keyPrefix: k.prefix }).catch(() => {});
+              if (window.location.pathname !== "/profile") window.location.assign("/profile");
+            });
+          }
+        } else {
+          setProfile(null);
         }
-      } else {
-        setProfile(null);
+      } catch (e) {
+        // A Firestore failure (rules, quota, offline) must not leave the app on
+        // "Loading…" forever: the finally below still resolves auth, the user
+        // stays signed in with a degraded (null) profile, and the error is
+        // surfaced instead of swallowed.
+        setError(e instanceof Error ? e.message : "profile sync failed");
+      } finally {
+        setLoading(false);
+        setAuthResolved(true);
       }
-      setLoading(false);
-      setAuthResolved(true);
     });
   }, []);
 

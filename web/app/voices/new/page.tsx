@@ -52,12 +52,16 @@ export default function NewCharacterPage() {
   }, [phase === "complete"]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ONE poller for both the analyze leg and the commit leg.
+  const [pollStalled, setPollStalled] = useState(false);
   useIngestJob({
     jobId,
     enabled: POLLING_PHASES.has(phase),
     onJob: (j: Job) => dispatch({ type: "JOB_POLLED", job: j }),
     onExpired: () => dispatch({ type: "JOB_EXPIRED" }),
+    onStalled: setPollStalled,
   });
+  // Reset the degraded-connection notice whenever polling stops/starts.
+  useEffect(() => { setPollStalled(false); }, [jobId, phase]);
 
   // Record Voice Vault ownership exactly once, when the commit completes.
   const recorded = useRef(false);
@@ -189,6 +193,11 @@ export default function NewCharacterPage() {
         </p>
 
         {error && <ErrorBanner>{error}</ErrorBanner>}
+        {pollStalled && POLLING_PHASES.has(phase) && (
+          <ErrorBanner severity="warning">
+            connection to the studio is degraded — retrying. Your job keeps running server-side.
+          </ErrorBanner>
+        )}
 
         {/* UPLOAD */}
         {phase === "upload" && (
