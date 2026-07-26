@@ -42,7 +42,9 @@ from service.engine import (
 )
 from service.voices import BUILTIN, emotion_map, router as voices_router
 from service.keys import router as keys_router
-from service.ingest_api import router as ingest_router
+from service.ingest_api import (
+    router as ingest_router, start_background as ingest_start_background,
+)
 from service.packs import router as packs_router
 from service.takes import router as takes_router, reviews_router
 
@@ -55,6 +57,9 @@ logger = logging.getLogger("gravitone")
 async def lifespan(app: FastAPI):
     global ENGINE
     ENGINE = TtsEngine()
+    # Ingest job rehydration + the GC sweeper used to run as import side
+    # effects; they belong to the app's lifecycle, not to `import`.
+    await asyncio.get_event_loop().run_in_executor(None, ingest_start_background)
     # Model loading is blocking; do it off the event loop.
     await asyncio.get_event_loop().run_in_executor(None, ENGINE.start)
     yield

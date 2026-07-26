@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import shutil
 import subprocess
 import threading
@@ -34,6 +35,8 @@ from pydantic import BaseModel
 from service import ingest
 from service.config import SETTINGS
 from service.errors import job_expired
+
+logger = logging.getLogger("gravitone")
 
 router = APIRouter(prefix="/v1/ingest", tags=["ingest"])
 
@@ -116,13 +119,28 @@ def probe_duration(path: Path) -> float | None:
 # ── state persistence (all callers hold _LOCK) ────────────────────────────────
 def _persist(job: dict) -> None:
     wd = Path(job["work_dir"])
+    # Do NOT mkdir: a teardown (DELETE or GC) may have just rmtree'd this
+    # workdir, and recreating it here resurrects an orphan directory that no
+    # job owns. If the tree is gone the job is gone — there is nothing to
+    # persist.
+    if not wd.is_dir():
+        return
     try:
-        wd.mkdir(parents=True, exist_ok=True)
         tmp = wd / "state.json.tmp"
         tmp.write_text(json.dumps(job), "utf-8")
         tmp.replace(wd / "state.json")
-    except OSError:
-        pass
+    except OSError as exc:
+        # Losing the on-disk mirror means a restart can't rehydrate this job —
+        # worth a log line rather than a bare pass.
+        logger.warning("ingest job %s: state persist failed: %s",
+                       job.get("id"), exc)
+
+
+def _get_job(job_id: str) -> dict | None:
+    """Locked lookup. Phase threads MUST use this: a bare JOBS[job_id] races a
+    concurrent DELETE and dies with an uncaught KeyError on a bare thread."""
+    with _LOCK:
+        return JOBS.get(job_id)
 
 
 def _update(job: dict, **fields) -> None:
@@ -174,10 +192,7 @@ def _rehydrate() -> None:
         if job.get("status") in ("running", "committing"):
             job["status"] = "error"
             job["error"] = "interrupted by restart"
-            try:
-                sf.write_text(json.dumps(job), "utf-8")
-            except OSError:
-                pass
+            _persist(job)  # tmp+replace, same as every other writer
         JOBS[job["id"]] = job
 
 
@@ -185,6 +200,11 @@ def _gc_once() -> None:
     now = time.time()
     with _LOCK:
         for jid in [j for j, v in JOBS.items() if now - v.get("created", 0) > _TTL]:
+            # Set the cancel flag BEFORE deleting anything — same teardown
+            # protocol as cancel_job. Without it a phase thread that outlived
+            # the TTL keeps working against a deleted workdir (and _persist
+            # used to recreate the directory behind GC's back).
+            JOBS[jid]["cancel"] = True
             shutil.rmtree(JOBS[jid]["work_dir"], ignore_errors=True)
             JOBS.pop(jid, None)
         live = {v["work_dir"] for v in JOBS.values()}
@@ -202,16 +222,22 @@ def _gc_once() -> None:
 
 def _gc_loop() -> None:
     while True:
-        time.sleep(_GC_INTERVAL)
         try:
+            # Sweep FIRST: the most valuable sweep is the one right after a
+            # restart (orphan workdirs left by the previous process), and
+            # sleeping first stranded those for a full interval.
             _gc_once()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001 - the loop must never die
+            logger.warning("ingest GC sweep failed: %s", exc)
+        time.sleep(_GC_INTERVAL)
 
 
 # ── background phases ─────────────────────────────────────────────────────────
 def _analyze(job_id: str, audio: Path) -> None:
-    job = JOBS[job_id]
+    job = _get_job(job_id)
+    if job is None:  # cancelled between Thread.start() and here
+        audio.unlink(missing_ok=True)
+        return
     analyze_fn = ingest.sovereign_analyze if job["mode"] == "sovereign" else ingest.analyze
     try:
         res = analyze_fn(
@@ -229,7 +255,9 @@ def _analyze(job_id: str, audio: Path) -> None:
 
 
 def _label(job_id: str, target: str) -> None:
-    job = JOBS[job_id]
+    job = _get_job(job_id)
+    if job is None:  # cancelled between Thread.start() and here
+        return
     try:
         res = ingest.label_and_stem(
             Path(job["work_dir"]), target,
@@ -254,7 +282,9 @@ def _commit_progress(job: dict, done: int, total: int, current: str | None) -> N
 
 def _do_commit(job_id: str, character: str, emotions: list[str], character_id: str | None,
                statement: str) -> None:
-    job = JOBS[job_id]
+    job = _get_job(job_id)
+    if job is None:  # cancelled between Thread.start() and here
+        return
     total = len(emotions)
 
     def cancelled() -> bool:
@@ -272,7 +302,17 @@ def _do_commit(job_id: str, character: str, emotions: list[str], character_id: s
         return
     with _LOCK:
         if job.get("cancel"):
-            return  # DELETE already set 'cancelled' and cleaned up
+            # DELETE/GC tore the job down mid-clone. That only removes the
+            # WORKDIR — any emotions already cloned are registered Voices in
+            # VOICES_DIR and stay live. Say so: dropping this list silently
+            # left a partial Character nobody knew existed.
+            if created:
+                logger.warning(
+                    "ingest job %s cancelled after cloning %d voice(s); they "
+                    "remain registered and are not rolled back: %s",
+                    job_id, len(created),
+                    [v.get("voice_id") for v in created if isinstance(v, dict)])
+            return
         job["committed"] = created
         job["partial"] = {"emotions_done": total, "emotions_total": total, "current": None}
         job["status"] = "committed"
@@ -334,7 +374,7 @@ def get_job(job_id: str):
 
 @router.get("/{job_id}/speaker-preview/{sid}")
 def speaker_preview(job_id: str, sid: str):
-    job = JOBS.get(job_id)
+    job = _get_job(job_id)
     if not job:
         return job_expired()
     p = Path(job["work_dir"]) / f"speaker_{sid}.wav"
@@ -364,7 +404,7 @@ def choose_speaker(job_id: str, req: SpeakerReq) -> dict:
 
 @router.get("/{job_id}/preview/{emotion}")
 def preview(job_id: str, emotion: str):
-    job = JOBS.get(job_id)
+    job = _get_job(job_id)
     if not job:
         return job_expired()
     stem = Path(job["work_dir"]) / f"stem_{emotion}.wav"
@@ -428,5 +468,24 @@ def cancel_job(job_id: str):
 
 
 # ── startup: rehydrate persisted jobs + launch the GC timer ───────────────────
-_rehydrate()
-threading.Thread(target=_gc_loop, daemon=True).start()
+_started = False
+
+
+def start_background() -> None:
+    """Rehydrate persisted jobs and start the GC sweeper. Called from the app
+    lifespan — NOT at import.
+
+    Doing this at import meant real disk work (scanning WORK_ROOT, rewriting
+    state.json) ran before the app was ready and outside lifespan supervision,
+    and every process that imported this module for any reason — a CLI, a test
+    runner — silently spawned a GC thread that could delete another replica's
+    workdirs. Tests in particular shared that live thread with the production
+    module globals they patch. Idempotent.
+    """
+    global _started
+    with _LOCK:
+        if _started:
+            return
+        _started = True
+    _rehydrate()
+    threading.Thread(target=_gc_loop, daemon=True, name="ingest-gc").start()

@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import io
 import json
+import shutil
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -167,6 +169,79 @@ class GcTests(unittest.TestCase):
             with mock.patch.object(ingest_api, "WORK_ROOT", root):
                 ingest_api._gc_once()
             self.assertNotIn("e", ingest_api.JOBS)
+
+    def test_gc_sets_cancel_before_teardown(self):
+        # A phase thread still holding a reference to the reaped job must see
+        # cancel=True — otherwise it keeps working against a deleted workdir.
+        # (cancel_job has always done this; GC used to skip the protocol.)
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            old = _make_job(root, "old", "committing",
+                            time.time() - ingest_api._TTL - 10)
+            ingest_api.JOBS["old"] = old
+            with mock.patch.object(ingest_api, "WORK_ROOT", root):
+                ingest_api._gc_once()
+            self.assertTrue(old["cancel"], "GC must flag the job it tears down")
+
+    def test_persist_does_not_resurrect_a_reaped_workdir(self):
+        # _persist used to mkdir(parents=True), recreating a directory GC or
+        # DELETE had just removed — an orphan tree owned by no job.
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            job = _make_job(root, "gone", "committing", time.time())
+            wd = Path(job["work_dir"])
+            self.assertTrue(wd.is_dir())
+            shutil.rmtree(wd)
+            ingest_api._persist(job)
+            self.assertFalse(wd.exists(), "persist must not recreate the workdir")
+
+
+class PhaseThreadTeardownTests(unittest.TestCase):
+    """A DELETE landing between Thread.start() and the phase body's first line
+    used to kill the thread with an uncaught KeyError."""
+
+    def setUp(self):
+        self._orig_jobs = dict(ingest_api.JOBS)
+        ingest_api.JOBS.clear()
+
+    def tearDown(self):
+        ingest_api.JOBS.clear()
+        ingest_api.JOBS.update(self._orig_jobs)
+
+    def test_phases_exit_quietly_when_job_is_gone(self):
+        with TemporaryDirectory() as td:
+            audio = Path(td) / "clip.wav"
+            audio.write_bytes(b"RIFF")
+            # JOBS is empty — every phase must return, not raise.
+            ingest_api._analyze("nosuch", audio)
+            ingest_api._label("nosuch", "spk1")
+            ingest_api._do_commit("nosuch", "Char", ["happy"], None, "mine")
+            self.assertFalse(audio.exists(), "_analyze cleans its upload up")
+
+    def test_get_job_is_locked_and_returns_none_when_absent(self):
+        self.assertIsNone(ingest_api._get_job("nope"))
+
+
+class BackgroundStartTests(unittest.TestCase):
+    def test_no_thread_starts_at_import(self):
+        # Importing the module must not spawn the GC sweeper: it would race
+        # tests that patch WORK_ROOT, and in production it ran before the app
+        # was ready. The lifespan calls start_background() instead.
+        names = [t.name for t in threading.enumerate()]
+        self.assertNotIn("ingest-gc", names)
+
+    def test_start_background_is_idempotent(self):
+        with mock.patch.object(ingest_api, "_rehydrate") as rehy, \
+             mock.patch.object(ingest_api.threading, "Thread") as thread:
+            orig = ingest_api._started
+            ingest_api._started = False
+            try:
+                ingest_api.start_background()
+                ingest_api.start_background()
+            finally:
+                ingest_api._started = orig
+            self.assertEqual(rehy.call_count, 1)
+            self.assertEqual(thread.call_count, 1)
 
 
 class CommitLifecycleTests(unittest.TestCase):
