@@ -9,6 +9,7 @@ import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { useVoicePreview, relTime } from "@/app/voices/_variants/data";
+import { useMounted } from "@/lib/useMounted";
 import { listVault, markRevoked, type VaultEntry } from "@/lib/voiceVault";
 
 const METHOD_LABEL: Record<string, string> = {
@@ -21,18 +22,22 @@ export default function MyVoices({ uid }: { uid: string }) {
   const [entries, setEntries] = useState<VaultEntry[] | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const mounted = useMounted();
   const { preview, playingId, busyId } = useVoicePreview();
 
   const refresh = useCallback(async () => {
     try {
-      setEntries(await listVault(uid));
+      const list = await listVault(uid);
+      if (!mounted.current) return;
+      setEntries(list);
     } catch {
       // A vault read failure must NOT render the "No cloned voices yet" empty
       // state — that would tell the user their consent-logged voices are gone.
+      if (!mounted.current) return;
       setEntries([]);
       setErr("couldn't load your voice vault — reload to retry (your voices are safe)");
     }
-  }, [uid]);
+  }, [uid, mounted]);
   useEffect(() => { void refresh(); }, [refresh]);
 
   const revoke = useCallback(async (e: VaultEntry) => {

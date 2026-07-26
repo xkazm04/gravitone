@@ -87,11 +87,14 @@ export default function GuidedRecorder({
       rec.start();
       setSeconds(0);
       setPhase("recording");
+      let elapsed = 0;
       timerRef.current = setInterval(() => {
-        setSeconds((s) => {
-          if (s + 1 >= MAX_SECONDS) recRef.current?.stop();
-          return s + 1;
-        });
+        // The auto-stop lives OUTSIDE the state updater: updaters must be pure,
+        // and React 19 StrictMode double-invokes them — calling rec.stop()
+        // in there could fire the stop twice.
+        elapsed += 1;
+        setSeconds(elapsed);
+        if (elapsed >= MAX_SECONDS) recRef.current?.stop();
       }, 1000);
     } catch {
       setError("microphone unavailable — allow mic access and try again");

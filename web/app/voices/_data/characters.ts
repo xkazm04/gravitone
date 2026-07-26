@@ -10,6 +10,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { apiJson, throwDetail } from "@/lib/apiFetch";
 import { CONSENT_STATEMENT } from "@/lib/consent";
+import { useMounted } from "@/lib/useMounted";
 import { EMOTIONS, emotionMeta, isBaseEmotion } from "@/lib/emotions";
 import { useAuth } from "@/lib/useAuth";
 import { recordVoiceOwnership, type ConsentMethod } from "@/lib/voiceVault";
@@ -163,17 +164,21 @@ export function useCharacters() {
   const [characters, setCharacters] = useState<Character[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const mounted = useMounted();
 
   const refresh = useCallback(async () => {
     try {
-      setCharacters(await fetchRoster());
+      const roster = await fetchRoster();
+      if (!mounted.current) return;
+      setCharacters(roster);
       setError(null);
     } catch (e) {
+      if (!mounted.current) return;
       setError(e instanceof Error ? e.message : "failed to load characters");
     } finally {
-      setLoading(false);
+      if (mounted.current) setLoading(false);
     }
-  }, []);
+  }, [mounted]);
 
   useEffect(() => { void refresh(); }, [refresh]);
 
@@ -226,17 +231,21 @@ export function useCharacter(characterId: string) {
   // Consent-receipt failures are a WARNING, not a clone failure: the voice
   // exists, its provenance record doesn't.
   const [vaultWarning, setVaultWarning] = useState<string | null>(null);
+  const mounted = useMounted();
 
   const refresh = useCallback(async () => {
     try {
-      setCharacter(await fetchCharacter(characterId));
+      const c = await fetchCharacter(characterId);
+      if (!mounted.current) return;
+      setCharacter(c);
       setError(null);
     } catch (e) {
+      if (!mounted.current) return;
       setError(e instanceof Error ? e.message : "failed to load character");
     } finally {
-      setLoading(false);
+      if (mounted.current) setLoading(false);
     }
-  }, [characterId]);
+  }, [characterId, mounted]);
 
   useEffect(() => { void refresh(); }, [refresh]);
 

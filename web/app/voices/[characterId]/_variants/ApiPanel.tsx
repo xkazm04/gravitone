@@ -6,6 +6,7 @@
 
 import { useMemo, useState } from "react";
 import { DEFAULT_BASE_URL, KEY_PLACEHOLDER } from "@/lib/switchkit";
+import { useCopyFeedback } from "@/lib/useCopyFeedback";
 
 type Recipe = { id: string; label: string; hint: string; code: string };
 
@@ -54,16 +55,10 @@ function buildRecipes(characterId: string, filled: string[]): Recipe[] {
 export default function ApiPanel({ characterId, filledEmotions }: { characterId: string; filledEmotions: string[] }) {
   const recipes = useMemo(() => buildRecipes(characterId, filledEmotions), [characterId, filledEmotions]);
   const [active, setActive] = useState(recipes[0].id);
-  const [copied, setCopied] = useState(false);
+  const { copy: copyText, copied, failed, reset: resetCopied } = useCopyFeedback();
   const recipe = recipes.find((r) => r.id === active) ?? recipes[0];
 
-  const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(recipe.code);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch { /* selectable anyway */ }
-  };
+  const copy = () => copyText(recipe.code);
 
   return (
     <div className="glass-panel mt-8 rounded-2xl p-5">
@@ -74,7 +69,7 @@ export default function ApiPanel({ characterId, filledEmotions }: { characterId:
         <div className="flex gap-1.5">
           {recipes.map((r) => (
             <button
-              key={r.id} onClick={() => { setActive(r.id); setCopied(false); }}
+              key={r.id} onClick={() => { setActive(r.id); resetCopied(); }}
               className={`font-jetbrains cursor-pointer rounded-full border px-2.5 py-1 text-[11px] transition ${
                 r.id === active ? "border-cyan-400/40 bg-cyan-400/10 text-cyan-200" : "border-white/12 text-white/60 hover:text-white"
               }`}
@@ -90,7 +85,7 @@ export default function ApiPanel({ characterId, filledEmotions }: { characterId:
       </pre>
       <button onClick={copy}
         className="font-jetbrains mt-3 cursor-pointer rounded-lg border border-white/15 px-3 py-1.5 text-[12px] text-white/85 transition hover:bg-white/5">
-        {copied ? "✓ copied" : "copy"}
+        {failed ? "copy blocked" : copied ? "✓ copied" : "copy"}
       </button>
     </div>
   );

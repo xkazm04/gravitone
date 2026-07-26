@@ -6,31 +6,14 @@
 // estimator would compare a lifetime total against one month's subscription.
 // Renders nothing until the backend is reachable and has served audio.
 
-import { useEffect, useState } from "react";
 import { elCostForLifetimeAudioMinutes, fmtUsd } from "@/lib/switchkit";
-
-type Health = { status?: string; metrics?: { audio_seconds_total?: number } };
+import { useHealthPoll } from "@/lib/useHealthPoll";
 
 export default function SavingsTicker() {
-  const [seconds, setSeconds] = useState<number | null>(null);
-
-  useEffect(() => {
-    let alive = true;
-    const poll = async () => {
-      try {
-        const r = await fetch("/api/health", { cache: "no-store" });
-        if (!r.ok) return;
-        const h = (await r.json()) as Health;
-        const s = h.metrics?.audio_seconds_total;
-        if (alive && typeof s === "number") setSeconds(s);
-      } catch {
-        /* backend away — ticker stays hidden */
-      }
-    };
-    void poll();
-    const id = setInterval(poll, 30_000);
-    return () => { alive = false; clearInterval(id); };
-  }, []);
+  // Shared poller — BenchmarksView reads the same endpoint on the same cadence.
+  const { health } = useHealthPoll();
+  const raw = health?.metrics?.audio_seconds_total;
+  const seconds = typeof raw === "number" ? raw : null;
 
   if (seconds === null || seconds < 1) return null;
 

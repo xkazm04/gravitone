@@ -10,6 +10,7 @@ import { useMemo, useState } from "react";
 import Link from "next/link";
 import { useAuth } from "@/lib/useAuth";
 import { getStoredKey } from "@/lib/mintKey";
+import { useCopyFeedback } from "@/lib/useCopyFeedback";
 import { DEFAULT_BASE_URL, KEY_PLACEHOLDER, SNIPPET_LANGS, type SnippetLang } from "@/lib/switchkit";
 import type { Take } from "./shared";
 
@@ -80,18 +81,12 @@ function buildSnippet(lang: SnippetLang, t: Take, apiKey: string): string {
 export default function TakeCode({ take }: { take: Take }) {
   const { user } = useAuth();
   const [lang, setLang] = useState<SnippetLang>("curl");
-  const [copied, setCopied] = useState(false);
+  const { copy: copyText, copied, failed } = useCopyFeedback();
 
   const storedKey = useMemo(() => (user ? getStoredKey(user.uid) : null), [user]);
   const snippet = buildSnippet(lang, take, storedKey?.secret ?? KEY_PLACEHOLDER);
 
-  const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(snippet);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch { /* selectable anyway */ }
-  };
+  const copy = () => copyText(snippet);
 
   return (
     <div className="mt-3 rounded-xl border border-white/10 bg-black/30 p-3">
@@ -118,7 +113,7 @@ export default function TakeCode({ take }: { take: Take }) {
       <div className="mt-2 flex flex-wrap items-center gap-3">
         <button onClick={copy}
           className="font-jetbrains cursor-pointer rounded-lg border border-white/15 px-3 py-1.5 text-[11px] text-white/85 transition hover:bg-white/5">
-          {copied ? "✓ copied" : storedKey ? "copy with my key" : "copy snippet"}
+          {failed ? "copy blocked — select it" : copied ? "✓ copied" : storedKey ? "copy with my key" : "copy snippet"}
         </button>
         {!storedKey && (
           <Link href="/profile" className="font-jetbrains text-[11px] text-cyan-300/80 underline-offset-2 transition hover:text-cyan-200 hover:underline">

@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useCopyFeedback } from "@/lib/useCopyFeedback";
 import Link from "next/link";
 import AppFrame from "@/components/ui/AppFrame";
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
@@ -20,7 +21,11 @@ export default function ProfilePage() {
   const [minting, setMinting] = useState(false);
   const [mintErr, setMintErr] = useState<string | null>(null);
   const [lang, setLang] = useState<SnippetLang>("curl");
-  const [copied, setCopied] = useState<"key" | "snippet" | null>(null);
+  const { copy, copied } = useCopyFeedback<"key" | "snippet">();
+  // Cleared on unmount so a save that lands as the user navigates away doesn't
+  // setState on a dead component.
+  const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (savedTimer.current) clearTimeout(savedTimer.current); }, []);
 
   useEffect(() => { if (profile?.displayName) setName(profile.displayName); }, [profile?.displayName]);
   useEffect(() => { if (user) setStoredKey(getStoredKey(user.uid)); }, [user]);
@@ -37,13 +42,7 @@ export default function ProfilePage() {
     setMinting(false);
   }
 
-  async function copyText(what: "key" | "snippet", text: string) {
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopied(what);
-      setTimeout(() => setCopied(null), 1500);
-    } catch { /* selectable anyway */ }
-  }
+  const copyText = (what: "key" | "snippet", text: string) => copy(text, what);
 
   async function save() {
     setSaving(true); setSaved(false); setSaveErr(null);
@@ -53,7 +52,7 @@ export default function ProfilePage() {
       // "Saving…" forever and the edit is silently lost.
       await updateProfile({ displayName: name.trim() || null });
       setSaved(true);
-      setTimeout(() => setSaved(false), 1500);
+      savedTimer.current = setTimeout(() => setSaved(false), 1500);
     } catch (e) {
       setSaveErr(e instanceof Error ? e.message : "couldn't save — try again");
     } finally {

@@ -9,6 +9,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import EmotionArt from "@/components/ui/EmotionArt";
 import { emotionMeta } from "@/lib/emotions";
+import { useCopyFeedback } from "@/lib/useCopyFeedback";
 import { computePeaks } from "@/app/playground/_variants/engine";
 
 // The take payload shape lives with its loader in lib/takes; re-exported here
@@ -21,7 +22,7 @@ export default function TakeCard({ take, compact = false }: { take: SharedTake; 
   const [peaks, setPeaks] = useState<number[]>([]);
   const [playing, setPlaying] = useState(false);
   const [progress, setProgress] = useState(0); // 0..1
-  const [copied, setCopied] = useState<"link" | "embed" | null>(null);
+  const { copy: copyText, copied, failed: copyFailed } = useCopyFeedback<"link" | "embed">();
   // Audio fetch/decode failure — previously swallowed, leaving a play button
   // that rendered enabled and did nothing, forever.
   const [audioErr, setAudioErr] = useState<string | null>(null);
@@ -98,12 +99,8 @@ export default function TakeCard({ take, compact = false }: { take: SharedTake; 
     const link = `${window.location.origin}/t/${take.id}`;
     const text = what === "link" ? link
       : `<iframe src="${link}/embed" width="480" height="220" frameborder="0" title="Gravitone voice card"></iframe>`;
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopied(what);
-      setTimeout(() => setCopied(null), 1500);
-    } catch { /* ignore */ }
-  }, [take.id]);
+    await copyText(text, what);
+  }, [take.id, copyText]);
 
   return (
     <div
@@ -183,11 +180,11 @@ export default function TakeCard({ take, compact = false }: { take: SharedTake; 
           <div className="flex gap-2">
             <button onClick={() => void copy("link")}
               className="font-jetbrains cursor-pointer rounded-lg border border-white/15 px-3 py-1.5 text-[11px] text-white/85 transition hover:bg-white/5">
-              {copied === "link" ? "✓ copied" : "copy link"}
+              {copyFailed === "link" ? "copy blocked" : copied === "link" ? "✓ copied" : "copy link"}
             </button>
             <button onClick={() => void copy("embed")}
               className="font-jetbrains cursor-pointer rounded-lg border border-white/15 px-3 py-1.5 text-[11px] text-white/85 transition hover:bg-white/5">
-              {copied === "embed" ? "✓ copied" : "embed"}
+              {copyFailed === "embed" ? "copy blocked" : copied === "embed" ? "✓ copied" : "embed"}
             </button>
           </div>
         )}

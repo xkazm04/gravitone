@@ -6,7 +6,7 @@ import Link from "next/link";
 import AppFrame from "@/components/ui/AppFrame";
 import { Button, Eyebrow } from "@/components/ui/Primitives";
 import EmotionArt from "@/components/ui/EmotionArt";
-import { readDetail } from "@/lib/apiFetch";
+import { apiJson, readDetail } from "@/lib/apiFetch";
 import { EMOTION_IDS, emotionMeta } from "@/lib/emotions";
 import { useAuth } from "@/lib/useAuth";
 import { recordVoiceOwnership } from "@/lib/voiceVault";
@@ -44,12 +44,19 @@ export default function NewCharacterPage() {
   // Cloneable characters change rarely; fetch on mount — plus once more when a
   // commit completes, so "scan another" offers the just-created character by
   // name in the extend dropdown instead of a stale list.
+  const atUpload = phase === "upload";
+  const atComplete = phase === "complete";
   useEffect(() => {
-    if (phase !== "upload" && phase !== "complete") return;
-    fetch("/api/characters", { cache: "no-store" }).then((r) => (r.ok ? r.json() : []))
-      .then((cs: (Character & { category: string })[]) => setCharacters(cs.filter((c) => c.category === "cloned")))
-      .catch(() => {});
-  }, [phase === "complete"]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (!atUpload && !atComplete) return;
+    let alive = true;
+    void apiJson<(Character & { category: string })[]>(
+      "/api/characters", { cache: "no-store" }, "could not load characters")
+      .then((cs) => { if (alive) setCharacters(cs.filter((c) => c.category === "cloned")); })
+      // The extend dropdown is optional here — the create flow still works
+      // without it, so a failure degrades quietly rather than blocking upload.
+      .catch(() => { if (alive) setCharacters([]); });
+    return () => { alive = false; };
+  }, [atUpload, atComplete]);
 
   // ONE poller for both the analyze leg and the commit leg.
   const [pollStalled, setPollStalled] = useState(false);

@@ -124,11 +124,13 @@ export default function HeroMicDemo() {
       rec.start();
       setSeconds(0);
       setPhase("recording");
+      let elapsed = 0;
       timerRef.current = setInterval(() => {
-        setSeconds((s) => {
-          if (s + 1 >= MAX_SECONDS) recRef.current?.stop();
-          return s + 1;
-        });
+        // Auto-stop outside the state updater — updaters must be pure, and
+        // StrictMode double-invokes them (same fix as GuidedRecorder).
+        elapsed += 1;
+        setSeconds(elapsed);
+        if (elapsed >= MAX_SECONDS) recRef.current?.stop();
       }, 1000);
     } catch {
       fail("microphone unavailable — allow mic access and try again");

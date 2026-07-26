@@ -9,6 +9,8 @@ import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { motion } from "framer-motion";
 import { Wordmark } from "@/components/ui/Primitives";
+import { useCopyFeedback } from "@/lib/useCopyFeedback";
+import { useHealthPoll } from "@/lib/useHealthPoll";
 import {
   BENCHMARKS,
   boxCapacityAudPerS,
@@ -65,33 +67,15 @@ export default function BenchmarksView() {
   const maxC = rows[rows.length - 1].usdPerAudioHour;
   const cheapestEl = rows.filter((r) => !r.isGravitone)[0];
 
-  // live proof strip
-  const [live, setLive] = useState<Health | null>(null);
-  useEffect(() => {
-    let alive = true;
-    const poll = async () => {
-      try {
-        const r = await fetch("/api/health", { cache: "no-store" });
-        if (r.ok && alive) setLive((await r.json()) as Health);
-      } catch { /* backend away */ }
-    };
-    void poll();
-    const id = setInterval(poll, 30_000);
-    return () => { alive = false; clearInterval(id); };
-  }, []);
+  // live proof strip — shared poller (SavingsTicker polls the same endpoint)
+  const { health: live, stale: liveStale } = useHealthPoll();
 
   // capacity planner
   const [streams, setStreams] = useState(4);
   const [dailyMin, setDailyMin] = useState(600);
   const plan = useMemo(() => planCapacity(streams, dailyMin), [streams, dailyMin]);
-  const [copied, setCopied] = useState(false);
-  const copyEnv = async () => {
-    try {
-      await navigator.clipboard.writeText(planEnvBlock(plan));
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch { /* selectable anyway */ }
-  };
+  const { copy: copyText, copied, failed } = useCopyFeedback();
+  const copyEnv = () => copyText(planEnvBlock(plan));
 
   return (
     <div className="font-hanken relative min-h-screen overflow-hidden bg-[#080a10] text-slate-200 grain">
@@ -224,7 +208,7 @@ export default function BenchmarksView() {
               </pre>
               <button onClick={copyEnv}
                 className="font-jetbrains mt-3 cursor-pointer rounded-lg border border-white/15 px-3 py-1.5 text-[12px] text-white/85 transition hover:bg-white/5">
-                {copied ? "✓ copied" : "copy env config"}
+                {failed ? "copy blocked — select it" : copied ? "✓ copied" : "copy env config"}
               </button>
             </div>
           </div>

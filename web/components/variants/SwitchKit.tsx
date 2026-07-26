@@ -7,6 +7,7 @@
 import { useMemo, useState } from "react";
 import Link from "next/link";
 import { motion } from "framer-motion";
+import { useCopyFeedback } from "@/lib/useCopyFeedback";
 import {
   ARM_BOXES,
   breakEvenChars,
@@ -29,7 +30,7 @@ const sliderToChars = (t: number) => Math.round(10 ** (LOG_MIN + (LOG_MAX - LOG_
 export default function SwitchKit() {
   const [t, setT] = useState(0.45); // ≈ Creator-tier volume by default
   const [lang, setLang] = useState<SnippetLang>("curl");
-  const [copied, setCopied] = useState(false);
+  const { copy: copyText, copied, failed } = useCopyFeedback();
 
   const chars = sliderToChars(t);
   const breakEven = useMemo(() => breakEvenChars(), []);
@@ -39,15 +40,7 @@ export default function SwitchKit() {
   }, [chars]);
 
   const snippet = migrationSnippet(lang);
-  const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(snippet);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch {
-      /* clipboard unavailable — the code is still selectable */
-    }
-  };
+  const copy = () => copyText(snippet);
 
   return (
     <section id="switch" className="border-t border-white/5 py-14">
@@ -147,7 +140,7 @@ export default function SwitchKit() {
                 onClick={copy}
                 className="font-jetbrains cursor-pointer rounded-lg border border-white/15 px-3 py-1.5 text-[12px] text-white/85 transition hover:bg-white/5"
               >
-                {copied ? "✓ copied" : "copy snippet"}
+                {failed ? "copy blocked — select it" : copied ? "✓ copied" : "copy snippet"}
               </button>
             </div>
           </div>

@@ -8,6 +8,7 @@
 //   * Missing emotions fall back to baseline; the take shows what actually ran.
 
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
+import { apiJson } from "@/lib/apiFetch";
 import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { AnimatePresence, motion } from "framer-motion";
@@ -98,20 +99,34 @@ export default function PlaygroundConsole() {
 
   const [preferred, setPreferred] = useState<{ character_id: string | null; picks: number }>({ character_id: null, picks: 0 });
 
+  const [rosterErr, setRosterErr] = useState<string | null>(null);
   useEffect(() => {
     // Default to the character clients have actually approved most often —
     // the review loop's pick data feeding back into the studio.
-    Promise.all([
-      fetch("/api/characters", { cache: "no-store" }).then((r) => (r.ok ? r.json() : [])),
-      fetch("/api/reviews/preferred", { cache: "no-store" }).then((r) => (r.ok ? r.json() : { character_id: null, picks: 0 })),
-    ])
-      .then(([cs, pref]: [Character[], { character_id: string | null; picks: number }]) => {
+    let alive = true;  // the sibling effect below always had this; this one didn't
+    (async () => {
+      try {
+        // Through apiJson so a 500 surfaces as a message instead of being
+        // erased into an empty character rail.
+        const cs = await apiJson<Character[]>("/api/characters",
+          { cache: "no-store" }, "could not load characters");
+        // The recommendation is decoration: if it fails, still show the rail.
+        const pref = await apiJson<{ character_id: string | null; picks: number }>(
+          "/api/reviews/preferred", { cache: "no-store" }, "no recommendation")
+          .catch(() => ({ character_id: null, picks: 0 }));
+        if (!alive) return;
         setCharacters(cs);
         setPreferred(pref);
+        setRosterErr(null);
         const winner = pref.character_id && cs.find((c) => c.character_id === pref.character_id);
         setCharId((winner || cs[0])?.character_id ?? "");
-      })
-      .catch(() => setCharacters([]));
+      } catch (e) {
+        if (!alive) return;
+        setCharacters([]);
+        setRosterErr(e instanceof Error ? e.message : "could not load characters");
+      }
+    })();
+    return () => { alive = false; };
   }, []);
 
   // Restore the most recent session takes from IndexedDB on mount so a refresh
@@ -416,6 +431,8 @@ export default function PlaygroundConsole() {
         <span className="font-jetbrains text-cyan-300">[emotion]…[/emotion]</span> to switch its{" "}
         <span className="text-white">Voices</span> mid-sentence. Missing emotions fall back to baseline.
       </p>
+
+      {rosterErr && <ErrorBanner>{rosterErr}</ErrorBanner>}
 
       {usingFallback && (
         <p className="font-jetbrains mt-4 rounded-lg border border-amber-400/25 bg-amber-400/5 px-4 py-2 text-[11px] text-amber-200/90">

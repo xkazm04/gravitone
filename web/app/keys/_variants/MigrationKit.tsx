@@ -7,6 +7,7 @@
 
 import { useEffect, useState } from "react";
 import { migrationSnippet, SNIPPET_LANGS, type SnippetLang } from "@/lib/switchkit";
+import { useCopyFeedback } from "@/lib/useCopyFeedback";
 
 type CheckState =
   | { phase: "idle" }
@@ -16,25 +17,17 @@ type CheckState =
 
 export default function MigrationKit({ apiKey }: { apiKey: string }) {
   const [lang, setLang] = useState<SnippetLang>("curl");
-  const [copied, setCopied] = useState(false);
+  const { copy: copyText, copied, failed, reset: resetCopied } = useCopyFeedback();
   const [check, setCheck] = useState<CheckState>({ phase: "idle" });
 
   useEffect(() => {
     setCheck({ phase: "idle" });
-    setCopied(false);
-  }, [apiKey]);
+    resetCopied();
+  }, [apiKey, resetCopied]);
 
   const snippet = migrationSnippet(lang, { apiKey });
 
-  const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(snippet);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch {
-      /* selectable anyway */
-    }
-  };
+  const copy = () => copyText(snippet);
 
   // Replays the same request shape an ElevenLabs client sends (via the
   // studio proxy, so it works from the browser without CORS).
@@ -90,7 +83,7 @@ export default function MigrationKit({ apiKey }: { apiKey: string }) {
           onClick={copy}
           className="font-jetbrains cursor-pointer rounded-lg border border-white/15 px-3 py-1.5 text-[11px] text-white/85 transition hover:bg-white/5"
         >
-          {copied ? "✓ copied" : "copy snippet with key"}
+          {failed ? "copy blocked — select it" : copied ? "✓ copied" : "copy snippet with key"}
         </button>
         <button
           onClick={runCheck} disabled={check.phase === "running"}

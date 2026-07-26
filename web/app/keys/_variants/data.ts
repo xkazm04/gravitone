@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { apiJson, throwDetail } from "@/lib/apiFetch";
+import { useMounted } from "@/lib/useMounted";
 
 export type ApiKey = {
   id: string;
@@ -38,18 +39,22 @@ export function useKeys() {
   const [keys, setKeys] = useState<ApiKey[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const mounted = useMounted();
 
   const refresh = useCallback(async () => {
     try {
-      setKeys(await apiJson<ApiKey[]>("/api/keys", { cache: "no-store" },
-        "failed to load keys"));
+      const list = await apiJson<ApiKey[]>("/api/keys", { cache: "no-store" },
+        "failed to load keys");
+      if (!mounted.current) return;
+      setKeys(list);
       setError(null);
     } catch (e) {
+      if (!mounted.current) return;
       setError(e instanceof Error ? e.message : "failed to load keys");
     } finally {
-      setLoading(false);
+      if (mounted.current) setLoading(false);
     }
-  }, []);
+  }, [mounted]);
 
   useEffect(() => { void refresh(); }, [refresh]);
 
