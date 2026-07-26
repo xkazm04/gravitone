@@ -23,6 +23,10 @@ export type Take = {
   characterId: string;
   characterName: string;
   mode: "gravitone" | "browser";
+  // Why the browser voice was used (browser takes only) — "unreachable",
+  // "draining" or "failed". Optional: takes restored from before this field
+  // existed have none.
+  fallbackReason?: "unreachable" | "draining" | "failed";
   url?: string;
   peaks: number[];
   seconds: number;

@@ -60,6 +60,18 @@ export async function uploadTake(t: Take): Promise<string> {
   return j.take_id as string;
 }
 
+/**
+ * WHY the browser voice was used. The fallback itself is deliberate (the
+ * playground should always produce something), but the three causes are not
+ * the same event and the UI must not report them identically:
+ *   unreachable — the request never completed (network / proxy down)
+ *   draining    — the backend is shutting down; it will be back
+ *   failed      — the engine answered with an error (5xx): it IS reachable,
+ *                 synthesis is what broke
+ * Saying "backend unreachable" for a 500 is the lie this type exists to stop.
+ */
+export type FallbackReason = "unreachable" | "draining" | "failed";
+
 export type SpeakResult = {
   mode: "gravitone" | "browser";
   url?: string;
@@ -75,6 +87,8 @@ export type SpeakResult = {
   // (e.g. similarity_boost, style) — surfaced so the no-op is never silent.
   ignoredSettings: string[];
   segments: Segment[];
+  // Set only when mode === "browser".
+  fallbackReason?: FallbackReason;
 };
 
 /**
@@ -82,6 +96,24 @@ export type SpeakResult = {
  * to drop to the browser voice — the engine is up and will accept a retry — so
  * it is thrown distinctly instead of collapsing into the fallback path.
  */
+/** True for a cancel triggered through an AbortSignal (fetch rejects with a
+ *  DOMException named "AbortError"; jsdom/node shapes vary, so check both). */
+export function isAbort(e: unknown): boolean {
+  return e instanceof DOMException
+    ? e.name === "AbortError"
+    : (e as { name?: string } | null)?.name === "AbortError";
+}
+
+/** The browser-speech take, tagged with WHY we fell back to it. */
+function browserFallback(plain: string, reason: FallbackReason): SpeakResult {
+  const seconds = Math.max(1.5, Math.round(plain.length * 0.055 * 10) / 10);
+  return {
+    mode: "browser", peaks: waveHeights(plain.length * 31 + 7, 56),
+    seconds, kb: 0, rtf: 0, synthSeconds: 0, queueSeconds: 0,
+    ignoredSettings: [], segments: [], fallbackReason: reason,
+  };
+}
+
 export class EngineBusyError extends Error {
   readonly retryAfterSec: number;
   constructor(retryAfterSec: number) {
@@ -170,9 +202,11 @@ async function gravitoneResult(res: Response, segments: Segment[], seed: number)
  * back to baseline; the per-segment report says what actually happened.
  * Falls back to browser speech (tags stripped) when the backend is unreachable.
  */
-export async function speak(text: string, characterId: string, expr: Expression): Promise<SpeakResult> {
+export async function speak(text: string, characterId: string, expr: Expression,
+                            signal?: AbortSignal): Promise<SpeakResult> {
   const trimmed = text.trim();
   let res: Response | null = null;
+  let reason: FallbackReason = "unreachable";
   try {
     res = await fetch("/api/speak", {
       method: "POST",
@@ -182,8 +216,12 @@ export async function speak(text: string, characterId: string, expr: Expression)
         text: trimmed,
         voice_settings: { temperature: expr.temperature, stability: expr.stability, quality: expr.quality },
       }),
+      signal,
     });
-  } catch {
+  } catch (e) {
+    // A user-initiated cancel is NOT a backend failure — propagate it so the
+    // caller can just drop the request instead of fabricating a browser take.
+    if (isAbort(e)) throw e;
     // Network / proxy-unreachable — the engine is genuinely out of reach, so
     // the browser voice is the honest fallback (handled below).
     res = null;
@@ -198,16 +236,12 @@ export async function speak(text: string, characterId: string, expr: Expression)
     if (res.ok) {
       return gravitoneResult(res, decodeSegments(res.headers.get("X-Segments")), trimmed.length * 31 + 7);
     }
-    // Any other upstream failure (502/503/500) keeps the browser fallback.
+    // Still falls back to the browser voice, but record what actually
+    // happened: a reachable engine that errored is not an unreachable one.
+    reason = res.status === 503 ? "draining" : "failed";
   }
 
-  const plain = stripTags(trimmed);
-  const seconds = Math.max(1.5, Math.round(plain.length * 0.055 * 10) / 10);
-  return {
-    mode: "browser", peaks: waveHeights(plain.length * 31 + 7, 56),
-    seconds, kb: 0, rtf: 0, synthSeconds: 0, queueSeconds: 0,
-    ignoredSettings: [], segments: [],
-  };
+  return browserFallback(stripTags(trimmed), reason);
 }
 
 /**
@@ -217,7 +251,8 @@ export async function speak(text: string, characterId: string, expr: Expression)
  * carry who spoke what. Falls back to browser speech (whole script, tags
  * stripped) when the backend is unreachable; 429 backpressure throws distinctly.
  */
-export async function perform(lines: PerfLine[], expr: Expression): Promise<SpeakResult> {
+export async function perform(lines: PerfLine[], expr: Expression,
+                              signal?: AbortSignal): Promise<SpeakResult> {
   const body = {
     lines: lines.map((l) => ({
       character_id: l.character_id,
@@ -226,13 +261,16 @@ export async function perform(lines: PerfLine[], expr: Expression): Promise<Spea
     })),
   };
   let res: Response | null = null;
+  let reason: FallbackReason = "unreachable";
   try {
     res = await fetch("/api/performance", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      signal,
     });
-  } catch {
+  } catch (e) {
+    if (isAbort(e)) throw e;  // user cancelled — not a backend failure
     res = null;
   }
 
@@ -244,13 +282,8 @@ export async function perform(lines: PerfLine[], expr: Expression): Promise<Spea
       const seed = lines.reduce((n, l) => n + l.text.length, 0) * 31 + 7;
       return gravitoneResult(res, decodePerformanceReport(res.headers.get("X-Performance-Report")), seed);
     }
+    reason = res.status === 503 ? "draining" : "failed";
   }
 
-  const plain = stripTags(lines.map((l) => l.text).join(" "));
-  const seconds = Math.max(1.5, Math.round(plain.length * 0.055 * 10) / 10);
-  return {
-    mode: "browser", peaks: waveHeights(plain.length * 31 + 7, 56),
-    seconds, kb: 0, rtf: 0, synthSeconds: 0, queueSeconds: 0,
-    ignoredSettings: [], segments: [],
-  };
+  return browserFallback(stripTags(lines.map((l) => l.text).join(" ")), reason);
 }

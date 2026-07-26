@@ -61,6 +61,17 @@ function Slider({ label, hint, value, min, max, step, onChange, format }: {
 // One directed line in the Script composer (stable id for keys + reordering).
 type ScriptLine = { id: string; characterId: string; text: string };
 
+// What to tell the user when a take came from the browser voice. Each string
+// names the ACTUAL cause; "unreachable" is no longer the catch-all.
+const FALLBACK_COPY: Record<"unreachable" | "draining" | "failed", string> = {
+  unreachable:
+    "Gravitone backend unreachable — speaking with your browser voice (metatags ignored).",
+  draining:
+    "Gravitone is restarting — spoke with your browser voice (metatags ignored). Try again in a moment.",
+  failed:
+    "Gravitone is reachable but synthesis failed — spoke with your browser voice (metatags ignored).",
+};
+
 export default function PlaygroundConsole() {
   const [text, setText] = useState(DEFAULT_TEXT);
   const [characters, setCharacters] = useState<Character[]>([]);
@@ -179,7 +190,11 @@ export default function PlaygroundConsole() {
   );
   const scriptChars = scriptLines.reduce((n, l) => n + stripTags(l.text).length, 0);
   const canGenerate = mode === "script" ? scriptLines.length > 0 : (!!plain && !!character);
-  const usingFallback = takes.some((t) => t.mode === "browser");
+  // The most recent browser take decides the notice: a 500 and an unplugged
+  // backend both drop to the browser voice, but they are different events and
+  // the banner used to report every one of them as "backend unreachable".
+  const lastFallback = takes.find((t) => t.mode === "browser");
+  const fallbackNotice = lastFallback && FALLBACK_COPY[lastFallback.fallbackReason ?? "unreachable"];
 
   function insertEmotion(emotion: string) {
     if (mode === "script") {
@@ -369,7 +384,7 @@ export default function PlaygroundConsole() {
       const take: Take = {
         id: `take-${Date.now()}-${seq.current}`, text: transcript,
         characterId: lines[0].character_id, characterName: label,
-        mode: r.mode, url: r.url, peaks: r.peaks, seconds: r.seconds, kb: r.kb, rtf: r.rtf,
+        mode: r.mode, fallbackReason: r.fallbackReason, url: r.url, peaks: r.peaks, seconds: r.seconds, kb: r.kb, rtf: r.rtf,
         synthSeconds: r.synthSeconds, queueSeconds: r.queueSeconds,
         ignoredSettings: r.ignoredSettings, segments: r.segments, expr: { ...expr },
         createdAt: Date.now(), lines,
@@ -395,7 +410,7 @@ export default function PlaygroundConsole() {
       const take: Take = {
         id: `take-${Date.now()}-${seq.current}`, text: text.trim(),
         characterId: character.character_id, characterName: character.name,
-        mode: r.mode, url: r.url, peaks: r.peaks, seconds: r.seconds, kb: r.kb, rtf: r.rtf,
+        mode: r.mode, fallbackReason: r.fallbackReason, url: r.url, peaks: r.peaks, seconds: r.seconds, kb: r.kb, rtf: r.rtf,
         synthSeconds: r.synthSeconds, queueSeconds: r.queueSeconds,
         ignoredSettings: r.ignoredSettings, segments: r.segments, expr: { ...expr },
         createdAt: Date.now(),
@@ -434,9 +449,9 @@ export default function PlaygroundConsole() {
 
       {rosterErr && <ErrorBanner>{rosterErr}</ErrorBanner>}
 
-      {usingFallback && (
+      {fallbackNotice && (
         <p className="font-jetbrains mt-4 rounded-lg border border-amber-400/25 bg-amber-400/5 px-4 py-2 text-[11px] text-amber-200/90">
-          Gravitone backend unreachable — speaking with your browser voice (metatags ignored).
+          {fallbackNotice}
         </p>
       )}
 
