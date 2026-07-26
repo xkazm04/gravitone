@@ -17,7 +17,7 @@ import { EASE } from "@/components/ui/tokens";
 import { EMOTION_IDS, emotionMeta, wrapWithTag } from "@/lib/emotions";
 import EmotionArt from "@/components/ui/EmotionArt";
 import { DEFAULT_EXPRESSION, DEFAULT_TEXT, stripTags, type Expression, type PerfLine, type Take } from "./shared";
-import { speak, perform, uploadTake, EngineBusyError } from "./engine";
+import { speak, perform, uploadTake, EngineBusyError, isAbort } from "./engine";
 import { putTake, getRecentTakes, deleteTake } from "@/lib/takeStore";
 import { useAudioPlayer } from "./useAudioPlayer";
 import EmotionPicker from "./EmotionPicker";
@@ -105,6 +105,8 @@ export default function PlaygroundConsole() {
   const [reviewErr, setReviewErr] = useState<string | null>(null);
   const seq = useRef(0);
   const areaRef = useRef<HTMLTextAreaElement>(null);
+  // In-flight generation, so it can be cancelled (or aborted on unmount).
+  const runRef = useRef<AbortController | null>(null);
 
   const { playingId, paused, progress, toggle, stop } = useAudioPlayer();
 
@@ -363,6 +365,27 @@ export default function PlaygroundConsole() {
     void deleteTake(id);
   }
 
+  /** Start a cancellable run, replacing any previous controller.
+   *  CPU synthesis of a long script can take minutes on a loaded box; without
+   *  a cancel the user can only wait or reload (HeroMicDemo added an abort for
+   *  this exact backend — the playground, where people generate repeatedly,
+   *  had none). */
+  function newRun(): AbortController {
+    const ctrl = new AbortController();
+    runRef.current = ctrl;
+    return ctrl;
+  }
+
+  /** Abort the in-flight generation. */
+  function cancelGenerate() {
+    runRef.current?.abort();
+    runRef.current = null;
+  }
+
+  // Abort on unmount too: navigating away should not leave a synthesis
+  // request holding a worker slot for a page nobody is looking at.
+  useEffect(() => () => runRef.current?.abort(), []);
+
   /** Dispatch to the active composer mode; wired to ⌘↵ and the retry button. */
   function generate() {
     if (mode === "script") void generateScript();
@@ -375,8 +398,9 @@ export default function PlaygroundConsole() {
     setBusyNotice(null);
     setToast(null);
     const lines: PerfLine[] = scriptLines.map((l) => ({ character_id: l.characterId, text: l.text.trim() }));
+    const ctrl = newRun();
     try {
-      const r = await perform(lines, expr);
+      const r = await perform(lines, expr, ctrl.signal);
       seq.current += 1;
       const distinct = [...new Set(lines.map((l) => l.character_id))];
       const label = distinct.length === 1 ? charName(distinct[0]) : `Ensemble · ${distinct.length} voices`;
@@ -392,7 +416,8 @@ export default function PlaygroundConsole() {
       setTakes((t) => [take, ...t]);
       void persistTake(take);
     } catch (e) {
-      if (e instanceof EngineBusyError) setBusyNotice({ retryAfterSec: e.retryAfterSec });
+      if (isAbort(e)) { /* user cancelled — no take, no error */ }
+      else if (e instanceof EngineBusyError) setBusyNotice({ retryAfterSec: e.retryAfterSec });
       else setToast("Generation failed — the backend returned an error. Please try again.");
     } finally { setBusy(false); }
   }
@@ -402,8 +427,9 @@ export default function PlaygroundConsole() {
     setBusy(true);
     setBusyNotice(null);
     setToast(null);
+    const ctrl = newRun();
     try {
-      const r = await speak(text, character.character_id, expr);
+      const r = await speak(text, character.character_id, expr, ctrl.signal);
       seq.current += 1;
       // Timestamped id so restored takes (which keep their stored ids) never
       // collide with freshly generated ones.
@@ -420,7 +446,9 @@ export default function PlaygroundConsole() {
     } catch (e) {
       // Backpressure keeps the engine reachable — offer a retry. Anything else
       // is a genuine failure that must be visible, not swallowed.
-      if (e instanceof EngineBusyError) {
+      if (isAbort(e)) {
+        // The user pressed Cancel: not a failure, so no toast and no take.
+      } else if (e instanceof EngineBusyError) {
         setBusyNotice({ retryAfterSec: e.retryAfterSec });
       } else {
         setToast("Generation failed — the backend returned an error. Please try again.");
@@ -606,7 +634,17 @@ export default function PlaygroundConsole() {
             <span className="font-jetbrains text-[11px] text-white/60">
               {mode === "script" ? "⌘↵ · one take from the whole script · 24kHz wav" : "⌘↵ to generate · exports 24kHz wav"}
             </span>
-            <Button onClick={generate} disabled={busy || !canGenerate}>{busy ? "Rendering…" : "Generate ▶"}</Button>
+            <div className="flex items-center gap-2">
+              {busy && (
+                <button
+                  onClick={cancelGenerate}
+                  className="font-jetbrains cursor-pointer rounded-lg border border-white/15 px-3 py-1.5 text-[11px] text-white/70 transition hover:border-rose-400/40 hover:text-rose-200"
+                >
+                  cancel
+                </button>
+              )}
+              <Button onClick={generate} disabled={busy || !canGenerate}>{busy ? "Rendering…" : "Generate ▶"}</Button>
+            </div>
           </div>
         </div>
 
