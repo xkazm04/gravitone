@@ -2,7 +2,7 @@
 // CORS issues and hides the endpoint. Set GRAVITONE_URL to point at a running
 // service (local :8080 by default, or your deployed Arm instance).
 import { NextRequest } from "next/server";
-import { backendFetch, readCappedText } from "@/lib/backend";
+import { backendFetch, jsonError, readCappedText } from "@/lib/backend";
 
 // playground voice-id → backend voice-id (cloned demo voice lives as step4)
 const VOICE_MAP: Record<string, string> = { mine: "step4" };
@@ -18,11 +18,11 @@ export async function POST(req: NextRequest) {
   try {
     body = JSON.parse(raw);
   } catch {
-    return new Response("bad request", { status: 400 });
+    return jsonError("bad request", 400);
   }
   const text = (body.text ?? "").trim();
   const voiceId = VOICE_MAP[body.voiceId ?? ""] ?? body.voiceId ?? "alba";
-  if (!text) return new Response("empty text", { status: 400 });
+  if (!text) return jsonError("empty text", 400);
 
   try {
     const upstream = await backendFetch(
@@ -35,7 +35,13 @@ export async function POST(req: NextRequest) {
       }
     );
     if (!upstream.ok) {
-      return new Response(`upstream ${upstream.status}`, { status: 502 });
+      // Status + body passthrough. The old `upstream ${status}` → 502 rewrite
+      // destroyed the backpressure signal: a 429 queue-full (with Retry-After)
+      // and a hard 500 both read as "broken" to every caller of this route.
+      const headers = new Headers({ "Content-Type": "application/json" });
+      const retryAfter = upstream.headers.get("Retry-After");
+      if (retryAfter) headers.set("Retry-After", retryAfter);
+      return new Response(await upstream.text(), { status: upstream.status, headers });
     }
     const buf = await upstream.arrayBuffer();
     return new Response(buf, {
@@ -48,6 +54,6 @@ export async function POST(req: NextRequest) {
     });
   } catch {
     // backend unreachable — signal the client to use its browser-speech fallback
-    return new Response("backend unreachable", { status: 503 });
+    return jsonError("backend unreachable", 503);
   }
 }

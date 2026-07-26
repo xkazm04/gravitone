@@ -1,22 +1,14 @@
 import { NextRequest } from "next/server";
-import { backendFetch } from "@/lib/backend";
+import { proxyJson } from "@/lib/backend";
 
 export async function GET(_req: NextRequest, ctx: { params: Promise<{ job: string }> }) {
+  // The poller — hit every 1-5s during a job. proxyJson gives it the read
+  // timeout it never had (a hung backend used to pin this handler open).
   const { job } = await ctx.params;
-  try {
-    const r = await backendFetch(`/v1/ingest/${encodeURIComponent(job)}`, { cache: "no-store" });
-    return new Response(await r.text(), { status: r.status, headers: { "Content-Type": "application/json" } });
-  } catch {
-    return new Response("backend unreachable", { status: 503 });
-  }
+  return proxyJson(`/v1/ingest/${encodeURIComponent(job)}`);
 }
 
 export async function DELETE(_req: NextRequest, ctx: { params: Promise<{ job: string }> }) {
   const { job } = await ctx.params;
-  try {
-    const r = await backendFetch(`/v1/ingest/${encodeURIComponent(job)}`, { method: "DELETE" });
-    return new Response(await r.text(), { status: r.status, headers: { "Content-Type": "application/json" } });
-  } catch {
-    return new Response("backend unreachable", { status: 503 });
-  }
+  return proxyJson(`/v1/ingest/${encodeURIComponent(job)}`, { method: "DELETE" });
 }

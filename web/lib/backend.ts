@@ -25,6 +25,10 @@ export const MAX_SYNTH_BODY_BYTES = 128 * 1024;
 // so they fail fast into the existing unreachable branch (503 / notFound).
 export const READ_TIMEOUT_MS = 15_000;
 
+// Mutations that are pure metadata ops (no synthesis, no upload) get this
+// generous default; slow paths (clone, scan, import) pass their own budget.
+export const WRITE_TIMEOUT_MS = 30_000;
+
 /** Consistent JSON error body for the proxy routes. The backend speaks JSON
  *  ({detail: …}); returning a plain-text error from a route breaks a
  *  JSON-parsing (ElevenLabs drop-in) client that reads every response as JSON. */
@@ -33,6 +37,41 @@ export function jsonError(detail: string, status: number): Response {
     status,
     headers: { "Content-Type": "application/json" },
   });
+}
+
+/** Proxy one JSON-speaking backend call: status passthrough, body passthrough,
+ *  Retry-After preserved (backpressure must survive the proxy), one JSON
+ *  unreachable shape, and a timeout on every call.
+ *
+ *  This is the missing half of the consolidation that produced proxyWavPost:
+ *  before it, 20 of 26 routes hand-rolled try/fetch/catch with five divergent
+ *  error dialects — plain-text 503s that broke JSON-parsing clients, upstream
+ *  statuses collapsed to generic 502s (destroying the 429 busy-vs-broken
+ *  signal), and 204/no-body handling that dropped backend error details. */
+export async function proxyJson(
+  path: string,
+  init: RequestInit & { timeoutMs?: number } = {},
+): Promise<Response> {
+  const { timeoutMs, ...rest } = init;
+  const method = (rest.method ?? "GET").toUpperCase();
+  const defaultMs = method === "GET" ? READ_TIMEOUT_MS : WRITE_TIMEOUT_MS;
+  let r: Response;
+  try {
+    r = await backendFetch(path, {
+      cache: "no-store",
+      ...rest,
+      signal: AbortSignal.timeout(timeoutMs ?? defaultMs),
+    });
+  } catch {
+    return jsonError("backend unreachable", 503);
+  }
+  if (r.status === 204 || r.status === 304) {
+    return new Response(null, { status: r.status });
+  }
+  const headers = new Headers({ "Content-Type": "application/json" });
+  const retryAfter = r.headers.get("Retry-After");
+  if (retryAfter) headers.set("Retry-After", retryAfter);
+  return new Response(await r.text(), { status: r.status, headers });
 }
 
 /** POST a JSON body to a synthesis endpoint and return its WAV.
@@ -60,11 +99,11 @@ export async function proxyWavPost(
       signal: AbortSignal.timeout(180_000),
     });
   } catch {
-    return new Response("backend unreachable", { status: 503 });
+    return jsonError("backend unreachable", 503);
   }
 
   if (!upstream.ok) {
-    const headers = new Headers();
+    const headers = new Headers({ "Content-Type": "application/json" });
     const retryAfter = upstream.headers.get("Retry-After");
     if (retryAfter) headers.set("Retry-After", retryAfter);
     return new Response(await upstream.text(), { status: upstream.status, headers });
@@ -89,7 +128,7 @@ export async function streamIngestAsset(upstreamPath: string): Promise<Response>
     const r = await backendFetch(upstreamPath, {
       signal: AbortSignal.timeout(READ_TIMEOUT_MS),
     });
-    if (!r.ok) return new Response("not found", { status: r.status });
+    if (!r.ok) return jsonError("not found", r.status);
     return new Response(r.body, {
       status: 200,
       headers: {
@@ -98,7 +137,7 @@ export async function streamIngestAsset(upstreamPath: string): Promise<Response>
       },
     });
   } catch {
-    return new Response("backend unreachable", { status: 503 });
+    return jsonError("backend unreachable", 503);
   }
 }
 
