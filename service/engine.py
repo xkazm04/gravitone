@@ -498,6 +498,15 @@ class TtsEngine:
     def ready(self) -> bool:
         return all(w.ready.is_set() for w in self._workers)
 
+    @property
+    def draining(self) -> bool:
+        """True once graceful shutdown began: submits are refused with 503.
+
+        Public so /health can fail readiness during the drain — a pod that
+        still reports ready keeps receiving traffic it will only reject.
+        """
+        return self._stopping
+
     def available_permits(self) -> int:
         """Admission permits currently free (max_inflight when fully idle).
 

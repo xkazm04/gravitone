@@ -65,6 +65,43 @@ with a named volume so cloned voices survive rebuilds.
   production-fleet follow-up in `docs/harness/`.
 - `docker volume gravitone-voices` — persisted voices; the service survives
   reboots via systemd `Restart=always`.
+- `docker volume gravitone-ingest` — ingest job workdirs + `state.json`.
+  Required for durability: jobs are rehydrated on restart, which only works
+  if the directory outlives the container.
+
+## Shutdown budget
+
+Three timeouts must stay ordered, longest last:
+
+| Setting | Default | Where |
+|---|---|---|
+| `TTS_DRAIN_TIMEOUT_S` | 20s | how long `engine.stop()` waits for in-flight generations |
+| `docker stop -t` / `terminationGracePeriodSeconds` | 30s / 45s | when the orchestrator SIGKILLs |
+| `TTS_REQUEST_TIMEOUT_S` | 120s | the caller's own ceiling (independent) |
+
+If the stop grace is shorter than the drain budget the process is killed
+mid-drain — in-flight generations die and a clone commit can be cut between
+registering a voice and recording it in the job state. `docker stop`'s 10s
+default is too short; `bootstrap.sh` passes `-t 30`.
+
+During the drain `/health` returns 503 `{"status": "draining"}` so a load
+balancer stops sending new work; liveness is a TCP probe, so failing readiness
+does not get the pod killed mid-drain.
+
+## Ingest is replica-affine
+
+Ingest jobs live in the creating process's memory (`JOBS` in
+`service/ingest_api.py`) and are only rehydrated from disk at startup. A
+multi-replica fleet behind `SO_REUSEPORT` (or a k8s Service) will round-robin
+the follow-up `GET /v1/ingest/{job}` to a replica that has never heard of the
+job and answer 404 `{"status": "expired"}`.
+
+So: run the **voice-creation flow against a single replica** (sticky sessions,
+a dedicated ingest pod, or `replicaCount: 1` while cloning). Synthesis
+(`/v1/text-to-speech`, `/v1/speak`, `/v1/performance`) has no such constraint —
+it is stateless and scales across replicas freely. The registry itself is safe
+either way: `mutate_meta` takes a cross-process file lock, so concurrent clones
+on different replicas cannot drop each other's voices.
 
 ## Operating it
 

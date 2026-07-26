@@ -65,7 +65,10 @@ async def lifespan(app: FastAPI):
     yield
     # Graceful drain: stop admitting, fail queued jobs fast (no caller hangs on
     # the request timeout), let in-flight generations finish, join workers.
-    await asyncio.get_event_loop().run_in_executor(None, ENGINE.stop)
+    # The budget is configurable so it can be kept under the orchestrator's
+    # stop grace (see Settings.drain_timeout_s).
+    await asyncio.get_event_loop().run_in_executor(
+        None, ENGINE.stop, SETTINGS.drain_timeout_s)
 
 
 app = FastAPI(title="Pocket TTS Service", version="1.0.0", lifespan=lifespan)
@@ -819,6 +822,12 @@ async def performance(req: PerformanceRequest):
 async def health():
     if ENGINE is None or not ENGINE.ready:
         return JSONResponse(status_code=503, content={"status": "loading"})
+    if ENGINE.draining:
+        # Readiness must fail the moment the drain starts, or the load balancer
+        # keeps routing new work to a pod that answers every submit with 503.
+        # Liveness is a TCP probe, so failing here removes us from the
+        # Endpoints list without getting killed mid-drain.
+        return JSONResponse(status_code=503, content={"status": "draining"})
     return {"status": "ready", "config": ENGINE.config(), "metrics": ENGINE.metrics.snapshot()}
 
 

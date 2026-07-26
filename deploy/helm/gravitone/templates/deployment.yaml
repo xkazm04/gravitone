@@ -37,6 +37,9 @@ spec:
               value: {{ .Values.tts.torchThreads | quote }}
             - name: TTS_QUEUE_MAX
               value: {{ .Values.tts.queueMax | quote }}
+            # Must stay below terminationGracePeriodSeconds below.
+            - name: TTS_DRAIN_TIMEOUT_S
+              value: "20"
             - name: TTS_LANGUAGE
               value: {{ .Values.tts.language | quote }}
             - name: TTS_HOST
@@ -64,6 +67,15 @@ spec:
           volumeMounts:
             - name: voices
               mountPath: /app/voices
+            # Ingest job workdirs + state.json. Without a mount the durability
+            # design (persist -> rehydrate on restart) is dead code: the
+            # directory lives in the pod's ephemeral layer and every restart
+            # drops in-flight clone jobs.
+            - name: ingest-jobs
+              mountPath: /app/ingest_jobs
+      # Longer than TTS_DRAIN_TIMEOUT_S (20s) so engine.stop() actually
+      # finishes; the default 30s left no headroom once readiness flipped.
+      terminationGracePeriodSeconds: 45
       volumes:
         - name: voices
           {{- if .Values.persistence.enabled }}
@@ -72,3 +84,8 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+        # NOTE: emptyDir is per-POD, which is correct — ingest jobs are held in
+        # the creating process's memory (JOBS) and are NOT shared between
+        # replicas. See "Ingest is replica-affine" in deploy/README.md.
+        - name: ingest-jobs
+          emptyDir: {}

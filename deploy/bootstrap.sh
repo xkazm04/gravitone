@@ -60,8 +60,13 @@ Restart=always
 RestartSec=5
 ExecStartPre=-/usr/bin/docker rm -f gravitone
 ExecStart=/usr/bin/docker run --name gravitone --env-file /etc/gravitone.env \
-  -p 8080:8080 -v gravitone-voices:/app/voices gravitone
-ExecStop=/usr/bin/docker stop gravitone
+  -p 8080:8080 -v gravitone-voices:/app/voices \
+  -v gravitone-ingest:/app/ingest_jobs gravitone
+# -t 30 must exceed TTS_DRAIN_TIMEOUT_S (20s): docker's 10s default SIGKILLs
+# the service mid-drain, so in-flight generations die and a commit can be cut
+# between registering a voice and recording it in the job state.
+ExecStop=/usr/bin/docker stop -t 30 gravitone
+TimeoutStopSec=40
 
 [Install]
 WantedBy=multi-user.target

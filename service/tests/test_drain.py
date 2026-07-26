@@ -16,6 +16,7 @@ import unittest
 
 from service.tests import fake_engine  # installs shims — must precede engine use
 
+import service.app as appmod
 import service.engine as enginemod
 from service.engine import ShuttingDown, TtsEngine
 
@@ -161,6 +162,48 @@ class ShuttingDownHttpMappingTests(unittest.TestCase):
         )
         self.assertEqual(resp.status_code, 503)
         self.assertEqual(resp.headers.get("retry-after"), "1")
+
+
+class DrainingHealthTests(unittest.TestCase):
+    """A draining pod must fail readiness, or the load balancer keeps routing
+    work to a process that answers every submit with 503."""
+
+    def setUp(self) -> None:
+        self._orig = appmod.ENGINE
+        from fastapi.testclient import TestClient
+        self.client = TestClient(appmod.app, raise_server_exceptions=False)
+
+    def tearDown(self) -> None:
+        appmod.ENGINE = self._orig
+
+    def test_health_reports_draining(self) -> None:
+        class _Draining:
+            ready = True
+            draining = True
+
+            def config(self):  # pragma: no cover - not reached while draining
+                return {}
+
+        appmod.ENGINE = _Draining()
+        resp = self.client.get("/health")
+        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(resp.json()["status"], "draining")
+
+    def test_health_ready_when_not_draining(self) -> None:
+        eng = fake_engine.FakeEngine(workers=1, delay=0.01)
+        eng.ready = True
+        eng.draining = False
+        appmod.ENGINE = eng
+        try:
+            resp = self.client.get("/health")
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(resp.json()["status"], "ready")
+        finally:
+            eng.close()
+
+    def test_engine_exposes_draining_without_reaching_into_privates(self) -> None:
+        from service.engine import TtsEngine
+        self.assertIsInstance(TtsEngine.draining, property)
 
 
 if __name__ == "__main__":

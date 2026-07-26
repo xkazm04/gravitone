@@ -86,6 +86,16 @@ class Settings:
     api_key: str = _str("TTS_API_KEY", "")
     # How long a request will wait for a worker before giving up (seconds).
     request_timeout_s: float = float(_str("TTS_REQUEST_TIMEOUT_S", "120"))
+    # How long graceful shutdown waits for in-flight generations to finish.
+    # This is ONE link in a chain that must be ordered longest-last:
+    #   drain_timeout_s  <  container stop grace (docker stop -t / k8s
+    #   terminationGracePeriodSeconds)
+    # If the orchestrator's grace is shorter, it SIGKILLs mid-drain and the
+    # careful shutdown in engine.stop() never gets to finish. Queued jobs are
+    # failed fast with 503 regardless, so this only bounds the wait for
+    # generations already inside the model (request_timeout_s is the caller's
+    # own ceiling and is deliberately independent of this one).
+    drain_timeout_s: float = float(_str("TTS_DRAIN_TIMEOUT_S", "20"))
 
 
 SETTINGS = Settings()
