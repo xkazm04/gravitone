@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
@@ -35,6 +36,8 @@ from service.emotions import (
 )
 
 router = APIRouter(tags=["voices"])
+
+logger = logging.getLogger("gravitone")
 
 VOICES_DIR = Path(SETTINGS.voices_dir)
 META_PATH = VOICES_DIR / "_meta.json"
@@ -657,6 +660,54 @@ def patch_voice(voice_id: str, patch: VoicePatch) -> Voice:
                      created=entry.get("created"), sample_seconds=entry.get("sample_seconds"))
 
     return mutate_meta(_mut)
+
+
+def remove_voices(voice_ids: list[str]) -> list[str]:
+    """Delete specific cloned Voices — registry entries AND embedding files.
+
+    The rollback primitive for a half-finished clone: a cancelled ingest commit
+    has already registered the emotions it got through, and leaving them turns
+    a cancel into "you now own a partial Character you never asked for".
+
+    Only the ids passed in are touched, so a cancelled *extend* leaves the
+    character's pre-existing Voices alone. A Character left with no Voices at
+    all is dropped too — it was created by this same commit and an empty
+    character is a ghost row in the roster. Missing ids are ignored (the point
+    is to converge on "not registered", not to assert what was there).
+
+    Returns the ids actually removed. Best-effort by design: it runs on a
+    teardown path, so a file that refuses to unlink is logged, not raised.
+    """
+    if not voice_ids:
+        return []
+    wanted = set(voice_ids)
+    removed: list[str] = []
+
+    def _mut(meta: dict) -> None:
+        touched_characters = set()
+        for vid in wanted:
+            entry = meta["voices"].pop(vid, None)
+            if entry is None:
+                continue
+            removed.append(vid)
+            cid = entry.get("character_id")
+            if cid:
+                touched_characters.add(cid)
+        # Drop characters this rollback emptied (an extend keeps its own).
+        for cid in touched_characters:
+            still_has = any(m.get("character_id") == cid for m in meta["voices"].values())
+            if not still_has:
+                meta["characters"].pop(cid, None)
+
+    mutate_meta(_mut)
+
+    for vid in removed:
+        path = VOICES_DIR / f"{vid}.safetensors"
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("rollback: could not delete %s: %s", path, exc)
+    return removed
 
 
 @router.delete("/v1/voices/{voice_id}", status_code=204)

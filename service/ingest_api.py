@@ -32,7 +32,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from service import ingest
+from service import ingest, voices
 from service.config import SETTINGS
 from service.errors import job_expired
 
@@ -301,22 +301,35 @@ def _do_commit(job_id: str, character: str, emotions: list[str], character_id: s
         _update(job, status="error", error=f"commit failed: {str(exc)[:300]}")
         return
     with _LOCK:
-        if job.get("cancel"):
-            # DELETE/GC tore the job down mid-clone. That only removes the
-            # WORKDIR — any emotions already cloned are registered Voices in
-            # VOICES_DIR and stay live. Say so: dropping this list silently
-            # left a partial Character nobody knew existed.
-            if created:
+        was_cancelled = bool(job.get("cancel"))
+        if not was_cancelled:
+            job["committed"] = created
+            job["partial"] = {"emotions_done": total, "emotions_total": total,
+                              "current": None}
+            job["status"] = "committed"
+            _persist(job)
+
+    if was_cancelled:
+        # DELETE/GC tore the job down mid-clone. Tearing down the WORKDIR does
+        # not touch VOICES_DIR, so every emotion that finished before the
+        # cancel is a live, registered Voice — a partial Character the user
+        # never agreed to. Undo exactly what this commit created (an extend
+        # keeps the character's pre-existing Voices).
+        ids = [v.get("voice_id") for v in created
+               if isinstance(v, dict) and v.get("voice_id")]
+        if ids:
+            try:
+                removed = voices.remove_voices(ids)
                 logger.warning(
-                    "ingest job %s cancelled after cloning %d voice(s); they "
-                    "remain registered and are not rolled back: %s",
-                    job_id, len(created),
-                    [v.get("voice_id") for v in created if isinstance(v, dict)])
-            return
-        job["committed"] = created
-        job["partial"] = {"emotions_done": total, "emotions_total": total, "current": None}
-        job["status"] = "committed"
-        _persist(job)
+                    "ingest job %s cancelled mid-clone; rolled back %d/%d "
+                    "voice(s): %s", job_id, len(removed), len(ids), removed)
+            except Exception as exc:  # noqa: BLE001 - teardown must not raise
+                # Never leave this silent: the voices are live and the user
+                # thinks they cancelled.
+                logger.error(
+                    "ingest job %s cancelled but ROLLBACK FAILED — these "
+                    "voices remain registered and must be removed by hand: "
+                    "%s (%s)", job_id, ids, exc)
 
 
 # ── endpoints ─────────────────────────────────────────────────────────────────

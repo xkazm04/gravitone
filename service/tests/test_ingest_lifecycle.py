@@ -295,11 +295,71 @@ class CommitLifecycleTests(unittest.TestCase):
                     out.append({"voice_id": f"v-{emo}", "emotion": emo, "seconds": 5})
                 return out
 
-            with mock.patch.object(ingest_api.ingest, "commit", side_effect=fake_commit):
+            # remove_voices is stubbed: this test is about the status, and the
+            # real one would mutate the repo's voices registry.
+            with mock.patch.object(ingest_api.ingest, "commit", side_effect=fake_commit), \
+                 mock.patch.object(ingest_api.voices, "remove_voices", return_value=[]):
                 ingest_api._do_commit("c2", "Ada", ["happy", "sad"], None, "I consent.")
 
             # cancel flag set → _do_commit must not overwrite status to 'committed'
             self.assertNotEqual(job["status"], "committed")
+
+    def test_cancelled_commit_rolls_back_the_voices_it_created(self):
+        # Cancelling only tore down the WORKDIR; the emotions already cloned
+        # stayed registered, so "cancel" silently handed the user a partial
+        # Character. They must be removed.
+        with TemporaryDirectory() as td:
+            job = _make_job(Path(td), "c3", "committing", time.time())
+            ingest_api.JOBS["c3"] = job
+
+            def fake_commit(work_dir, character, emotions, cid, *, consent=None,
+                            clip_sha256=None, progress=None, should_cancel=None):
+                job["cancel"] = True          # cancel lands mid-clone
+                return [{"voice_id": "v-happy", "emotion": "happy", "seconds": 5}]
+
+            with mock.patch.object(ingest_api.ingest, "commit", side_effect=fake_commit), \
+                 mock.patch.object(ingest_api.voices, "remove_voices",
+                                   return_value=["v-happy"]) as rm:
+                ingest_api._do_commit("c3", "Ada", ["happy", "sad"], None, "I consent.")
+
+            rm.assert_called_once_with(["v-happy"])
+            self.assertNotEqual(job["status"], "committed")
+
+    def test_successful_commit_rolls_back_nothing(self):
+        with TemporaryDirectory() as td:
+            job = _make_job(Path(td), "c4", "committing", time.time())
+            ingest_api.JOBS["c4"] = job
+
+            def fake_commit(work_dir, character, emotions, cid, **kw):
+                return [{"voice_id": f"v-{e}", "emotion": e, "seconds": 5} for e in emotions]
+
+            with mock.patch.object(ingest_api.ingest, "commit", side_effect=fake_commit), \
+                 mock.patch.object(ingest_api.voices, "remove_voices") as rm:
+                ingest_api._do_commit("c4", "Ada", ["happy"], None, "I consent.")
+
+            rm.assert_not_called()
+            self.assertEqual(job["status"], "committed")
+
+    def test_rollback_failure_is_logged_loudly_not_swallowed(self):
+        # If the rollback itself fails the voices ARE live and the user thinks
+        # they cancelled — that must never be silent.
+        with TemporaryDirectory() as td:
+            job = _make_job(Path(td), "c5", "committing", time.time())
+            ingest_api.JOBS["c5"] = job
+
+            def fake_commit(work_dir, character, emotions, cid, **kw):
+                job["cancel"] = True
+                return [{"voice_id": "v-happy", "emotion": "happy", "seconds": 5}]
+
+            with mock.patch.object(ingest_api.ingest, "commit", side_effect=fake_commit), \
+                 mock.patch.object(ingest_api.voices, "remove_voices",
+                                   side_effect=OSError("disk gone")), \
+                 self.assertLogs("gravitone", level="ERROR") as logs:
+                ingest_api._do_commit("c5", "Ada", ["happy"], None, "I consent.")
+
+            joined = "\n".join(logs.output)
+            self.assertIn("ROLLBACK FAILED", joined)
+            self.assertIn("v-happy", joined)
 
     def test_cancel_job_cleans_workdir_and_removes(self):
         with TemporaryDirectory() as td:
