@@ -10,18 +10,10 @@ import { NextRequest } from "next/server";
 
 import { proxyWavPost } from "@/lib/backend";
 
-// Upstream response headers we surface to the browser. Timing (synth/queue),
-// realtime factor, the base64 per-segment report, and any accepted-but-inert
-// voice settings — each only forwarded when the backend actually sent it.
-const FORWARD_HEADERS = [
-  "X-Audio-Seconds",
-  "X-Realtime-Factor",
-  "X-Synth-Seconds",
-  "X-Queue-Seconds",
-  "X-Ignored-Settings",
-  "X-Segments",
-] as const;
-
+// Upstream response headers surface to the browser through ONE shared list
+// (lib/serviceHeaders, mirroring the service's CORS_EXPOSE_HEADERS), not a
+// literal kept here by hand: the local copy silently omitted X-Synth-Segments,
+// which /v1/speak has always emitted for a multi-segment script.
 export async function POST(req: NextRequest) {
-  return proxyWavPost(req, "/v1/speak", FORWARD_HEADERS);
+  return proxyWavPost(req, "/v1/speak");
 }

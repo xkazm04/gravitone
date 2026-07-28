@@ -114,6 +114,16 @@ export type SpeakResult = {
   // (e.g. similarity_boost, style) — surfaced so the no-op is never silent.
   ignoredSettings: string[];
   segments: Segment[];
+  // How many synth jobs the script became (X-Synth-Segments), or 0 when the
+  // backend did not report it (single-segment takes, browser fallback).
+  //
+  // DELIBERATELY NOT RENDERED: the take card already draws one chip per segment
+  // from X-Segments / X-Performance-Report, so the count is on screen as the
+  // ribbon's length and a second numeric copy of it would be noise. It is
+  // decoded here because the header now survives the proxy at all (it never
+  // used to) and because the ribbon is best-effort — a report that fails to
+  // decode leaves this as the only evidence the take was multi-segment.
+  synthSegments: number;
   // Set only when mode === "browser".
   fallbackReason?: FallbackReason;
   // The backend's sanitized `detail` for the failure that caused the fallback.
@@ -143,7 +153,7 @@ function browserFallback(plain: string, reason: FallbackReason, detail?: string)
   return {
     mode: "browser", peaks: waveHeights(plain.length * 31 + 7, 56),
     seconds, kb: 0, rtf: 0, synthSeconds: 0, queueSeconds: 0,
-    ignoredSettings: [], segments: [], fallbackReason: reason,
+    ignoredSettings: [], segments: [], synthSegments: 0, fallbackReason: reason,
     fallbackDetail: detail,
   };
 }
@@ -254,6 +264,7 @@ async function gravitoneResult(res: Response, segments: Segment[], seed: number)
     queueSeconds: Number.isFinite(hdrQueue) ? hdrQueue : 0,
     ignoredSettings: decodeIgnored(res.headers.get("X-Ignored-Settings")),
     segments,
+    synthSegments: Math.max(0, Number(res.headers.get("X-Synth-Segments")) || 0),
   };
 }
 

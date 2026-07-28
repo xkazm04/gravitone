@@ -10,15 +10,8 @@ import { NextRequest } from "next/server";
 
 import { proxyWavPost } from "@/lib/backend";
 
-const FORWARD_HEADERS = [
-  "X-Audio-Seconds",
-  "X-Realtime-Factor",
-  "X-Synth-Seconds",
-  "X-Queue-Seconds",
-  "X-Ignored-Settings",
-  "X-Performance-Report",
-] as const;
-
+// Forwarded headers come from the one shared list (lib/serviceHeaders) — see
+// /api/speak for why a per-route literal was the bug.
 export async function POST(req: NextRequest) {
-  return proxyWavPost(req, "/v1/performance", FORWARD_HEADERS);
+  return proxyWavPost(req, "/v1/performance");
 }

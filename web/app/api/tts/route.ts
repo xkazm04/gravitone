@@ -3,6 +3,7 @@
 // service (local :8080 by default, or your deployed Arm instance).
 import { NextRequest } from "next/server";
 import { backendFetch, jsonError, readCappedText } from "@/lib/backend";
+import { forwardExposedHeaders } from "@/lib/serviceHeaders";
 
 // playground voice-id → backend voice-id (cloned demo voice lives as step4)
 const VOICE_MAP: Record<string, string> = { mine: "step4" };
@@ -44,13 +45,14 @@ export async function POST(req: NextRequest) {
       return new Response(await upstream.text(), { status: upstream.status, headers });
     }
     const buf = await upstream.arrayBuffer();
+    // Same forwarding as the premium routes, from the same list. The old
+    // two-header literal dropped X-Cache — which ONLY this upstream route emits
+    // — and wrote "" for a header the backend had not sent, so a client read an
+    // empty string where it should have read null.
     return new Response(buf, {
       status: 200,
-      headers: {
-        "Content-Type": "audio/wav",
-        "X-Audio-Seconds": upstream.headers.get("X-Audio-Seconds") ?? "",
-        "X-Realtime-Factor": upstream.headers.get("X-Realtime-Factor") ?? "",
-      },
+      headers: forwardExposedHeaders(
+        upstream.headers, new Headers({ "Content-Type": "audio/wav" })),
     });
   } catch {
     // backend unreachable — signal the client to use its browser-speech fallback

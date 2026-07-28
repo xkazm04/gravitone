@@ -4,6 +4,8 @@
 // call goes out bare, matching an unprotected local backend.
 // Server-only — never import from client components.
 
+import { forwardExposedHeaders } from "@/lib/serviceHeaders";
+
 const BASE = process.env.GRAVITONE_URL ?? "http://127.0.0.1:8080";
 
 export function backendFetch(path: string, init: RequestInit = {}): Promise<Response> {
@@ -74,18 +76,20 @@ export async function proxyJson(
   return new Response(await r.text(), { status: r.status, headers });
 }
 
-/** POST a JSON body to a synthesis endpoint and return its WAV.
+/** POST a JSON body to a synthesis endpoint and return its audio.
  *
  *  Shared by /api/speak and /api/performance, which were byte-identical apart
  *  from the upstream path and their forwarded-header allowlist. Handles the
  *  body cap, the 503 on an unreachable backend, the upstream-status passthrough
  *  (so a 429 stays a 429 and carries Retry-After for the client's backoff), and
- *  the header allowlist on success. Any hardening applied here now reaches both.
+ *  the header forwarding on success. Any hardening applied here now reaches both.
+ *
+ *  Headers come from ONE list (lib/serviceHeaders) rather than a per-route
+ *  literal — see that module for why three hand-kept subsets was the bug.
  */
 export async function proxyWavPost(
   req: Request,
   backendPath: string,
-  forwardHeaders: readonly string[],
 ): Promise<Response> {
   const body = await readCappedText(req);
   if (body instanceof Response) return body;
@@ -109,11 +113,8 @@ export async function proxyWavPost(
     return new Response(await upstream.text(), { status: upstream.status, headers });
   }
 
-  const headers = new Headers({ "Content-Type": "audio/wav" });
-  for (const h of forwardHeaders) {
-    const v = upstream.headers.get(h);
-    if (v) headers.set(h, v);
-  }
+  const headers = forwardExposedHeaders(
+    upstream.headers, new Headers({ "Content-Type": "audio/wav" }));
   return new Response(await upstream.arrayBuffer(), { status: 200, headers });
 }
 
