@@ -57,6 +57,7 @@ class _EngineCase(unittest.TestCase):
 class ParallelSpeakTests(_EngineCase):
 
     def test_speak_runs_segments_concurrently_in_order(self) -> None:
+        self._configure(workers=2)
         eng = fake_engine.FakeEngine(workers=2, delay=0.2)
         appmod.ENGINE = eng
         resp = self.client.post(
@@ -101,7 +102,11 @@ class ParallelSpeakTests(_EngineCase):
         self.assertEqual(resp.headers["x-queue-seconds"], "0.0")
 
     def test_speak_midscript_rejection_fails_whole_request_429(self) -> None:
-        # capacity 1: the 2nd segment's admission is refused -> whole 429.
+        # A GENUINELY saturated engine: on a 2-worker box both segments are one
+        # wave, and capacity 1 refuses the 2nd -> whole 429. (The cap bounds how
+        # much a script may claim; it never turns a real refusal into a retry
+        # loop.)
+        self._configure(workers=2)
         appmod.ENGINE = fake_engine.FakeEngine(workers=2, delay=0.02, capacity=1)
         resp = self.client.post(
             "/v1/speak",
@@ -115,6 +120,7 @@ class ParallelSpeakTests(_EngineCase):
         # Same 429 path: segment 1 was accepted before segment 2 was refused.
         # It must be ABANDONED, not left to synthesize into a response that
         # will never be sent (the pool would burn a slot for nothing).
+        self._configure(workers=2)
         eng = fake_engine.FakeEngine(workers=2, delay=0.02, capacity=1)
         appmod.ENGINE = eng
         resp = self.client.post(
@@ -129,8 +135,11 @@ class ParallelSpeakTests(_EngineCase):
     def test_failed_segment_abandons_its_siblings(self) -> None:
         # Segment 2 of 3 raises. gather cancels the sibling coroutines, but the
         # worker futures keep running unless we abandon them — that waste is
-        # what this pins.
-        eng = fake_engine.FakeEngine(workers=1, delay=0.02,
+        # what this pins. workers=3 so all three are ONE wave, i.e. genuinely
+        # siblings (with a smaller cap they'd be separate waves and there would
+        # be nothing in flight to abandon).
+        self._configure(workers=3)
+        eng = fake_engine.FakeEngine(workers=3, delay=0.02,
                                      errors={"World": "segment exploded"})
         appmod.ENGINE = eng
         resp = self.client.post(
@@ -147,6 +156,7 @@ class ParallelSpeakTests(_EngineCase):
 class ParallelPerformanceTests(_EngineCase):
 
     def test_performance_lines_run_concurrently_in_order(self) -> None:
+        self._configure(workers=2)
         eng = fake_engine.FakeEngine(workers=2, delay=0.2)
         appmod.ENGINE = eng
         resp = self.client.post(
@@ -187,6 +197,97 @@ class ParallelPerformanceTests(_EngineCase):
                          str(round(4.0 / synth, 3)))
         self.assertEqual(resp.headers["x-synth-segments"], "4")
         self.assertEqual(resp.headers["x-queue-seconds"], "0.0")
+
+
+class BoundedSubmissionTests(_EngineCase):
+    """A premium script must not 429 itself.
+
+    Both routes flatten their input into one job per emotion segment — a 64-line
+    ensemble easily becomes hundreds — and used to submit every one at the same
+    instant against an admission window of ``workers + queue_max`` (33 by
+    default). The longer the script, the more certain the rejection, which is
+    the exact input these routes exist to showcase. Submission is now bounded by
+    ``_max_batch_units()``, the drop-in route's policy, applied in waves.
+    """
+
+    _LINE = "[happy]alpha[/happy] [sad]beta[/sad] [happy]gamma"  # 3 segments
+
+    def test_full_64_line_script_completes_under_default_config(self) -> None:
+        self._configure(workers=1, queue_max=32)
+        window = appmod.SETTINGS.workers + appmod.SETTINGS.queue_max  # 33
+        eng = fake_engine.FakeEngine(workers=1, delay=0.0, capacity=window)
+        appmod.ENGINE = eng
+        resp = self.client.post(
+            "/v1/performance",
+            json={"lines": [{"character_id": "sarah", "text": self._LINE}
+                            for _ in range(64)]},
+        )
+        # 192 segments against a 33-slot window: this was a 429 by construction.
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(eng.jobs), 192, "segments were dropped or merged")
+        # One worker means one segment at a time — the cap follows real
+        # parallelism, so nothing queues behind its own siblings.
+        self.assertEqual(eng.max_concurrent, 1)
+        report = json.loads(base64.b64decode(resp.headers["x-performance-report"]))
+        self.assertEqual(len(report), 192)
+        self.assertEqual([r["line"] for r in report[:3]], [0, 0, 0])
+        self.assertEqual([r["text"] for r in report[:3]],
+                         ["alpha", "beta", "gamma"])
+        self.assertEqual([r["voice_id"] for r in report[:3]],
+                         ["v_happy", "v_sad", "v_happy"])
+        self.assertEqual(report[-1]["line"], 63)
+
+    def test_speak_long_script_completes_and_keeps_segment_order(self) -> None:
+        self._configure(workers=1, queue_max=32)
+        eng = fake_engine.FakeEngine(workers=1, delay=0.0, capacity=33)
+        appmod.ENGINE = eng
+        text = " ".join(f"[{'happy' if i % 2 else 'sad'}]word{i}[/"
+                        f"{'happy' if i % 2 else 'sad'}]" for i in range(40))
+        resp = self.client.post(
+            "/v1/speak", json={"character_id": "sarah", "text": text})
+        self.assertEqual(resp.status_code, 200)
+        expected = [f"word{i}" for i in range(40)]
+        self.assertEqual(eng.submit_order, expected)
+        report = json.loads(base64.b64decode(resp.headers["x-segments"]))
+        self.assertEqual([r["text"] for r in report], expected)
+        # ...and the concatenated audio is those segments, in that order.
+        self.assertEqual(resp.content[:4], b"RIFF")
+        samples = resp.content[44:]
+        self.assertEqual(len(samples), 40 * 480)
+        for i, job in enumerate(eng.jobs):
+            self.assertEqual(samples[i * 480:(i + 1) * 480],
+                             job.future.result().wav_bytes[44:],
+                             f"segment {i} out of order")
+
+    def test_bound_follows_workers_not_queue_depth(self) -> None:
+        # A 2-worker box with a deep queue: the cap is 2 (real parallelism), so
+        # an engine with only 2 slots free serves a 6-segment script fine. If
+        # the cap were derived from workers+queue_max this would 429.
+        self._configure(workers=2, queue_max=32)
+        eng = fake_engine.FakeEngine(workers=2, delay=0.02, capacity=2)
+        appmod.ENGINE = eng
+        text = " ".join(f"[happy]s{i}[/happy]" for i in range(6))
+        resp = self.client.post(
+            "/v1/speak", json={"character_id": "sarah", "text": text})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(eng.jobs), 6)
+        self.assertLessEqual(eng.max_concurrent, 2)
+        self.assertEqual(eng.submit_order, [f"s{i}" for i in range(6)])
+
+    def test_a_saturated_engine_still_429s_the_whole_performance(self) -> None:
+        # The cap bounds ambition, it does not paper over real saturation.
+        self._configure(workers=2, queue_max=32)
+        eng = fake_engine.FakeEngine(workers=2, delay=0.02, capacity=1)
+        appmod.ENGINE = eng
+        resp = self.client.post(
+            "/v1/performance",
+            json={"lines": [{"character_id": "sarah", "text": "[happy]one"},
+                            {"character_id": "sarah", "text": "[sad]two"}]},
+        )
+        self.assertEqual(resp.status_code, 429)
+        self.assertEqual(resp.headers["retry-after"], "1")
+        self.assertEqual(len(eng.jobs), 1)
+        self.assertTrue(eng.jobs[0].abandoned.is_set())
 
 
 class AwaitResultTests(unittest.TestCase):

@@ -349,6 +349,44 @@ def _submit_batch(specs: list[tuple[str, str, dict]],
     return jobs
 
 
+async def _submit_and_gather_in_waves(specs: list[tuple[str, str, dict]]) -> list:
+    """Submit a multi-segment script as WAVES, returning results in spec order.
+
+    ``/v1/speak`` and ``/v1/performance`` flatten their input into one job per
+    emotion segment — a 64-line ensemble script easily becomes hundreds — and
+    submitted every one of them at the same instant against an admission window
+    of ``workers + queue_max`` (33 by default). Past that the request 429'd
+    itself: the failure scaled with exactly the input the premium routes exist
+    to showcase.
+
+    The bound is ``_max_batch_units()``, the SAME policy the drop-in route uses
+    — derived from the parallelism this process actually HAS
+    (``SETTINGS.workers``), never from queue depth. Two different answers to
+    "how many units may one request submit" would be worse than one wrong one.
+
+    Where the drop-in route differs is what it does when the input exceeds the
+    cap: its units are slices of ONE text, so ``_chunk_text`` MERGES them.
+    Segments here cannot merge — each names the voice that speaks it, and
+    merging would change WHICH voice says WHICH words — so the script is
+    submitted in successive waves of at most the cap instead. Order is
+    untouched: waves go in order, each wave gathers in order, and a script that
+    already fit is exactly one wave, i.e. the previous call sequence byte for
+    byte.
+
+    Admission still fails the WHOLE request: an ``AdmissionRejected`` anywhere
+    propagates to the caller's 429, and ``_submit_batch`` has already abandoned
+    that wave's siblings. Waves that already completed are not undone — they are
+    finished audio, not a burning worker slot — which is the same trade the
+    streaming route's rolling window makes.
+    """
+    cap = max(1, _max_batch_units())
+    results: list = []
+    for i in range(0, len(specs), cap):
+        jobs = _submit_batch(specs[i:i + cap])
+        results.extend(await _gather_results(jobs))
+    return results
+
+
 async def _gather_results(jobs: list):
     """Await a whole batch, abandoning every job if any of them fails.
 
@@ -1195,12 +1233,15 @@ async def speak(
     segments = parse_segments(req.text)
     overrides = _overrides(req.voice_settings)
 
-    # Resolve every segment's voice, then submit them ALL before awaiting any:
-    # the pool processes them concurrently (up to WORKERS at once) instead of
-    # paying N× latency serially. Admission (429) is decided at submit time; if
-    # any segment is rejected the whole request fails with 429 and the segments
-    # already submitted are abandoned (see _submit_batch) rather than burning
-    # worker slots for a response that will never be sent.
+    # Resolve every segment's voice, then submit in WAVES bounded by this
+    # process's real parallelism (_submit_and_gather_in_waves): a wave is
+    # submitted before any of it is awaited, so the pool runs it concurrently
+    # instead of paying N× latency serially, while a long script can no longer
+    # 429 itself by claiming more of the admission window than there are workers
+    # to use. Admission (429) is decided at submit time; if any segment is
+    # rejected the whole request fails with 429 and that wave's already-submitted
+    # segments are abandoned (see _submit_batch) rather than burning worker slots
+    # for a response that will never be sent.
     resolved: list[tuple] = []
     fallbacks: list[tuple[str, str]] = []
     for seg in segments:
@@ -1213,12 +1254,11 @@ async def speak(
 
     t_start = time.perf_counter()
     try:
-        jobs = _submit_batch([(voice_id, seg.text, overrides)
-                              for (seg, voice_id, used, fell_back) in resolved])
+        results = await _submit_and_gather_in_waves(
+            [(voice_id, seg.text, overrides)
+             for (seg, voice_id, used, fell_back) in resolved])
     except AdmissionRejected as exc:
         return _backpressure_response(_Backpressure(str(exc)))
-
-    results = await _gather_results(jobs)
 
     wavs: list[bytes] = []
     report: list[dict] = []
@@ -1296,10 +1336,12 @@ async def performance(req: PerformanceRequest):
                                     detail=f"unknown character '{line.character_id}' (line {i})")
             emaps[line.character_id] = emap
 
-    # Flatten every line into its emotion segments, resolving voices first,
-    # then submit them ALL concurrently and gather in order — an N-segment
-    # script occupies up to WORKERS at once instead of serialising. A rejected
-    # segment fails the whole request with 429 (see /v1/speak for the rationale).
+    # Flatten every line into its emotion segments, resolving voices first, then
+    # submit in waves bounded by real parallelism and gather in order — an
+    # N-segment script occupies up to WORKERS at once instead of serialising,
+    # and a 64-line ensemble no longer submits hundreds of segments into a
+    # 33-slot window. A rejected segment fails the whole request with 429 (see
+    # /v1/speak and _submit_and_gather_in_waves for the rationale).
     tasks: list[tuple] = []  # (line_idx, character_id, seg, voice_id, used, fell_back)
     fallbacks: list[tuple[str, str]] = []
     for i, line in enumerate(req.lines):
@@ -1315,11 +1357,10 @@ async def performance(req: PerformanceRequest):
 
     t_start = time.perf_counter()
     try:
-        jobs = _submit_batch([(t[3], t[2].text, t[6]) for t in tasks])
+        results = await _submit_and_gather_in_waves(
+            [(t[3], t[2].text, t[6]) for t in tasks])
     except AdmissionRejected as exc:
         return _backpressure_response(_Backpressure(str(exc)))
-
-    results = await _gather_results(jobs)
 
     wavs: list[bytes] = []
     report: list[dict] = []
