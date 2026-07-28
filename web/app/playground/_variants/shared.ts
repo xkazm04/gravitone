@@ -90,5 +90,57 @@ export function stripTags(text: string): string {
   return text.replace(/\[\/?[a-zA-Z_]*\]/g, "").replace(/\s+/g, " ").trim();
 }
 
+// ── the limits the SERVER actually enforces ─────────────────────────────────
+// Mirrored from service/app.py (SpeakRequest.text / PerformanceLine.text
+// max_length=8000, PerformanceRequest.lines max_length=64) and
+// web/lib/backend.ts (MAX_SYNTH_BODY_BYTES). The composer used to enforce none
+// of them, so the ceiling was learned by having a render rejected.
+export const MAX_TEXT_CHARS = 8000;
+export const MAX_SCRIPT_LINES = 64;
+export const MAX_BODY_BYTES = 128 * 1024;
+
 export const DEFAULT_TEXT =
   "Hello there. [excited]This part is amazing![/excited] And now, back to normal.";
+
+/**
+ * Why this composer cannot be rendered — or null when it can.
+ *
+ * The composer enforced nothing, so every one of these limits was learned by
+ * having a render rejected AFTER the wait. Each message names the number, the
+ * ceiling and what to do about it; the caller shows it before submit and gates
+ * Generate on it.
+ *
+ * The character caps count the RAW text (metatags included), because that is
+ * what the backend receives and measures.
+ */
+export function composerLimit(input: {
+  mode: "solo" | "script";
+  text: string;
+  script: Array<{ text: string }>;
+}): string | null {
+  const bytes = (v: string) => new TextEncoder().encode(v).length;
+  if (input.mode === "solo") {
+    const over = input.text.length - MAX_TEXT_CHARS;
+    if (over > 0) {
+      return `${input.text.length.toLocaleString()} characters — ${over.toLocaleString()} over the ${MAX_TEXT_CHARS.toLocaleString()}-character limit the engine accepts. Shorten it or split it into a script.`;
+    }
+    if (bytes(input.text) > MAX_BODY_BYTES) {
+      return `This take is ${Math.round(bytes(input.text) / 1024)} KB — over the ${Math.round(MAX_BODY_BYTES / 1024)} KB the studio can forward in one request.`;
+    }
+    return null;
+  }
+  const longLine = input.script.findIndex((l) => l.text.length > MAX_TEXT_CHARS);
+  if (longLine >= 0) {
+    return `Line ${longLine + 1} is over the ${MAX_TEXT_CHARS.toLocaleString()}-character limit the engine accepts per line.`;
+  }
+  if (input.script.length > MAX_SCRIPT_LINES) {
+    return `${input.script.length} lines — the engine renders at most ${MAX_SCRIPT_LINES} in one performance.`;
+  }
+  // Every line adds its own JSON envelope (ids, settings) on top of its text;
+  // 64 bytes per line keeps the estimate on the safe side of the proxy's cap.
+  const body = input.script.reduce((n, l) => n + bytes(l.text) + 64, 0);
+  if (body > MAX_BODY_BYTES) {
+    return `This script is ${Math.round(body / 1024)} KB — over the ${Math.round(MAX_BODY_BYTES / 1024)} KB the studio can forward in one request. Render it in parts.`;
+  }
+  return null;
+}

@@ -6,12 +6,13 @@
 // active Character lacks are dimmed and marked as substituted (the backend
 // picks the nearest recorded emotion first, and only then baseline).
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef } from "react";
 import { createPortal } from "react-dom";
 import Link from "next/link";
 import { AnimatePresence, motion } from "framer-motion";
 import EmotionArt from "@/components/ui/EmotionArt";
 import { EMOTION_IDS, emotionMeta } from "@/lib/emotions";
+import { useClientReady } from "@/lib/useMounted";
 import { EASE } from "@/components/ui/tokens";
 
 const R = 150;
@@ -34,17 +35,52 @@ export default function EmotionPicker({
   characterId: string;
 }) {
   // Portal to <body> so the modal escapes AppFrame's overflow/stacking context
-  // (that was why it rendered below the page sections). Close on Escape.
-  const [mounted, setMounted] = useState(false);
-  useEffect(() => setMounted(true), []);
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [open, onClose]);
+  // (that was why it rendered below the page sections).
+  const ready = useClientReady();
+  const panelRef = useRef<HTMLDivElement>(null);
+  // Where focus came from, so closing puts it back — a keyboard user who opens
+  // the wheel from the composer must not be returned to the top of the page.
+  const opener = useRef<HTMLElement | null>(null);
 
-  if (!mounted) return null;
+  // This claimed role="dialog" aria-modal="true" while leaving focus outside
+  // it: Tab walked the page behind the overlay, and a screen-reader user was
+  // told they were in a modal that did not contain them.
+  useEffect(() => {
+    // `ready` is a dependency because the portal (and therefore the panel this
+    // focuses) does not exist on the first render.
+    if (!open || !ready) return;
+    opener.current = document.activeElement as HTMLElement | null;
+    const focusables = () =>
+      Array.from(panelRef.current?.querySelectorAll<HTMLElement>(
+        'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+      ) ?? []).filter((el) => !el.hasAttribute("disabled"));
+    // Focus the panel itself rather than the first spoke, so the dialog's label
+    // is announced before its options.
+    panelRef.current?.focus();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") { onClose(); return; }
+      if (e.key !== "Tab") return;
+      const items = focusables();
+      if (items.length === 0) { e.preventDefault(); return; }
+      const first = items[0];
+      const last = items[items.length - 1];
+      const active = document.activeElement;
+      // Wrap at both ends — that wrap IS the trap.
+      if (e.shiftKey && (active === first || active === panelRef.current)) {
+        e.preventDefault(); last.focus();
+      } else if (!e.shiftKey && active === last) {
+        e.preventDefault(); first.focus();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      // Restore focus on close (and on unmount while open).
+      opener.current?.focus?.();
+    };
+  }, [open, ready, onClose]);
+
+  if (!ready) return null;
 
   return createPortal(
     <AnimatePresence>
@@ -59,7 +95,9 @@ export default function EmotionPicker({
             initial={{ opacity: 0, scale: 0.94 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.96 }}
             transition={{ duration: 0.28, ease: EASE }}
             onClick={(e) => e.stopPropagation()}
-            className="glass-panel relative rounded-3xl p-8"
+            ref={panelRef}
+            tabIndex={-1}
+            className="glass-panel relative rounded-3xl p-8 focus:outline-none"
           >
             <div className="mb-2 text-center">
               <div className="font-jetbrains text-[11px] uppercase tracking-widest text-cyan-300/80">insert emotion</div>

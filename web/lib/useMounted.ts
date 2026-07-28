@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 
 /**
  * A ref that goes false on unmount, for guarding setState after an await.
@@ -21,4 +21,20 @@ export function useMounted() {
     return () => { mounted.current = false; };
   }, []);
   return mounted;
+}
+
+/**
+ * True only once the component is running in the BROWSER — the guard a portal
+ * needs before touching `document`.
+ *
+ * This is deliberately NOT useMounted: that ref is `true` from the first render
+ * (server included) because its job is to catch unmount during an await. Using
+ * it as a portal guard would render `createPortal(document.body)` during SSR.
+ * Three components hand-rolled this same two-liner (EmotionPicker,
+ * SecretReveal, GuidedRecorder); one name, one import.
+ */
+export function useClientReady(): boolean {
+  const [ready, setReady] = useState(false);
+  useEffect(() => setReady(true), []);
+  return ready;
 }

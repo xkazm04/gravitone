@@ -20,7 +20,10 @@ import { Button, Eyebrow } from "@/components/ui/Primitives";
 import { EASE } from "@/components/ui/tokens";
 import { EMOTION_IDS, emotionMeta, wrapWithTag } from "@/lib/emotions";
 import EmotionArt from "@/components/ui/EmotionArt";
-import { DEFAULT_EXPRESSION, DEFAULT_TEXT, stripTags, type Expression, type PerfLine, type ScriptLine, type Take } from "./shared";
+import {
+  composerLimit, DEFAULT_EXPRESSION, DEFAULT_TEXT, MAX_SCRIPT_LINES, MAX_TEXT_CHARS,
+  stripTags, type Expression, type PerfLine, type ScriptLine, type Take,
+} from "./shared";
 // Composer durability — the same IndexedDB mechanism the take log uses.
 import { loadComposer, reconcileCharacters, saveComposer, type ComposerState } from "@/lib/composerStore";
 import { speak, perform, uploadTake, refinePeaks, EngineBusyError, isAbort, type FallbackReason } from "./engine";
@@ -61,6 +64,10 @@ function Slider({ label, hint, value, min, max, step, onChange, format }: {
     </div>
   );
 }
+
+// How many Characters the rail shows before it has to be expanded. The density
+// is deliberate — the overflow is a panel, not a wall of buttons.
+const RAIL_PREVIEW = 10;
 
 // What to tell the user when a take came from the browser voice. Each string
 // names the ACTUAL cause; "unreachable" is no longer the catch-all.
@@ -209,6 +216,14 @@ export default function PlaygroundConsole() {
   const seq = useRef(0);
   const areaRef = useRef<HTMLTextAreaElement>(null);
   const composerRef = useRef<HTMLDivElement>(null); // scroll target for "reuse"
+  // The character rail showed the first ten Characters and stopped, with no
+  // affordance at all — clone an eleventh voice and it was simply unreachable
+  // in Solo mode, while Script mode's <select> listed every one of them. Same
+  // data, two truths. The rail keeps its density (ten, then a scrollable panel)
+  // and gains a filter once the roster is big enough to need one.
+  const [railOpen, setRailOpen] = useState(false);
+  const [railQuery, setRailQuery] = useState("");
+  const railRefs = useRef<Array<HTMLButtonElement | null>>([]);
   // In-flight generation, so it can be cancelled (or aborted on unmount).
   const runRef = useRef<AbortController | null>(null);
   const mounted = useMounted();
@@ -398,6 +413,38 @@ export default function PlaygroundConsole() {
     () => (character?.scale?.length ? character.scale : EMOTION_IDS),
     [character],
   );
+  // Which Characters the rail draws. Collapsed it shows RAIL_PREVIEW, but never
+  // hides the selected one — a selection you cannot see is how "nothing is
+  // selected" gets misread.
+  const railMatches = useMemo(() => {
+    const q = railQuery.trim().toLowerCase();
+    if (!q) return characters;
+    return characters.filter((c) => c.name.toLowerCase().includes(q) || c.character_id.toLowerCase().includes(q));
+  }, [characters, railQuery]);
+  const railVisible = useMemo(() => {
+    if (railOpen) return railMatches;
+    const head = railMatches.slice(0, RAIL_PREVIEW);
+    const sel = railMatches.find((c) => c.character_id === charId);
+    return sel && !head.includes(sel) ? [sel, ...head.slice(0, RAIL_PREVIEW - 1)] : head;
+  }, [railMatches, railOpen, charId]);
+  const railHidden = railMatches.length - railVisible.length;
+
+  /** Roving-tabindex arrow navigation across the rail. Only the pressed button
+   *  is in the tab order; arrows move focus within the group (Enter/Space still
+   *  does the selecting, so focus never changes the voice by accident). */
+  function onRailKey(e: React.KeyboardEvent<HTMLButtonElement>, i: number) {
+    const last = railVisible.length - 1;
+    const to =
+      e.key === "ArrowRight" || e.key === "ArrowDown" ? (i === last ? 0 : i + 1)
+      : e.key === "ArrowLeft" || e.key === "ArrowUp" ? (i === 0 ? last : i - 1)
+      : e.key === "Home" ? 0
+      : e.key === "End" ? last
+      : -1;
+    if (to < 0) return;
+    e.preventDefault();
+    railRefs.current[to]?.focus();
+  }
+
   const plain = stripTags(text);
   const estSec = Math.max(1.5, Math.round(plain.length * 0.055 * 10) / 10);
   // Script mode: the non-empty lines that will actually be synthesized.
@@ -406,7 +453,13 @@ export default function PlaygroundConsole() {
     [script],
   );
   const scriptChars = scriptLines.reduce((n, l) => n + stripTags(l.text).length, 0);
-  const canGenerate = mode === "script" ? scriptLines.length > 0 : (!!plain && !!character);
+
+  // The server's limits, stated BEFORE the request (service/app.py's 8000-char
+  // and 64-line caps, the proxy's 128 KB body). One pure function so the rule
+  // is testable and lives next to the constants it enforces.
+  const blocked = useMemo(() => composerLimit({ mode, text, script }), [mode, text, script]);
+
+  const canGenerate = !blocked && (mode === "script" ? scriptLines.length > 0 : (!!plain && !!character));
   // The LAST run decides the notice: a 500 and an unplugged backend both drop
   // to the browser voice, but they are different events — and once a gravitone
   // take succeeds the notice is simply no longer true.
@@ -471,6 +524,11 @@ export default function PlaygroundConsole() {
   function removeLine(idx: number) {
     if (script.length <= 1) return;
     setScript((s) => (s.length <= 1 ? s : s.filter((_, i) => i !== idx)));
+    // Compact the ref array with the list. It never was, so after a removal the
+    // refs were off by one against the rows and the LAST slot still pointed at
+    // a detached textarea — emotion-tag insertion (which reads selectionStart
+    // from lineRefs) put the caret in the wrong row.
+    lineRefs.current.splice(idx, 1);
     // Removing a line ABOVE the active one shifts the active row down by one;
     // plain clamping (the old code) left activeLine pointing at a DIFFERENT
     // line, so emotion tags landed on a row the user wasn't editing.
@@ -906,11 +964,27 @@ export default function PlaygroundConsole() {
             </span>
           )}
         </div>
-        <div className="flex flex-wrap gap-2">
-          {characters.slice(0, 10).map((c) => {
+        {railOpen && characters.length > RAIL_PREVIEW && (
+          <input
+            value={railQuery}
+            onChange={(e) => setRailQuery(e.target.value)}
+            placeholder="Filter characters…"
+            aria-label="Filter characters"
+            className="font-jetbrains mb-2 w-full max-w-xs rounded-lg border border-white/15 bg-black/40 px-3 py-1.5 text-[12px] text-white/85 placeholder:text-white/40 focus:border-cyan-400/40 focus:outline-none"
+          />
+        )}
+        <div
+          role="group"
+          aria-label="Character"
+          className={`flex flex-wrap gap-2 ${railOpen ? "max-h-64 overflow-y-auto pr-1" : ""}`}
+        >
+          {railVisible.map((c, i) => {
             const on = c.character_id === charId;
             return (
               <button key={c.character_id} onClick={() => setCharId(c.character_id)} aria-pressed={on}
+                ref={(el) => { railRefs.current[i] = el; }}
+                onKeyDown={(e) => onRailKey(e, i)}
+                tabIndex={on || (!charId && i === 0) ? 0 : -1}
                 className={`flex items-center gap-2.5 rounded-xl border px-3 py-2 text-left transition ${on ? "border-cyan-400/40 bg-cyan-400/10" : "border-white/10 hover:border-white/25"}`}>
                 <span className="h-6 w-6 rounded-full" style={{ background: `radial-gradient(circle at 30% 30%, hsl(${(c.character_id.length * 47) % 360} 90% 70%), hsl(${(c.character_id.length * 47) % 360} 80% 45%))` }} />
                 <span>
@@ -920,7 +994,31 @@ export default function PlaygroundConsole() {
               </button>
             );
           })}
+          {railHidden > 0 && (
+            <button
+              onClick={() => setRailOpen(true)}
+              aria-expanded={false}
+              title="Show every Character — Script mode already lists them all"
+              className="font-jetbrains rounded-xl border border-dashed border-white/15 px-3 py-2 text-[11px] text-white/65 transition hover:border-cyan-400/40 hover:text-cyan-200"
+            >
+              +{railHidden} more
+            </button>
+          )}
+          {railOpen && (
+            <button
+              onClick={() => { setRailOpen(false); setRailQuery(""); }}
+              aria-expanded
+              className="font-jetbrains rounded-xl border border-dashed border-white/15 px-3 py-2 text-[11px] text-white/65 transition hover:border-white/35"
+            >
+              show fewer
+            </button>
+          )}
         </div>
+        {railOpen && railMatches.length === 0 && (
+          <p className="font-jetbrains mt-2 text-[11px] text-white/55">
+            No Character matches “{railQuery}”.
+          </p>
+        )}
       </div>
 
       <div className="mt-6 grid gap-5 lg:grid-cols-[1.35fr_0.65fr]">
@@ -936,15 +1034,19 @@ export default function PlaygroundConsole() {
                 </button>
               ))}
             </div>
-            <span>
+            {/* The counter states the REAL ceiling, and turns as the text
+                approaches it — the limit used to be discovered by a rejected
+                render. */}
+            <span className={blocked ? "text-rose-300" : (mode === "solo" && text.length > MAX_TEXT_CHARS * 0.9) ? "text-amber-200/90" : ""}>
               {mode === "script"
-                ? `${scriptChars} chars · ${scriptLines.length} line${scriptLines.length === 1 ? "" : "s"}`
-                : `${plain.length} chars · ~${estSec}s audio`}
+                ? `${scriptChars} chars · ${scriptLines.length}/${MAX_SCRIPT_LINES} line${scriptLines.length === 1 ? "" : "s"}`
+                : `${text.length.toLocaleString()}/${MAX_TEXT_CHARS.toLocaleString()} chars · ~${estSec}s audio`}
             </span>
           </div>
 
           {mode === "solo" ? (
             <textarea ref={areaRef} value={text} onChange={(e) => setText(e.target.value)}
+              aria-invalid={text.length > MAX_TEXT_CHARS}
               onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") generate(); }}
               rows={5} placeholder="Type something. Select words, then click an emotion to tag them…"
               className="font-hanken w-full resize-none bg-transparent px-5 py-4 text-base leading-relaxed text-white placeholder:text-white/55 focus:outline-none" />
@@ -980,13 +1082,22 @@ export default function PlaygroundConsole() {
                     onChange={(e) => updateLine(i, { text: e.target.value })}
                     onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") generate(); }}
                     rows={2}
+                    aria-invalid={line.text.length > MAX_TEXT_CHARS}
                     placeholder="Line text… tag with [emotion]…[/emotion] to switch this Character's Voices"
                     className="font-hanken w-full resize-none bg-transparent text-sm leading-relaxed text-white placeholder:text-white/40 focus:outline-none" />
+                  {line.text.length > MAX_TEXT_CHARS && (
+                    <p className="font-jetbrains mt-1 text-[11px] text-rose-300">
+                      {line.text.length.toLocaleString()}/{MAX_TEXT_CHARS.toLocaleString()} characters — this line is too long to render.
+                    </p>
+                  )}
                 </div>
               ))}
-              <button onClick={addLine}
-                className="font-jetbrains w-full rounded-xl border border-dashed border-white/15 py-2 text-[11px] text-white/60 transition hover:border-cyan-400/40 hover:text-cyan-200">
-                + add line
+              <button onClick={addLine} disabled={script.length >= MAX_SCRIPT_LINES}
+                title={script.length >= MAX_SCRIPT_LINES
+                  ? `A performance renders at most ${MAX_SCRIPT_LINES} lines in one call`
+                  : "Add a line to the script"}
+                className="font-jetbrains w-full rounded-xl border border-dashed border-white/15 py-2 text-[11px] text-white/60 transition enabled:hover:border-cyan-400/40 enabled:hover:text-cyan-200 disabled:opacity-40">
+                {script.length >= MAX_SCRIPT_LINES ? `line limit reached (${MAX_SCRIPT_LINES})` : "+ add line"}
               </button>
             </div>
           )}
@@ -1024,8 +1135,10 @@ export default function PlaygroundConsole() {
           </div>
 
           <div className="flex items-center justify-between border-t border-white/8 px-5 py-3">
-            <span className="font-jetbrains text-[11px] text-white/60">
-              {mode === "script" ? "⌘↵ · one take from the whole script · 24kHz wav" : "⌘↵ to generate · exports 24kHz wav"}
+            <span className={`font-jetbrains text-[11px] ${blocked ? "text-rose-300" : "text-white/60"}`}>
+              {blocked
+                ? blocked
+                : mode === "script" ? "⌘↵ · one take from the whole script · 24kHz wav" : "⌘↵ to generate · exports 24kHz wav"}
             </span>
             <div className="flex items-center gap-2">
               {busy && (
@@ -1036,7 +1149,10 @@ export default function PlaygroundConsole() {
                   cancel
                 </button>
               )}
-              <Button onClick={generate} disabled={busy || !canGenerate}>{busy ? "Rendering…" : "Generate ▶"}</Button>
+              <Button onClick={generate} disabled={busy || !canGenerate}
+                title={blocked ?? (canGenerate ? "Render this take" : "Write something to render")}>
+                {busy ? "Rendering…" : "Generate ▶"}
+              </Button>
             </div>
           </div>
         </div>
