@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import type { Character } from "@/app/voices/_data/characters";
 import { DEFAULT_EXPRESSION, TAKE_TIMING_VERSION, type Take } from "./shared";
+import type { SpeakResult } from "./engine";
 
 // ── the harness ───────────────────────────────────────────────────────────────
 // PlaygroundConsole is the studio's largest surface and had no render test at
@@ -121,6 +122,18 @@ async function startRender() {
   return await screen.findByText("rendering");
 }
 
+/** Press Generate with a synthesis call that resolves into a take. */
+async function generateOnce(result: Partial<SpeakResult> = {}) {
+  engineMocks.speak.mockResolvedValue({
+    mode: "gravitone", url: "blob:new", blob: new Blob(["wav"]), peaks: [0.4, 0.9],
+    seconds: 2.5, kb: 30, rtf: 0.3, synthSeconds: 8, queueSeconds: 0,
+    ignoredSettings: [], segments: [], ...result,
+  } satisfies SpeakResult);
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: /Generate/ }));
+  });
+}
+
 /** The whole status paragraph under the render clock. */
 function statusLine(): HTMLElement {
   const row = screen.getByText("rendering").closest("div.glass-panel");
@@ -217,5 +230,181 @@ describe("PlaygroundConsole — the render estimate names its basis or its absen
     expect(statusLine()).toHaveTextContent(/realtime factor is not visible to this studio/i);
     // …and the take itself is still in the log.
     expect(screen.getByText("Stored line.")).toBeInTheDocument();
+  });
+});
+
+// ── direction 2: the console's own surfaces ───────────────────────────────────
+
+describe("PlaygroundConsole — the fallback banner describes the LATEST take", () => {
+  it("names the actual cause of a browser fallback", async () => {
+    await mountConsole();
+    await generateOnce({ mode: "browser", fallbackReason: "failed", fallbackDetail: "engine error (req-7)" });
+    const banner = screen.getByText(/reachable but synthesis failed/i);
+    expect(banner).toHaveTextContent(/Backend said: engine error \(req-7\)/);
+  });
+
+  it("drops the banner once a later take succeeds", async () => {
+    // It used to scan the whole log for ANY browser take ever made, so one
+    // fallback pinned the warning across every later successful render — and
+    // across a session restore.
+    await mountConsole();
+    await generateOnce({ mode: "browser", fallbackReason: "unreachable" });
+    expect(screen.getByText(/backend unreachable — speaking with your browser voice/i)).toBeInTheDocument();
+    await generateOnce({ mode: "gravitone" });
+    expect(screen.queryByText(/browser voice/i)).toBeNull();
+  });
+});
+
+describe("PlaygroundConsole — a finished render is announced", () => {
+  it("puts the completed take in a live region", async () => {
+    // The render clock is aria-live="off" (it ticks 4x/s) and the take log is
+    // not a live region, so a screen-reader user got no signal at all that the
+    // thing they pressed Generate for had happened.
+    await mountConsole();
+    await generateOnce({ mode: "gravitone", seconds: 2.5 });
+    expect(screen.getByRole("status")).toHaveTextContent(
+      /Take ready — 2.5 seconds of audio from Sarah/i);
+  });
+
+  it("says when the take came from the browser voice instead", async () => {
+    await mountConsole();
+    await generateOnce({ mode: "browser", fallbackReason: "unreachable", seconds: 1.5 });
+    expect(screen.getByRole("status")).toHaveTextContent(/Browser-voice take ready/i);
+  });
+
+  it("does not re-announce a spent message on the next run", async () => {
+    await mountConsole();
+    await generateOnce({ mode: "gravitone", seconds: 2.5 });
+    engineMocks.speak.mockImplementation(() => new Promise<never>(() => {}));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Generate/ }));
+    });
+    expect(screen.getByRole("status")).toHaveTextContent("");
+  });
+});
+
+describe("PlaygroundConsole — the character rail's filter and keyboard navigation", () => {
+  const roster = [
+    "Aria", "Bo", "Cleo", "Dee", "Eli", "Fin", "Gus", "Hana", "Ivo", "Jun", "Kit", "Lena",
+  ].map((n) => char(n.toLowerCase(), n));
+
+  /** Open the overflow panel, where the filter lives. */
+  async function openRail() {
+    await mountConsole({ characters: roster });
+    fireEvent.click(screen.getByRole("button", { name: /\+2 more/ }));
+    return screen.getByLabelText("Filter characters");
+  }
+
+  it("reaches a Character the collapsed rail cannot show", async () => {
+    // Clone an eleventh voice and it used to be simply unreachable in Solo
+    // mode, while Script mode's select listed every one of them.
+    await mountConsole({ characters: roster });
+    expect(screen.queryByRole("button", { name: /Lena/ })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /\+2 more/ }));
+    expect(screen.getByRole("button", { name: /Lena/ })).toBeInTheDocument();
+  });
+
+  it("filters the rail and says when nothing matches", async () => {
+    const filter = await openRail();
+    fireEvent.change(filter, { target: { value: "na" } });
+    expect(screen.getByRole("button", { name: /Hana/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Lena/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Aria/ })).toBeNull();
+    fireEvent.change(filter, { target: { value: "zzz" } });
+    expect(screen.getByText(/No Character matches/)).toBeInTheDocument();
+  });
+
+  it("moves focus between the Characters actually on screen after a filter", async () => {
+    // The refs behind the roving tabindex are keyed by Character id rather than
+    // by position in the filtered list. This pins the BEHAVIOUR — arrows land
+    // on the buttons that are actually on screen — which is what must survive
+    // whatever the refs are keyed on next.
+    const filter = await openRail();
+    fireEvent.change(filter, { target: { value: "na" } });
+    const hana = screen.getByRole("button", { name: /Hana/ });
+    const lena = screen.getByRole("button", { name: /Lena/ });
+    hana.focus();
+    fireEvent.keyDown(hana, { key: "ArrowRight" });
+    expect(document.activeElement).toBe(lena);
+    // …and it wraps, still within the visible set.
+    fireEvent.keyDown(lena, { key: "ArrowRight" });
+    expect(document.activeElement).toBe(hana);
+    fireEvent.keyDown(hana, { key: "ArrowLeft" });
+    expect(document.activeElement).toBe(lena);
+  });
+
+  it("keeps arrow keys inside the visible set when the filter widens again", async () => {
+    const filter = await openRail();
+    fireEvent.change(filter, { target: { value: "na" } });
+    fireEvent.change(filter, { target: { value: "" } });
+    const aria = screen.getByRole("button", { name: /Aria/ });
+    aria.focus();
+    fireEvent.keyDown(aria, { key: "End" });
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: /Lena/ }));
+    fireEvent.keyDown(document.activeElement as HTMLElement, { key: "Home" });
+    expect(document.activeElement).toBe(aria);
+  });
+});
+
+describe("PlaygroundConsole — reuse loads a take back into the composer", () => {
+  it("restores a solo take as solo", async () => {
+    await mountConsole({ restored: [take({ text: "Reused solo line.", url: "blob:r" })] });
+    fireEvent.click(screen.getByRole("button", { name: /reuse/ }));
+    expect(screen.getByRole("button", { name: "solo" })).toHaveAttribute("aria-pressed", "true");
+    expect((screen.getAllByRole("textbox")[0] as HTMLTextAreaElement).value).toBe("Reused solo line.");
+  });
+
+  it("restores a performance take as a script, line by line", async () => {
+    await mountConsole({
+      characters: [char("sarah", "Sarah"), char("bo", "Bo")],
+      restored: [take({
+        text: "Sarah: One.  ·  Bo: Two.", url: "blob:r",
+        lines: [{ character_id: "sarah", text: "One." }, { character_id: "bo", text: "Two." }],
+      })],
+    });
+    fireEvent.click(screen.getByRole("button", { name: /reuse/ }));
+    expect(screen.getByRole("button", { name: "script" })).toHaveAttribute("aria-pressed", "true");
+    const values = screen.getAllByRole("textbox").map((t) => (t as HTMLTextAreaElement).value);
+    expect(values).toContain("One.");
+    expect(values).toContain("Two.");
+    // Each line keeps the Character that spoke it.
+    expect((screen.getByLabelText("Character for line 1") as HTMLSelectElement).value).toBe("sarah");
+    expect((screen.getByLabelText("Character for line 2") as HTMLSelectElement).value).toBe("bo");
+  });
+});
+
+describe("PlaygroundConsole — a failed publish is reported and cleans up after itself", () => {
+  const shareable = () => [take({ url: "blob:r", blob: new Blob(["wav"]) })];
+
+  it("says what the backend said and offers the button again", async () => {
+    await mountConsole({ restored: shareable() });
+    engineMocks.uploadTake.mockRejectedValue(new Error("take store full (req-9)"));
+    vi.useFakeTimers();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "↗ share" }));
+    });
+    expect(screen.getByRole("button", { name: "✗ failed" })).toBeInTheDocument();
+    expect(screen.getByText(/could not be published — take store full \(req-9\)/)).toBeInTheDocument();
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    expect(screen.getByRole("button", { name: "↗ share" })).toBeInTheDocument();
+  });
+
+  it("leaves no timer running for a console the user has navigated away from", async () => {
+    // The self-clearing chip was a bare setTimeout with no cleanup and no
+    // mounted guard — it kept a setState scheduled against a dead component,
+    // the one async path in this file that did not check mounted.current.
+    const { unmount } = await mountConsole({ restored: shareable() });
+    engineMocks.uploadTake.mockRejectedValue(new Error("nope"));
+    // Only setTimeout is faked: framer-motion's animation frames would otherwise
+    // be counted as pending timers too. Installed AFTER mount, so the only
+    // timeout in play is the chip's own.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "↗ share" }));
+    });
+    expect(screen.getByRole("button", { name: "✗ failed" })).toBeInTheDocument();
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
+    unmount();
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

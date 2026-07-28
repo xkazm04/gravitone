@@ -205,6 +205,13 @@ export default function PlaygroundConsole() {
   const [startedAt, setStartedAt] = useState<number | null>(null);
   // Transient error surface so generation failures are never silent.
   const [toast, setToast] = useState<string | null>(null);
+  // What to ANNOUNCE when a render finishes. Nothing announced one: the render
+  // clock is deliberately aria-live="off" (it changes four times a second) and
+  // the take log is not a live region, so a screen-reader user pressed Generate
+  // and then sat in silence — the one thing the whole page exists to tell them
+  // was the one thing it never said. Failures already speak: ErrorBanner is
+  // role="alert".
+  const [announcement, setAnnouncement] = useState("");
   // Why the LAST generation dropped to the browser voice (null = it didn't).
   // Derived from the take list this used to scan for *any* browser take ever
   // made, so the banner stayed pinned across later successful renders and
@@ -251,7 +258,17 @@ export default function PlaygroundConsole() {
   // and gains a filter once the roster is big enough to need one.
   const [railOpen, setRailOpen] = useState(false);
   const [railQuery, setRailQuery] = useState("");
-  const railRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  // Keyed by character_id, NOT by position in the filtered list.
+  //
+  // As a position-indexed array this was never compacted (the way lineRefs has
+  // to be), so a filter left entries past the visible count pointing at
+  // unmounted buttons. That is not reachable TODAY — the inline ref callback is
+  // a new closure every render, so React re-attaches every visible index, and a
+  // test that filters the rail and arrows across it passes either way (checked).
+  // It is one memoised callback away from being reachable, and the correctness
+  // of roving focus should not rest on that. An id cannot drift from the list
+  // it keys.
+  const railRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
   // In-flight generation, so it can be cancelled (or aborted on unmount).
   const runRef = useRef<AbortController | null>(null);
   const mounted = useMounted();
@@ -485,7 +502,8 @@ export default function PlaygroundConsole() {
       : -1;
     if (to < 0) return;
     e.preventDefault();
-    railRefs.current[to]?.focus();
+    const target = railVisible[to];
+    if (target) railRefs.current.get(target.character_id)?.focus();
   }
 
   const plain = stripTags(text);
@@ -699,9 +717,32 @@ export default function PlaygroundConsole() {
       setShareErr(e instanceof Error && e.message
         ? `This take could not be published — ${e.message}`
         : "This take could not be published. The take itself is safe in your log.");
-      setTimeout(() => setShares((s) => { const { [t.id]: _, ...rest } = s; return rest; }), 2000);
+      // The "✗ failed" chip clears itself — see the effect below, which owns
+      // the timer.
     }
   }
+
+  // Let a failed share chip fade back to "↗ share" so the button is offerable
+  // again. This used to be a bare setTimeout inside share()'s catch: no cleanup
+  // and no `mounted.current` check, so navigating away left a timer holding a
+  // setState on a dead component (every other async path in this file guards).
+  // As an effect, React cancels it on unmount and on the next change for free.
+  const erroredShares = Object.entries(shares)
+    .filter(([, v]) => v === "error").map(([id]) => id).sort().join(" ");
+  useEffect(() => {
+    if (!erroredShares) return;
+    const ids = erroredShares.split(" ");
+    const timer = setTimeout(() => {
+      setShares((s) => {
+        const next = { ...s };
+        // Only clear what is STILL failed — a retry that has since gone pending
+        // or succeeded must not be reset by an older timer.
+        for (const id of ids) if (next[id] === "error") delete next[id];
+        return next;
+      });
+    }, 2000);
+    return () => clearTimeout(timer);
+  }, [erroredShares]);
 
   /** Publish a take if needed and return its share id (the review needs one). */
   async function ensureShared(t: Take): Promise<string> {
@@ -748,6 +789,14 @@ export default function PlaygroundConsole() {
    *  settle so the stored take carries its final waveform. */
   function addTake(take: Take) {
     setTakes((t) => [take, ...t]);
+    // The count makes each message distinct, so two identical takes in a row
+    // are both announced (a live region ignores an unchanged string).
+    const n = takesRef.current.length + 1;
+    setAnnouncement(
+      take.mode === "browser"
+        ? `Browser-voice take ready — ${take.seconds} seconds from ${take.characterName}, Gravitone was not used. ${n} take${n === 1 ? "" : "s"} in the log.`
+        : `Take ready — ${take.seconds} seconds of audio from ${take.characterName}. ${n} take${n === 1 ? "" : "s"} in the log.`,
+    );
     if (!take.blob) { void persistTake(take); return; }
     void refinePeaks(take.blob).then((p) => {
       const finished: Take = p
@@ -827,6 +876,7 @@ export default function PlaygroundConsole() {
     setBusyNotice(null);
     setToast(null);
     setFallback(null);
+    setAnnouncement("");        // the PREVIOUS take's announcement is spent
     setStartedAt(Date.now());   // starts the render clock for this run
   }
 
@@ -918,6 +968,10 @@ export default function PlaygroundConsole() {
 
   return (
     <div className="pb-24">
+      {/* The completion announcement. A take arriving is a visual-only event —
+          a new card slides into a log that is not a live region — so this is
+          the only thing that tells a screen-reader user their render finished. */}
+      <p role="status" aria-live="polite" className="sr-only">{announcement}</p>
       <EmotionPicker
         open={pickerOpen}
         onClose={() => setPickerOpen(false)}
@@ -1037,7 +1091,10 @@ export default function PlaygroundConsole() {
             const on = c.character_id === charId;
             return (
               <button key={c.character_id} onClick={() => setCharId(c.character_id)} aria-pressed={on}
-                ref={(el) => { railRefs.current[i] = el; }}
+                ref={(el) => {
+                  if (el) railRefs.current.set(c.character_id, el);
+                  else railRefs.current.delete(c.character_id);
+                }}
                 onKeyDown={(e) => onRailKey(e, i)}
                 tabIndex={on || (!charId && i === 0) ? 0 : -1}
                 className={`flex items-center gap-2.5 rounded-xl border px-3 py-2 text-left transition ${on ? "border-cyan-400/40 bg-cyan-400/10" : "border-white/10 hover:border-white/25"}`}>
