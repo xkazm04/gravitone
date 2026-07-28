@@ -5,7 +5,7 @@ roster to `.find()` it. These tests prove the endpoint returns exactly the
 Character the roster would carry for that id, reports consent per voice, and
 surfaces pack-import provenance (imported.from / imported.at) on the Character.
 
-All heavy work (ffmpeg cleanup, pocket_tts export) is mocked — no audio, no
+All heavy work (ffmpeg cleanup, the service.export_stems child) is mocked — no audio, no
 model, no network.
 """
 from __future__ import annotations
@@ -21,6 +21,8 @@ import service.app as appmod
 import service.ingest as ingest
 import service.voices as vc
 from fastapi.testclient import TestClient
+from service import export_stems
+from service.tests.test_clone_path import fake_export_child
 
 CLIP = b"RIFFfake-wav-bytes\x00\x01\x02\x03"
 STATEMENT = "I own this voice or have the speaker's explicit consent to clone it."
@@ -37,7 +39,8 @@ class CharacterReadTests(unittest.TestCase):
             mock.patch.object(ingest, "VOICES_DIR", self.root),
             mock.patch.object(ingest, "clean_audio", side_effect=self._fake_clean),
             mock.patch.object(vc, "_wav_seconds", return_value=12.0),
-            mock.patch.object(vc.subprocess, "run", side_effect=self._fake_export),
+            mock.patch.object(export_stems.subprocess, "run",
+                              side_effect=fake_export_child()),
         ]
         for p in self._patches:
             p.start()
@@ -52,11 +55,6 @@ class CharacterReadTests(unittest.TestCase):
     @staticmethod
     def _fake_clean(src: Path, dst: Path, sr: int = 24000) -> None:
         Path(dst).write_bytes(b"clean")
-
-    @staticmethod
-    def _fake_export(cmd, capture_output=False):
-        Path(cmd[-1]).write_bytes(b"tensors")
-        return mock.Mock(returncode=0, stderr=b"")
 
     def _clone(self, character="Ada", emotion="baseline"):
         return self.client.post(

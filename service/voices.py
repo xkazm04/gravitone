@@ -4,8 +4,10 @@ A **Voice** is one embedding (one speaker, one emotion). A **Character** groups
 Voices of the same speaker across the emotion scale. See `service/emotions.py`
 for the vocabulary and the metatag grammar.
 
-Cloning runs `pocket-tts export-voice` in a subprocess so the (heavy) model load
-is isolated from the serving workers. Metadata lives in `voices/_meta.json`.
+Cloning runs in a `service.export_stems` child process so the (heavy) model load
+is isolated from the serving workers — the SAME exporter the ingest commit uses,
+which verifies each embedding by loading it back. Metadata lives in
+`voices/_meta.json`.
 """
 from __future__ import annotations
 
@@ -15,8 +17,6 @@ import logging
 import os
 import re
 import shutil
-import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -28,7 +28,7 @@ from pathlib import Path
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
-from service import errors
+from service import errors, export_stems
 from service.atomicio import file_lock
 from service.config import SETTINGS
 from service.demand import all_demand, demand_for
@@ -643,8 +643,8 @@ def character_manifest(character_id: str) -> dict:
     }
 
 
-# NOT async: this handler runs ffmpeg and a `pocket_tts export-voice`
-# subprocess (seconds). On the event loop that froze every concurrent
+# NOT async: this handler runs ffmpeg and a `service.export_stems` child
+# process (seconds). On the event loop that froze every concurrent
 # synthesis response and stream; as a `def` handler FastAPI runs it in the
 # anyio threadpool where blocking is correct.
 @router.post("/v1/voices", response_model=Voice, status_code=201)
@@ -712,14 +712,25 @@ def create_voice(
         # left a phantom Character slugged from the voice id, which the user
         # never asked for. Staged here, that failure takes the file with it.
         staged = tmp / f"{voice_id}.safetensors"
-        ex = subprocess.run(
-            [sys.executable, "-m", "pocket_tts", "export-voice", str(clean), str(staged)],
-            capture_output=True)
-        if ex.returncode != 0 or not staged.is_file():
-            # Subprocess stderr is server internals — log it, hand the caller a
-            # request id (same leak posture as the synthesis 500 in app.py).
+        # The SAME exporter the ingest commit uses (service/export_stems.py):
+        # one model load, and — the reason this path changed — a round-trip
+        # load-back of the embedding it just wrote, with the proven
+        # `pocket_tts export-voice` CLI kept as the fallback when anything in
+        # that route fails. Spawning the CLI directly, as this endpoint used to,
+        # verified nothing: a serializer or format mismatch registered a voice
+        # that then failed at synthesis time, long after the user had left.
+        # A clone that cannot be loaded back now fails the REQUEST, and (with
+        # the staging above) leaves nothing registered.
+        err = export_stems.export_batch(
+            [{"emotion": emotion, "src": clean, "dst": staged}],
+            language=SETTINGS.language, quantize=SETTINGS.quantize,
+            spec_dir=tmp).get(emotion)
+        if err is not None or not staged.is_file():
+            # The exporter's error carries subprocess stderr — server internals.
+            # Log it, hand the caller a request id (same leak posture as the
+            # synthesis 500 in app.py).
             raise errors.sanitized_500(
-                "clone", errors.tail(ex.stderr.decode(errors="ignore")))
+                "clone", errors.tail(err or "exporter wrote no embedding"))
 
         created = datetime.now(timezone.utc).isoformat(timespec="seconds")
 

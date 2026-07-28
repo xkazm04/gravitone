@@ -9,7 +9,7 @@ tests prove:
   * a clone WITH attestation writes the receipt (correct shape + sha256 of the
     exact uploaded bytes) and reports consent=True on the Voice model.
 
-All heavy work (ffmpeg cleanup, pocket_tts export subprocess) is mocked — no
+All heavy work (ffmpeg cleanup, the `service.export_stems` child) is mocked — no
 audio, no model, no network.
 """
 from __future__ import annotations
@@ -27,6 +27,8 @@ import service.app as appmod
 import service.ingest as ingest
 import service.voices as vc
 from fastapi.testclient import TestClient
+from service import export_stems
+from service.tests.test_clone_path import fake_export_child
 
 CLIP = b"RIFFfake-wav-bytes-for-sha256-and-upload\x00\x01\x02\x03"
 STATEMENT = "I own this voice or have the speaker's explicit consent to clone it."
@@ -38,7 +40,7 @@ class DirectCloneConsentTests(unittest.TestCase):
         self.root = Path(self._dir.name)
         self.client = TestClient(appmod.app, raise_server_exceptions=False)
         # Point the registry + voices store at an isolated temp dir and make the
-        # export subprocess + ffmpeg cleanup no-ops that produce the expected
+        # export child + ffmpeg cleanup no-ops that produce the expected
         # artefacts, so the endpoint runs end-to-end without a model.
         self._patches = [
             mock.patch.object(vc, "VOICES_DIR", self.root),
@@ -46,7 +48,8 @@ class DirectCloneConsentTests(unittest.TestCase):
             mock.patch.object(ingest, "VOICES_DIR", self.root),
             mock.patch.object(ingest, "clean_audio", side_effect=self._fake_clean),
             mock.patch.object(vc, "_wav_seconds", return_value=12.0),
-            mock.patch.object(vc.subprocess, "run", side_effect=self._fake_export),
+            mock.patch.object(export_stems.subprocess, "run",
+                              side_effect=fake_export_child()),
         ]
         for p in self._patches:
             p.start()
@@ -61,11 +64,6 @@ class DirectCloneConsentTests(unittest.TestCase):
     @staticmethod
     def _fake_clean(src: Path, dst: Path, sr: int = 24000) -> None:
         Path(dst).write_bytes(b"clean")  # a wav stand-in; _wav_seconds is mocked
-
-    @staticmethod
-    def _fake_export(cmd, capture_output=False):
-        Path(cmd[-1]).write_bytes(b"tensors")  # the export writes the safetensors
-        return mock.Mock(returncode=0, stderr=b"")
 
     def _post(self, **data):
         return self.client.post(

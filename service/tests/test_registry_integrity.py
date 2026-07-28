@@ -24,6 +24,7 @@ subprocesses are mocked — no ffmpeg, no model.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import unittest
@@ -35,6 +36,8 @@ from fastapi import HTTPException
 
 import service.ingest as ingest
 import service.voices as voices
+from service import export_stems
+from service.tests.test_clone_path import fake_export_child
 
 CLIP = b"RIFFfake-wav-bytes"
 STATEMENT = "I own this voice."
@@ -119,19 +122,15 @@ class CloneCommitOrderingTests(_RegistryCase):
             filename = "clip.wav"
 
             def __init__(self, data: bytes) -> None:
-                import io
                 self.file = io.BytesIO(data)
 
         def _fake_clean(src, dst, sr=24000):
             Path(dst).write_bytes(b"clean")
 
-        def _fake_export(cmd, capture_output=False):
-            Path(cmd[-1]).write_bytes(b"tensors")
-            return mock.Mock(returncode=0, stderr=b"")
-
         with mock.patch.object(ingest, "clean_audio", side_effect=_fake_clean), \
              mock.patch.object(voices, "_wav_seconds", return_value=12.0), \
-             mock.patch.object(voices.subprocess, "run", side_effect=_fake_export):
+             mock.patch.object(export_stems.subprocess, "run",
+                               side_effect=fake_export_child()):
             return voices.create_voice(
                 file=_Upload(CLIP), character="Ada", emotion="baseline", tags="",
                 attested="true", statement=STATEMENT, **kw)

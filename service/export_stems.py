@@ -22,6 +22,15 @@ status line to stdout per finished stem — flushed immediately — and exit.
 Exit code is 0 only when every stem exported; nonzero otherwise. The parent
 terminates this process to cancel — cleanly, between lines.
 
+Two parents, one exporter. `ingest.commit` drives the child with Popen because
+it streams per-emotion progress and cancels between stems; the direct-upload
+clone (`voices.create_voice`) has a single stem and no progress to stream, so it
+calls :func:`export_batch`, which runs the same child to completion and returns
+the parsed statuses. Both therefore get the load-back verification and the CLI
+fallback in `_export_one` — the direct clone used to spawn `pocket_tts
+export-voice` itself, with NO verification, so a serializer/format mismatch
+registered a voice that only failed later, at synthesis time.
+
 pocket_tts / torch are imported INSIDE `main` so the module stays importable
 (and `compileall`-clean) on boxes without the model stack; unit tests inject a
 fake `pocket_tts` into sys.modules and never touch the real model.
@@ -29,8 +38,55 @@ fake `pocket_tts` into sys.modules and never touch the real model.
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
+
+
+def export_batch(stems: list[dict], *, language: str, quantize: bool,
+                 spec_dir: Path, timeout: float | None = None) -> dict[str, str | None]:
+    """Export ``stems`` in ONE child process; return ``{emotion: error or None}``.
+
+    The blocking half of the protocol above, for callers with nothing to stream:
+    write the spec, run the child to completion, parse its status lines. Each
+    stem is ``{"emotion", "src", "dst"}``; an emotion the child never reported
+    on gets the child's stderr tail as its error, so "no status line" is never
+    mistaken for success.
+
+    ``subprocess.run`` (not Popen) on purpose — it communicates on both pipes,
+    so the two-pipe deadlock `ingest.commit` has to spawn a stderr drain thread
+    to avoid cannot happen here. Use Popen if you need progress or cancellation
+    between stems; use this if you just need the embeddings.
+    """
+    spec_path = Path(spec_dir) / "export_spec.json"
+    spec_path.write_text(json.dumps({
+        "language": language, "quantize": quantize,
+        "stems": [{"emotion": s["emotion"], "src": str(s["src"]), "dst": str(s["dst"])}
+                  for s in stems],
+    }), "utf-8")
+
+    ex = subprocess.run(
+        [sys.executable, "-m", "service.export_stems", str(spec_path)],
+        capture_output=True, timeout=timeout)
+
+    results: dict[str, str | None] = {}
+    for line in ex.stdout.decode(errors="ignore").splitlines():
+        if not line.strip():
+            continue
+        try:
+            evt = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        emo = evt.get("emotion")
+        if emo is None:
+            continue
+        results[emo] = None if evt.get("ok") else (evt.get("error") or "export failed")
+
+    silent = ex.stderr.decode(errors="ignore")[-300:].strip() or \
+        f"exporter exited {ex.returncode} without reporting this stem"
+    for s in stems:
+        results.setdefault(s["emotion"], silent)
+    return results
 
 
 def _emit(obj: dict) -> None:
@@ -101,8 +157,13 @@ def _export_one(model, src, dst: Path) -> str | None:
     makes — so a serializer/format mismatch can never ship a voice that later
     fails to load. Any failure falls back to the proven ``pocket_tts
     export-voice`` CLI for that stem (one cold model load, failure path only).
+
+    The fallback triggers on ANY failure of the in-process route: the model
+    refusing the source, no serializer being found for the state, nothing
+    written, or — the case that matters — the round-trip load-back raising. It
+    is kept because the CLI is the proven invocation; the load-back is what
+    makes trusting the fast path safe.
     """
-    import subprocess
     try:
         state = model.get_state_for_audio_prompt(str(src), truncate=True)
         _save_voice_state(model, state, dst)
