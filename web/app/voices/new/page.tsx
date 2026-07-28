@@ -12,7 +12,7 @@ import { useAuth } from "@/lib/useAuth";
 import { recordVoiceOwnership } from "@/lib/voiceVault";
 import { CONSENT_STATEMENT } from "@/lib/consent";
 import WaveformLab from "./_loaders/WaveformLab";
-import { DetectionFinding, SovereignLimits, type LoaderData } from "./_loaders/shared";
+import { DetectionFinding, SovereignLimits, segmentFailureNote, type LoaderData } from "./_loaders/shared";
 import {
   reducer, initialState, POLLING_PHASES,
   type Character, type Job, type ModeInfo,
@@ -209,7 +209,16 @@ export default function NewCharacterPage() {
     dispatch({ type: "RESET", kind: "scan-another" });
   }
 
-  const loaderData: LoaderData = { steps: job?.steps ?? [], partial: job?.partial ?? {}, duration: job?.duration };
+  const loaderData: LoaderData = { steps: job?.steps ?? [], partial: job?.partial ?? {}, duration: job?.duration, mode: job?.mode };
+
+  // Which pipeline the copy on this page is describing. Before a scan there is
+  // no job, so the user's pill decides — and for `auto` the backend has already
+  // told us which way it will resolve. Null only while that is genuinely
+  // unknown, and the mode-neutral wording is used then.
+  const activeMode: "cloud" | "sovereign" | null =
+    job?.mode ?? (ingestMode === "sovereign" ? "sovereign" : modeInfo?.resolved_auto ?? null);
+  const sovereign = activeMode === "sovereign";
+  const failureNote = segmentFailureNote(job?.partial ?? {});
 
   return (
     <AppFrame>
@@ -217,9 +226,14 @@ export default function NewCharacterPage() {
         <Link href="/voices" className="font-jetbrains text-[12px] text-white/45 transition hover:text-white">← characters</Link>
         <Eyebrow>new character</Eyebrow>
         <h1 className="font-instrument mt-3 text-4xl text-white">Build from a recording.</h1>
+        {/* Sovereign mode transcribes nothing, diarizes nothing and classifies
+            no emotions — this sentence claimed all three unconditionally. */}
         <p className="mt-2 max-w-2xl text-base text-white/70">
-          Drop a recording — we transcribe &amp; diarize it, you pick the speaker, we isolate them,
-          detect emotions, and propose a set of emotion Voices to assign into a Character.
+          {sovereign
+            ? "Drop a recording — we clean it on this machine, find the speech by level, and build the baseline Voice of your Character. Emotions are added afterwards with the guided per-emotion capture."
+            : activeMode === "cloud"
+            ? "Drop a recording — we transcribe & diarize it, you pick the speaker, we isolate them, detect emotions, and propose a set of emotion Voices to assign into a Character."
+            : "Drop a recording — we analyse it, you pick the speaker, and we propose Voices to assign into a Character."}
         </p>
 
         {error && <ErrorBanner>{error}</ErrorBanner>}
@@ -332,8 +346,17 @@ export default function NewCharacterPage() {
         {/* SPEAKER PICK */}
         {phase === "speaker" && job?.speakers && (
           <div className="mt-8 max-w-3xl">
-            <h2 className="font-instrument text-2xl text-white">Which voice is your character?</h2>
-            <p className="mt-1 text-sm text-white/60">{job.speakers.length} speakers detected. Play a sample, then pick the one to build from.</p>
+            <h2 className="font-instrument text-2xl text-white">
+              {job.mode === "sovereign" ? "This is what will be cloned." : "Which voice is your character?"}
+            </h2>
+            {/* "N speakers detected" is a diarization result. Sovereign mode has
+                no diarizer — its single entry is an assumption, not a finding,
+                and it was also printing "1 speakers". */}
+            <p className="mt-1 text-sm text-white/60">
+              {job.mode === "sovereign"
+                ? "Sovereign mode cannot tell speakers apart, so everything audible is treated as one speaker. Play the sample to hear what that is, then continue."
+                : `${job.speakers.length} speaker${job.speakers.length === 1 ? "" : "s"} detected. Play a sample, then pick the one to build from.`}
+            </p>
             <div className="mt-5 space-y-2">
               {job.speakers.map((s, i) => (
                 <div key={s.id} className="glass-panel flex items-center gap-3 rounded-xl px-4 py-3">
@@ -365,19 +388,26 @@ export default function NewCharacterPage() {
           <div className="mt-8">
             <div className="font-jetbrains flex flex-wrap gap-4 text-[12px] text-white/60">
               <span>{result.duration}s audio</span>
-              <span>{result.speakers.length} speakers · target <span className="text-white">{result.target}</span></span>
+              <span>
+                {result.mode === "sovereign"
+                  ? "single speaker assumed (no local diarization)"
+                  : `${result.speakers.length} speaker${result.speakers.length === 1 ? "" : "s"}`}
+                {" · "}target <span className="text-white">{result.target}</span>
+              </span>
               <span>{result.utterances} utterances</span>
             </div>
-            {(job?.partial?.label_errors ?? 0) > 0 && (
-              <p className="font-jetbrains mt-3 rounded-lg border border-amber-400/20 bg-amber-400/5 px-3 py-2 text-[12px] text-amber-200/85">
-                {job!.partial!.label_errors} segment{job!.partial!.label_errors === 1 ? "" : "s"} couldn’t be classified — they fell back to the baseline stem.
-              </p>
-            )}
+            {/* What the pipeline DOES with a failed segment: nothing. The
+                `usable` filter drops it, so it reaches no stem at all — the
+                opposite of the "fell back to the baseline stem" this said. */}
+            {failureNote && <ErrorBanner severity="warning">{failureNote}</ErrorBanner>}
 
             <div className="mt-6 flex items-end justify-between">
               <div>
                 <h2 className="font-instrument text-2xl text-white">Proposed voices</h2>
-                <p className="mt-1 text-sm text-white/60">Keep or descope each emotion. “Short” stems are below the clone threshold.</p>
+                <p className="mt-1 text-sm text-white/60">
+                  Keep or descope each emotion. “Short” stems hold under{" "}
+                  {result.min_stem}s of audio, the minimum this backend clones from.
+                </p>
               </div>
               <span className="font-jetbrains text-[12px] text-white/60">{selected.size} selected</span>
             </div>

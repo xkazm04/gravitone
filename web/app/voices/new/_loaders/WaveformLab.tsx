@@ -5,7 +5,7 @@
 // (bars coloured by the live tally), and the headline metric tracks the stage.
 // The waveform IS the data, not a spinner beside it.
 
-import { EmotionTally, stateOf, type LoaderData } from "./shared";
+import { EmotionTally, segmentFailureNote, stateOf, usableCounts, type LoaderData } from "./shared";
 import { EMOTIONS } from "@/lib/emotions";
 
 const BARS = 52;
@@ -27,7 +27,15 @@ export default function WaveformLab({ data }: { data: LoaderData }) {
   const p = data.partial;
   const labeling = stateOf(data, "label") !== "pending";
   const stemming = stateOf(data, "stem") !== "pending";
-  const colors = barColors(labeling ? p.emotion_counts : undefined);
+  // The tally the bars and the readout draw must be the segments that will
+  // actually reach a stem: a failed segment is parked on `baseline` by the
+  // backend's progress counter, and drawing it made the loader promise
+  // baseline audio the stem builder was about to discard.
+  const counts = p.emotion_counts
+    ? usableCounts(p.emotion_counts, p.label_errors ?? 0)
+    : undefined;
+  const colors = barColors(labeling ? counts : undefined);
+  const failures = segmentFailureNote(p);
 
   // Headline copy comes from the SERVER's own step labels — never fabricated
   // here — so a sovereign scan reads its true local steps ("Detect speech",
@@ -74,8 +82,8 @@ export default function WaveformLab({ data }: { data: LoaderData }) {
 
       {/* live readout */}
       <div className="mt-4 min-h-[52px]">
-        {p.emotion_counts ? (
-          <EmotionTally counts={p.emotion_counts} />
+        {counts ? (
+          <EmotionTally counts={counts} />
         ) : p.speakers ? (
           <div className="flex flex-wrap justify-center gap-1.5">
             {p.speakers.map((s) => (
@@ -83,12 +91,19 @@ export default function WaveformLab({ data }: { data: LoaderData }) {
             ))}
           </div>
         ) : null}
-        {p.transcript && !p.emotion_counts && (
-          <p className="mx-auto mt-3 line-clamp-2 max-w-lg text-center text-[12px] italic text-white/45">“{p.transcript}”</p>
+        {/* Sovereign mode transcribes NOTHING — the backend puts its own
+            note in this slot (ingest.py::sovereign_analyze), and quoting it
+            presented the pipeline's summary as words the speaker said. */}
+        {p.transcript && !counts && (
+          data.mode === "sovereign" ? (
+            <p className="mx-auto mt-3 max-w-lg text-center text-[12px] text-white/45">{p.transcript}</p>
+          ) : (
+            <p className="mx-auto mt-3 line-clamp-2 max-w-lg text-center text-[12px] italic text-white/45">“{p.transcript}”</p>
+          )
         )}
-        {(p.label_errors ?? 0) > 0 && (
-          <p className="font-jetbrains mt-3 text-center text-[11px] text-amber-200/70">
-            {p.label_errors} segment{p.label_errors === 1 ? "" : "s"} couldn’t be classified — falling back to baseline
+        {failures && (
+          <p className="font-jetbrains mx-auto mt-3 max-w-lg text-center text-[11px] leading-relaxed text-amber-200/70">
+            {failures}
           </p>
         )}
       </div>

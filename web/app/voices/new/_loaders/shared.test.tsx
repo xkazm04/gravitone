@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { render, screen } from "@testing-library/react";
-import { DetectionFinding, SovereignLimits, type Detection } from "./shared";
+import {
+  DetectionFinding, SovereignLimits, segmentFailureNote, usableCounts,
+  type Detection,
+} from "./shared";
 
 const base: Detection = {
   outcome: "spans", spans: 4, speech_seconds: 31.2,
@@ -77,5 +80,54 @@ describe("DetectionFinding", () => {
         note="this recording is silence." />);
     expect(container.textContent).not.toContain("0 spans");
     expect(container.textContent).toContain("this recording is silence.");
+  });
+});
+
+describe("segmentFailureNote", () => {
+  it("says nothing when nothing failed", () => {
+    expect(segmentFailureNote({})).toBeNull();
+    expect(segmentFailureNote({ label_errors: 0 })).toBeNull();
+  });
+
+  it("never claims a failed segment reached the baseline stem", () => {
+    // service/ingest.py's `usable` filter admits neither an undecodable nor an
+    // unclassified segment to ANY stem — the old copy said the opposite.
+    const note = segmentFailureNote({ label_errors: 3, extract_errors: 1, classify_errors: 2 })!;
+    expect(note).not.toMatch(/fell back|falling back/);
+    expect(note).toContain("left out of every stem");
+    expect(note).toContain("never folded into the baseline");
+  });
+
+  it("tells decode failures and classify failures apart", () => {
+    const note = segmentFailureNote({ label_errors: 3, extract_errors: 1, classify_errors: 2 })!;
+    expect(note).toContain("1 couldn’t be decoded");
+    expect(note).toContain("2 couldn’t be classified");
+    const onlyDecode = segmentFailureNote({ label_errors: 2, extract_errors: 2, classify_errors: 0 })!;
+    expect(onlyDecode).toContain("2 couldn’t be decoded");
+    expect(onlyDecode).not.toContain("classified");
+  });
+
+  it("pluralizes, and falls back to the legacy total alone", () => {
+    expect(segmentFailureNote({ label_errors: 1, extract_errors: 1 })).toContain("1 segment left");
+    const legacy = segmentFailureNote({ label_errors: 2 })!;
+    expect(legacy).toContain("2 segments left out of every stem.");
+  });
+});
+
+describe("usableCounts", () => {
+  it("stops counting failed segments as baseline", () => {
+    // _settle parks a failed segment on `baseline` so progress still advances;
+    // the stem builder then excludes it. The tally must match the stem.
+    expect(usableCounts({ baseline: 5, happy: 2 }, 2)).toEqual({ baseline: 3, happy: 2 });
+  });
+
+  it("drops baseline entirely when every baseline segment failed", () => {
+    expect(usableCounts({ baseline: 2, sad: 1 }, 2)).toEqual({ sad: 1 });
+  });
+
+  it("is a no-op with no failures, and never goes negative", () => {
+    const counts = { baseline: 4 };
+    expect(usableCounts(counts, 0)).toBe(counts);
+    expect(usableCounts({ baseline: 1 }, 9)).toEqual({});
   });
 });

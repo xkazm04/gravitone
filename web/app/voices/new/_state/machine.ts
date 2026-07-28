@@ -19,7 +19,13 @@ export type Speaker = { id: string; utterances: number; seconds: number; sample_
 // the whole point is that an emotionally blended baseline is never presented as
 // a clean one (service/ingest.py::plan_baseline).
 export type Stem = { emotion: string; seconds: number; segments: number; eligible: boolean; cues: string[]; note?: string | null };
-export type Result = { duration: number; speakers: string[]; target: string; utterances: number; stems: Stem[] };
+// `min_stem` is the seconds-of-audio floor a stem must clear to be cloneable
+// (service/ingest.py::MIN_STEM_SECONDS, echoed back per job) and `mode` is the
+// pipeline that produced this ledger. Both are served on every result and both
+// were dropped on the floor: the review screen spoke of "the clone threshold"
+// without ever naming it, and reported a speaker COUNT in a mode that cannot
+// count speakers.
+export type Result = { duration: number; speakers: string[]; target: string; utterances: number; stems: Stem[]; min_stem: number; mode?: "cloud" | "sovereign" };
 export type Character = { character_id: string; name: string };
 export type Created = { voice_id: string; emotion: string };
 

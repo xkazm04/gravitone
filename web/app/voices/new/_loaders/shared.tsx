@@ -1,7 +1,7 @@
 "use client";
 
 import { motion } from "framer-motion";
-import { EMOTIONS } from "@/lib/emotions";
+import { BASELINE, EMOTIONS } from "@/lib/emotions";
 
 export type Partial = {
   words?: number;
@@ -10,8 +10,13 @@ export type Partial = {
   segments_total?: number;
   segments_done?: number;
   emotion_counts?: Record<string, number>;
-  // segments whose classification failed and fell back to the baseline stem
+  // Segments that DEGRADED, and why. A failed segment is labelled `baseline`
+  // in the tally (service/ingest.py::_settle gives it that placeholder) but the
+  // `usable` filter keeps it out of every stem — it is UNUSED audio, not
+  // baseline audio. `label_errors` is the legacy total of the two below.
   label_errors?: number;
+  extract_errors?: number;   // ffmpeg could not decode that span
+  classify_errors?: number;  // the classifier failed or said nothing about it
   // commit phase: live per-emotion cloning progress
   emotions_done?: number;
   emotions_total?: number;
@@ -118,10 +123,53 @@ export type LoaderData = {
   steps: LoaderStep[];
   partial: Partial;
   duration?: number;
+  // The pipeline that is running. The loader needs it because `partial` fields
+  // do not mean the same thing in both modes — sovereign puts a NOTE in the
+  // transcript slot, and it must not be set as speech.
+  mode?: "cloud" | "sovereign";
 };
 
 export function stateOf(data: LoaderData, key: string) {
   return data.steps.find((s) => s.key === key)?.state ?? "pending";
+}
+
+/**
+ * What the DEGRADED segments of this scan actually are, or null if there are
+ * none. Read the code, not the old copy: a segment that failed extraction has
+ * no wav to splice, and a segment that failed classification is deliberately
+ * left unlabelled — `usable` (service/ingest.py) admits neither to a stem,
+ * precisely so a guess can never pollute the one stem that must stay pure. The
+ * banner used to say they "fell back to the baseline stem", which is the exact
+ * opposite of what the pipeline does.
+ */
+export function segmentFailureNote(p: Partial): string | null {
+  const extract = p.extract_errors ?? 0;
+  const classify = p.classify_errors ?? 0;
+  const total = p.label_errors ?? extract + classify;
+  if (total <= 0) return null;
+  const why: string[] = [];
+  if (extract) why.push(`${extract} couldn’t be decoded`);
+  if (classify) why.push(`${classify} couldn’t be classified`);
+  const detail = why.length ? ` — ${why.join(", ")}` : "";
+  return `${total} segment${total === 1 ? "" : "s"} left out of every stem${detail}. ` +
+    "An unlabelled segment is never folded into the baseline, so it can’t change the neutral voice.";
+}
+
+/**
+ * The live tally with the failed segments removed. `_settle` records a failed
+ * segment as `baseline` so the progress count still advances, which made the
+ * loader over-report baseline while the stem it was drawing excluded exactly
+ * those segments.
+ */
+export function usableCounts(
+  counts: Record<string, number>, failed = 0,
+): Record<string, number> {
+  if (failed <= 0) return counts;
+  const out = { ...counts };
+  const left = (out[BASELINE] ?? 0) - failed;
+  if (left > 0) out[BASELINE] = left;
+  else delete out[BASELINE];
+  return out;
 }
 
 /** Live per-emotion tally — grows as segments are classified. */
