@@ -64,7 +64,10 @@ import numpy as np
 from service.config import SETTINGS
 from service.emotions import BASELINE, EMOTION_SCALE
 from service.errors import UserFacing
-from service.voices import VOICES_DIR, _load_meta, _slug, mutate_meta, voice_file_path
+from service.voices import (
+    VOICES_DIR, _load_meta, _slug, mutate_meta, reject_builtin_collision,
+    slot_holder, voice_file_path,
+)
 
 ELEVEN_KEY = os.environ.get("ELEVEN_LABS_API_KEY", "")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
@@ -1294,6 +1297,12 @@ def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: st
     short stems anyway. The returned list contains only the Voices actually
     created; skipped emotions are simply absent from it (and logged)."""
     cid = existing_cid or _slug(character)
+    if existing_cid is None:
+        # The same boundary check create_voice and import_pack make, made here
+        # for the third creation path: a name that slugs onto a built-in id is
+        # refused BEFORE the model is loaded, so ingest cannot mint the collided
+        # Character that _build_characters then has to log its way around.
+        reject_builtin_collision(cid, character.strip() or cid)
     meta = _load_meta()
     name = meta["characters"].get(cid, {}).get("name", character) if existing_cid else character
 
@@ -1314,6 +1323,17 @@ def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: st
         if not allow_short and seconds < MIN_STEM_SECONDS:
             skipped.append({"emotion": emo, "seconds": seconds})
             _log(f"commit: skipping '{emo}' — {seconds:.2f}s < {MIN_STEM_SECONDS:.0f}s minimum")
+            continue
+        held = slot_holder(meta, cid, emo)
+        if held is not None:
+            # (character_id, emotion) is the registry's real key: a second row
+            # for a slot is a Voice the roster shows and synthesis can never
+            # reach. An EXTEND of a character that already covers this emotion
+            # is therefore skipped and reported — the same treatment a too-short
+            # stem gets — rather than failing the whole commit or (as before)
+            # cloning a duplicate that only the logs would ever mention.
+            skipped.append({"emotion": emo, "held_by": held})
+            _log(f"commit: skipping '{emo}' — '{cid}' already has a voice for it ({held})")
             continue
         voice_id = f"{cid}-{emo}-{uuid.uuid4().hex[:6]}"
         plan.append({"emotion": emo, "src": str(sw), "seconds": seconds,
@@ -1388,10 +1408,31 @@ def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: st
                 "consented_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "clip_sha256": clip_sha256, "statement": consent}
 
-        def _add(meta, entry=entry, vid=p["voice_id"]):
+        def _add(meta, entry=entry, vid=p["voice_id"], emo=emo):
+            # Re-checked UNDER the registry lock, like create_voice's commit:
+            # cloning takes seconds per stem, so a concurrent clone (or a second
+            # ingest of the same character) can take the slot after the plan was
+            # built. Returning the holder instead of raising keeps the Voices
+            # this commit already registered — a raise here skips the save.
+            held = slot_holder(meta, cid, emo, exclude=vid)
+            if held is not None:
+                return held
             meta["voices"][vid] = entry
             meta["characters"].setdefault(cid, {"name": name, "tags": ["ingested"]})
-        mutate_meta(_add)
+            return None
+        lost_to = mutate_meta(_add)
+        if lost_to is not None:
+            # Unregistered, so the embedding must go too: the roster is
+            # glob-driven, and a .safetensors with no row is a phantom
+            # Character slugged out of the voice id.
+            _log(f"commit: '{emo}' slot was taken by {lost_to} mid-commit — discarding {p['voice_id']}")
+            Path(p["dst"]).unlink(missing_ok=True)
+            done += 1
+            if progress:
+                progress(done, None)
+                if done < len(plan):
+                    progress(done, plan[done]["emotion"])
+            continue
         made = {"voice_id": p["voice_id"], "emotion": emo, "seconds": p["seconds"]}
         created.append(made)
         if on_voice:

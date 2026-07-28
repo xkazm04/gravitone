@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from service import errors, export_stems
 from service.atomicio import file_lock
@@ -135,7 +135,21 @@ class EmotionReq(BaseModel):
 
 
 class VoicePatch(BaseModel):
-    name: str | None = None
+    """The only thing a Voice can be re-slotted to is another emotion.
+
+    `name` used to live here and was written into the voice's registry row —
+    but EVERY read derives a Voice's display name from its CHARACTER row
+    (`_cloned_voices`: f"{cname} · {emotion}"), and the PATCH response returned
+    that derived name too. So the API accepted a rename, reported a name it had
+    not changed, and nothing ever read the value again. Renaming is
+    `PATCH /v1/characters/{id}` — one speaker, one name.
+
+    Extras are FORBIDDEN rather than ignored: a client still sending
+    `{"name": …}` gets a 422 that says the field is gone, instead of a silent
+    200 that changes nothing (which is the bug this replaces).
+    """
+    model_config = ConfigDict(extra="forbid")
+
     emotion: str | None = None
 
 
@@ -418,6 +432,66 @@ def reject_builtin_collision(character_id: str, name: str) -> None:
             "pick a different name")
 
 
+def slot_holder(meta: dict, character_id: str, emotion: str,
+                *, exclude: str | None = None) -> str | None:
+    """The voice_id already occupying (character_id, emotion), or None.
+
+    `(character_id, emotion)` is the registry's primary key in everything but
+    name: `emotion_map` (the synthesis lookup) and the manifest both reduce a
+    Character's voices to ONE voice per emotion, so a second row for the same
+    slot is a voice that exists in the roster and can never be spoken.
+    Every write path resolves the slot through this one function.
+    """
+    for vid, m in meta["voices"].items():
+        if vid == exclude:
+            continue
+        if m.get("character_id") == character_id and m.get("emotion") == emotion:
+            return vid
+    return None
+
+
+def reject_slot_collision(meta: dict, character_id: str, emotion: str,
+                          *, exclude: str | None = None) -> None:
+    """409 if (character_id, emotion) is taken, NAMING the voice that holds it.
+
+    The holder is in the message on purpose: "already has a 'sad' voice" leaves
+    the user hunting through the roster for a Voice they may not remember
+    recording, and there is no merge/rename flow to fall back on. With the id
+    they can delete it (DELETE /v1/voices/{id}) or re-slot it.
+    """
+    holder = slot_holder(meta, character_id, emotion, exclude=exclude)
+    if holder is not None:
+        raise HTTPException(
+            409,
+            f"'{character_id}' already has a '{emotion}' voice ({holder}) — "
+            "delete or re-slot that voice first")
+
+
+def _by_emotion(voices: list[Voice]) -> dict[str, Voice]:
+    """emotion -> the ONE Voice that serves it, for a Character's voice list.
+
+    Pre-existing duplicate slots (rows written before uniqueness was enforced
+    on every path) are TOLERATED, not crashed on, and resolved the same way
+    everywhere: the first voice in the caller's order wins, the rest are logged.
+
+    They are deliberately NOT dropped from the roster — a Voice that is invisible
+    is also undeletable, which is exactly the failure the built-in collision
+    rule repudiates. So the roster keeps showing both (coverage counts distinct
+    emotions, so the count stays honest) while `emotion_map` and the manifest
+    agree on which one actually speaks.
+    """
+    out: dict[str, Voice] = {}
+    for v in voices:
+        if v.emotion in out:
+            logger.warning(
+                "character '%s' has two voices for '%s' (%s and %s); %s serves the "
+                "slot — delete one to resolve", v.character_id, v.emotion,
+                out[v.emotion].voice_id, v.voice_id, out[v.emotion].voice_id)
+            continue
+        out[v.emotion] = v
+    return out
+
+
 def _build_characters() -> list[Character]:
     meta = _load_meta()
     chars: dict[str, Character] = {}
@@ -495,7 +569,7 @@ def get_character_or_404(character_id: str) -> Character:
 def emotion_map(character_id: str) -> dict[str, str]:
     """emotion -> voice_id for one Character (used by /v1/speak)."""
     c = find_character(character_id)
-    return {v.emotion: v.voice_id for v in c.voices} if c else {}
+    return {e: v.voice_id for e, v in _by_emotion(c.voices).items()} if c else {}
 
 
 # ── endpoints ─────────────────────────────────────────────────────────────────
@@ -538,7 +612,12 @@ def add_custom_emotion(character_id: str, req: EmotionReq) -> Character:
 def remove_custom_emotion(character_id: str, emotion: str) -> None:
     """Drop an empty custom slot. Refuses while a Voice still occupies it —
     delete the Voice first (never silently destroy an embedding)."""
-    emotion = emotion.strip().lower()
+    # Normalized through the SAME validator that admitted the slot, so the
+    # path param can address exactly the rows add_custom_emotion can create.
+    try:
+        emotion = normalize_emotion(emotion)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
     if emotion in EMOTION_SCALE:
         raise HTTPException(400, "base-scale emotions cannot be removed")
 
@@ -616,10 +695,14 @@ def character_manifest(character_id: str) -> dict:
     can perform natively, and what every other request will fall back to.
     Clients check this before directing a script (/v1/performance)."""
     c = get_character_or_404(character_id)
+    # Same one-voice-per-emotion reduction as emotion_map, so the manifest can
+    # never advertise a voice_id the synthesis path wouldn't pick (a dict
+    # comprehension here let the LAST duplicate win while emotion_map took the
+    # first).
     native = {
-        v.emotion: {"voice_id": v.voice_id, "sample_seconds": v.sample_seconds,
-                    "consent": v.consent}
-        for v in c.voices
+        e: {"voice_id": v.voice_id, "sample_seconds": v.sample_seconds,
+            "consent": v.consent}
+        for e, v in _by_emotion(c.voices).items()
     }
     # Same deterministic pick resolve() uses, so the manifest can never
     # advertise a fallback the synthesis path wouldn't actually choose.
@@ -675,8 +758,11 @@ def create_voice(
     # clone never gets made and no orphan embedding is left behind.
     reject_builtin_collision(cid, character.strip() or cid)
 
-    if emotion in emotion_map(cid):
-        raise HTTPException(409, f"'{character}' already has a '{emotion}' voice")
+    holder = emotion_map(cid).get(emotion)
+    if holder:  # fast fail; re-checked under the lock in _commit
+        raise HTTPException(
+            409, f"'{character}' already has a '{emotion}' voice ({holder}) — "
+            "delete or re-slot that voice first")
 
     VOICES_DIR.mkdir(parents=True, exist_ok=True)
     voice_id = f"{cid}-{emotion}-{uuid.uuid4().hex[:6]}"
@@ -742,9 +828,7 @@ def create_voice(
             # re-check both would write (duplicate/orphaned embeddings for one
             # slot). Mirrors import_pack. The embedding is still staged in the
             # temp dir here, so this refusal has nothing to clean up.
-            for existing in meta["voices"].values():
-                if existing.get("character_id") == cid and existing.get("emotion") == emotion:
-                    raise HTTPException(409, f"'{character}' already has a '{emotion}' voice")
+            reject_slot_collision(meta, cid, emotion)
             meta["voices"][voice_id] = {
                 "name": character.strip(), "character_id": cid, "emotion": emotion,
                 "created": created, "sample_seconds": seconds, "lang": "EN",
@@ -782,14 +866,42 @@ def create_voice(
 
 @router.patch("/v1/voices/{voice_id}", response_model=Voice)
 def patch_voice(voice_id: str, patch: VoicePatch) -> Voice:
+    """Re-slot a cloned Voice onto another emotion.
+
+    This route used to be the ONLY way into the registry that skipped the
+    module's own invariants: a bare `.strip().lower()` (so "Battle Cry" or
+    "a.b" — names the metatag grammar can never address — landed in a row), no
+    uniqueness check (so both of a Character's voices could claim 'sad', after
+    which `emotion_map` spoke one and the roster counted the other), and no
+    custom-slot registration. It now goes through exactly what `create_voice`
+    goes through, under the same lock.
+    """
+    emotion: str | None = None
+    if patch.emotion is not None:
+        try:
+            emotion = normalize_emotion(patch.emotion)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+
     def _mut(meta: dict) -> Voice:
         entry = meta["voices"].get(voice_id)
         if entry is None:
             raise HTTPException(404, "voice not found")
-        if patch.emotion:
-            entry["emotion"] = patch.emotion.strip().lower()
-        if patch.name:
-            entry["name"] = patch.name.strip()
+        if emotion is not None and emotion != entry.get("emotion"):
+            cid = entry["character_id"]
+            # Under the lock, excluding this voice (a no-op re-slot onto its own
+            # emotion must not 409 against itself).
+            reject_slot_collision(meta, cid, emotion, exclude=voice_id)
+            entry["emotion"] = emotion
+            if emotion not in EMOTION_SCALE:
+                # Same self-registration create_voice does: a novel emotion
+                # becomes a declared custom slot on the Character, so it
+                # survives the Voice being deleted and shows up in /v1/emotions.
+                cm = meta["characters"].setdefault(cid, {"name": cid, "tags": []})
+                custom = list(cm.get("custom_emotions") or [])
+                if emotion not in custom:
+                    custom.append(emotion)
+                cm["custom_emotions"] = custom
         cname = meta["characters"].get(entry["character_id"], {}).get("name", entry["character_id"])
         return Voice(voice_id=voice_id, character_id=entry["character_id"], emotion=entry["emotion"],
                      name=f"{cname} · {entry['emotion']}", category="cloned",
@@ -893,7 +1005,22 @@ def delete_voice(voice_id: str) -> None:
 
 @router.patch("/v1/characters/{character_id}", response_model=Character)
 def patch_character(character_id: str, patch: CharacterPatch) -> Character:
+    """Rename / retag a CLONED Character.
+
+    Built-ins are refused, like every other mutating character route
+    (`add_custom_emotion`, `delete_voice`, `delete_character`): the premade
+    roster ships with the service, a rename would be a registry row shadowing a
+    name other installs still call by its old one, and nothing could restore it
+    except editing _meta.json by hand. The `setdefault` here also used to MINT a
+    row for any id at all, so a typo'd id created a character with no voices —
+    a ghost that the roster never shows and no route can delete.
+    """
+    if character_id in BUILTIN_IDS:
+        raise HTTPException(409, f"'{character_id}' is a built-in character and cannot be renamed")
+
     def _mut(meta: dict) -> None:
+        if not any(m.get("character_id") == character_id for m in meta["voices"].values()):
+            raise HTTPException(404, "character not found (built-ins cannot be edited)")
         cm = meta["characters"].setdefault(character_id, {"name": character_id, "tags": []})
         if patch.name:
             cm["name"] = patch.name.strip()
