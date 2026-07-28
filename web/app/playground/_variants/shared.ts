@@ -67,7 +67,36 @@ export type Take = {
   // the /v1/performance code export and survives session restore. Absent (undefined)
   // for solo takes.
   lines?: PerfLine[];
+  // Which generation of the TIMING numbers above (rtf / synthSeconds /
+  // queueSeconds) this take carries — see TAKE_TIMING_VERSION. Absent on every
+  // take written before the marker existed.
+  timingVersion?: number;
 };
+
+/**
+ * Version of a take's TIMING numbers.
+ *
+ * Takes are durable (lib/takeStore, IndexedDB), so the console restores records
+ * written by older builds — and it uses the newest take's `rtf` to calibrate the
+ * render estimate. When the MEANING of `rtf` changes, an old record silently
+ * calibrates today's estimate with yesterday's arithmetic: the pre-fix value was
+ * a sum of the per-segment factors, which overstates throughput and therefore
+ * understates the wait the user is about to sit through.
+ *
+ * 1 — `rtf` is the wall-clock realtime factor of the whole call
+ *     (X-Realtime-Factor). Records with NO marker predate that fix and are not
+ *     used as an estimate basis; they still play, download, share and export
+ *     exactly as before, and their numbers are still displayed as what that run
+ *     reported. Bump this whenever the timing arithmetic changes again.
+ */
+export const TAKE_TIMING_VERSION = 1;
+
+/** Whether a take's timing may be used to calibrate the render estimate.
+ *  A take from an older build is not wrong to show — it is only wrong to
+ *  predict with. */
+export function isTimingBasis(t: Pick<Take, "mode" | "rtf" | "timingVersion">): boolean {
+  return t.mode === "gravitone" && t.rtf > 0 && t.timingVersion === TAKE_TIMING_VERSION;
+}
 
 /** Expression controls. Pocket TTS has no emotion/speed parameter — these are
  *  the model's real sampling knobs (temp / noise_clamp / lsd_decode_steps). */

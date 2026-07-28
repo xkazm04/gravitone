@@ -21,8 +21,8 @@ import { EASE } from "@/components/ui/tokens";
 import { EMOTION_IDS, emotionMeta, wrapWithTag } from "@/lib/emotions";
 import EmotionArt from "@/components/ui/EmotionArt";
 import {
-  composerLimit, DEFAULT_EXPRESSION, DEFAULT_TEXT, MAX_SCRIPT_LINES, MAX_TEXT_CHARS,
-  stripTags, type Expression, type PerfLine, type ScriptLine, type Take,
+  composerLimit, DEFAULT_EXPRESSION, DEFAULT_TEXT, isTimingBasis, MAX_SCRIPT_LINES, MAX_TEXT_CHARS,
+  stripTags, TAKE_TIMING_VERSION, type Expression, type PerfLine, type ScriptLine, type Take,
 } from "./shared";
 // Composer durability — the same IndexedDB mechanism the take log uses.
 import { loadComposer, reconcileCharacters, saveComposer, type ComposerState } from "@/lib/composerStore";
@@ -98,9 +98,13 @@ function fmtElapsed(ms: number): string {
  * that re-measures on every render. The clock only ever drew this one row, so
  * this is where its state belongs. Nothing about what is displayed changed.
  */
-function RenderStatus({ startedAt, etaSec, estAudioSec, etaBasisLabel, queued, inFlight, healthStale }: {
+function RenderStatus({ startedAt, etaSec, estAudioSec, etaBasisLabel, noEtaLabel, queued, inFlight, metricsUnavailable, healthStale }: {
   startedAt: number | null; etaSec: number | null; estAudioSec: number;
-  etaBasisLabel: string; queued: number; inFlight: number; healthStale: boolean;
+  etaBasisLabel: string; noEtaLabel: string;
+  // null = the engine did not report this number. NOT the same as 0, which is
+  // a real reading of an empty queue.
+  queued: number | null; inFlight: number | null;
+  metricsUnavailable: boolean; healthStale: boolean;
 }) {
   const [elapsedMs, setElapsedMs] = useState(0);
   // Keyed on startedAt, so a new run restarts the clock and unmounting (the run
@@ -133,7 +137,7 @@ function RenderStatus({ startedAt, etaSec, estAudioSec, etaBasisLabel, queued, i
             always labelled, always sourced, and when it is exceeded it
             says so instead of stalling at "1s remaining". */}
         {etaSec === null ? (
-          <span>No estimate yet — the first render on this machine is what calibrates one.</span>
+          <span>{noEtaLabel}</span>
         ) : overEstimate ? (
           <span className="text-amber-200/80">
             Past the ~{etaSec}s estimate — still rendering ({etaBasisLabel}; an estimate, not a measurement of this run).
@@ -141,12 +145,31 @@ function RenderStatus({ startedAt, etaSec, estAudioSec, etaBasisLabel, queued, i
         ) : (
           <span>Estimated ~{etaSec}s for ~{estAudioSec}s of audio — {etaBasisLabel}.</span>
         )}
-        {queued > 0 && (
-          <span title="Jobs waiting for a synthesis worker across the engine">
-            · {queued} job{queued === 1 ? "" : "s"} queued ahead of the pool
+        {/* An ABSENT queue reading is not an empty queue. The engine gates its
+            metrics behind the observability scope (service/app.py::health), so
+            a studio with no API key against a keyed backend gets a bare
+            {"status":"ready"} — coercing that to 0 made "we cannot see the
+            queue" render identically to "the queue is empty", with nothing
+            stale about it because the request succeeded. */}
+        {metricsUnavailable ? (
+          <span className="text-amber-200/70" title="The engine reports queue depth only to callers holding its observability scope — set GRAVITONE_API_KEY for this studio to see it">
+            · queue depth unavailable to this studio — this is not a reading of an empty queue
           </span>
+        ) : (
+          <>
+            {queued !== null && queued > 0 && (
+              <span title="Jobs waiting for a synthesis worker across the engine">
+                · {queued} job{queued === 1 ? "" : "s"} queued ahead of the pool
+              </span>
+            )}
+            {inFlight !== null && inFlight > 0 && <span title="Jobs a worker is synthesizing right now">· {inFlight} rendering</span>}
+            {/* Said out loud, so "nothing queued" is an affirmative reading
+                rather than the absence of a chip. */}
+            {queued === 0 && inFlight === 0 && (
+              <span title="The engine reported an empty queue">· queue clear</span>
+            )}
+          </>
         )}
-        {inFlight > 0 && <span title="Jobs a worker is synthesizing right now">· {inFlight} rendering</span>}
         {healthStale && <span className="text-amber-200/70">· queue reading is stale</span>}
       </p>
     </motion.div>
@@ -241,8 +264,23 @@ export default function PlaygroundConsole() {
   // while a render is in flight so the queue reading stays current.
   const { health, stale: healthStale } = useHealthPoll(busy ? 5_000 : 30_000);
   const engineStatus = health?.status;                       // ready | loading | draining
-  const queued = Number(health?.metrics?.queued ?? 0);
-  const inFlight = Number(health?.metrics?.in_flight ?? 0);
+  // The engine's live metrics are OPTIONAL in the health response: they are
+  // gated behind the observability scope, and a studio with no
+  // GRAVITONE_API_KEY talking to a keyed backend is a legitimate deployment
+  // (web/lib/backend.ts attaches the key only when one is configured). Missing
+  // therefore means UNAVAILABLE, never zero — `Number(undefined ?? 0)` turned
+  // "we cannot see the queue" into "the queue is empty".
+  const metric = (key: string): number | null => {
+    const v = health?.metrics?.[key];
+    return typeof v === "number" && Number.isFinite(v) ? v : null;
+  };
+  const queued = metric("queued");
+  const inFlight = metric("in_flight");
+  // The engine ANSWERED, and told us nothing about its queue. (A backend the
+  // studio cannot reach at all is a different sentence, and the engine notice
+  // above already says it.)
+  const metricsUnavailable =
+    !!health && engineStatus !== "unreachable" && queued === null && inFlight === null;
   // null = nothing worth saying. Every string states the CONSEQUENCE of
   // generating right now, which is what the user is about to decide.
   const engineNotice =
@@ -478,14 +516,24 @@ export default function PlaygroundConsole() {
   const estAudioSec = mode === "script"
     ? Math.max(1.5, Math.round(scriptChars * 0.055 * 10) / 10)
     : estSec;
-  const lastRtf = takes.find((t) => t.mode === "gravitone" && t.rtf > 0)?.rtf;
-  const liveRtfRaw = health?.metrics?.realtime_factor;
-  const liveRtf = typeof liveRtfRaw === "number" && liveRtfRaw > 0 ? liveRtfRaw : undefined;
+  // Only a take whose timing means what this build thinks it means may
+  // calibrate an estimate — a record restored from before the wall-clock rtf
+  // fix carries a summed per-segment factor that understates the wait
+  // (shared.ts::TAKE_TIMING_VERSION).
+  const lastRtf = takes.find(isTimingBasis)?.rtf;
+  const liveRtfRaw = metric("realtime_factor");
+  const liveRtf = liveRtfRaw !== null && liveRtfRaw > 0 ? liveRtfRaw : undefined;
   const rtfBasis = lastRtf ?? liveRtf;
   const etaSec = rtfBasis ? Math.max(1, Math.round(estAudioSec / rtfBasis)) : null;
   const etaBasisLabel = lastRtf
     ? `your last render ran at ${lastRtf}× realtime`
     : liveRtf ? `the engine is averaging ${liveRtf}× realtime` : "";
+  // With no basis there is no estimate — but WHY there is none is the honest
+  // part. "The first render calibrates one" is untrue when the engine's own
+  // average exists and is merely invisible to this studio.
+  const noEtaLabel = metricsUnavailable
+    ? "No estimate yet — the engine's realtime factor is not visible to this studio, and no render here has calibrated one."
+    : "No estimate yet — the first render on this machine is what calibrates one.";
 
   const fallbackNotice = fallback && (
     fallback.detail
@@ -818,6 +866,7 @@ export default function PlaygroundConsole() {
         synthSeconds: r.synthSeconds, queueSeconds: r.queueSeconds,
         ignoredSettings: r.ignoredSettings, segments: r.segments, expr: { ...expr },
         createdAt: Date.now(), format: r.format, lines,
+        timingVersion: TAKE_TIMING_VERSION,
       };
       addTake(take);
       setFallback(r.mode === "browser" ? { reason: r.fallbackReason ?? "unreachable", detail: r.fallbackDetail } : null);
@@ -848,6 +897,7 @@ export default function PlaygroundConsole() {
         synthSeconds: r.synthSeconds, queueSeconds: r.queueSeconds,
         ignoredSettings: r.ignoredSettings, segments: r.segments, expr: { ...expr },
         createdAt: Date.now(), format: r.format,
+        timingVersion: TAKE_TIMING_VERSION,
       };
       addTake(take);
       setFallback(r.mode === "browser" ? { reason: r.fallbackReason ?? "unreachable", detail: r.fallbackDetail } : null);
@@ -1245,8 +1295,9 @@ export default function PlaygroundConsole() {
         <AnimatePresence initial={false}>
           {busy && (
             <RenderStatus key="rendering" startedAt={startedAt} etaSec={etaSec}
-              estAudioSec={estAudioSec} etaBasisLabel={etaBasisLabel}
-              queued={queued} inFlight={inFlight} healthStale={healthStale} />
+              estAudioSec={estAudioSec} etaBasisLabel={etaBasisLabel} noEtaLabel={noEtaLabel}
+              queued={queued} inFlight={inFlight}
+              metricsUnavailable={metricsUnavailable} healthStale={healthStale} />
           )}
 
           {takes.map((t) => {
