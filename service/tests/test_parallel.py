@@ -260,22 +260,26 @@ class BoundedSubmissionTests(_EngineCase):
                              f"segment {i} out of order")
 
     def test_bound_follows_workers_not_queue_depth(self) -> None:
-        # A 2-worker box with a deep queue: the cap is 2 (real parallelism), so
-        # a 6-segment script goes out in three waves of 2 and succeeds against
-        # an engine with only a HANDFUL of slots. If the cap were derived from
-        # workers+queue_max (34) the whole script would be submitted at once
-        # and refused, which is what this pins.
+        # A 2-worker box with a deep queue: the cap must follow the WORKERS (2),
+        # not workers+queue_max (34). What discriminates the two is SUBMISSION
+        # WIDTH — a capped run offers 2 units at a time, an uncapped one offers
+        # all 6 together — so the engine's capacity is the instrument, and it
+        # has to sit between them.
         #
-        # capacity is 3, not 2, on purpose: a wave releases its permits on the
-        # fake's worker threads, so a capacity exactly EQUAL to the wave size
-        # leaves zero slack and the next wave races that release — the test
-        # then 429s a few runs in a hundred while the code is correct. One
-        # spare slot removes the race without weakening the assertion, because
-        # 3 is still far below the 6 an uncapped submission would need.
-        # Production has no such tension: the window is workers+queue_max (34
-        # here) against a wave of `workers`.
+        # capacity=5 is chosen, not incidental. Below 6 so an uncapped
+        # submission is refused (that is the tooth); far enough above the wave
+        # size of 2 that the test cannot race the fake's permit release. An
+        # earlier version used capacity=3, reasoning that one spare slot covered
+        # the lag — it covers ONE late release, not both of a wave's, and it
+        # still failed about once in twelve. Three spare slots cover a whole
+        # wave's worth of lag.
+        #
+        # `max_concurrent` is asserted too but is NOT the discriminator: it
+        # counts jobs the fake is EXECUTING, which its own 2-worker pool bounds
+        # no matter how many were admitted. Do not rewrite this test around it —
+        # it passes just as happily with a queue-derived cap.
         self._configure(workers=2, queue_max=32)
-        eng = fake_engine.FakeEngine(workers=2, delay=0.02, capacity=3)
+        eng = fake_engine.FakeEngine(workers=2, delay=0.02, capacity=5)
         appmod.ENGINE = eng
         text = " ".join(f"[happy]s{i}[/happy]" for i in range(6))
         resp = self.client.post(
