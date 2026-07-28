@@ -118,13 +118,21 @@ class PureHelperTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             rep.replica_command(8000, reuse_port=True, fd=None)
 
-    def test_metrics_targets(self) -> None:
+    def test_metrics_targets_sequential_ports_are_per_replica(self) -> None:
         seq = rep.metrics_targets("0.0.0.0", 8000, 2, reuse_port=False)
         self.assertEqual(seq, [(0, "http://127.0.0.1:8000/metrics"),
                                (1, "http://127.0.0.1:8001/metrics")])
-        shared = rep.metrics_targets("0.0.0.0", 8000, 2, reuse_port=True)
-        self.assertEqual([u for _, u in shared],
-                         ["http://127.0.0.1:8000/metrics"] * 2)
+        self.assertEqual(rep.metrics_scope(False), rep.SCOPE_POOL_TOTAL)
+
+    def test_metrics_targets_under_reuse_port_is_one_unlabelled_scrape(self) -> None:
+        # This used to return the SAME url N times, and the aggregator summed
+        # the results — N random samples of one arbitrary replica added into a
+        # "pool total". Under SO_REUSEPORT there is exactly one thing we can
+        # scrape and we cannot say which replica answered: one target, index
+        # None, and a scope that forbids summing.
+        shared = rep.metrics_targets("0.0.0.0", 8000, 4, reuse_port=True)
+        self.assertEqual(shared, [(None, "http://127.0.0.1:8000/metrics")])
+        self.assertEqual(rep.metrics_scope(True), rep.SCOPE_SAMPLE)
 
     def test_backoff_delay_is_bounded_and_grows(self) -> None:
         self.assertEqual(rep.backoff_delay(0), 0.5)
@@ -147,7 +155,10 @@ class AggregateMetricsTests(unittest.TestCase):
                                "timeouts": 1, "abandoned": 1}},
         }
         res = rep.aggregate_metrics([(0, "u0"), (1, "u1")],
-                                    fetch=lambda u: responses[u])
+                                    fetch=lambda u: responses[u],
+                                    scope=rep.SCOPE_POOL_TOTAL)
+        self.assertEqual(res["scope"], rep.SCOPE_POOL_TOTAL)
+        self.assertTrue(res["complete"])
         t = res["totals"]
         self.assertEqual(t["received"], 15)
         self.assertEqual(t["completed"], 13)
@@ -167,9 +178,52 @@ class AggregateMetricsTests(unittest.TestCase):
 
         res = rep.aggregate_metrics([(0, "ok"), (1, "bad")], fetch=fetch)
         self.assertEqual(res["totals"]["received"], 7)   # only the good one
+        # A partial scrape yields a real but INCOMPLETE total; say so.
+        self.assertEqual(res["replicas_reporting"], 1)
+        self.assertEqual(res["replicas_expected"], 2)
+        self.assertFalse(res["complete"])
         self.assertTrue(res["replicas"][0]["ok"])
         self.assertFalse(res["replicas"][1]["ok"])
         self.assertIn("error", res["replicas"][1])
+
+    def test_audio_seconds_total_is_summed(self) -> None:
+        # Additive, float, and what the studio's savings ticker reads — it was
+        # missing from AGG_KEYS, so a pool reported one replica's audio.
+        responses = {"u0": {"metrics": {"audio_seconds_total": 12.5}},
+                     "u1": {"metrics": {"audio_seconds_total": 7.25}}}
+        res = rep.aggregate_metrics([(0, "u0"), (1, "u1")],
+                                    fetch=lambda u: responses[u])
+        self.assertEqual(res["totals"]["audio_seconds_total"], 19.75)
+
+    def test_reuse_port_scope_refuses_to_publish_a_total(self) -> None:
+        # THE bug this direction fixes: under SO_REUSEPORT the aggregate must
+        # not present itself as a pool figure.
+        calls = []
+
+        def fetch(url):
+            calls.append(url)
+            return {"metrics": {"received": 10, "completed": 9,
+                                "audio_seconds_total": 4.0}}
+
+        res = rep.aggregate_metrics(
+            rep.metrics_targets("0.0.0.0", 8000, 4, reuse_port=True),
+            fetch=fetch, scope=rep.metrics_scope(True), replicas_expected=4)
+        self.assertEqual(len(calls), 1)           # scraped once, not 4x
+        self.assertEqual(res["scope"], rep.SCOPE_SAMPLE)
+        self.assertIsNone(res["totals"])          # no fake pool number at all
+        self.assertEqual(res["sample"]["received"], 10)
+        self.assertEqual(res["replicas_expected"], 4)
+        self.assertIn("SO_REUSEPORT", res["note"])
+
+    def test_sample_scope_survives_an_unreachable_replica(self) -> None:
+        def fetch(url):
+            raise ConnectionError("refused")
+
+        res = rep.aggregate_metrics([(None, "shared")], fetch=fetch,
+                                    scope=rep.SCOPE_SAMPLE, replicas_expected=2)
+        self.assertIsNone(res["totals"])
+        self.assertIsNone(res["sample"])
+        self.assertEqual(res["replicas_reporting"], 0)
 
     def test_accepts_bare_metrics_dict(self) -> None:
         res = rep.aggregate_metrics([(0, "u")],
@@ -280,6 +334,10 @@ class AggKeysContractTests(unittest.TestCase):
     # from AGG_KEYS. Anything new must be classified on purpose — that's the
     # point of this test, not an exemption list to grow thoughtlessly.
     NON_ADDITIVE_INTS = {"window_size"}  # length of the latency sample window
+    # Percentiles and ratios: averaging/summing them across replicas is
+    # meaningless (they are None on a fresh Metrics(), hence the explicit list).
+    NON_ADDITIVE_FLOATS = {"latency_p50_s", "latency_p95_s", "latency_p99_s",
+                           "synth_p50_s", "realtime_factor"}
 
     def test_agg_keys_match_engine_metrics_snapshot(self) -> None:
         from service.tests import fake_engine  # noqa: F401  (installs dep shims)
@@ -296,6 +354,17 @@ class AggKeysContractTests(unittest.TestCase):
             f"replicas.AGG_KEYS does not sum, so the aggregated pool /metrics silently "
             f"under-reports them. Either add them to AGG_KEYS (it cannot import engine — "
             f"stdlib-only supervisor) or list them in NON_ADDITIVE_INTS if they are gauges.")
+
+        # Floats too: audio_seconds_total is additive and was missed for years
+        # because this test only walked integers.
+        float_fields = {k for k, v in snap.items() if isinstance(v, float)}
+        unclassified_floats = (float_fields - set(rep.AGG_KEYS)
+                               - self.NON_ADDITIVE_FLOATS)
+        self.assertEqual(
+            unclassified_floats, set(),
+            f"engine.Metrics.snapshot() emits float field(s) {sorted(unclassified_floats)} "
+            f"that replicas.AGG_KEYS does not sum. Add them to AGG_KEYS if additive, "
+            f"or to NON_ADDITIVE_FLOATS if they are averages/percentiles.")
 
         stale = set(rep.AGG_KEYS) - set(snap)
         self.assertEqual(

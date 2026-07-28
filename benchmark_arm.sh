@@ -79,7 +79,8 @@ run_cfg "NxT2"   "$HALF"  2        "1,2,4,$NPROC"
 # ---------- 5. shipped topology: the real replica launcher ----------
 # Benchmark the SAME process the sizing advisor recommends: `service.replicas`.
 # loadtest --replicas starts/stops the launcher itself, polls /health for
-# readiness, and scrapes the aggregated metrics side port per level. This
+# readiness, and scrapes the launcher's metrics side port per level (which
+# states whether those counters are a pool total or a one-replica sample). This
 # replaces the old hand-rolled `service.app`-on-ports-8080+i scaling that was
 # never the thing we actually ship.
 echo ">> replica sweep: python -m service.replicas (the real launcher) at 1,2,4 replicas"

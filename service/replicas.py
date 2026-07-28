@@ -20,10 +20,19 @@ Port sharing:
     kernel feature isn't available, so replicas fall back to sequential ports
     ``port, port+1, … port+N-1``. This is logged clearly at start-up.
 
-Aggregated metrics are addressed per replica. Under ``SO_REUSEPORT`` the
-replicas are not individually addressable (they answer on one shared port), so
-the aggregator scrapes the shared port once per replica and sums — accurate
-pool totals require the sequential-port mode; this is documented and logged.
+Aggregated metrics are addressed per replica, and the aggregator only claims a
+POOL TOTAL when it can actually reach every replica:
+
+  * sequential-port mode — each replica has its own URL, so ``/metrics``
+    returns ``scope: "pool_total"``: real sums over all N.
+  * ``SO_REUSEPORT`` mode — the replicas share one port and the kernel routes
+    each scrape to an arbitrary one of them. Scraping that port N times and
+    summing does not produce a pool total; it produces N random samples of one
+    pool member added together, which is a bigger, wronger number than the
+    single sample it came from. So we scrape ONCE and return
+    ``scope: "single_replica_sample"`` with ``totals: null`` — a sample that
+    says it is a sample. Use ``--no-reuse-port`` (or a real metrics backend)
+    when you need true pool totals.
 """
 from __future__ import annotations
 
@@ -59,9 +68,25 @@ IS_LINUX = sys.platform.startswith("linux")
 # from pool totals) is covered by test_replicas.test_agg_keys_match_engine_metrics,
 # which CAN import both sides. If you rename a counter in engine.Metrics, that
 # test fails — update this tuple.
+#
+# audio_seconds_total is a FLOAT and was missing for exactly that reason (the
+# drift test above only walks integer fields). It is additive, and it is what
+# the studio's savings ticker reads, so a pool that omitted it under-reported
+# every replica but one.
 AGG_KEYS = (
     "received", "completed", "rejected_429", "errored", "timeouts",
-    "abandoned", "in_flight", "queued",
+    "abandoned", "in_flight", "queued", "audio_seconds_total",
+)
+
+# What an aggregated /metrics document is a measurement OF.
+SCOPE_POOL_TOTAL = "pool_total"              # every replica scraped and summed
+SCOPE_SAMPLE = "single_replica_sample"       # one arbitrary replica, unsummable
+
+_SAMPLE_NOTE = (
+    "SO_REUSEPORT: replicas share one port and are not individually "
+    "addressable, so these counters come from ONE arbitrary replica and are "
+    "NOT pool totals. Restart the launcher with --no-reuse-port for "
+    "per-replica addressability (this trades away kernel load-balancing)."
 )
 
 # Environment variables pinned per replica so the whole box isn't oversubscribed
@@ -134,11 +159,27 @@ def replica_command(port: int, reuse_port: bool, host: str = "0.0.0.0",
     return cmd
 
 
+def metrics_scope(reuse_port: bool) -> str:
+    """What the aggregated document can honestly claim in this port mode."""
+    return SCOPE_SAMPLE if reuse_port else SCOPE_POOL_TOTAL
+
+
 def metrics_targets(host: str, port: int, replicas: int,
-                    reuse_port: bool) -> list[tuple[int, str]]:
-    """(replica_index, /metrics URL) for each replica. Under SO_REUSEPORT every
-    entry points at the one shared port (see the module docstring caveat)."""
+                    reuse_port: bool) -> list[tuple[int | None, str]]:
+    """Scrape targets as ``(replica_index, /metrics URL)``.
+
+    Sequential ports: one target per replica, index = that replica.
+
+    ``SO_REUSEPORT``: ONE target with index ``None``. The replicas share a port,
+    so the kernel hands each scrape to an arbitrary member — there is no such
+    thing as "replica i's URL" here. Emitting the same URL N times (what this
+    used to do) invited the caller to sum N samples of one unknown replica into
+    a fake pool total; one target, honestly unlabelled, cannot be summed by
+    accident.
+    """
     scrape_host = "127.0.0.1" if host in ("0.0.0.0", "") else host
+    if reuse_port:
+        return [(None, f"http://{scrape_host}:{port}/metrics")]
     ports = serving_ports(port, replicas, reuse_port)
     return [(i, f"http://{scrape_host}:{p}/metrics") for i, p in enumerate(ports)]
 
@@ -156,17 +197,30 @@ def _http_get_json(url: str, timeout: float = 2.0) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def aggregate_metrics(targets: list[tuple[int, str]],
-                      fetch: Callable[[str], dict] = _http_get_json) -> dict:
-    """Fan out ``/metrics`` to every replica and sum into pool totals.
+def aggregate_metrics(targets: list[tuple[int | None, str]],
+                      fetch: Callable[[str], dict] = _http_get_json,
+                      scope: str = SCOPE_POOL_TOTAL,
+                      replicas_expected: Optional[int] = None) -> dict:
+    """Scrape the targets and report what they honestly add up to.
 
     ``fetch(url)`` returns a replica's parsed ``/metrics`` JSON (shape
     ``{"config": ..., "metrics": {...}}``, or a bare metrics dict). A replica
-    that can't be reached is reported with ``ok: false`` and skipped from the
-    totals rather than failing the whole aggregation.
+    that can't be reached is reported with ``ok: false`` and skipped rather
+    than failing the whole scrape.
+
+    ``scope`` decides what the document claims (see ``metrics_scope``):
+
+    * ``pool_total`` — every replica is individually addressable, so the
+      counters are summed into ``totals``. ``replicas_reporting`` /
+      ``replicas_expected`` travel with them: a partial scrape yields a total
+      that is real but INCOMPLETE, and the consumer has to be able to see that.
+    * ``single_replica_sample`` — the replicas share a port (SO_REUSEPORT) and
+      cannot be told apart. ``totals`` is ``null`` — deliberately, so nothing
+      downstream can mistake a sample for a pool figure — and the one scrape is
+      published as ``sample`` with a ``note`` saying why.
     """
-    replicas: list[dict] = []
-    totals = {k: 0 for k in AGG_KEYS}
+    entries: list[dict] = []
+    reporting = 0
     for idx, url in targets:
         entry: dict = {"replica": idx, "url": url}
         try:
@@ -174,15 +228,36 @@ def aggregate_metrics(targets: list[tuple[int, str]],
             metrics = data.get("metrics", data) if isinstance(data, dict) else {}
             entry["ok"] = True
             entry["metrics"] = metrics
-            for k in AGG_KEYS:
-                v = metrics.get(k)
-                if isinstance(v, (int, float)) and not isinstance(v, bool):
-                    totals[k] += v
+            reporting += 1
         except Exception as exc:  # noqa: BLE001 - one bad replica must not break the rest
             entry["ok"] = False
             entry["error"] = str(exc)
-        replicas.append(entry)
-    return {"replicas": replicas, "totals": totals}
+        entries.append(entry)
+
+    doc: dict = {
+        "scope": scope,
+        "replicas": entries,
+        "replicas_expected": (replicas_expected if replicas_expected is not None
+                              else len(targets)),
+        "replicas_reporting": reporting,
+    }
+    if scope == SCOPE_SAMPLE:
+        ok = next((e for e in entries if e.get("ok")), None)
+        doc["totals"] = None          # there is no total to give, so give none
+        doc["sample"] = ok.get("metrics") if ok else None
+        doc["note"] = _SAMPLE_NOTE
+        return doc
+
+    totals = {k: 0 for k in AGG_KEYS}
+    for entry in entries:
+        for k in AGG_KEYS:
+            v = (entry.get("metrics") or {}).get(k)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                totals[k] += v
+    totals["audio_seconds_total"] = round(totals["audio_seconds_total"], 2)
+    doc["totals"] = totals
+    doc["complete"] = reporting == doc["replicas_expected"]
+    return doc
 
 
 # ---------------------------------------------------------------------------
@@ -360,12 +435,18 @@ class ReplicaSupervisor:
 # Aggregated-metrics HTTP endpoint (stdlib only)
 # ---------------------------------------------------------------------------
 def make_metrics_server(host: str, metrics_port: int,
-                        targets: list[tuple[int, str]]) -> ThreadingHTTPServer:
-    """A tiny HTTP server that answers GET /metrics with the summed pool view."""
+                        targets: list[tuple[int | None, str]],
+                        scope: str = SCOPE_POOL_TOTAL,
+                        replicas_expected: Optional[int] = None) -> ThreadingHTTPServer:
+    """A tiny HTTP server answering GET /metrics with the pool view — summed
+    when the replicas are addressable, an explicitly-labelled single-replica
+    sample when SO_REUSEPORT means they are not."""
 
     class _Handler(BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802
-            body = json.dumps(aggregate_metrics(targets)).encode("utf-8")
+            body = json.dumps(aggregate_metrics(
+                targets, scope=scope,
+                replicas_expected=replicas_expected)).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -409,9 +490,14 @@ def main(argv: Optional[list[str]] = None) -> None:
                             cores=args.cores)
     metrics_port = args.metrics_port if args.metrics_port is not None else args.port + 1000
     targets = metrics_targets(args.host, args.port, args.replicas, sup.reuse_port)
-    server = make_metrics_server(args.host, metrics_port, targets)
+    scope = metrics_scope(sup.reuse_port)
+    server = make_metrics_server(args.host, metrics_port, targets, scope=scope,
+                                 replicas_expected=args.replicas)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    logger.info("aggregated metrics on http://%s:%d/metrics", args.host, metrics_port)
+    logger.info("metrics on http://%s:%d/metrics (scope=%s)",
+                args.host, metrics_port, scope)
+    if scope == SCOPE_SAMPLE:
+        logger.warning("metrics scope is %s: %s", SCOPE_SAMPLE, _SAMPLE_NOTE)
 
     try:
         sup.run()

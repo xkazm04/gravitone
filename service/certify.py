@@ -168,6 +168,29 @@ def evaluate(result: dict) -> dict:
     }
 
 
+def topology_status(result: dict) -> dict:
+    """What topology produced the run, and what its server-side counters mean.
+
+    The shipped Linux topology shares one port across replicas (SO_REUSEPORT),
+    so the launcher cannot address them individually and its counters are a
+    SAMPLE of one replica. The client-side numbers (latency, throughput, audio
+    per wall-second) are still real — they were measured through the shared
+    port across the whole pool — but the certificate must not restate sampled
+    counters as a pool aggregate, so it says which it has.
+    """
+    topo = result.get("topology") or {}
+    scope = topo.get("metrics_scope") or "unknown"
+    return {
+        "mode": topo.get("mode") or "unknown",
+        "replicas": topo.get("replicas"),
+        "server_metrics_scope": scope,
+        "server_metrics_note": (
+            topo.get("metrics_scope_note")
+            or "this result predates scoped server-side counters"),
+        "pool_aggregate_available": scope == "pool_total",
+    }
+
+
 def _canonical(cert: dict) -> bytes:
     unsigned = {k: v for k, v in cert.items() if k not in ("sha256", "signature")}
     return json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
@@ -178,6 +201,7 @@ def build_certificate(result: dict) -> dict:
         "version": CERT_VERSION,
         "issued": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "hardware": gather_hardware(),
+        "topology": topology_status(result),
         **evaluate(result),
         "thresholds": THRESHOLDS,
         "loadtest_args": result.get("args", {}),
@@ -236,6 +260,10 @@ def main() -> None:
         print(f"  {'PASS' if c['pass'] else 'FAIL'}  {c['check']}: {c['got']} (want {c['want']})")
     if cap["audio_minutes_per_hour"]:
         print(f"Capacity: ~{cap['audio_minutes_per_hour']} audio-min/hour at cap {cap['recommended_cap']}")
+    topo = cert["topology"]
+    if not topo["pool_aggregate_available"]:
+        print(f"Server counters: {topo['server_metrics_scope']} — "
+              f"{topo['server_metrics_note']}")
     rc = cert["recommended_config"]
     print(f"Config: {rc['replicas']} replicas x TTS_TORCH_THREADS={rc['TTS_TORCH_THREADS']}, "
           f"TTS_QUEUE_MAX={rc['TTS_QUEUE_MAX']}")

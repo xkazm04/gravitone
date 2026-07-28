@@ -85,6 +85,33 @@ class VerdictTests(unittest.TestCase):
         self.assertEqual(cert["version"], "gravitone-cert/2")
 
 
+class CertificateTopologyTests(unittest.TestCase):
+    """The certificate must not restate a sampled counter as a pool aggregate."""
+
+    def test_reuse_port_run_says_its_counters_are_a_sample(self) -> None:
+        result = _result()
+        result["topology"] = lt.topology_block("replicas", 4, [], lt.SCOPE_SAMPLE)
+        cert = certify.build_certificate(result)
+        topo = cert["topology"]
+        self.assertEqual(topo["server_metrics_scope"], lt.SCOPE_SAMPLE)
+        self.assertFalse(topo["pool_aggregate_available"])
+        self.assertIn("NOT pool totals", topo["server_metrics_note"])
+        # Sampled counters do not invalidate the client-side measurement.
+        self.assertEqual(cert["verdict"], "certified")
+
+    def test_addressable_run_may_claim_a_pool_aggregate(self) -> None:
+        result = _result()
+        result["topology"] = lt.topology_block("replicas", 4, [],
+                                               lt.SCOPE_POOL_TOTAL)
+        topo = certify.topology_status(result)
+        self.assertTrue(topo["pool_aggregate_available"])
+
+    def test_result_without_topology_claims_nothing(self) -> None:
+        topo = certify.topology_status(_result())
+        self.assertEqual(topo["server_metrics_scope"], "unknown")
+        self.assertFalse(topo["pool_aggregate_available"])
+
+
 class CertVersionTests(unittest.TestCase):
     def test_version_bumped_so_old_artifacts_are_distinguishable(self) -> None:
         # v1 certificates were issued from cache-blind results; a consumer must

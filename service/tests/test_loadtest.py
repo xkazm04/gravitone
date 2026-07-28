@@ -252,12 +252,77 @@ class MetricsDeltaTests(unittest.TestCase):
         self.assertNotIn("received", d)   # no matching 'before' value
         self.assertNotIn("completed", d)  # non-numeric
 
-    def test_topology_block_shape(self) -> None:
-        per_level = [{"concurrency": 1, "pool_delta": {"received": 12}}]
-        block = lt.topology_block("replicas", 4, per_level)
+    def test_delta_includes_audio_seconds_total(self) -> None:
+        d = lt.metrics_delta({"audio_seconds_total": 10.0},
+                             {"audio_seconds_total": 42.5})
+        self.assertEqual(d["audio_seconds_total"], 32.5)
+
+    def test_topology_block_states_what_its_counters_are(self) -> None:
+        per_level = [{"concurrency": 1, "scope": lt.SCOPE_SAMPLE,
+                      "counter_delta": {"received": 12}}]
+        block = lt.topology_block("replicas", 4, per_level, lt.SCOPE_SAMPLE)
         self.assertEqual(block["mode"], "replicas")
         self.assertEqual(block["replicas"], 4)
-        self.assertEqual(block["aggregated_metrics_per_level"], per_level)
+        self.assertEqual(block["metrics_per_level"], per_level)
+        # The shipped SO_REUSEPORT topology cannot substantiate a pool total,
+        # so the block must not imply one.
+        self.assertEqual(block["metrics_scope"], lt.SCOPE_SAMPLE)
+        self.assertIn("NOT pool totals", block["metrics_scope_note"])
+        self.assertNotIn("aggregated_metrics_per_level", block)
+
+    def test_pool_total_scope_is_labelled_too(self) -> None:
+        block = lt.topology_block("replicas", 4, [], lt.SCOPE_POOL_TOTAL)
+        self.assertEqual(block["metrics_scope"], lt.SCOPE_POOL_TOTAL)
+        self.assertIn("summed", block["metrics_scope_note"])
+
+
+class ScrapeScopeTests(unittest.TestCase):
+    """The harness must carry the launcher's honesty flag, not flatten it."""
+
+    def _serve(self, doc):
+        """Run a one-shot HTTP server returning ``doc`` and scrape it."""
+        import asyncio
+        import json
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        body = json.dumps(doc).encode()
+
+        class _H(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        srv = HTTPServer(("127.0.0.1", 0), _H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            url = f"http://127.0.0.1:{srv.server_port}/metrics"
+            return asyncio.run(lt._scrape_pool_metrics(url))
+        finally:
+            srv.shutdown()
+
+    def test_pool_total_is_read_as_a_total(self) -> None:
+        got = self._serve({"scope": "pool_total",
+                           "totals": {"received": 40, "audio_seconds_total": 9.5}})
+        self.assertEqual(got["scope"], lt.SCOPE_POOL_TOTAL)
+        self.assertEqual(got["counters"]["received"], 40)
+
+    def test_reuse_port_sample_is_read_as_a_sample(self) -> None:
+        got = self._serve({"scope": "single_replica_sample", "totals": None,
+                           "sample": {"received": 10}, "note": "..."})
+        self.assertEqual(got["scope"], lt.SCOPE_SAMPLE)
+        self.assertEqual(got["counters"]["received"], 10)
+
+    def test_unreachable_metrics_port_reports_unknown_scope(self) -> None:
+        import asyncio
+        got = asyncio.run(lt._scrape_pool_metrics("http://127.0.0.1:1/metrics"))
+        self.assertEqual(got, {"scope": lt.SCOPE_UNKNOWN, "counters": {}})
 
 
 class ScrapePoolTotalsTests(unittest.TestCase):
@@ -265,9 +330,9 @@ class ScrapePoolTotalsTests(unittest.TestCase):
 
     def test_unreachable_metrics_port_returns_empty(self) -> None:
         import asyncio
-        # Nothing is listening on this port -> httpx raises -> {} (not a crash).
-        totals = asyncio.run(lt._scrape_pool_totals("http://127.0.0.1:1/metrics"))
-        self.assertEqual(totals, {})
+        # Nothing is listening -> httpx raises -> empty counters (not a crash).
+        got = asyncio.run(lt._scrape_pool_metrics("http://127.0.0.1:1/metrics"))
+        self.assertEqual(got["counters"], {})
 
 
 # ---------------------------------------------------------------------------
@@ -464,8 +529,8 @@ class CpuSplitTests(unittest.TestCase):
 class SingleServerMetricsScrapeTests(unittest.TestCase):
     def test_unreachable_metrics_returns_empty(self) -> None:
         import asyncio
-        totals = asyncio.run(lt._scrape_server_metrics("http://127.0.0.1:1/metrics"))
-        self.assertEqual(totals, {})
+        got = asyncio.run(lt._scrape_server_metrics("http://127.0.0.1:1/metrics"))
+        self.assertEqual(got, {"scope": lt.SCOPE_UNKNOWN, "counters": {}})
 
 
 if __name__ == "__main__":

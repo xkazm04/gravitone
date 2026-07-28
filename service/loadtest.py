@@ -340,11 +340,28 @@ def build_result(rows, knee, recommended, *, route, fmt, corpus,
 # ---------------------------------------------------------------------------
 # Direction 1 — benchmark the topology we actually ship (service.replicas)
 # ---------------------------------------------------------------------------
-# Pool counters worth reporting per level (the launcher's aggregated totals).
+# Server-side counters worth reporting per level. Scope matters: see
+# METRICS_SCOPE_* — the same key set is either a real pool total or one
+# replica's sample, and the result JSON always says which.
 TOPOLOGY_METRIC_KEYS = (
     "received", "completed", "rejected_429", "errored", "timeouts",
-    "abandoned", "in_flight", "queued",
+    "abandoned", "in_flight", "queued", "audio_seconds_total",
 )
+
+# What the per-level counter deltas describe (mirrors service.replicas scopes).
+SCOPE_POOL_TOTAL = "pool_total"                  # every replica scraped + summed
+SCOPE_SAMPLE = "single_replica_sample"           # SO_REUSEPORT: one unknown replica
+SCOPE_SINGLE_PROCESS = "single_process"          # --url mode: the one server
+SCOPE_UNKNOWN = "unknown"                        # scrape failed / no scope field
+
+SCOPE_NOTES = {
+    SCOPE_POOL_TOTAL: "counters summed across every replica (addressable ports)",
+    SCOPE_SAMPLE: ("counters come from ONE arbitrary replica: under SO_REUSEPORT "
+                   "the replicas share a port and cannot be told apart, so these "
+                   "are NOT pool totals and must not be read as pool throughput"),
+    SCOPE_SINGLE_PROCESS: "counters from the single server under test",
+    SCOPE_UNKNOWN: "the metrics endpoint did not say what it was reporting",
+}
 
 
 def default_metrics_port(port: int) -> int:
@@ -368,11 +385,12 @@ def replicas_launch_command(replicas: int, port: int, metrics_port: int,
 
 
 def metrics_delta(before: dict, after: dict) -> dict:
-    """Per-counter (after - before) over the aggregated pool totals.
+    """Per-counter (after - before) over two counter snapshots.
 
-    ``before``/``after`` are the ``totals`` dicts scraped from the launcher's
-    side metrics port around one level. Non-numeric or missing counters are
-    skipped so a partial scrape can't crash the run.
+    ``before``/``after`` are the counter dicts scraped around one level (a pool
+    total, a single-replica sample, or one server's own /metrics — the caller
+    records WHICH). Non-numeric or missing counters are skipped so a partial
+    scrape can't crash the run.
     """
     delta: dict = {}
     for k in TOPOLOGY_METRIC_KEYS:
@@ -383,50 +401,68 @@ def metrics_delta(before: dict, after: dict) -> dict:
     return delta
 
 
-def topology_block(mode: str, replicas: int, per_level: list) -> dict:
+def topology_block(mode: str, replicas: int, per_level: list,
+                   metrics_scope: str = SCOPE_UNKNOWN) -> dict:
     """The result-JSON block describing WHAT topology produced these numbers.
 
     mode "single" = one in-process server (``--url``); mode "replicas" = the
-    ``service.replicas`` launcher driving N single-worker processes, with the
-    aggregated pool-counter deltas captured around every level.
+    ``service.replicas`` launcher driving N single-worker processes.
+
+    ``metrics_scope`` is the honesty flag on the per-level counter deltas. The
+    shipped Linux topology (SO_REUSEPORT) cannot address individual replicas,
+    so its deltas are a SAMPLE of one replica, never a pool total — this block
+    says so instead of publishing an aggregate nobody can substantiate.
     """
     return {
         "mode": mode,
         "replicas": replicas,
-        "aggregated_metrics_per_level": per_level,
+        "metrics_scope": metrics_scope,
+        "metrics_scope_note": SCOPE_NOTES.get(metrics_scope, ""),
+        "metrics_per_level": per_level,
     }
 
 
-async def _scrape_pool_totals(metrics_url: str) -> dict:
-    """Scrape the launcher's aggregated /metrics and return its pool totals
-    (empty dict if unreachable — a missing scrape must not abort the ramp)."""
+async def _scrape_pool_metrics(metrics_url: str) -> dict:
+    """Scrape the launcher's /metrics and return ``{"scope", "counters"}``.
+
+    The launcher publishes ``totals`` ONLY when it could address every replica;
+    under SO_REUSEPORT it publishes ``sample`` with ``totals: null`` because the
+    replicas share a port. This helper carries that distinction into the result
+    JSON instead of flattening both into "the pool numbers". Empty scope +
+    empty counters if unreachable — a missing scrape must not abort the ramp.
+    """
     try:
         async with httpx.AsyncClient() as c:
             r = await c.get(metrics_url, timeout=5)
             if r.status_code == 200:
-                return r.json().get("totals", {}) or {}
+                doc = r.json()
+                scope = doc.get("scope") or SCOPE_UNKNOWN
+                counters = doc.get("totals")
+                if not counters:
+                    counters = doc.get("sample") or {}
+                return {"scope": scope, "counters": counters}
     except Exception:  # noqa: BLE001
         pass
-    return {}
+    return {"scope": SCOPE_UNKNOWN, "counters": {}}
 
 
 async def _scrape_server_metrics(metrics_url: str) -> dict:
     """Scrape a SINGLE server's GET /metrics and return its counter snapshot.
 
-    The app serves ``{"config": ..., "metrics": {...}}``; the launcher serves
-    ``{"totals": {...}}``. This returns the single-server ``metrics`` block (the
-    same counter shape ``metrics_delta`` consumes) so single mode gets the same
-    per-level timeouts/abandoned/queue deltas the replica mode already reports.
-    Empty dict on any failure — a missing scrape must never abort the ramp.
+    The app serves ``{"config": ..., "metrics": {...}}``. Returned in the same
+    ``{"scope", "counters"}`` envelope as the launcher scrape so both modes
+    record what their counters describe — here one process, completely.
+    Empty counters on any failure — a missing scrape must never abort the ramp.
     """
     try:
         async with httpx.AsyncClient() as c:
             r = await c.get(metrics_url, timeout=5)
             if r.status_code == 200:
-                return r.json().get("metrics", {}) or {}
+                return {"scope": SCOPE_SINGLE_PROCESS,
+                        "counters": r.json().get("metrics", {}) or {}}
     except Exception:  # noqa: BLE001
         pass
-    return {}
+    return {"scope": SCOPE_UNKNOWN, "counters": {}}
 
 
 async def _wait_launcher_ready(serving_url: str, proc, timeout: float = 180.0,
@@ -741,7 +777,8 @@ def print_plan(result: dict) -> None:
     print(f"  python -m service.replicas --replicas {cap} --port {port}")
     if topo.get("mode") == "replicas":
         print(f"  (validated: this benchmark drove service.replicas at "
-              f"{topo.get('replicas')} replica(s) — see topology.aggregated_metrics_per_level)")
+              f"{topo.get('replicas')} replica(s) — see topology.metrics_per_level, "
+              f"scope={topo.get('metrics_scope')})")
     else:
         print("  (single-server run: re-run with --replicas to measure this launcher directly)")
     print("\nScale by adding processes/replicas, not in-process workers (GIL-bound).")
@@ -751,14 +788,17 @@ def print_plan(result: dict) -> None:
 
 async def run_ramp(args, levels, n_per_level, *, scrape=None):
     """Ramp through ``levels``, print the live table, and return
-    ``(rows, knee, recommended, per_level_metrics)``.
+    ``(rows, knee, recommended, per_level_metrics, metrics_scope)``.
 
-    If ``scrape`` (an async ``() -> pool-totals dict``) is supplied, the
-    aggregated pool counters are captured before/after each level and their
-    delta recorded — that's how the replica topology reports timeouts/abandoned.
+    If ``scrape`` (an async ``() -> {"scope", "counters"}``) is supplied, the
+    server-side counters are captured before/after each level and their delta
+    recorded — that's how timeouts/abandoned/queue land in the JSON. The scope
+    the endpoint reported travels with every delta, because under SO_REUSEPORT
+    those counters are ONE replica's sample, not a pool total.
     """
     rows = []
     per_level_metrics: list = []
+    metrics_scope = SCOPE_UNKNOWN
     baseline_p95 = None
     knee = None
     route = getattr(args, "route", "synth")
@@ -827,10 +867,17 @@ async def run_ramp(args, levels, n_per_level, *, scrape=None):
             print(f"     ^ low confidence: only {row['ok']} sample(s) < {LOW_CONFIDENCE_N}; "
                   f"treat p95/p99 as indicative, not exact")
         if scrape is not None:
-            delta = metrics_delta(before or {}, after or {})
-            per_level_metrics.append({"concurrency": c, "pool_delta": delta})
+            before, after = before or {}, after or {}
+            scope = after.get("scope") or before.get("scope") or SCOPE_UNKNOWN
+            if scope != SCOPE_UNKNOWN:
+                metrics_scope = scope
+            delta = metrics_delta(before.get("counters") or {},
+                                  after.get("counters") or {})
+            per_level_metrics.append({"concurrency": c, "scope": scope,
+                                      "counter_delta": delta})
             if delta:
-                print("     pool Δ: "
+                label = "sampled replica Δ" if scope == SCOPE_SAMPLE else "server Δ"
+                print(f"     {label}: "
                       + " ".join(f"{k}={v}" for k, v in delta.items() if v))
 
         if c == levels[0]:
@@ -850,8 +897,11 @@ async def run_ramp(args, levels, n_per_level, *, scrape=None):
     else:
         print(f"No degradation across tested levels (up to {levels[-1]}). "
               f"Push higher with --levels to find the ceiling.")
+    if metrics_scope == SCOPE_SAMPLE:
+        print("NOTE: server-side counters above are a SAMPLE of one replica "
+              "(SO_REUSEPORT shares one port); they are not pool totals.")
     print("=" * 60)
-    return rows, knee, recommended, per_level_metrics
+    return rows, knee, recommended, per_level_metrics, metrics_scope
 
 
 def _write_result(args, result) -> None:
@@ -888,7 +938,8 @@ async def run_replicas_mode(args, levels, n_per_level) -> None:
             print(f"!! {exc}")
             return
         print(f"launcher ready on {serving_url} "
-              f"({args.replicas} replicas); aggregated metrics on {metrics_url}")
+              f"({args.replicas} replicas); launcher metrics on {metrics_url} "
+              f"(the launcher states their scope — pool total vs one-replica sample)")
         if not sys.platform.startswith("linux") and args.replicas > 1:
             # Without SO_REUSEPORT the launcher falls back to sequential ports
             # and this ramp only ever hits the first replica — the other N-1
@@ -912,9 +963,9 @@ async def run_replicas_mode(args, levels, n_per_level) -> None:
             print(f"warmup complete ({warmed}/{args.warmup} ok)")
 
         async def scrape():
-            return await _scrape_pool_totals(metrics_url)
+            return await _scrape_pool_metrics(metrics_url)
 
-        rows, knee, recommended, per_level = await run_ramp(
+        rows, knee, recommended, per_level, metrics_scope = await run_ramp(
             args, levels, n_per_level, scrape=scrape)
         if proc.poll() is not None:
             print(f"!! launcher died during the ramp (code {proc.returncode}); "
@@ -925,7 +976,8 @@ async def run_replicas_mode(args, levels, n_per_level) -> None:
             route=args.route, fmt=args.format, corpus=args.text,
             service_config=service_config, meta=runtime_metadata(),
             cache_mode=args.cache_mode,
-            extra={"topology": topology_block("replicas", args.replicas, per_level),
+            extra={"topology": topology_block("replicas", args.replicas,
+                                              per_level, metrics_scope),
                    "cpu_accounting": cpu_accounting_note(args.server_pid)})
         _write_result(args, result)
     finally:
@@ -1023,14 +1075,14 @@ async def main():
     async def scrape():
         return await _scrape_server_metrics(f"{args.url}/metrics")
 
-    rows, knee, recommended, per_level = await run_ramp(
+    rows, knee, recommended, per_level, metrics_scope = await run_ramp(
         args, levels, n_per_level, scrape=scrape)
     result = build_result(
         rows, knee, recommended,
         route=args.route, fmt=args.format, corpus=args.text,
         service_config=service_config, meta=runtime_metadata(),
         cache_mode=args.cache_mode,
-        extra={"topology": topology_block("single", 1, per_level),
+        extra={"topology": topology_block("single", 1, per_level, metrics_scope),
                "cpu_accounting": cpu_accounting_note(args.server_pid)})
     _write_result(args, result)
 

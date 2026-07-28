@@ -206,13 +206,18 @@ What it does:
   **falls back to sequential ports** `8000, 8001, … 8000+N-1` (logged at start-up).
 - **Supervises** the replicas: restarts a dead one with bounded exponential
   backoff, fans `SIGTERM` out to all children on shutdown, and waits for them.
-- **Aggregated metrics**: a stdlib HTTP endpoint on `--metrics-port` (default
-  `--port + 1000`, e.g. `:9000`) fans `GET /metrics` out to every replica and
-  returns `{"replicas": [...], "totals": {received, completed, rejected_429,
-  errored, timeouts, abandoned, in_flight, queued}}`. Per-replica totals are
-  exact in the sequential-port mode; under `SO_REUSEPORT` the replicas answer on
-  one shared port and aren't individually addressable (documented trade-off —
-  use `--no-reuse-port` if you need per-replica accuracy).
+- **Pool metrics**: a stdlib HTTP endpoint on `--metrics-port` (default
+  `--port + 1000`, e.g. `:9000`) that says what it is measuring via `scope`:
+  - sequential-port mode → `scope: "pool_total"`, with real `totals`
+    (`received, completed, rejected_429, errored, timeouts, abandoned,
+    in_flight, queued, audio_seconds_total`) plus `replicas_reporting` /
+    `replicas_expected` so a partial scrape is visible.
+  - `SO_REUSEPORT` mode → `scope: "single_replica_sample"`, `totals: null`, and
+    a `sample` from ONE arbitrary replica. The replicas share a port, so no
+    scrape can address them individually and no honest pool total exists;
+    the endpoint publishes the sample and says so rather than summing N random
+    samples of one member. Use `--no-reuse-port` (trading away kernel
+    load-balancing) when you need real per-replica totals.
 
 `python -m service.certify` prints the recommended replica count for your box
 and the exact `service.replicas` command to run it.
