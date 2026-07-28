@@ -139,16 +139,24 @@ class Settings:
 
     # --- Long-form segmentation -------------------------------------------
     # Target size, in characters, of ONE synthesis unit. Long text is
-    # sentence-split and neighbouring sentences are coalesced up to this budget,
-    # so a long body becomes several jobs that run on different workers instead
-    # of one serial job. Text shorter than the budget stays a single unit and
-    # takes exactly the pre-segmentation path (identical bytes, identical
-    # headers). This is a TARGET, not a bound on the number of units: greedy
-    # coalescing only merges when the combined length fits, so sentences longer
-    # than half the budget never merge and the count tracks sentence count. The
-    # route that submits its units all at once widens the budget until the count
-    # fits its own ceiling (app._max_batch_units) — set this for prosody, and
-    # let that ceiling own admission safety.
+    # sentence-split and neighbouring sentences are coalesced up to this budget.
+    # This is a TARGET, not a bound on the number of units: greedy coalescing
+    # only merges when the combined length fits, so sentences longer than half
+    # the budget never merge and the count tracks sentence count.
+    #
+    # Who actually splits, and why:
+    #   * the STREAMING route always does. Its rolling window costs no extra
+    #     admission and finer units mean a lower time-to-first-byte even on ONE
+    #     worker (first-segment time instead of whole-body time).
+    #   * the batching drop-in route only when `workers` > 1, because it submits
+    #     every unit at once and a unit past the worker count merely queues
+    #     behind its own siblings while still costing an admission slot and a
+    #     concat seam (app._max_batch_units caps it at the real worker count).
+    #     At the shipped workers=1 a long body therefore stays ONE job on that
+    #     route — exactly the pre-segmentation path, identical bytes and
+    #     headers, as short text always was.
+    # Set this for PROSODY (how long a natural span is); let _max_batch_units
+    # own admission safety.
     chunk_chars: int = _int("TTS_CHUNK_CHARS", 350)
 
     # --- Synthesis result cache -------------------------------------------

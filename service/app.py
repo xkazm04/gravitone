@@ -469,28 +469,49 @@ def _split_sentences(text: str) -> list[str]:
     return parts or [text]
 
 
-# Ceiling on the units ONE all-at-once batch may submit, whatever the queue
-# depth is. Past this, more segments buy little parallelism (a single process
-# has `workers` of them) while multiplying concat seams — and one caller should
-# never be able to claim a huge admission window on its own.
+# Hard ceiling on the units ONE all-at-once batch may submit, however many
+# workers a process is configured with. Past this the concat seams and per-unit
+# model setup/teardown grow while one caller claims an ever larger share of the
+# admission window everybody else is queueing in.
 _MAX_BATCH_UNITS = 16
 
 
 def _max_batch_units() -> int:
     """How many units one BATCHED request may split into.
 
-    The drop-in route submits every unit at once, so the unit count is an
-    admission cost: the `workers + queue_max` window is shared with every other
-    caller. Half of it, capped at ``_MAX_BATCH_UNITS``, leaves real headroom.
-    Never below 1 — with a tiny configured queue this degrades to the original
-    single-job request rather than turning long text into a certain 429.
+    Derived from the parallelism this process actually HAS — ``SETTINGS.workers``
+    independent model instances — and NOT from the admission window. The drop-in
+    route submits every unit at the same instant, so a unit beyond the worker
+    count does not start any sooner: it queues behind its own siblings and runs
+    serially anyway, while still costing an admission slot, a concat seam and a
+    per-unit model setup/teardown. Same total model work, strictly more
+    overhead. (``workers + queue_max`` is a QUEUE-DEPTH knob; deriving the cap
+    from it also meant raising ``queue_max`` for backpressure headroom silently
+    raised how much of it one caller could claim.)
 
-    The streaming route does NOT pass a cap: it submits in a rolling window
-    (see ``text_to_speech_stream``), so its unit count costs no admission and
-    smaller units buy lower time-to-first-byte.
+    On the topology this product SHIPS that means 1. ``workers`` defaults to 1
+    (config.py: generation is GIL/serialization-bound, so the recommendation is
+    to scale by PROCESS) and ``replicas.py`` hard-pins ``TTS_WORKERS=1`` into
+    every replica it spawns. A single-worker replica cannot run two units at
+    once, so the honest batch size is one and a long body takes the plain
+    single-job path. Batching is untouched and still correct for an operator who
+    really does run ``TTS_WORKERS=N``: there it splits into at most N units that
+    genuinely occupy N workers.
+
+    Still bounded by ``_MAX_BATCH_UNITS`` and by half the ``workers +
+    queue_max`` window, so a large in-process pool cannot let one caller take
+    the admission window away from everybody else.
+
+    The streaming route does NOT pass a cap: it submits in a rolling window (see
+    ``text_to_speech_stream``), so its unit count costs no admission — and its
+    win is time-to-first-byte, which a single worker delivers just as well
+    (first-segment time instead of whole-body time).
     """
+    parallel = max(1, int(SETTINGS.workers))
+    if parallel == 1:
+        return 1
     window = max(1, SETTINGS.workers + SETTINGS.queue_max)
-    return max(1, min(_MAX_BATCH_UNITS, window // 2))
+    return max(1, min(_MAX_BATCH_UNITS, parallel, window // 2))
 
 
 def _coalesce(parts: list[str], budget: int) -> list[str]:
@@ -533,12 +554,20 @@ def _chunk_text(text: str, max_units: int | None = None) -> list[str]:
     allows, which is what parallelism wants — each doubling is one more linear
     pass over a list that is at most a few hundred sentences.
 
+    ``max_units=1`` means "there is no parallelism to split for" (the shipped
+    single-worker replica, see ``_max_batch_units``) and short-circuits: the
+    body comes back as the un-segmented text itself, so the caller takes the
+    original single-job path byte for byte instead of paying a widen loop to
+    re-derive it.
+
     Callers that submit incrementally (the streaming route) pass no cap and
     keep sentence-grained units.
     """
     parts = _split_sentences(text)
     if len(parts) <= 1:
         return parts
+    if max_units is not None and int(max_units) <= 1:
+        return [text.strip()]
     budget = max(1, int(SETTINGS.chunk_chars))
     if max_units is None:
         return _coalesce(parts, budget)
@@ -673,15 +702,25 @@ async def text_to_speech(
 ):
     """Drop-in ElevenLabs synthesis.
 
-    Long text is segmented (``_chunk_text``) and the units are submitted as ONE
-    batch, so an N-unit body occupies up to N workers concurrently instead of
-    serialising on a single worker — the same treatment /v1/speak and
-    /v1/performance already get. The segments are re-joined with the engine's
-    ``concat_wavs`` (the identical path /v1/speak uses, so seams behave the
-    same). Text that fits ``SETTINGS.chunk_chars`` stays ONE unit and takes the
-    original single-job path unchanged, bytes and headers included, and the
-    unit count is capped at ``_max_batch_units()`` so a long body can never
-    submit more jobs than the admission window has room for.
+    Long text is segmented (``_chunk_text``) only as far as this process can
+    actually run in parallel. The units are submitted as ONE batch, so a unit
+    beyond ``SETTINGS.workers`` would not occupy another worker — it would queue
+    behind its own siblings — and ``_max_batch_units()`` caps the count at the
+    real worker count for exactly that reason.
+
+    On the SHIPPED single-worker replica (``workers`` defaults to 1 and
+    ``replicas.py`` pins ``TTS_WORKERS=1``) that cap is 1, so EVERY body, long
+    or short, takes the plain single-job path — no batch, no concat seams, no
+    multi-slot admission cost, bytes and headers exactly as before segmentation
+    existed. With ``TTS_WORKERS=N`` a long body splits into at most N units that
+    do run concurrently and are re-joined with the engine's own ``concat_wavs``
+    (the identical path /v1/speak uses, so seams behave the same); that request
+    reports ``X-Synth-Segments``.
+
+    Long text on a single worker is not slower than it was — it is the same one
+    job it always was. For lower latency on long text whatever the worker count,
+    use ``/stream``: its rolling window drops time-to-first-byte to
+    first-segment time with one worker just as well as with N.
 
     Results are cached per process (``SYNTH_CACHE``) on the full request
     identity, and concurrent identical requests collapse onto one synthesis.
@@ -705,8 +744,10 @@ async def text_to_speech(
 
     async def _synthesize() -> CachedAudio:
         """Render this request from scratch, recording its true timings."""
-        # Batched submission: the unit count is capped, because every unit
-        # takes an admission slot at the same instant (_max_batch_units).
+        # Batched submission: the unit count is capped at the parallelism this
+        # process actually has, because every unit takes an admission slot at
+        # the same instant (_max_batch_units). At the shipped workers=1 the cap
+        # is 1 and this returns a single unit — the branch below.
         units = _chunk_text(req.text, max_units=_max_batch_units())
         if len(units) <= 1:
             # Single unit: identical to the pre-segmentation behaviour,
