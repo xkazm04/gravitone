@@ -129,12 +129,16 @@ bash benchmark_arm_ab.sh       # A/B each Arm inference setting on its own
                                # realtime factor each one bought ON THIS BOX.
 ```
 
-Every one of those settings is applied by default and individually revertible
-from the environment (`TTS_INFERENCE_MODE`, `TTS_FLUSH_DENORMAL`,
-`TTS_TORCH_INTEROP_THREADS`, `TTS_QUANTIZE` / `TTS_QUANTIZED_ENGINE`,
-`TTS_FFMPEG_THREADS`, `ONEDNN_DEFAULT_FPMATH_MODE`) — see `service/config.py`
-for what each default is and why. The repo quotes no speedup figures: run the
-A/B on your hardware and use its numbers.
+All of those settings are individually revertible from the environment
+(`TTS_INFERENCE_MODE`, `TTS_FLUSH_DENORMAL`, `TTS_TORCH_INTEROP_THREADS`,
+`TTS_FFMPEG_THREADS`, `ONEDNN_DEFAULT_FPMATH_MODE`, `TTS_QUANTIZE` /
+`TTS_QUANTIZED_ENGINE`) and all are applied by default **except int8
+quantization**, which stays off until an A/B row on your own hardware shows a
+win — the "~27% faster" figure this repo used to quote was measured on x86
+(fbgemm) and does not transfer to aarch64, where int8 comes from a different
+backend than the fp32 path. See `service/config.py` for each default and why.
+The repo quotes no speedup figures: run the A/B on your hardware and use its
+numbers.
 
 ### Option B — native venv
 
