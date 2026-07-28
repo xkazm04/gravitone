@@ -1172,15 +1172,35 @@ async def performance(req: PerformanceRequest):
 
 @app.get("/health")
 async def health():
-    if ENGINE is None or not ENGINE.ready:
+    if ENGINE is None:
         return JSONResponse(status_code=503, content={"status": "loading"})
+    if not ENGINE.ready:
+        # `ready` is derived from LIVE worker threads, not from a one-time
+        # startup flag: a replica whose worker died mid-loop reports not-ready
+        # here (status "unavailable" once it has given up restarting it), which
+        # is what lets the process supervisor replace it. Without this, a
+        # replica with no functioning worker answered 200 forever while every
+        # request piled into a queue nobody served.
+        failed = bool(getattr(ENGINE, "failed", False))
+        body = {"status": "unavailable" if failed else "loading"}
+        live = getattr(ENGINE, "live_workers", None)
+        if live is not None:
+            body["workers_live"] = live
+            body["workers_configured"] = getattr(ENGINE, "worker_count", live)
+        return JSONResponse(status_code=503, content=body)
     if ENGINE.draining:
         # Readiness must fail the moment the drain starts, or the load balancer
         # keeps routing new work to a pod that answers every submit with 503.
         # Liveness is a TCP probe, so failing here removes us from the
         # Endpoints list without getting killed mid-drain.
         return JSONResponse(status_code=503, content={"status": "draining"})
-    return {"status": "ready", "config": ENGINE.config(), "metrics": ENGINE.metrics.snapshot()}
+    body = {"status": "ready", "config": ENGINE.config(),
+            "metrics": ENGINE.metrics.snapshot()}
+    live = getattr(ENGINE, "live_workers", None)
+    if live is not None:  # real engine; fakes in tests don't model threads
+        body["workers_live"] = live
+        body["workers_configured"] = getattr(ENGINE, "worker_count", live)
+    return body
 
 
 @app.get("/metrics")
