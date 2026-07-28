@@ -515,7 +515,11 @@ def plan_baseline(by_emotion: dict[str, list[dict]], min_stem: float) -> Baselin
     never be presented as a clean one.
 
     Segments are measured by their extracted wav (the same measurement the stem
-    file will have), not by the labelled span, and stay in recording order.
+    file will have), not by the labelled span. The neutral segments stay in
+    recording order; any borrowed ones are APPENDED after them (borrow order,
+    then recording order within an emotion), so the stem is not one continuous
+    timeline — deliberate, because it keeps the genuinely-neutral audio first
+    and contiguous.
     """
     def _dur(l: dict) -> float:
         try:
