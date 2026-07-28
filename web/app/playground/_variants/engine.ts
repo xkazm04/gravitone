@@ -1,6 +1,6 @@
 "use client";
 
-import { readDetail, throwDetail } from "@/lib/apiFetch";
+import { apiJson, readDetail, throwDetail } from "@/lib/apiFetch";
 import { stripTags, waveHeights, type Expression, type PerfLine, type Segment, type Take } from "./shared";
 
 // One module-level AudioContext shared across every peak computation. Browsers
@@ -20,7 +20,8 @@ function peakContext(): AudioContext {
   return sharedCtx;
 }
 
-/** Decode a WAV blob and reduce it to N peak bars + true duration. */
+/** Decode a WAV blob and reduce it to N peak bars + true duration. Throws if the
+ *  blob cannot be decoded (no AudioContext, malformed WAV) — see refinePeaks. */
 export async function computePeaks(blob: Blob, n = 56): Promise<{ peaks: number[]; duration: number }> {
   const ctx = peakContext();
   const buf = await ctx.decodeAudioData(await blob.arrayBuffer());
@@ -41,24 +42,45 @@ export async function computePeaks(blob: Blob, n = 56): Promise<{ peaks: number[
 }
 
 /**
+ * Best-effort real waveform for a take that is ALREADY on screen.
+ *
+ * Returns null instead of throwing: a decode hiccup on a concatenated
+ * multi-segment WAV must never cost the user their take, so the synthetic bars
+ * simply stay. This is the same degrade the synthesis path used to do inline —
+ * it just no longer happens before the take can be shown.
+ */
+export async function refinePeaks(blob: Blob): Promise<{ peaks: number[]; duration: number } | null> {
+  try {
+    return await computePeaks(blob);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Publish a take to the backend as a public Voice Card and return its id.
  * The single upload path shared by "↗ share" and the client-review flow — both
  * turn the take's audio blob into the same multipart POST to /api/takes.
  * Throws for browser-fallback takes (no audio blob to publish).
  */
 export async function uploadTake(t: Take): Promise<string> {
-  if (!t.url) throw new Error("browser-fallback takes cannot be shared");
-  const blob = await (await fetch(t.url)).blob();
+  // The take carries its own audio blob (synthesis hands it over, and session
+  // restore reads it back out of IndexedDB). Re-fetching t.url — an object URL
+  // pointing at a blob we already hold — was a copy of the whole WAV for
+  // nothing.
+  if (!t.blob) throw new Error("browser-fallback takes cannot be shared");
+  const blob = t.blob;
   const fd = new FormData();
   fd.append("file", blob, "take.wav");
   fd.append("meta", JSON.stringify({
     character_id: t.characterId, character_name: t.characterName,
     text: t.text, seconds: t.seconds, rtf: t.rtf, segments: t.segments,
   }));
-  const r = await fetch("/api/takes", { method: "POST", body: fd });
-  const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(j?.detail ?? "could not publish the take");
-  return j.take_id as string;
+  // Through the apiFetch contract so the backend's sanitized `detail` (request
+  // id included) reaches the caller's banner instead of a generic sentence.
+  const j = await apiJson<{ take_id: string }>(
+    "/api/takes", { method: "POST", body: fd }, "could not publish the take");
+  return j.take_id;
 }
 
 /**
@@ -76,6 +98,10 @@ export type FallbackReason = "unreachable" | "draining" | "failed";
 export type SpeakResult = {
   mode: "gravitone" | "browser";
   url?: string;
+  // The synthesized audio itself. It was created by res.blob(), turned into an
+  // object URL and then thrown away, so persisting and publishing the take each
+  // fetched the object URL to get the same bytes back. Carried instead.
+  blob?: Blob;
   peaks: number[];
   seconds: number;
   kb: number;
@@ -215,21 +241,13 @@ async function gravitoneResult(res: Response, segments: Segment[], seed: number)
   const hdrRtf = Number(res.headers.get("X-Realtime-Factor"));
   const hdrSynth = Number(res.headers.get("X-Synth-Seconds"));
   const hdrQueue = Number(res.headers.get("X-Queue-Seconds"));
-  // Waveform extraction is best-effort — a decode hiccup on the concatenated
-  // multi-segment WAV must NOT drop us to the browser fallback. Keep the real
-  // audio; fall back to synthetic bars.
-  let peaks = waveHeights(seed, 56);
-  let duration = 0;
-  try {
-    const p = await computePeaks(blob);
-    peaks = p.peaks;
-    duration = p.duration;
-  } catch {
-    /* keep the synthetic peaks; audio still plays */
-  }
+  // The take ships with synthetic bars and the caller refines them (see
+  // refinePeaks) once it is on screen. Decoding the whole WAV here delayed the
+  // take's APPEARANCE by a full main-thread decode for a decoration; the
+  // degrade-to-synthetic-bars path is now simply "the refinement never landed".
   return {
-    mode: "gravitone", url, peaks,
-    seconds: Math.round((hdrSec || duration) * 10) / 10,
+    mode: "gravitone", url, blob, peaks: waveHeights(seed, 56),
+    seconds: Math.round((hdrSec || 0) * 10) / 10,
     kb: Math.round(blob.size / 1024),
     rtf: hdrRtf || 0,
     synthSeconds: Number.isFinite(hdrSynth) ? hdrSynth : 0,

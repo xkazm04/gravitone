@@ -33,6 +33,10 @@ export type Take = {
   // when the engine answered at all.
   fallbackDetail?: string;
   url?: string;
+  // The take's audio, kept alongside its object URL so publishing/persisting it
+  // never has to fetch the URL back into a second copy of the same bytes.
+  // Absent for browser-fallback takes (nothing was synthesized).
+  blob?: Blob;
   peaks: number[];
   seconds: number;
   kb: number;

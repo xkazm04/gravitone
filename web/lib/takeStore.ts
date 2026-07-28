@@ -21,7 +21,7 @@ const MAX_STORED = 50;
 type StoredRecord = {
   id: string;
   createdAt: number;
-  take: Omit<Take, "url">;
+  take: Omit<Take, "url" | "blob">;
   blob: Blob | null;
 };
 
@@ -71,7 +71,9 @@ export async function putTake(take: Take, blob: Blob | null): Promise<void> {
   let db: IDBDatabase | null = null;
   try {
     db = await openDb();
-    const { url: _url, ...rest } = take;
+    // url and blob are both session-scoped views of the audio; the bytes are
+    // stored ONCE, in the record's own blob field.
+    const { url: _url, blob: _blob, ...rest } = take;
     await runTx(db, "readwrite", (store) => {
       store.put({ id: take.id, createdAt: take.createdAt, take: rest, blob });
     });
@@ -102,6 +104,9 @@ export async function getRecentTakes(limit = 20): Promise<Take[]> {
     return records.slice(0, limit).map((r) => ({
       ...r.take,
       url: r.blob ? URL.createObjectURL(r.blob) : undefined,
+      // Restored takes carry their blob too, so sharing one after a refresh
+      // publishes the bytes we just read instead of fetching the object URL.
+      blob: r.blob ?? undefined,
     }));
   } catch {
     return [];

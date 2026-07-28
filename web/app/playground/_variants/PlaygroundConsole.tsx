@@ -21,17 +21,15 @@ import { EASE } from "@/components/ui/tokens";
 import { EMOTION_IDS, emotionMeta, wrapWithTag } from "@/lib/emotions";
 import EmotionArt from "@/components/ui/EmotionArt";
 import { DEFAULT_EXPRESSION, DEFAULT_TEXT, stripTags, type Expression, type PerfLine, type Take } from "./shared";
-import { speak, perform, uploadTake, EngineBusyError, isAbort, type FallbackReason } from "./engine";
+import { speak, perform, uploadTake, refinePeaks, EngineBusyError, isAbort, type FallbackReason } from "./engine";
+// ONE character-list data layer, shared with the voices module — the playground
+// used to fetch /api/characters itself, so the app had two truths about the
+// roster (and two places to fix when it went stale).
+import { loadRoster, type Character } from "@/app/voices/_data/characters";
 import { putTake, getRecentTakes, deleteTake } from "@/lib/takeStore";
 import { useAudioPlayer } from "./useAudioPlayer";
 import EmotionPicker from "./EmotionPicker";
 import TakeCode from "./TakeCode";
-
-type Character = {
-  character_id: string; name: string; category: "cloned" | "premade";
-  emotions: string[]; coverage: number; total: number; lang: string;
-  scale?: string[]; custom_emotions?: string[]; // the character's own palette
-};
 
 function Bars({ peaks, progress = 0, active = false, className = "" }: { peaks: number[]; progress?: number; active?: boolean; className?: string }) {
   return (
@@ -85,6 +83,69 @@ function fmtElapsed(ms: number): string {
   return `${m}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
 }
 
+/**
+ * The "rendering" row, INCLUDING its ticking clock.
+ *
+ * The clock used to live in PlaygroundConsole, so every 250ms tick re-rendered
+ * the whole take log — and each take card is an AnimatePresence `layout` child
+ * that re-measures on every render. The clock only ever drew this one row, so
+ * this is where its state belongs. Nothing about what is displayed changed.
+ */
+function RenderStatus({ startedAt, etaSec, estAudioSec, etaBasisLabel, queued, inFlight, healthStale }: {
+  startedAt: number | null; etaSec: number | null; estAudioSec: number;
+  etaBasisLabel: string; queued: number; inFlight: number; healthStale: boolean;
+}) {
+  const [elapsedMs, setElapsedMs] = useState(0);
+  // Keyed on startedAt, so a new run restarts the clock and unmounting (the run
+  // finishing or being cancelled) clears the interval.
+  useEffect(() => {
+    if (startedAt === null) return;
+    setElapsedMs(Date.now() - startedAt);
+    const id = setInterval(() => setElapsedMs(Date.now() - startedAt), 250);
+    return () => clearInterval(id);
+  }, [startedAt]);
+  const overEstimate = etaSec !== null && elapsedMs / 1000 > etaSec;
+
+  return (
+    <motion.div initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
+      className="glass-panel mb-2 rounded-xl px-5 py-4">
+      <div className="flex items-center gap-4">
+        <span className="font-jetbrains shrink-0 text-[11px] text-cyan-300">rendering</span>
+        <div className="flex h-8 flex-1 items-end gap-[2px]" aria-hidden>
+          {Array.from({ length: 48 }).map((_, i) => (
+            <span key={i} className="eq-bar w-[2px] rounded-full bg-cyan-300/60" style={{ height: "100%", animationDelay: `${(i % 7) * 0.08}s` }} />
+          ))}
+        </div>
+        {/* The one MEASURED number on this row. */}
+        <span className="font-jetbrains shrink-0 text-[12px] tabular-nums text-white/85" aria-live="off">
+          {fmtElapsed(elapsedMs)}
+        </span>
+      </div>
+      <p className="font-jetbrains mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-white/55">
+        {/* An estimate presented as a measurement is a lie, so it is
+            always labelled, always sourced, and when it is exceeded it
+            says so instead of stalling at "1s remaining". */}
+        {etaSec === null ? (
+          <span>No estimate yet — the first render on this machine is what calibrates one.</span>
+        ) : overEstimate ? (
+          <span className="text-amber-200/80">
+            Past the ~{etaSec}s estimate — still rendering ({etaBasisLabel}; an estimate, not a measurement of this run).
+          </span>
+        ) : (
+          <span>Estimated ~{etaSec}s for ~{estAudioSec}s of audio — {etaBasisLabel}.</span>
+        )}
+        {queued > 0 && (
+          <span title="Jobs waiting for a synthesis worker across the engine">
+            · {queued} job{queued === 1 ? "" : "s"} queued ahead of the pool
+          </span>
+        )}
+        {inFlight > 0 && <span title="Jobs a worker is synthesizing right now">· {inFlight} rendering</span>}
+        {healthStale && <span className="text-amber-200/70">· queue reading is stale</span>}
+      </p>
+    </motion.div>
+  );
+}
+
 export default function PlaygroundConsole() {
   const [text, setText] = useState(DEFAULT_TEXT);
   const [characters, setCharacters] = useState<Character[]>([]);
@@ -108,7 +169,6 @@ export default function PlaygroundConsole() {
   // A CPU-only render takes seconds or minutes and the console showed the same
   // decorative equalizer for both.
   const [startedAt, setStartedAt] = useState<number | null>(null);
-  const [elapsedMs, setElapsedMs] = useState(0);
   // Transient error surface so generation failures are never silent.
   const [toast, setToast] = useState<string | null>(null);
   // Why the LAST generation dropped to the browser voice (null = it didn't).
@@ -129,6 +189,10 @@ export default function PlaygroundConsole() {
   // durable — saying nothing would leave the "survives a refresh" promise
   // silently broken.
   const [storageErr, setStorageErr] = useState<string | null>(null);
+  // Why publishing a take failed. The button's "✗ failed" says THAT it failed;
+  // the backend's own detail (request id included) says what to do about it,
+  // and share()'s catch used to throw it away.
+  const [shareErr, setShareErr] = useState<string | null>(null);
   // client-review link: selected take ids → /r/{id}
   const [reviewSel, setReviewSel] = useState<Set<string>>(new Set());
   const [reviewBusy, setReviewBusy] = useState(false);
@@ -163,33 +227,37 @@ export default function PlaygroundConsole() {
 
   const [rosterErr, setRosterErr] = useState<string | null>(null);
   useEffect(() => {
-    // Default to the character clients have actually approved most often —
-    // the review loop's pick data feeding back into the studio.
-    let alive = true;  // the sibling effect below always had this; this one didn't
+    // Two INDEPENDENT reads that used to be awaited one after the other, so the
+    // rail waited for a recommendation it does not depend on. They are started
+    // together now, and a real AbortController (not just an `alive` flag) means
+    // navigating away actually cancels them instead of leaving the requests to
+    // finish for a page nobody is looking at.
+    const ctrl = new AbortController();
+    // The roster goes through the shared data layer; the recommendation is
+    // decoration, so its failure degrades to "no recommendation" and never
+    // costs the user the rail.
+    const rosterP = loadRoster(ctrl.signal);
+    const prefP = apiJson<{ character_id: string | null; picks: number }>(
+      "/api/reviews/preferred", { cache: "no-store", signal: ctrl.signal }, "no recommendation")
+      .catch(() => ({ character_id: null, picks: 0 }));
     (async () => {
       try {
-        // Through apiJson so a 500 surfaces as a message instead of being
-        // erased into an empty character rail.
-        const cs = await apiJson<Character[]>("/api/characters",
-          { cache: "no-store" }, "could not load characters");
-        // The recommendation is decoration: if it fails, still show the rail.
-        const pref = await apiJson<{ character_id: string | null; picks: number }>(
-          "/api/reviews/preferred", { cache: "no-store" }, "no recommendation")
-          .catch(() => ({ character_id: null, picks: 0 }));
-        if (!alive) return;
+        const [cs, pref] = [await rosterP, await prefP];
+        if (!mounted.current || ctrl.signal.aborted) return;
         setCharacters(cs);
         setPreferred(pref);
         setRosterErr(null);
         const winner = pref.character_id && cs.find((c) => c.character_id === pref.character_id);
         setCharId((winner || cs[0])?.character_id ?? "");
       } catch (e) {
-        if (!alive) return;
+        // An abort is this component going away, not a failed read.
+        if (!mounted.current || isAbort(e) || ctrl.signal.aborted) return;
         setCharacters([]);
         setRosterErr(e instanceof Error ? e.message : "could not load characters");
       }
     })();
-    return () => { alive = false; };
-  }, []);
+    return () => ctrl.abort();
+  }, [mounted]);
 
   // Restore the most recent session takes from IndexedDB on mount so a refresh
   // no longer destroys the log. Each restored take carries a fresh object URL.
@@ -268,7 +336,6 @@ export default function PlaygroundConsole() {
   const etaBasisLabel = lastRtf
     ? `your last render ran at ${lastRtf}× realtime`
     : liveRtf ? `the engine is averaging ${liveRtf}× realtime` : "";
-  const overEstimate = etaSec !== null && elapsedMs / 1000 > etaSec;
 
   const fallbackNotice = fallback && (
     fallback.detail
@@ -374,12 +441,18 @@ export default function PlaygroundConsole() {
     }
     if (!t.url || existing === "pending") return;
     setShares((s) => ({ ...s, [t.id]: "pending" }));
+    setShareErr(null);
     try {
       const id = await uploadOnce(t);
+      if (!mounted.current) return;
       setShares((s) => ({ ...s, [t.id]: id }));
       await copyShareLink(t.id, id);
-    } catch {
+    } catch (e) {
+      if (!mounted.current) return;
       setShares((s) => ({ ...s, [t.id]: "error" }));
+      setShareErr(e instanceof Error && e.message
+        ? `This take could not be published — ${e.message}`
+        : "This take could not be published. The take itself is safe in your log.");
       setTimeout(() => setShares((s) => { const { [t.id]: _, ...rest } = s; return rest; }), 2000);
     }
   }
@@ -419,14 +492,39 @@ export default function PlaygroundConsole() {
     } finally { if (mounted.current) setReviewBusy(false); }
   }
 
+  /** Put a take in the log NOW, then refine its waveform.
+   *
+   *  Peak extraction decodes the whole WAV; doing it inside synthesis meant the
+   *  take could not appear until a main-thread decode finished, for a
+   *  decoration. The take is shown with its synthetic bars, the real ones swap
+   *  in when the decode lands, and a decode that fails simply leaves the
+   *  synthetic bars (the same degrade as before). Persistence waits for that
+   *  settle so the stored take carries its final waveform. */
+  function addTake(take: Take) {
+    setTakes((t) => [take, ...t]);
+    if (!take.blob) { void persistTake(take); return; }
+    void refinePeaks(take.blob).then((p) => {
+      const finished: Take = p
+        // X-Audio-Seconds is authoritative; the decoded duration only fills in
+        // when the backend did not report one.
+        ? { ...take, peaks: p.peaks, seconds: take.seconds || Math.round(p.duration * 10) / 10 }
+        : take;
+      if (mounted.current && p) {
+        setTakes((list) => list.map((t) => (t.id === take.id ? { ...t, peaks: finished.peaks, seconds: finished.seconds } : t)));
+      }
+      void persistTake(finished);
+    });
+  }
+
   /** Persist a take (audio blob + metadata) so it survives a refresh.
    *  A failure here (quota exceeded, storage blocked) does not lose the take —
    *  but it DOES break the durability the log promises, so it is reported
    *  rather than swallowed. */
   async function persistTake(t: Take) {
     try {
-      const blob = t.url ? await (await fetch(t.url)).blob() : null;
-      await putTake(t, blob);
+      // The take already holds its blob (engine.ts carries it through); this
+      // used to fetch the take's own object URL to get the same bytes back.
+      await putTake(t, t.blob ?? null);
       if (mounted.current) setStorageErr(null);
     } catch (e) {
       if (!mounted.current) return;
@@ -469,15 +567,6 @@ export default function PlaygroundConsole() {
   // request holding a worker slot for a page nobody is looking at.
   useEffect(() => () => runRef.current?.abort(), []);
 
-  // The render clock. Ticks only while a run is in flight and is cleared with
-  // it (including on cancel, which flips `busy` back).
-  useEffect(() => {
-    if (!busy || startedAt === null) return;
-    setElapsedMs(Date.now() - startedAt);
-    const id = setInterval(() => setElapsedMs(Date.now() - startedAt), 250);
-    return () => clearInterval(id);
-  }, [busy, startedAt]);
-
   // Count the backend's Retry-After down so the retry button can wait for it.
   useEffect(() => {
     if (!busyNotice) { setRetryIn(0); return; }
@@ -493,7 +582,6 @@ export default function PlaygroundConsole() {
     setToast(null);
     setFallback(null);
     setStartedAt(Date.now());   // starts the render clock for this run
-    setElapsedMs(0);
   }
 
   /** Report a generation failure with what the backend actually said. Errors
@@ -528,14 +616,13 @@ export default function PlaygroundConsole() {
         id: `take-${Date.now()}-${seq.current}`, text: transcript,
         characterId: lines[0].character_id, characterName: label,
         mode: r.mode, fallbackReason: r.fallbackReason, fallbackDetail: r.fallbackDetail,
-        url: r.url, peaks: r.peaks, seconds: r.seconds, kb: r.kb, rtf: r.rtf,
+        url: r.url, blob: r.blob, peaks: r.peaks, seconds: r.seconds, kb: r.kb, rtf: r.rtf,
         synthSeconds: r.synthSeconds, queueSeconds: r.queueSeconds,
         ignoredSettings: r.ignoredSettings, segments: r.segments, expr: { ...expr },
         createdAt: Date.now(), lines,
       };
-      setTakes((t) => [take, ...t]);
+      addTake(take);
       setFallback(r.mode === "browser" ? { reason: r.fallbackReason ?? "unreachable", detail: r.fallbackDetail } : null);
-      void persistTake(take);
     } catch (e) {
       if (!mounted.current) return;
       if (isAbort(e)) { /* user cancelled — no take, no error */ }
@@ -559,14 +646,13 @@ export default function PlaygroundConsole() {
         id: `take-${Date.now()}-${seq.current}`, text: text.trim(),
         characterId: character.character_id, characterName: character.name,
         mode: r.mode, fallbackReason: r.fallbackReason, fallbackDetail: r.fallbackDetail,
-        url: r.url, peaks: r.peaks, seconds: r.seconds, kb: r.kb, rtf: r.rtf,
+        url: r.url, blob: r.blob, peaks: r.peaks, seconds: r.seconds, kb: r.kb, rtf: r.rtf,
         synthSeconds: r.synthSeconds, queueSeconds: r.queueSeconds,
         ignoredSettings: r.ignoredSettings, segments: r.segments, expr: { ...expr },
         createdAt: Date.now(),
       };
-      setTakes((t) => [take, ...t]);
+      addTake(take);
       setFallback(r.mode === "browser" ? { reason: r.fallbackReason ?? "unreachable", detail: r.fallbackDetail } : null);
-      void persistTake(take);
     } catch (e) {
       if (!mounted.current) return;
       // Backpressure keeps the engine reachable — offer a retry. Anything else
@@ -608,6 +694,17 @@ export default function PlaygroundConsole() {
       {fallbackNotice && <ErrorBanner severity="warning">{fallbackNotice}</ErrorBanner>}
 
       {storageErr && <ErrorBanner severity="warning">{storageErr}</ErrorBanner>}
+
+      {/* Publishing failed: nothing was created, so this is an error, not a
+          degraded success. */}
+      {shareErr && (
+        <ErrorBanner>
+          <span className="flex items-center justify-between gap-3">
+            <span>{shareErr}</span>
+            <button onClick={() => setShareErr(null)} aria-label="Dismiss" className="shrink-0 text-rose-200/70 transition hover:text-rose-100">✕</button>
+          </span>
+        </ErrorBanner>
+      )}
 
       {busyNotice && (
         <ErrorBanner severity="warning">
@@ -864,42 +961,9 @@ export default function PlaygroundConsole() {
 
         <AnimatePresence initial={false}>
           {busy && (
-            <motion.div key="rendering" initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
-              className="glass-panel mb-2 rounded-xl px-5 py-4">
-              <div className="flex items-center gap-4">
-                <span className="font-jetbrains shrink-0 text-[11px] text-cyan-300">rendering</span>
-                <div className="flex h-8 flex-1 items-end gap-[2px]" aria-hidden>
-                  {Array.from({ length: 48 }).map((_, i) => (
-                    <span key={i} className="eq-bar w-[2px] rounded-full bg-cyan-300/60" style={{ height: "100%", animationDelay: `${(i % 7) * 0.08}s` }} />
-                  ))}
-                </div>
-                {/* The one MEASURED number on this row. */}
-                <span className="font-jetbrains shrink-0 text-[12px] tabular-nums text-white/85" aria-live="off">
-                  {fmtElapsed(elapsedMs)}
-                </span>
-              </div>
-              <p className="font-jetbrains mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-white/55">
-                {/* An estimate presented as a measurement is a lie, so it is
-                    always labelled, always sourced, and when it is exceeded it
-                    says so instead of stalling at "1s remaining". */}
-                {etaSec === null ? (
-                  <span>No estimate yet — the first render on this machine is what calibrates one.</span>
-                ) : overEstimate ? (
-                  <span className="text-amber-200/80">
-                    Past the ~{etaSec}s estimate — still rendering ({etaBasisLabel}; an estimate, not a measurement of this run).
-                  </span>
-                ) : (
-                  <span>Estimated ~{etaSec}s for ~{estAudioSec}s of audio — {etaBasisLabel}.</span>
-                )}
-                {queued > 0 && (
-                  <span title="Jobs waiting for a synthesis worker across the engine">
-                    · {queued} job{queued === 1 ? "" : "s"} queued ahead of the pool
-                  </span>
-                )}
-                {inFlight > 0 && <span title="Jobs a worker is synthesizing right now">· {inFlight} rendering</span>}
-                {healthStale && <span className="text-amber-200/70">· queue reading is stale</span>}
-              </p>
-            </motion.div>
+            <RenderStatus key="rendering" startedAt={startedAt} etaSec={etaSec}
+              estAudioSec={estAudioSec} etaBasisLabel={etaBasisLabel}
+              queued={queued} inFlight={inFlight} healthStale={healthStale} />
           )}
 
           {takes.map((t) => {

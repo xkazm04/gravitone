@@ -79,13 +79,79 @@ export function relTime(iso?: string | null): string {
   return `${Math.floor(h / 24)}d ago`;
 }
 
+// ── the shared roster request ─────────────────────────────────────────────────
+// ONE way to ask for the character list. The playground kept its own
+// `apiJson("/api/characters")` next to this module's, so the app had two
+// truths about which Characters exist (and the rail and the script <select>
+// could disagree). Both now call loadRoster().
+//
+// Deliberately NOT a time-based cache. A previous fetch-reduction round in this
+// repo shipped a roster that stayed stale after a clone; the win here is
+// concurrency and one code path, not skipped requests. This only shares a
+// request that is IN FLIGHT AT THIS MOMENT, so every mount still sees server
+// truth, and any mutation detaches the in-flight request (invalidateRoster) so
+// a post-mutation refresh can never be served pre-mutation data.
+type RosterReq = { promise: Promise<Character[]>; ctrl: AbortController; waiters: number };
+let current: RosterReq | null = null;
+
+function abortError(): DOMException {
+  return new DOMException("roster load aborted", "AbortError");
+}
+
+/**
+ * Load the character roster, sharing an already in-flight request.
+ *
+ * `signal` genuinely aborts: the caller's promise rejects with an AbortError
+ * immediately, and the underlying request is cancelled once NOBODY is waiting
+ * for it any more (cancelling a shared request out from under another mounted
+ * component would be the obvious way to get this wrong).
+ */
+export function loadRoster(signal?: AbortSignal): Promise<Character[]> {
+  if (signal?.aborted) return Promise.reject(abortError());
+  if (!current) {
+    const ctrl = new AbortController();
+    const req: RosterReq = { ctrl, waiters: 0, promise: null as never };
+    req.promise = apiJson<Character[]>(
+      "/api/characters", { cache: "no-store", signal: ctrl.signal },
+      "failed to load characters",
+    ).finally(() => { if (current === req) current = null; });
+    current = req;
+  }
+  const req = current;
+  req.waiters += 1;
+  let released = false;
+  const release = () => { if (!released) { released = true; req.waiters -= 1; } };
+
+  if (!signal) return req.promise.finally(release);
+
+  return new Promise<Character[]>((resolve, reject) => {
+    const onAbort = () => {
+      release();
+      // Last one out cancels the request; otherwise it keeps serving the others.
+      if (req.waiters <= 0) req.ctrl.abort();
+      reject(abortError());
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    req.promise.then(
+      (v) => { signal.removeEventListener("abort", onAbort); release(); resolve(v); },
+      (e) => { signal.removeEventListener("abort", onAbort); release(); reject(e); },
+    );
+  });
+}
+
+/** A mutation just changed the roster: detach the in-flight request so the next
+ *  loadRoster() starts a fresh one. Callers already waiting still get their
+ *  answer — it simply stops being handed to anyone new. */
+export function invalidateRoster(): void {
+  current = null;
+}
+
 // ── request helpers ───────────────────────────────────────────────────────────
 // Failure→message conversion lives in lib/apiFetch (shared with every data
 // layer); every mutation below routes through it so callers get a real message
 // to show, never silence.
 async function fetchRoster(): Promise<Character[]> {
-  return apiJson<Character[]>("/api/characters", { cache: "no-store" },
-    "failed to load characters");
+  return loadRoster();
 }
 
 /** Fetch ONE Character (the detail page). Returns null on 404 so the page can
@@ -114,6 +180,7 @@ export async function cloneVoice(
   fd.append("statement", CONSENT_STATEMENT);
   const r = await fetch("/api/voices", { method: "POST", body: fd });
   if (!r.ok) return throwDetail(r, `clone failed (${r.status})`);
+  invalidateRoster(); // the roster now has a voice (or a character) it didn't
   return (await r.json()) as Voice;
 }
 
@@ -121,6 +188,7 @@ export async function cloneVoice(
 export async function deleteVoiceReq(voiceId: string): Promise<void> {
   const r = await fetch(`/api/voices/${encodeURIComponent(voiceId)}`, { method: "DELETE" });
   if (!r.ok) return throwDetail(r, "delete failed");
+  invalidateRoster();
 }
 
 /** Rename / retag a Character; returns the server-normalized Character. */
@@ -134,12 +202,14 @@ export async function patchCharacterReq(
     body: JSON.stringify(patch),
   });
   if (!r.ok) return throwDetail(r, `update failed (${r.status})`);
+  invalidateRoster();
   return (await r.json()) as Character;
 }
 
 export async function deleteCharacterReq(id: string): Promise<void> {
   const r = await fetch(`/api/characters/${encodeURIComponent(id)}`, { method: "DELETE" });
   if (!r.ok) return throwDetail(r, "delete failed");
+  invalidateRoster();
 }
 
 export async function addCustomEmotionReq(id: string, name: string): Promise<void> {
@@ -149,6 +219,7 @@ export async function addCustomEmotionReq(id: string, name: string): Promise<voi
     body: JSON.stringify({ name }),
   });
   if (!r.ok) return throwDetail(r, `could not add "${name}"`);
+  invalidateRoster();
 }
 
 export async function removeCustomEmotionReq(id: string, emotion: string): Promise<void> {
@@ -157,6 +228,7 @@ export async function removeCustomEmotionReq(id: string, emotion: string): Promi
     { method: "DELETE" },
   );
   if (!r.ok && r.status !== 404) return throwDetail(r, "could not remove the slot");
+  invalidateRoster();
 }
 
 // ── roster hook ───────────────────────────────────────────────────────────────

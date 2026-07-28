@@ -1,6 +1,6 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
-import { EngineBusyError, isAbort, perform, speak } from "./engine";
-import { DEFAULT_EXPRESSION } from "./shared";
+import { EngineBusyError, isAbort, perform, refinePeaks, speak, uploadTake } from "./engine";
+import { DEFAULT_EXPRESSION, type Take } from "./shared";
 
 const EXPR = DEFAULT_EXPRESSION;
 
@@ -134,5 +134,64 @@ describe("isAbort", () => {
   it("is false for other failures", () => {
     expect(isAbort(new TypeError("network"))).toBe(false);
     expect(isAbort(null)).toBe(false);
+  });
+});
+
+describe("the take carries its own audio", () => {
+  it("returns the synthesized blob instead of only an object URL", async () => {
+    // persistTake and uploadTake each used to fetch() the take's own object URL
+    // to get these exact bytes back — two extra copies of the whole WAV.
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(wavResponse()));
+    vi.stubGlobal("URL", { ...URL, createObjectURL: () => "blob:x", revokeObjectURL: () => {} });
+    const r = await speak("hi", "sarah", EXPR);
+    expect(r.blob).toBeInstanceOf(Blob);
+    expect(r.blob!.size).toBe(44);
+  });
+
+  it("does not wait for a waveform decode before returning the take", async () => {
+    // jsdom has no AudioContext, so a decode inside synthesis would have to be
+    // caught; the take now ships with synthetic bars and is refined later.
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(wavResponse()));
+    vi.stubGlobal("URL", { ...URL, createObjectURL: () => "blob:x", revokeObjectURL: () => {} });
+    const r = await speak("hi", "sarah", EXPR);
+    expect(r.peaks).toHaveLength(56);
+    expect(r.mode).toBe("gravitone");
+  });
+
+  it("refinePeaks degrades to null rather than costing the user the take", async () => {
+    expect(await refinePeaks(new Blob([new Uint8Array(44)]))).toBeNull();
+  });
+});
+
+describe("uploadTake", () => {
+  const take = (over: Partial<Take> = {}): Take => ({
+    id: "take-1", text: "hi", characterId: "sarah", characterName: "Sarah",
+    mode: "gravitone", url: "blob:x", blob: new Blob([new Uint8Array(8)]),
+    peaks: [], seconds: 1, kb: 1, rtf: 1, synthSeconds: 0, queueSeconds: 0,
+    ignoredSettings: [], segments: [], expr: EXPR, createdAt: 1, ...over,
+  });
+
+  it("publishes the take's own blob — never re-fetching the object URL", async () => {
+    const f = vi.fn().mockResolvedValue(new Response(JSON.stringify({ take_id: "t1" }), { status: 200 }));
+    vi.stubGlobal("fetch", f);
+    expect(await uploadTake(take())).toBe("t1");
+    expect(f).toHaveBeenCalledTimes(1);
+    expect(f.mock.calls[0][0]).toBe("/api/takes");
+  });
+
+  it("throws the backend's detail so the caller can show it", async () => {
+    // share()'s catch had nothing to show because this threw a generic message.
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ detail: "take store full (request cd34)" }), { status: 500 })));
+    await expect(uploadTake(take())).rejects.toMatchObject({
+      message: "take store full (request cd34)",
+    });
+  });
+
+  it("refuses a browser-fallback take (there is no audio to publish)", async () => {
+    const f = vi.fn();
+    vi.stubGlobal("fetch", f);
+    await expect(uploadTake(take({ url: undefined, blob: undefined }))).rejects.toThrow(/cannot be shared/);
+    expect(f).not.toHaveBeenCalled();
   });
 });
