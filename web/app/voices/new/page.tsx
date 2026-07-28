@@ -340,7 +340,9 @@ export default function NewCharacterPage() {
                           <span className="flex items-center gap-2 text-sm font-medium text-white">
                             <span className="h-2 w-2 rounded-full" style={{ background: `hsl(${m.hue} 85% 62%)` }} />{m.label}
                             {!st.eligible && <span className="font-jetbrains rounded bg-amber-400/10 px-1.5 py-0.5 text-[10px] text-amber-200">short</span>}
+                            {st.note && <span className="font-jetbrains rounded bg-amber-400/10 px-1.5 py-0.5 text-[10px] text-amber-200">mixed</span>}
                           </span>
+                          {st.note && <span className="mt-1 block max-w-[26rem] text-[11px] leading-snug text-amber-200/70">{st.note}</span>}
                         </td>
                         <td className="font-jetbrains px-3 py-2 text-[12px] text-white/70">{st.seconds}s</td>
                         <td className="font-jetbrains px-3 py-2 text-[12px] text-white/60">{st.segments}</td>

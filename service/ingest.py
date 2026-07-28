@@ -8,7 +8,10 @@ CLOUD ("quality" — richest results, audio leaves the machine):
   3. ISOLATE  ElevenLabs Voice Isolator → clean studio track (timing preserved).
   4. LABEL    Gemini 3.5-flash classifies each segment into our emotion scale;
               low-confidence segments escalate to gemini-3.1-pro-preview.
-  5. STEM     group segments by emotion → concatenate → one clean sample/emotion.
+  5. STEM     group segments by emotion → splice (level-matched, crossfaded) →
+              one clean sample/emotion. The baseline (neutral) stem is built from
+              baseline-labelled audio ONLY; see plan_baseline for the stated
+              fallback when a recording has too little neutral speech.
 
 SOVEREIGN (audio NEVER leaves the machine — ffmpeg only, no API keys):
   1. CLEAN    ffmpeg highpass + afftdn denoise + loudnorm → clean.wav.
@@ -42,7 +45,9 @@ import wave
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, NamedTuple
+
+import numpy as np
 
 from service.config import SETTINGS
 from service.emotions import BASELINE, EMOTION_SCALE
@@ -129,25 +134,133 @@ def to_wav(src: Path, dst: Path, start: float | None = None, end: float | None =
         raise RuntimeError(f"ffmpeg failed: {r.stderr.decode(errors='ignore')[-200:]}")
 
 
-def concat_wavs(paths: list[Path], dst: Path, cap_seconds: float = 30.0) -> float:
-    frames: list[bytes] = []
-    params = None
-    total = 0.0
+# ── stem splicing ─────────────────────────────────────────────────────────────
+# Segments cut from different places in a recording do not join cleanly. Hard-
+# splicing raw frames puts a waveform discontinuity — an audible click — at every
+# boundary, and utterances recorded minutes apart routinely sit several dB apart.
+# That is not cosmetic here: the stem IS the reference audio the speaker
+# embedding is built from, so the clicks and the level jumps get learned. Every
+# splice therefore gets:
+#   * LEVEL MATCHING — each segment is scaled towards the group's MEDIAN RMS,
+#     with the gain clamped to _GAIN_RANGE so one near-silent or already-hot
+#     outlier is not dragged the whole way (which would pump), and then held
+#     under _PEAK_CEILING so matching can never create clipping.
+#   * A CROSSFADE THROUGH SILENCE — a raised-cosine fade-out, a short silent gap,
+#     a fade-in. Overlapping two unrelated utterances would smear them into each
+#     other; fading each edge to zero removes the discontinuity, and the gap
+#     restores the natural pause between utterances that hard-splicing destroyed.
+# Non-16-bit or multichannel input skips the DSP and is concatenated raw (the
+# pipeline only ever produces 24 kHz mono 16-bit, via to_wav).
+_FADE_SECONDS = 0.010
+_GAP_SECONDS = 0.080
+_GAIN_RANGE = (0.5, 2.0)
+_PEAK_CEILING = 0.97
+_SILENT_RMS = 1e-4
+
+
+class Splice(NamedTuple):
+    """What was actually WRITTEN — not what was requested. `seconds` always
+    measures the file on disk, so callers can judge eligibility against the same
+    number `commit` will re-measure there."""
+    seconds: float
+    segments: int
+
+
+def _level_match(arrs: list["np.ndarray"]) -> list["np.ndarray"]:
+    rms = [float(np.sqrt(np.mean(np.square(a)))) if a.size else 0.0 for a in arrs]
+    voiced = [r for r in rms if r > _SILENT_RMS]
+    if not voiced:
+        return arrs
+    target = float(np.median(voiced))
+    out: list[np.ndarray] = []
+    for a, r in zip(arrs, rms):
+        if r <= _SILENT_RMS:
+            out.append(a)
+            continue
+        gain = min(max(target / r, _GAIN_RANGE[0]), _GAIN_RANGE[1])
+        peak = float(np.max(np.abs(a)))
+        if peak * gain > _PEAK_CEILING:
+            gain = _PEAK_CEILING / peak
+        out.append(a * gain)
+    return out
+
+
+def _fade_edges(a: "np.ndarray", rate: int) -> None:
+    """Raised-cosine fade in/out, in place — the click killer at each splice."""
+    n = min(int(_FADE_SECONDS * rate), a.size // 2)
+    if n <= 0:
+        return
+    ramp = (0.5 - 0.5 * np.cos(np.linspace(0.0, np.pi, n))).astype(np.float32)
+    a[:n] *= ramp
+    a[-n:] *= ramp[::-1]
+
+
+def concat_wavs(paths: list[Path], dst: Path, cap_seconds: float = 30.0) -> Splice:
+    """Splice segment wavs into one stem; returns what was written.
+
+    CAP SEMANTICS: `cap_seconds` is a HARD CEILING on the written file, at
+    whole-segment granularity — the first segment that would overflow it ends the
+    stem instead of being appended (the old code appended and *then* broke, so
+    the file could run past the cap while the reported length was clamped to it:
+    two different numbers for one stem). A single segment longer than the whole
+    cap is truncated to it rather than dropped, so an unbroken monologue still
+    yields a stem. The returned `seconds` is measured from the frames written,
+    silent gaps included, and therefore always matches the file.
+    """
     if not paths:
         raise RuntimeError("no speech detected in the clip")
+    raw: list[bytes] = []
+    params = None
     for p in paths:
         with wave.open(str(p), "rb") as w:
             if params is None:
                 params = w.getparams()
-            total += w.getnframes() / w.getframerate()
-            frames.append(w.readframes(w.getnframes()))
-            if total >= cap_seconds:
-                break
+            raw.append(w.readframes(w.getnframes()))
+    assert params is not None
+    rate = params.framerate
+    width = params.sampwidth * params.nchannels
+    spliceable = params.sampwidth == 2 and params.nchannels == 1
+    gap_frames = int(_GAP_SECONDS * rate) if spliceable else 0
+
+    # Select under the cap BEFORE any DSP, counting the gaps that will be added.
+    cap_frames = max(1, int(cap_seconds * rate))
+    kept: list[bytes] = []
+    frames = 0
+    for b in raw:
+        n = len(b) // width
+        add = n + (gap_frames if kept else 0)
+        if frames + add > cap_frames:
+            if kept:
+                break                          # whole-segment granularity
+            b = b[:cap_frames * width]         # lone oversize segment → truncate
+            add = len(b) // width
+        kept.append(b)
+        frames += add
+
+    if spliceable:
+        arrs = [np.frombuffer(b, dtype="<i2").astype(np.float32) / 32768.0 for b in kept]
+        arrs = _level_match(arrs)
+        for a in arrs:
+            _fade_edges(a, rate)
+        silence = np.zeros(gap_frames, dtype=np.float32)
+        pieces = [x for a in arrs for x in (silence, a)][1:]  # no leading gap
+        joined = np.concatenate(pieces) if pieces else np.zeros(0, dtype=np.float32)
+        peak = float(np.max(np.abs(joined))) if joined.size else 0.0
+        if peak > _PEAK_CEILING:
+            joined = joined * (_PEAK_CEILING / peak)
+        out = np.clip(np.round(joined * 32767.0), -32768, 32767).astype("<i2").tobytes()
+    else:
+        out = b"".join(kept)
+
     with wave.open(str(dst), "wb") as w:
-        w.setparams(params)  # type: ignore[arg-type]
-        for f in frames:
-            w.writeframes(f)
-    return round(min(total, cap_seconds), 2)
+        w.setparams(params)
+        w.writeframes(out)
+    return Splice(round((len(out) // width) / rate, 2), len(kept))
+
+
+def _wav_seconds(path: Path) -> float:
+    with wave.open(str(path), "rb") as w:
+        return w.getnframes() / w.getframerate()
 
 
 # ── ElevenLabs ────────────────────────────────────────────────────────────────
@@ -368,6 +481,88 @@ def analyze(audio: Path, work_dir: Path,
     return {"duration": duration, "transcript": transcript, "speakers": speakers}
 
 
+# ── baseline (neutral) stem composition ───────────────────────────────────────
+# Order in which non-neutral emotions may be borrowed when there is not enough
+# baseline-labelled audio: nearest-to-neutral delivery first. `whisper` is last
+# despite being low-arousal — it lacks full phonation, so it is the worst thing
+# to teach a neutral speaker embedding. Custom emotions (not on this list) come
+# after everything listed, alphabetically. This is a borrow ORDER, not a change
+# to the emotion scale.
+BASELINE_BORROW_ORDER = ["calm", "confused", "sad", "happy", "excited", "angry", "whisper"]
+
+
+class BaselinePlan(NamedTuple):
+    labs: list[dict]              # segments to splice, in the order to splice them
+    borrowed: list[dict]          # [{emotion, segments}] non-neutral top-up, if any
+    neutral_seconds: float        # how much genuinely baseline-labelled audio existed
+    neutral_segments: int
+
+
+def plan_baseline(by_emotion: dict[str, list[dict]], min_stem: float) -> BaselinePlan:
+    """Choose the segments for the NEUTRAL reference stem.
+
+    The baseline Voice is what every untagged line of speech is cloned from, so
+    what goes in here decides how the character sounds by default. The pipeline
+    used to concatenate EVERY usable segment — the angry, sad and excited takes
+    included — which made the "neutral" embedding an average of every emotion in
+    the recording. It is now built from baseline-labelled audio ONLY.
+
+    When there is not enough of that to clear `min_stem` the stem would be
+    ineligible and the Character would ship with no neutral Voice at all, so we
+    top it up — but only just enough to clear the bar, nearest-neutral emotion
+    first (BASELINE_BORROW_ORDER), and the borrow is reported so the UI states
+    it. The thing we refuse is silence: an emotionally blended baseline must
+    never be presented as a clean one.
+
+    Segments are measured by their extracted wav (the same measurement the stem
+    file will have), not by the labelled span, and stay in recording order.
+    """
+    def _dur(l: dict) -> float:
+        try:
+            return _wav_seconds(Path(l["wav"]))
+        except Exception:  # noqa: BLE001 - a missing wav simply contributes nothing
+            return 0.0
+
+    labs = sorted(by_emotion.get(BASELINE, []), key=lambda l: l["i"])
+    neutral = sum(_dur(l) for l in labs)
+    have = neutral
+    plan = list(labs)
+    borrowed: list[dict] = []
+    if have < min_stem:
+        rank = {e: i for i, e in enumerate(BASELINE_BORROW_ORDER)}
+        others = sorted((e for e in by_emotion if e != BASELINE),
+                        key=lambda e: (rank.get(e, len(rank)), e))
+        for emo in others:
+            if have >= min_stem:
+                break
+            taken = 0
+            for l in sorted(by_emotion[emo], key=lambda l: l["i"]):
+                if have >= min_stem:
+                    break
+                plan.append(l)
+                have += _dur(l)
+                taken += 1
+            if taken:
+                borrowed.append({"emotion": emo, "segments": taken})
+    return BaselinePlan(plan, borrowed, round(neutral, 2), len(labs))
+
+
+def baseline_note(plan: BaselinePlan, seconds: float, min_stem: float) -> str | None:
+    """The user-visible sentence explaining a non-pure baseline stem. None when
+    the stem is genuinely all-neutral — the fallback is never silent."""
+    if not plan.borrowed:
+        return None
+    what = ", ".join(f"{b['segments']}× {b['emotion']}" for b in plan.borrowed)
+    head = (f"only {plan.neutral_seconds:.1f}s of neutral speech in this recording "
+            f"({plan.neutral_segments} segment(s))")
+    if seconds >= min_stem:
+        return (f"{head} — topped up with {what} to reach the {min_stem:.0f}s minimum, "
+                f"so this voice is not purely neutral. Record more neutral speech for "
+                f"a cleaner default voice.")
+    return (f"{head} — still under the {min_stem:.0f}s minimum even after borrowing "
+            f"{what}. Record more neutral speech.")
+
+
 # ── LABEL + STEM for a chosen speaker ─────────────────────────────────────────
 def label_and_stem(work_dir: Path, target: str, min_stem: float = MIN_STEM_SECONDS, limit: int = 40,
                    progress: Callable[[str, str], None] | None = None,
@@ -435,18 +630,25 @@ def label_and_stem(work_dir: Path, target: str, min_stem: float = MIN_STEM_SECON
     for lab in usable:
         by_emotion.setdefault(lab["emotion"], []).append(lab)
     stems: list[dict] = []
+
+    plan = plan_baseline(by_emotion, min_stem)
     base_wav = work_dir / "stem_baseline.wav"
-    base_dur = concat_wavs([Path(l["wav"]) for l in usable], base_wav)
-    stems.append({"emotion": BASELINE, "seconds": base_dur, "segments": len(usable),
-                  "eligible": base_dur >= min_stem, "cues": []})
+    base = concat_wavs([Path(l["wav"]) for l in plan.labs], base_wav)
+    stems.append({"emotion": BASELINE, "seconds": base.seconds, "segments": base.segments,
+                  "eligible": base.seconds >= min_stem, "cues": [],
+                  "note": baseline_note(plan, base.seconds, min_stem)})
     for emo, labs in by_emotion.items():
         if emo == BASELINE:
             continue
-        total = round(sum(l["dur"] for l in labs), 2)
+        labs = sorted(labs, key=lambda l: l["i"])      # recording order, always
         sw = work_dir / f"stem_{emo}.wav"
         d = concat_wavs([Path(l["wav"]) for l in labs], sw)
-        stems.append({"emotion": emo, "seconds": d, "segments": len(labs),
-                      "eligible": total >= min_stem, "cues": [l["cue"] for l in labs[:3]]})
+        # Eligibility is judged on the WRITTEN file — the exact measurement
+        # commit() re-takes — so the UI can never promise a stem that then gets
+        # skipped at commit with no user-visible reason.
+        stems.append({"emotion": emo, "seconds": d.seconds, "segments": d.segments,
+                      "eligible": d.seconds >= min_stem,
+                      "cues": [l["cue"] for l in labs[:3]], "note": None})
     order = {e: i for i, e in enumerate(EMOTION_SCALE)}
     stems.sort(key=lambda s: order.get(s["emotion"], 99))
     prog("stem", "done")

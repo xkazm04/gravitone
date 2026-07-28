@@ -1,6 +1,8 @@
-"""Ingest audio path — segment extraction boundaries.
+"""Ingest audio path — segment extraction and stem assembly.
 
-`to_wav` seeks on the INPUT (`-ss` before `-i`) so an extract no longer decodes
+This is the audio that every cloned voice is built from, and it was untested.
+
+Part 1 — `to_wav` seeks on the INPUT (`-ss` before `-i`) so an extract no longer decodes
 the whole recording from byte zero. Input seeking can land on the nearest seek
 point, which would silently shift a labelled span and corrupt every clone made
 from it — so these tests PROVE the boundaries rather than assuming them.
@@ -11,19 +13,28 @@ span, and identify each second of the result by counting zero crossings
 (what the pipeline actually feeds `to_wav`) and an mp3 source (the compressed
 case, where seek points are coarse and a fast seek would visibly shift).
 
-Requires ffmpeg; skipped when it is not on PATH.
+Part 2 — stem assembly: WHAT goes into the neutral stem (baseline-labelled audio
+only, with a stated fallback), HOW segments are spliced (level-matched, faded,
+gapped — no clicks in the reference audio), the cap semantics, and that reported
+eligibility is computed from the same measurement `commit` will re-take.
+
+Part 1 requires ffmpeg (skipped without it); part 2 synthesises its own wavs.
 """
 from __future__ import annotations
 
 import array
+import json
+import math
 import shutil
 import subprocess
 import unittest
 import wave
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 from service import ingest
+from service.emotions import BASELINE
 
 HAVE_FFMPEG = shutil.which("ffmpeg") is not None
 
@@ -50,16 +61,21 @@ def _read(path: Path) -> tuple[array.array, int]:
     return samples, rate
 
 
-def _tone_of(samples: array.array, rate: int, sec: float) -> float:
-    """Dominant frequency of the 0.8 s window starting at `sec` (zero crossings).
-    The window is inset from the second's edges so a few ms of codec delay or
-    fade cannot bleed a neighbouring tone into the measurement."""
-    a, b = int((sec + 0.1) * rate), min(int((sec + 0.9) * rate), len(samples))
-    win = samples[a:b]
-    assert len(win) > rate // 10, f"window at {sec}s is short ({len(win)} samples)"
+def _freq(win, rate: int) -> float:
+    """Frequency of a pure tone, by zero crossings (2 per cycle)."""
     crossings = sum(1 for i in range(1, len(win))
                     if (win[i - 1] < 0) != (win[i] < 0))
     return crossings / 2 / (len(win) / rate)
+
+
+def _tone_of(samples: array.array, rate: int, sec: float) -> float:
+    """Dominant frequency of the 0.8 s window starting at `sec`. The window is
+    inset from the second's edges so a few ms of codec delay or fade cannot
+    bleed a neighbouring tone into the measurement."""
+    a, b = int((sec + 0.1) * rate), min(int((sec + 0.9) * rate), len(samples))
+    win = samples[a:b]
+    assert len(win) > rate // 10, f"window at {sec}s is short ({len(win)} samples)"
+    return _freq(win, rate)
 
 
 @unittest.skipUnless(HAVE_FFMPEG, "ffmpeg not available")
@@ -146,6 +162,246 @@ class ExtractBoundaryTests(unittest.TestCase):
     def test_empty_span_is_rejected(self) -> None:
         with self.assertRaises(RuntimeError):
             ingest.to_wav(Path("x.wav"), Path("y.wav"), 5.0, 5.0)
+
+
+RATE = 24000
+
+
+def _write_tone(path: Path, freq: float, seconds: float, amp: float = 0.5) -> None:
+    """A pure tone wav in the pipeline's own format (24 kHz mono 16-bit).
+    Identity travels as FREQUENCY so level matching (which normalises amplitude)
+    cannot erase which segment a piece of a stem came from."""
+    n = int(seconds * RATE)
+    data = array.array("h", (int(amp * 32767 * math.sin(2 * math.pi * freq * i / RATE))
+                             for i in range(n)))
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(RATE)
+        w.writeframes(data.tobytes())
+
+
+def _pieces(path: Path) -> list[array.array]:
+    """Split a stem back into its segments at the silent gaps — which also
+    proves the gaps are there."""
+    samples, rate = _read(path)
+    out: list[array.array] = []
+    cur = array.array("h")
+    run = 0
+    quiet = 60                      # ≈ -55 dBFS: silence, not a fade tail
+    min_gap = int(0.04 * rate)
+    for s in samples:
+        if abs(s) < quiet:
+            run += 1
+            cur.append(s)
+        else:
+            if run >= min_gap and len(cur) > run:
+                out.append(cur[:-run])
+                cur = array.array("h")
+            run = 0
+            cur.append(s)
+    if len(cur) - run > 0:
+        out.append(cur[:len(cur) - run] if run else cur)
+    return [p for p in out if len(p) > rate // 20]
+
+
+class ConcatCapTests(unittest.TestCase):
+    """The reported duration must equal the written file, always."""
+
+    def test_empty_input_is_rejected(self) -> None:
+        with TemporaryDirectory() as td:
+            with self.assertRaises(RuntimeError):
+                ingest.concat_wavs([], Path(td) / "out.wav")
+
+    def test_reported_seconds_match_the_file(self) -> None:
+        with TemporaryDirectory() as td:
+            wd = Path(td)
+            paths = []
+            for i in range(3):
+                p = wd / f"s{i}.wav"
+                _write_tone(p, 300 + 100 * i, 2.0)
+                paths.append(p)
+            res = ingest.concat_wavs(paths, wd / "stem.wav")
+            with wave.open(str(wd / "stem.wav"), "rb") as w:
+                on_disk = round(w.getnframes() / w.getframerate(), 2)
+            self.assertEqual(res.seconds, on_disk)
+            self.assertEqual(res.segments, 3)
+            # 3 × 2s + 2 silent gaps
+            self.assertAlmostEqual(res.seconds, 6.0 + 2 * ingest._GAP_SECONDS, places=2)
+
+    def test_cap_is_a_hard_ceiling_at_whole_segments(self) -> None:
+        with TemporaryDirectory() as td:
+            wd = Path(td)
+            paths = []
+            for i in range(4):
+                p = wd / f"s{i}.wav"
+                _write_tone(p, 300 + 100 * i, 12.0)
+                paths.append(p)
+            res = ingest.concat_wavs(paths, wd / "stem.wav", cap_seconds=30.0)
+            with wave.open(str(wd / "stem.wav"), "rb") as w:
+                on_disk = w.getnframes() / w.getframerate()
+            self.assertLessEqual(on_disk, 30.0)       # the OLD code wrote 36s here
+            self.assertEqual(res.segments, 2)         # third would overflow → dropped
+            self.assertEqual(res.seconds, round(on_disk, 2))
+
+    def test_lone_oversize_segment_is_truncated_not_dropped(self) -> None:
+        with TemporaryDirectory() as td:
+            wd = Path(td)
+            p = wd / "s.wav"
+            _write_tone(p, 400, 40.0)
+            res = ingest.concat_wavs([p], wd / "stem.wav", cap_seconds=30.0)
+            self.assertEqual(res.segments, 1)
+            self.assertEqual(res.seconds, 30.0)
+            with wave.open(str(wd / "stem.wav"), "rb") as w:
+                self.assertEqual(round(w.getnframes() / w.getframerate(), 2), 30.0)
+
+
+class SpliceQualityTests(unittest.TestCase):
+    """No clicks and no level pumping in the audio the embedding learns from."""
+
+    def _stem(self, wd: Path, amps: list[float]) -> Path:
+        paths = []
+        for i, a in enumerate(amps):
+            p = wd / f"s{i}.wav"
+            _write_tone(p, 400.0, 2.0, amp=a)
+            paths.append(p)
+        ingest.concat_wavs(paths, wd / "stem.wav")
+        return wd / "stem.wav"
+
+    def test_levels_are_matched_without_clipping(self) -> None:
+        with TemporaryDirectory() as td:
+            wd = Path(td)
+            stem = self._stem(wd, [0.28, 0.5, 0.45])   # ~5 dB spread going in
+            parts = _pieces(stem)
+            self.assertEqual(len(parts), 3)
+            rms = [math.sqrt(sum(float(s) ** 2 for s in p) / len(p)) for p in parts]
+            spread_db = 20 * math.log10(max(rms) / min(rms))
+            self.assertLess(spread_db, 1.5, f"levels still {spread_db:.1f} dB apart")
+            peak = max(abs(s) for p in parts for s in p)
+            self.assertLessEqual(peak, int(ingest._PEAK_CEILING * 32767) + 1)
+
+    def test_gain_is_clamped_so_a_silent_segment_cannot_pump(self) -> None:
+        with TemporaryDirectory() as td:
+            wd = Path(td)
+            stem = self._stem(wd, [0.5, 0.5, 0.001])   # one near-silent outlier
+            parts = _pieces(stem)
+            quiet = min(parts, key=lambda p: max(abs(s) for s in p))
+            gain = max(abs(s) for s in quiet) / (0.001 * 32767)
+            self.assertLessEqual(gain, ingest._GAIN_RANGE[1] * 1.05,
+                                 "near-silent segment was boosted past the clamp")
+
+    def test_splice_boundaries_are_faded_to_zero(self) -> None:
+        """A hard splice steps the waveform — that click gets learned."""
+        with TemporaryDirectory() as td:
+            wd = Path(td)
+            paths = []
+            for i in range(3):
+                p = wd / f"s{i}.wav"
+                # start each tone at a different phase-hostile frequency so a raw
+                # concatenation WOULD step hard at the joins
+                _write_tone(p, 317.0 + 211 * i, 1.0)
+                paths.append(p)
+            ingest.concat_wavs(paths, wd / "stem.wav")
+            samples, rate = _read(wd / "stem.wav")
+            step = max(abs(samples[i] - samples[i - 1]) for i in range(1, len(samples)))
+            # the largest legitimate sample-to-sample step of the loudest tone
+            legit = 2 * math.pi * 739 / rate * ingest._PEAK_CEILING * 32767
+            self.assertLess(step, legit * 1.5, "waveform discontinuity at a splice")
+            for p in _pieces(wd / "stem.wav"):
+                self.assertLess(abs(p[0]), 500)    # faded in
+                self.assertLess(abs(p[-1]), 500)   # faded out
+
+
+def _seg_at(i: int, dur: float = 2.0) -> dict:
+    return {"speaker": "speaker_0", "start": i * dur, "end": (i + 1) * dur, "text": f"t{i}"}
+
+
+class StemAssemblyTests(unittest.TestCase):
+    """WHAT lands in the neutral stem, and whether the UI can trust `eligible`."""
+
+    #: segment index → (emotion, tone Hz). Frequency identifies the segment
+    #: inside the finished stem.
+    def _run(self, td: str, layout: list[str], dur: float = 2.0, min_stem: float = 4.0):
+        wd = Path(td)
+        n = len(layout)
+        with wave.open(str(wd / "clean.wav"), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(RATE)
+            w.writeframes(b"\x00\x00" * RATE)
+        (wd / "segments.json").write_text(
+            json.dumps([_seg_at(i, dur) for i in range(n)]), "utf-8")
+
+        def fake_to_wav(src, dst, a=None, b=None):
+            i = int(Path(dst).stem.split("_")[1])
+            _write_tone(Path(dst), 300.0 + 100 * i, dur)
+
+        def fake_label(wav_path):
+            i = int(Path(wav_path).stem.split("_")[1])
+            return {"emotion": layout[i], "confidence": 0.9, "cue": f"c{i}", "model": "flash"}
+
+        with mock.patch.object(ingest, "to_wav", side_effect=fake_to_wav), \
+             mock.patch.object(ingest, "label_emotion", side_effect=fake_label):
+            res = ingest.label_and_stem(wd, "speaker_0", min_stem=min_stem, mode="cloud")
+        return wd, res, {s["emotion"]: s for s in res["stems"]}
+
+    def _tones_in(self, path: Path) -> list[int]:
+        return [round(_freq(p, RATE) / 100) * 100 for p in _pieces(path)]
+
+    def test_baseline_holds_only_neutral_audio(self) -> None:
+        layout = [BASELINE, BASELINE, BASELINE, "angry", "sad", "excited"]
+        with TemporaryDirectory() as td:
+            wd, res, by = self._run(td, layout)
+            base = by[BASELINE]
+            self.assertIsNone(base["note"])              # genuinely all-neutral
+            self.assertEqual(base["segments"], 3)
+            self.assertTrue(base["eligible"])
+            # tones 300/400/500 are the baseline segments; 600/700/800 are the
+            # angry/sad/excited takes and must NOT be in the neutral reference.
+            self.assertEqual(self._tones_in(wd / "stem_baseline.wav"), [300, 400, 500])
+
+    def test_emotion_stems_group_and_stay_in_recording_order(self) -> None:
+        layout = [BASELINE, "angry", BASELINE, "angry", BASELINE, "angry"]
+        with TemporaryDirectory() as td:
+            wd, res, by = self._run(td, layout)
+            self.assertEqual(by["angry"]["segments"], 3)
+            self.assertEqual(self._tones_in(wd / "stem_angry.wav"), [400, 600, 800])
+            self.assertEqual(self._tones_in(wd / "stem_baseline.wav"), [300, 500, 700])
+            # display order follows the emotion scale, baseline first
+            self.assertEqual(res["stems"][0]["emotion"], BASELINE)
+
+    def test_thin_neutral_borrows_nearest_and_says_so(self) -> None:
+        layout = [BASELINE, "angry", "calm", "happy"]     # only 2s neutral, need 4s
+        with TemporaryDirectory() as td:
+            wd, res, by = self._run(td, layout)
+            base = by[BASELINE]
+            self.assertTrue(base["eligible"])
+            self.assertIsNotNone(base["note"])
+            self.assertIn("calm", base["note"])           # nearest-neutral first
+            self.assertNotIn("angry", base["note"])       # and ONLY what was needed
+            self.assertEqual(self._tones_in(wd / "stem_baseline.wav"), [300, 500])
+
+    def test_no_neutral_at_all_is_reported_not_hidden(self) -> None:
+        layout = ["angry", "whisper", "happy"]
+        with TemporaryDirectory() as td:
+            wd, res, by = self._run(td, layout)
+            note = by[BASELINE]["note"]
+            self.assertIsNotNone(note)
+            self.assertIn("0.0s of neutral speech", note)
+            self.assertIn("happy", note)                  # happy borrowed before…
+            self.assertNotIn("whisper", note)             # …whisper (no phonation)
+
+    def test_eligible_matches_what_commit_will_measure(self) -> None:
+        """The UI must not promise a stem that commit then silently skips."""
+        layout = [BASELINE, BASELINE, "angry", "sad", "sad"]
+        with TemporaryDirectory() as td:
+            wd, res, by = self._run(td, layout, dur=1.7)
+            for st in res["stems"]:
+                sw = wd / f"stem_{st['emotion']}.wav"
+                with wave.open(str(sw), "rb") as w:      # exactly commit()'s measurement
+                    seconds = round(w.getnframes() / w.getframerate(), 2)
+                self.assertEqual(st["seconds"], seconds)
+                self.assertEqual(st["eligible"], seconds >= res["min_stem"])
 
 
 if __name__ == "__main__":

@@ -13,7 +13,12 @@
 import type { LoaderStep, Partial as PartialData } from "../_loaders/shared";
 
 export type Speaker = { id: string; utterances: number; seconds: number; sample_text: string };
-export type Stem = { emotion: string; seconds: number; segments: number; eligible: boolean; cues: string[] };
+// `note` is the backend's statement about a stem that is not what its label
+// implies — today: a baseline stem topped up with non-neutral segments because
+// the recording had too little neutral speech. It must be SHOWN, never dropped:
+// the whole point is that an emotionally blended baseline is never presented as
+// a clean one (service/ingest.py::plan_baseline).
+export type Stem = { emotion: string; seconds: number; segments: number; eligible: boolean; cues: string[]; note?: string | null };
 export type Result = { duration: number; speakers: string[]; target: string; utterances: number; stems: Stem[] };
 export type Character = { character_id: string; name: string };
 export type Created = { voice_id: string; emotion: string };
