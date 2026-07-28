@@ -12,12 +12,16 @@ import { useAuth } from "@/lib/useAuth";
 import { recordVoiceOwnership } from "@/lib/voiceVault";
 import { CONSENT_STATEMENT } from "@/lib/consent";
 import WaveformLab from "./_loaders/WaveformLab";
-import type { LoaderData } from "./_loaders/shared";
+import { DetectionFinding, SovereignLimits, type LoaderData } from "./_loaders/shared";
 import {
   reducer, initialState, POLLING_PHASES,
-  type Character, type Job,
+  type Character, type Job, type ModeInfo,
 } from "./_state/machine";
 import { useIngestJob } from "./_state/useIngestJob";
+
+// Phases where a scanned recording is on screen and the mode that produced it
+// is still load-bearing for what the user is reading.
+const SCAN_PHASES: ReadonlySet<string> = new Set(["processing", "speaker", "review"]);
 
 export default function NewCharacterPage() {
   const { user } = useAuth();
@@ -35,6 +39,11 @@ export default function NewCharacterPage() {
   // sovereign = force local-only: the recording never leaves the machine.
   const [ingestMode, setIngestMode] = useState<"auto" | "sovereign">("auto");
   const [characters, setCharacters] = useState<Character[]>([]);
+  // What the BACKEND says each mode does — including which mode `auto` resolves
+  // to on this box. The panel below states sovereign's limits from this, never
+  // from a copy of the constant kept over here.
+  const [modeInfo, setModeInfo] = useState<ModeInfo | null>(null);
+  const [modeInfoFailed, setModeInfoFailed] = useState(false);
 
   const fileRef = useRef<HTMLInputElement>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -57,6 +66,17 @@ export default function NewCharacterPage() {
       .catch(() => { if (alive) setCharacters([]); });
     return () => { alive = false; };
   }, [atUpload, atComplete]);
+
+  // Mode descriptions are backend constants — fetch once. A failure is SAID
+  // (the panel can't invent the limits), never swallowed into silence.
+  useEffect(() => {
+    let alive = true;
+    void apiJson<ModeInfo>("/api/ingest/modes", { cache: "no-store" },
+      "could not load ingest modes")
+      .then((m) => { if (alive) { setModeInfo(m); setModeInfoFailed(false); } })
+      .catch(() => { if (alive) setModeInfoFailed(true); });
+    return () => { alive = false; };
+  }, []);
 
   // ONE poller for both the analyze leg and the commit leg.
   const [pollStalled, setPollStalled] = useState(false);
@@ -209,6 +229,20 @@ export default function NewCharacterPage() {
           </ErrorBanner>
         )}
 
+        {/* What THIS job is doing to the recording. Driven by job.mode, so a
+            scan that `auto` RESOLVED to sovereign states its limits exactly as
+            loudly as one where the pill was pressed — the resolved case used to
+            state nothing at all. Shown from the moment analyze finishes (that
+            is when the backend has them) through the review ledger. */}
+        {job?.mode === "sovereign" && SCAN_PHASES.has(phase) && (
+          <div className="mt-4 max-w-3xl space-y-3">
+            {(job.limits?.length ?? 0) > 0 && (
+              <SovereignLimits limits={job.limits!} heading="sovereign mode · what this scan cannot do" />
+            )}
+            {job.detection && <DetectionFinding detection={job.detection} note={job.note} />}
+          </div>
+        )}
+
         {/* UPLOAD */}
         {phase === "upload" && (
           <div className="mt-8 max-w-2xl">
@@ -243,11 +277,40 @@ export default function NewCharacterPage() {
                   🔒 Sovereign — audio never leaves this machine
                 </button>
               </div>
-              <p className="font-jetbrains mt-2 text-[11px] leading-relaxed text-white/50">
-                {ingestMode === "sovereign"
-                  ? "Local ffmpeg pipeline only — nothing leaves this box. In exchange: one voice (everyone audible in the recording is cloned as the same speaker — there is no local diarization), one emotion (the neutral baseline; the rest are recorded afterwards with the guided per-emotion capture), and no transcript."
-                  : "Uses ElevenLabs (diarize + isolate) and Gemini (emotion labels) when the backend has keys; falls back to local processing when it doesn't."}
-              </p>
+              {/* Everything below is the BACKEND's description of the modes.
+                  This panel used to re-type SOVEREIGN_LIMITS by hand, so the
+                  two could drift with nothing to catch it, and `auto` never
+                  said which mode it would actually resolve to. */}
+              <div className="mt-3 space-y-2">
+                {modeInfoFailed && (
+                  <ErrorBanner severity="warning">
+                    couldn&apos;t load what each mode does from the backend — the limits of
+                    whichever mode runs are stated again once the scan starts.
+                  </ErrorBanner>
+                )}
+                {!modeInfo && !modeInfoFailed && (
+                  <p className="font-jetbrains text-[11px] text-white/40">loading what each mode does…</p>
+                )}
+                {ingestMode === "sovereign" ? (
+                  modeInfo && (
+                    <p className="font-jetbrains text-[11px] leading-relaxed text-white/50">
+                      {modeInfo.sovereign.note}
+                    </p>
+                  )
+                ) : (
+                  <p className="font-jetbrains text-[11px] leading-relaxed text-white/50">
+                    Uses ElevenLabs (diarize + isolate) and Gemini (emotion labels) when the
+                    backend has keys, and the local sovereign pipeline when it doesn&apos;t.
+                    {modeInfo?.resolved_auto === "sovereign" &&
+                      " This backend has no cloud keys configured, so auto will run the local pipeline — with the limits below."}
+                    {modeInfo?.resolved_auto === "cloud" &&
+                      " This backend has cloud keys, so auto will run the cloud pipeline."}
+                  </p>
+                )}
+                {modeInfo && (ingestMode === "sovereign" || modeInfo.resolved_auto === "sovereign") && (
+                  <SovereignLimits limits={modeInfo.sovereign.limits} />
+                )}
+              </div>
             </div>
 
             <Button onClick={startScan} disabled={!file} className="mt-5 cursor-pointer">Scan recording →</Button>
@@ -281,7 +344,14 @@ export default function NewCharacterPage() {
                   </button>
                   <div className="min-w-0 flex-1">
                     <div className="font-jetbrains text-[12px] text-white/80">{s.id} · <span className="text-white">{s.seconds}s</span> · {s.utterances} utterances</div>
-                    <div className="line-clamp-1 text-sm italic text-white/50">“{s.sample_text}”</div>
+                    {/* Quotation marks + italics mean "this is what they said".
+                        In sovereign mode nothing is transcribed, so sample_text
+                        is a finding about the recording and is set as one. */}
+                    {job.mode === "sovereign" ? (
+                      <div className="text-[12px] leading-snug text-white/50">{s.sample_text}</div>
+                    ) : (
+                      <div className="line-clamp-1 text-sm italic text-white/50">“{s.sample_text}”</div>
+                    )}
                   </div>
                   <Button onClick={() => chooseSpeaker(s.id)} className="shrink-0 cursor-pointer px-4 py-2 text-[13px]">Use this →</Button>
                 </div>

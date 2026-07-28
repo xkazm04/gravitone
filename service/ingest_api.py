@@ -385,7 +385,15 @@ def _analyze(job_id: str, audio: Path) -> None:
         # What this phase actually spent — zeros in sovereign mode, which is
         # itself worth showing (the audio never left the machine).
         _partial(job, {"spend": _spend_for(job_id).snapshot()})
+        # `note`, `limits` and `detection` are what the analyze phase LEARNED
+        # about this recording (sovereign only, today): the mode's own limits,
+        # the speech-detection outcome and the levels it measured. They used to
+        # be dropped here, so the studio hand-copied the limits constant and
+        # never saw an outcome at all. Absent in cloud mode → None, not a key
+        # the client has to distinguish from "not computed yet".
         _update(job, speakers=res["speakers"], duration=res["duration"],
+                note=res.get("note"), limits=res.get("limits"),
+                detection=res.get("detection"),
                 status="awaiting_speaker")
     except ingest.Cancelled:
         # Not a failure: the job is already torn down and `_update` would
@@ -524,6 +532,7 @@ def start_scan(file: UploadFile = File(...), mode: str = Form("auto")) -> dict:
         "id": job_id, "status": "running", "step": None, "mode": resolved,
         "steps": [{**s, "state": "pending"} for s in STEPS_BY_MODE[resolved]],
         "partial": {}, "speakers": None, "duration": 0, "result": None, "error": None,
+        "note": None, "limits": None, "detection": None,
         "work_dir": str(work_dir), "created": time.time(),
         "clip_sha256": hashlib.sha256(data).hexdigest(), "cancel": False,
         "committed": None}
@@ -535,7 +544,28 @@ def start_scan(file: UploadFile = File(...), mode: str = Form("auto")) -> dict:
 
 
 _PUBLIC_KEYS = ("id", "status", "step", "steps", "partial", "speakers",
-                "duration", "result", "error", "mode", "committed")
+                "duration", "result", "error", "mode", "committed",
+                # What analyze learned about THIS recording. A key the job dict
+                # holds but this tuple omits is computed and then thrown away —
+                # that is exactly what happened to these three.
+                "note", "limits", "detection")
+
+
+@router.get("/modes")
+def modes() -> dict:
+    """What each ingest mode does to a recording, from the backend's own
+    constants — and which one `auto` resolves to right now.
+
+    Declared BEFORE `/{job_id}` on purpose: the dynamic route would otherwise
+    swallow this path and answer "job expired". The studio used to hand-write
+    sovereign's limits into its upload panel, one copy per side of the API with
+    nothing to catch a drift; `resolve_mode` is served with them so a user whose
+    `auto` will resolve to sovereign is told before they upload, not after."""
+    return {
+        "resolved_auto": ingest.resolve_mode("auto"),
+        "sovereign": {"limits": list(ingest.SOVEREIGN_LIMITS),
+                      "note": ingest.sovereign_note()},
+    }
 
 
 @router.get("/{job_id}")

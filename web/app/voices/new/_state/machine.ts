@@ -10,7 +10,7 @@
 // privacy mode, which clip is playing, the cloned-character list) stays as
 // plain useState in the page — it isn't part of the flow's state graph.
 
-import type { LoaderStep, Partial as PartialData } from "../_loaders/shared";
+import type { Detection, LoaderStep, Partial as PartialData } from "../_loaders/shared";
 
 export type Speaker = { id: string; utterances: number; seconds: number; sample_text: string };
 // `note` is the backend's statement about a stem that is not what its label
@@ -27,6 +27,21 @@ export type Job = {
   status: string; step: string | null; steps: LoaderStep[]; partial: PartialData;
   speakers: Speaker[] | null; duration: number; result: Result | null; error: string | null;
   mode?: "cloud" | "sovereign"; committed?: Created[] | null;
+  // What the analyze phase learned about THIS recording, served from the job
+  // once analyze finishes (sovereign only, today; null in cloud mode):
+  //   note      — the backend's sentence about the detection outcome
+  //   limits    — SOVEREIGN_LIMITS as the backend holds them, so the studio
+  //               states them instead of keeping its own copy
+  //   detection — the outcome plus the levels it was decided on
+  note?: string | null;
+  limits?: string[] | null;
+  detection?: Detection | null;
+};
+
+/** GET /api/ingest/modes — the backend's own description of each ingest mode. */
+export type ModeInfo = {
+  resolved_auto: "cloud" | "sovereign";
+  sovereign: { limits: string[]; note: string };
 };
 
 export type Phase =
