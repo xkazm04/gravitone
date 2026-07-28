@@ -18,6 +18,11 @@ export type Segment = {
 /** One directed line of a multi-character performance script. */
 export type PerfLine = { character_id: string; text: string };
 
+/** One line in the Script composer (stable id for React keys + reordering).
+ *  Lives here rather than in the console because it is persisted — see
+ *  lib/composerStore. */
+export type ScriptLine = { id: string; characterId: string; text: string };
+
 export type Take = {
   id: string;
   text: string;

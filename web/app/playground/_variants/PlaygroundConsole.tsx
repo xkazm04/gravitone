@@ -20,7 +20,9 @@ import { Button, Eyebrow } from "@/components/ui/Primitives";
 import { EASE } from "@/components/ui/tokens";
 import { EMOTION_IDS, emotionMeta, wrapWithTag } from "@/lib/emotions";
 import EmotionArt from "@/components/ui/EmotionArt";
-import { DEFAULT_EXPRESSION, DEFAULT_TEXT, stripTags, type Expression, type PerfLine, type Take } from "./shared";
+import { DEFAULT_EXPRESSION, DEFAULT_TEXT, stripTags, type Expression, type PerfLine, type ScriptLine, type Take } from "./shared";
+// Composer durability — the same IndexedDB mechanism the take log uses.
+import { loadComposer, reconcileCharacters, saveComposer, type ComposerState } from "@/lib/composerStore";
 import { speak, perform, uploadTake, refinePeaks, EngineBusyError, isAbort, type FallbackReason } from "./engine";
 // ONE character-list data layer, shared with the voices module — the playground
 // used to fetch /api/characters itself, so the app had two truths about the
@@ -59,9 +61,6 @@ function Slider({ label, hint, value, min, max, step, onChange, format }: {
     </div>
   );
 }
-
-// One directed line in the Script composer (stable id for keys + reordering).
-type ScriptLine = { id: string; characterId: string; text: string };
 
 // What to tell the user when a take came from the browser voice. Each string
 // names the ACTUAL cause; "unreachable" is no longer the catch-all.
@@ -189,6 +188,15 @@ export default function PlaygroundConsole() {
   // durable — saying nothing would leave the "survives a refresh" promise
   // silently broken.
   const [storageErr, setStorageErr] = useState<string | null>(null);
+  // Composer durability. `restored` is what came off disk waiting for the
+  // roster (character ids can only be validated against the server's list);
+  // `composerErr` reports a composer that is NOT being saved, and
+  // `composerNotice` reports work that was restored but had to be repaired.
+  const [restored, setRestored] = useState<ComposerState | null>(null);
+  const [composerReady, setComposerReady] = useState(false);
+  const [composerErr, setComposerErr] = useState<string | null>(null);
+  const [composerNotice, setComposerNotice] = useState<string | null>(null);
+  const reconciled = useRef(false);
   // Why publishing a take failed. The button's "✗ failed" says THAT it failed;
   // the backend's own detail (request id included) says what to do about it,
   // and share()'s catch used to throw it away.
@@ -200,6 +208,7 @@ export default function PlaygroundConsole() {
   const [reviewErr, setReviewErr] = useState<string | null>(null);
   const seq = useRef(0);
   const areaRef = useRef<HTMLTextAreaElement>(null);
+  const composerRef = useRef<HTMLDivElement>(null); // scroll target for "reuse"
   // In-flight generation, so it can be cancelled (or aborted on unmount).
   const runRef = useRef<AbortController | null>(null);
   const mounted = useMounted();
@@ -247,8 +256,8 @@ export default function PlaygroundConsole() {
         setCharacters(cs);
         setPreferred(pref);
         setRosterErr(null);
-        const winner = pref.character_id && cs.find((c) => c.character_id === pref.character_id);
-        setCharId((winner || cs[0])?.character_id ?? "");
+        // Which Character is selected is decided in ONE place below — it now
+        // has to reconcile a restored selection against the live roster.
       } catch (e) {
         // An abort is this component going away, not a failed read.
         if (!mounted.current || isAbort(e) || ctrl.signal.aborted) return;
@@ -258,6 +267,89 @@ export default function PlaygroundConsole() {
     })();
     return () => ctrl.abort();
   }, [mounted]);
+
+  // ── composer durability ────────────────────────────────────────────────────
+  // The take log has survived a refresh since an earlier round; the WORK that
+  // produced it did not. Same mechanism (lib/playgroundDb), one store each.
+
+  // A live mirror of the composer, so the restore below can tell whether the
+  // user got here first without re-running on every keystroke.
+  const live = useRef({ text, script, mode, expr });
+  useEffect(() => { live.current = { text, script, mode, expr }; });
+
+  useEffect(() => {
+    let cancelled = false;
+    loadComposer()
+      .then((s) => {
+        if (cancelled || !s) return;
+        const cur = live.current;
+        // Typing (or switching mode) before the restore landed means the user
+        // is already working — their input wins over the stored session.
+        const pristine = cur.text === DEFAULT_TEXT && cur.script.length === 0
+          && cur.mode === "solo" && cur.expr === DEFAULT_EXPRESSION;
+        if (!pristine) return;
+        setText(s.text);
+        setScript(s.script);
+        setExpr(s.expr);
+        setMode(s.mode);
+        setActiveLine(s.activeLine);
+        // charId waits for the roster: a stored id may name a Character that
+        // has since been deleted (see the reconcile effect).
+        setRestored(s);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        const why = e instanceof Error ? e.message : "storage unavailable";
+        setComposerErr(`Your last composer session could not be restored (${why}). Anything you write now is also NOT being saved.`);
+      })
+      // Saving starts only once the restore has settled, so an empty composer
+      // can never overwrite the stored one first.
+      .finally(() => { if (!cancelled) setComposerReady(true); });
+    return () => { cancelled = true; };
+  }, []);
+
+  // Persist on a debounce. Saving on every keystroke would put an IndexedDB
+  // transaction behind every character typed; 800ms of quiet is the trade.
+  useEffect(() => {
+    if (!composerReady) return;
+    const id = setTimeout(() => {
+      void saveComposer({ text, script, expr, mode, charId, activeLine })
+        .then(() => { if (mounted.current) setComposerErr(null); })
+        .catch((e) => {
+          if (!mounted.current) return;
+          const why = e instanceof Error ? e.message : "storage unavailable";
+          setComposerErr(`Your composer is NOT being saved for after a refresh (${why}).`);
+        });
+    }, 800);
+    return () => clearTimeout(id);
+  }, [composerReady, text, script, expr, mode, charId, activeLine, mounted]);
+
+  // The ONE place the selected Character is decided. It reconciles three
+  // sources against the live roster: an already-valid selection (the user's own
+  // click), a restored session, and the client-approved default. A stored id
+  // whose Character was deleted must not leave the rail with nothing selected
+  // or a script <select> pointing at a value it does not offer.
+  useEffect(() => {
+    if (characters.length === 0) return;
+    const ids = characters.map((c) => c.character_id);
+    const fallback = (preferred.character_id && ids.includes(preferred.character_id)
+      ? preferred.character_id
+      : ids[0]);
+    if (restored && !reconciled.current) {
+      reconciled.current = true;
+      const { state, dropped } = reconcileCharacters(restored, ids, fallback);
+      setCharId(state.charId || fallback);
+      setScript(state.script);
+      if (dropped.length > 0) {
+        const name = characters.find((c) => c.character_id === fallback)?.name ?? fallback;
+        setComposerNotice(
+          `${dropped.length === 1 ? "A Character" : `${dropped.length} Characters`} in your restored session no longer exist (${dropped.join(", ")}) — those lines now use ${name}. Check them before generating.`,
+        );
+      }
+      return;
+    }
+    setCharId((cur) => (cur && ids.includes(cur) ? cur : fallback));
+  }, [characters, preferred, restored]);
 
   // Restore the most recent session takes from IndexedDB on mount so a refresh
   // no longer destroys the log. Each restored take carries a fresh object URL.
@@ -398,18 +490,61 @@ export default function PlaygroundConsole() {
     // Follow the active row through the swap so tags keep targeting it.
     setActiveLine((a) => (a === idx ? j : a === j ? idx : a));
   }
-  /** Switch composer mode, seeding a starter two-character script on first use. */
+  /** Switch composer mode, CARRYING the composed text across.
+   *
+   *  Going to Script used to replace whatever was in the solo composer with a
+   *  canned two-line demo — the user's own sentence, tags and all, was simply
+   *  gone. The demo now only appears when there is nothing to carry. */
   function switchMode(m: "solo" | "script") {
-    if (m === "script" && script.length === 0) {
-      const first = charId || characters[0]?.character_id || "";
-      const second = characters.find((c) => c.character_id !== first)?.character_id || first;
-      setScript([
-        newLine(first, "Hello there."),
-        newLine(second, "[excited]Great to finally meet you![/excited]"),
-      ]);
-      setActiveLine(0);
+    if (m === "script") {
+      if (script.length === 0) {
+        const first = charId || characters[0]?.character_id || "";
+        const second = characters.find((c) => c.character_id !== first)?.character_id || first;
+        setScript(text.trim()
+          ? [newLine(first, text), newLine(second, "")]
+          : [
+              newLine(first, "Hello there."),
+              newLine(second, "[excited]Great to finally meet you![/excited]"),
+            ]);
+        setActiveLine(0);
+      }
+    } else if (!text.trim()) {
+      // Back to Solo with nothing in it: adopt the line being edited rather
+      // than handing the user a blank page they already filled in once.
+      const carried = script[activeLine]?.text || script.find((l) => l.text.trim())?.text;
+      if (carried) setText(carried);
     }
     setMode(m);
+  }
+
+  /** Load a take back into the composer, ready to re-run.
+   *
+   *  Every take already stores the text, Character and expression that produced
+   *  it; without this, acting on "sad → nearest emotion" meant retyping the
+   *  prompt from the ribbon. Characters that have since been deleted are
+   *  reported, not silently swapped. */
+  function reuseTake(t: Take) {
+    const ids = characters.map((c) => c.character_id);
+    const fallback = (charId && ids.includes(charId) ? charId : ids[0]) ?? "";
+    const candidate: ComposerState = t.lines?.length
+      ? {
+          text, mode: "script", expr: { ...t.expr }, charId: t.characterId, activeLine: 0,
+          script: t.lines.map((l, i) => ({
+            id: `line-reuse-${t.id}-${i}`, characterId: l.character_id, text: l.text,
+          })),
+        }
+      : { text: t.text, mode: "solo", expr: { ...t.expr }, charId: t.characterId, activeLine: 0, script };
+    const { state, dropped } = reconcileCharacters(candidate, ids, fallback);
+    setMode(state.mode);
+    setText(state.text);
+    setScript(state.script);
+    setActiveLine(0);
+    setExpr(state.expr);
+    setCharId(state.charId);
+    setComposerNotice(dropped.length > 0
+      ? `Loaded into the composer, but ${dropped.join(", ")} no longer exists — those lines now use ${charName(state.charId)}.`
+      : null);
+    composerRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
   }
 
   // Coalesce concurrent uploads of the SAME take: share() and ensureShared()
@@ -695,6 +830,21 @@ export default function PlaygroundConsole() {
 
       {storageErr && <ErrorBanner severity="warning">{storageErr}</ErrorBanner>}
 
+      {/* The composer is not durable right now — say so while there is still
+          time to copy the text out. */}
+      {composerErr && <ErrorBanner severity="warning">{composerErr}</ErrorBanner>}
+
+      {/* Restored (or reused) work that had to be repaired: a Character it
+          named is gone. Dismissible — it is about one action, not a state. */}
+      {composerNotice && (
+        <ErrorBanner severity="warning">
+          <span className="flex items-center justify-between gap-3">
+            <span>{composerNotice}</span>
+            <button onClick={() => setComposerNotice(null)} aria-label="Dismiss" className="shrink-0 text-amber-200/70 transition hover:text-amber-100">✕</button>
+          </span>
+        </ErrorBanner>
+      )}
+
       {/* Publishing failed: nothing was created, so this is an error, not a
           degraded success. */}
       {shareErr && (
@@ -775,7 +925,7 @@ export default function PlaygroundConsole() {
 
       <div className="mt-6 grid gap-5 lg:grid-cols-[1.35fr_0.65fr]">
         {/* compose bay */}
-        <div className="glass-panel rounded-2xl">
+        <div ref={composerRef} className="glass-panel rounded-2xl">
           <div className="font-jetbrains flex items-center justify-between border-b border-white/8 px-5 py-2.5 text-[11px] uppercase tracking-widest text-white/60">
             <div className="flex items-center gap-1">
               {(["solo", "script"] as const).map((m) => (
@@ -1018,6 +1168,13 @@ export default function PlaygroundConsole() {
                       : shares[t.id] && copied === t.id ? "✓ link copied"
                       : shares[t.id] ? "↗ copy link"
                       : "↗ share"}
+                  </button>
+                  <button
+                    onClick={() => reuseTake(t)}
+                    title="Load this take's text, Character and expression back into the composer"
+                    className="font-jetbrains shrink-0 rounded-lg border border-white/15 px-3 py-1.5 text-[11px] text-white/80 transition hover:border-cyan-400/40 hover:text-cyan-200"
+                  >
+                    ↺ reuse
                   </button>
                   <button
                     onClick={() => setCodeFor((c) => (c === t.id ? null : t.id))}
