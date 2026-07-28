@@ -90,12 +90,39 @@ def clean_audio(src: Path, dst: Path, sr: int = 24000) -> None:
         raise RuntimeError(f"audio cleanup failed: {r.stderr.decode(errors='ignore')[-200:]}")
 
 
+# Segment extracts seek on the INPUT (`-ss` BEFORE `-i`). With `-ss` after `-i`
+# ffmpeg demuxes and DECODES everything from byte zero up to the start point and
+# throws it away, so every one of the up-to-40 labelling extracts (plus every
+# per-speaker preview) paid for a full decode of the recording — the largest
+# avoidable CPU cost in ingest, on a CPU-only Arm product. Input seeking makes an
+# extract cost the same wherever it lands.
+#
+# Accuracy is the trap: a bare input seek can land on the nearest seek point and
+# silently shift a labelled span. So the cut is made in TWO STAGES — a coarse
+# input seek to `start - _SEEK_PREROLL` (cheap, container granularity) and a fine
+# output-side `-ss _SEEK_PREROLL` that decodes only the preroll and lands
+# sample-accurately on `start`. The span is given as `-t` (a duration, relative
+# to the seeked timeline) instead of `-to`, whose meaning after a timestamp-
+# shifting input seek is easy to get wrong. See test_ingest_audio.py, which
+# proves the cut boundaries by frequency on both wav and mp3 sources.
+_SEEK_PREROLL = 0.5
+
+
 def to_wav(src: Path, dst: Path, start: float | None = None, end: float | None = None) -> None:
-    cmd = ["ffmpeg", "-y", "-i", str(src)]
-    if start is not None:
-        cmd += ["-ss", f"{start:.3f}"]
+    """Extract [start, end) of `src` as mono 24 kHz wav (both bounds optional)."""
+    cmd = ["ffmpeg", "-y"]
+    fine = 0.0
+    if start is not None and start > 0:
+        fine = min(start, _SEEK_PREROLL)
+        cmd += ["-ss", f"{start - fine:.3f}"]  # coarse: before -i, skips the decode
+    cmd += ["-i", str(src)]
+    if fine > 0:
+        cmd += ["-ss", f"{fine:.3f}"]          # fine: after -i, sample-accurate
     if end is not None:
-        cmd += ["-to", f"{end:.3f}"]
+        span = end - (start or 0.0)
+        if span <= 0:
+            raise RuntimeError(f"empty span requested: {start} → {end}")
+        cmd += ["-t", f"{span:.3f}"]
     cmd += ["-ac", "1", "-ar", "24000", str(dst)]
     r = subprocess.run(cmd, capture_output=True)
     if r.returncode != 0:
