@@ -127,6 +127,11 @@ async function generateOnce(result: Partial<SpeakResult> = {}) {
   engineMocks.speak.mockResolvedValue({
     mode: "gravitone", url: "blob:new", blob: new Blob(["wav"]), peaks: [0.4, 0.9],
     seconds: 2.5, kb: 30, rtf: 0.3, synthSeconds: 8, queueSeconds: 0,
+    // `synthSegments` and `format` became required on SpeakResult in the same
+    // wave that added this harness (the proxy builder's mp3 + header work).
+    // `satisfies` is what pointed here — keep it, so the next field addition
+    // fails at this one fixture instead of somewhere downstream.
+    synthSegments: 1, format: "wav_24000",
     ignoredSettings: [], segments: [], ...result,
   } satisfies SpeakResult);
   await act(async () => {
