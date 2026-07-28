@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import dataclasses
 import json
 import threading
 import types
@@ -24,10 +25,19 @@ from service.engine import SynthResult
 _EMAP = {"baseline": "v_base", "happy": "v_happy", "sad": "v_sad"}
 
 
-class ParallelSpeakTests(unittest.TestCase):
+class _EngineCase(unittest.TestCase):
+    """Fake engine + fake emotion map, with SETTINGS restored between cases.
+
+    ``_configure(workers=N)`` states the DEPLOYMENT topology a case is written
+    against — the premium routes derive how much they may submit at once from
+    ``SETTINGS.workers``, so a case that wants N concurrent segments must say it
+    is running a TTS_WORKERS=N box and give the fake a matching pool.
+    """
+
     def setUp(self) -> None:
         self._orig_engine = appmod.ENGINE
         self._orig_emap = appmod.emotion_map
+        self._orig_settings = appmod.SETTINGS
         appmod.emotion_map = lambda cid: dict(_EMAP)
         from fastapi.testclient import TestClient
         self.client = TestClient(appmod.app)
@@ -38,6 +48,13 @@ class ParallelSpeakTests(unittest.TestCase):
             eng.close()  # don't leak the fake's worker pool
         appmod.ENGINE = self._orig_engine
         appmod.emotion_map = self._orig_emap
+        appmod.SETTINGS = self._orig_settings
+
+    def _configure(self, **kw) -> None:
+        appmod.SETTINGS = dataclasses.replace(appmod.SETTINGS, **kw)
+
+
+class ParallelSpeakTests(_EngineCase):
 
     def test_speak_runs_segments_concurrently_in_order(self) -> None:
         eng = fake_engine.FakeEngine(workers=2, delay=0.2)
@@ -55,6 +72,33 @@ class ParallelSpeakTests(unittest.TestCase):
         report = json.loads(base64.b64decode(resp.headers["x-segments"]))
         self.assertEqual([r["text"] for r in report], ["Hello", "World"])
         self.assertEqual([r["voice_id"] for r in report], ["v_happy", "v_sad"])
+
+    def test_synth_seconds_is_wall_clock_not_the_sum(self) -> None:
+        # Modelled on test_longform's drop-in-route case: four 0.2s segments on
+        # four workers took ~0.2s of wall-clock. Summing the per-segment times
+        # would report 0.8s — a duration that never elapsed — and a realtime
+        # factor that never existed.
+        self._configure(workers=4)
+        eng = fake_engine.FakeEngine(workers=4, delay=0.2)
+        appmod.ENGINE = eng
+        resp = self.client.post(
+            "/v1/speak",
+            json={"character_id": "sarah",
+                  "text": "[happy]One[/happy] [sad]Two[/sad] "
+                          "[happy]Three[/happy] [sad]Four"},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(eng.jobs), 4)
+        synth = float(resp.headers["x-synth-seconds"])
+        self.assertGreaterEqual(synth, 0.15)
+        self.assertLess(synth, 0.6)
+        # Audio duration, by contrast, IS the sum — it's a real total length.
+        self.assertEqual(resp.headers["x-audio-seconds"], "4.0")
+        self.assertEqual(resp.headers["x-realtime-factor"],
+                         str(round(4.0 / synth, 3)))
+        # Header parity with the drop-in route's batch path.
+        self.assertEqual(resp.headers["x-synth-segments"], "4")
+        self.assertEqual(resp.headers["x-queue-seconds"], "0.0")
 
     def test_speak_midscript_rejection_fails_whole_request_429(self) -> None:
         # capacity 1: the 2nd segment's admission is refused -> whole 429.
@@ -100,20 +144,7 @@ class ParallelSpeakTests(unittest.TestCase):
             self.assertTrue(job.abandoned.is_set(), f"job {i} not abandoned")
 
 
-class ParallelPerformanceTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self._orig_engine = appmod.ENGINE
-        self._orig_emap = appmod.emotion_map
-        appmod.emotion_map = lambda cid: dict(_EMAP)
-        from fastapi.testclient import TestClient
-        self.client = TestClient(appmod.app)
-
-    def tearDown(self) -> None:
-        eng = appmod.ENGINE
-        if isinstance(eng, fake_engine.FakeEngine):
-            eng.close()  # don't leak the fake's worker pool
-        appmod.ENGINE = self._orig_engine
-        appmod.emotion_map = self._orig_emap
+class ParallelPerformanceTests(_EngineCase):
 
     def test_performance_lines_run_concurrently_in_order(self) -> None:
         eng = fake_engine.FakeEngine(workers=2, delay=0.2)
@@ -131,6 +162,31 @@ class ParallelPerformanceTests(unittest.TestCase):
         report = json.loads(base64.b64decode(resp.headers["x-performance-report"]))
         self.assertEqual([r["line"] for r in report], [0, 1])
         self.assertEqual([r["text"] for r in report], ["Line one", "Line two"])
+
+    def test_synth_seconds_is_wall_clock_not_the_sum(self) -> None:
+        self._configure(workers=4)
+        eng = fake_engine.FakeEngine(workers=4, delay=0.2)
+        appmod.ENGINE = eng
+        resp = self.client.post(
+            "/v1/performance",
+            json={"lines": [
+                {"character_id": "sarah", "text": "[happy]One"},
+                {"character_id": "sarah", "text": "[sad]Two"},
+                {"character_id": "sarah", "text": "[happy]Three"},
+                {"character_id": "sarah", "text": "[sad]Four"},
+            ]},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(eng.jobs), 4)
+        synth = float(resp.headers["x-synth-seconds"])
+        # Four concurrent 0.2s lines: ~0.2s elapsed, never the 0.8s sum.
+        self.assertGreaterEqual(synth, 0.15)
+        self.assertLess(synth, 0.6)
+        self.assertEqual(resp.headers["x-audio-seconds"], "4.0")
+        self.assertEqual(resp.headers["x-realtime-factor"],
+                         str(round(4.0 / synth, 3)))
+        self.assertEqual(resp.headers["x-synth-segments"], "4")
+        self.assertEqual(resp.headers["x-queue-seconds"], "0.0")
 
 
 class AwaitResultTests(unittest.TestCase):

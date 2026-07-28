@@ -878,6 +878,12 @@ async def text_to_speech(
 
     bypass = cache_bypass_requested(request.headers if request is not None else None)
     key = _cache_key(voice_id, req.text, overrides, req.frames_after_eos)
+    # `received` is "requests this replica served". A cache-served request never
+    # reaches ENGINE.submit (which is the only other place that bumps it), so
+    # without these calls the counter silently stopped counting them and every
+    # ratio derived from it — and `cache_hits`/`collapsed` in /metrics and in
+    # replicas.AGG_KEYS — was structurally zero.
+    hits_before, collapsed_before = SYNTH_CACHE.hits, SYNTH_CACHE.collapsed
     try:
         if bypass:
             # No lookup, no single-flight collapse, no store: this request is
@@ -891,6 +897,18 @@ async def text_to_speech(
         return _backpressure_response(exc)
 
     if was_cached:
+        # Which KIND of cache serve this was: a stored hit, or a collapse onto
+        # another request's in-flight render. The cache reports the two
+        # separately, so classify by which of its counters this call moved.
+        # (Two identical requests resolving inside the same await window can
+        # swap the labels between themselves; the SUM — and `received`, the
+        # number this exists to correct — is exact either way.)
+        if SYNTH_CACHE.hits > hits_before:
+            ENGINE.metrics.on_cache_hit()
+        elif SYNTH_CACHE.collapsed > collapsed_before:
+            ENGINE.metrics.on_collapsed()
+        else:  # pragma: no cover - defensive: served, so it counts as received
+            ENGINE.metrics.on_cache_hit()
         # The truth, not a replayed number: what this request actually spent.
         synth_seconds = round(time.perf_counter() - t_request, 6)
         queue_seconds = 0.0
@@ -1155,6 +1173,18 @@ async def speak(
     Emotions the Character lacks fall back to its baseline Voice. The per-segment
     report (what was requested vs what was used) is returned base64-JSON in the
     `X-Segments` header so the UI can show the substitutions.
+
+    Timing headers mirror the drop-in route's contract: ``X-Synth-Seconds`` is
+    the WALL-CLOCK time this request spent synthesizing (submission to concat),
+    never the sum of the per-segment times — the segments run concurrently, so a
+    sum reports a duration that never elapsed and a realtime factor that never
+    existed. ``X-Queue-Seconds`` is the worst segment's admission wait (the
+    request is only as fast as its slowest queued segment) and
+    ``X-Synth-Segments`` says how many jobs the script became.
+
+    Not cached: unlike the drop-in route, /v1/speak has no result cache, so
+    there is no ``X-Cache`` header to report — a header that always said "miss"
+    would be noise, not a diagnostic.
     """
     assert ENGINE is not None
 
@@ -1181,6 +1211,7 @@ async def speak(
     if fallbacks:  # one executor hop, not one disk write per segment
         await _offload(_record_fallbacks, fallbacks)
 
+    t_start = time.perf_counter()
     try:
         jobs = _submit_batch([(voice_id, seg.text, overrides)
                               for (seg, voice_id, used, fell_back) in resolved])
@@ -1192,25 +1223,31 @@ async def speak(
     wavs: list[bytes] = []
     report: list[dict] = []
     total_audio = 0.0
-    total_synth = 0.0
     for (seg, voice_id, used, fell_back), result in zip(resolved, results):
         wavs.append(result.wav_bytes)
         total_audio += result.audio_seconds
-        total_synth += result.synth_seconds
         report.append({
             "text": seg.text, "requested": seg.emotion, "used": used,
             "fallback": fell_back, "voice_id": voice_id, "seconds": result.audio_seconds,
         })
 
     body = await _offload(concat_wavs, wavs)
-    rtf = round(total_audio / total_synth, 3) if total_synth else 0.0
+    # Wall-clock for the WHOLE request, not the sum of per-segment synth times:
+    # the segments ran concurrently, so summing them would report a duration
+    # that never elapsed (and a realtime factor that never was). Same shape as
+    # the drop-in route's batch path.
+    synth_seconds = round(time.perf_counter() - t_start, 3)
+    queue_seconds = round(max((r.queue_seconds for r in results), default=0.0), 3)
     return Response(
         content=body, media_type="audio/wav",
         headers={
             "X-Audio-Seconds": str(round(total_audio, 2)),
-            "X-Synth-Seconds": str(round(total_synth, 3)),
-            "X-Realtime-Factor": str(rtf),
+            "X-Synth-Seconds": str(synth_seconds),
+            "X-Queue-Seconds": str(queue_seconds),
+            "X-Realtime-Factor": (str(round(total_audio / synth_seconds, 3))
+                                  if synth_seconds else "n/a"),
             "X-Segments": base64.b64encode(json.dumps(report).encode()).decode(),
+            **({"X-Synth-Segments": str(len(results))} if len(results) > 1 else {}),
             **_ignored_headers(req.voice_settings),
         },
     )
@@ -1237,6 +1274,12 @@ async def performance(req: PerformanceRequest):
     line/segment substitution report comes back base64-JSON in
     X-Performance-Report. Premium surface: requires the "performance" key
     scope (the root key always passes).
+
+    Timing headers follow /v1/speak's contract: ``X-Synth-Seconds`` is the
+    request's WALL-CLOCK synthesis time (the segments run concurrently, so the
+    per-segment sum is a duration that never elapsed), ``X-Queue-Seconds`` the
+    worst segment's admission wait, ``X-Synth-Segments`` the job count. Not
+    cached, so no ``X-Cache``.
     """
     assert ENGINE is not None
 
@@ -1270,6 +1313,7 @@ async def performance(req: PerformanceRequest):
     if fallbacks:  # one executor hop, not one disk write per segment
         await _offload(_record_fallbacks, fallbacks)
 
+    t_start = time.perf_counter()
     try:
         jobs = _submit_batch([(t[3], t[2].text, t[6]) for t in tasks])
     except AdmissionRejected as exc:
@@ -1280,11 +1324,9 @@ async def performance(req: PerformanceRequest):
     wavs: list[bytes] = []
     report: list[dict] = []
     total_audio = 0.0
-    total_synth = 0.0
     for (i, character_id, seg, voice_id, used, fell_back, _overr), result in zip(tasks, results):
         wavs.append(result.wav_bytes)
         total_audio += result.audio_seconds
-        total_synth += result.synth_seconds
         report.append({
             "line": i, "character_id": character_id, "text": seg.text,
             "requested": seg.emotion, "used": used, "fallback": fell_back,
@@ -1292,14 +1334,19 @@ async def performance(req: PerformanceRequest):
         })
 
     body = await _offload(concat_wavs, wavs)
-    rtf = round(total_audio / total_synth, 3) if total_synth else 0.0
+    # Wall-clock, not the per-segment sum — see /v1/speak.
+    synth_seconds = round(time.perf_counter() - t_start, 3)
+    queue_seconds = round(max((r.queue_seconds for r in results), default=0.0), 3)
     return Response(
         content=body, media_type="audio/wav",
         headers={
             "X-Audio-Seconds": str(round(total_audio, 2)),
-            "X-Synth-Seconds": str(round(total_synth, 3)),
-            "X-Realtime-Factor": str(rtf),
+            "X-Synth-Seconds": str(synth_seconds),
+            "X-Queue-Seconds": str(queue_seconds),
+            "X-Realtime-Factor": (str(round(total_audio / synth_seconds, 3))
+                                  if synth_seconds else "n/a"),
             "X-Performance-Report": base64.b64encode(json.dumps(report).encode()).decode(),
+            **({"X-Synth-Segments": str(len(results))} if len(results) > 1 else {}),
             **({"X-Ignored-Settings": ",".join(ignored)} if ignored else {}),
         },
     )

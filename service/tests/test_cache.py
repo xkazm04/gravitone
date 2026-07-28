@@ -152,6 +152,106 @@ class CacheHonestTimingTests(_Base):
         self.assertEqual(appmod.SYNTH_CACHE.stats()["entries"], entries)
 
 
+class CacheServedRequestsAreCountedTests(_Base):
+    """`received` must mean "requests this replica served", cache included.
+
+    A cache-served request never reaches ``ENGINE.submit``, the only other
+    place that bumps ``received`` — so ``Metrics.on_cache_hit`` /
+    ``on_collapsed`` existed with ZERO production callers, ``/metrics``
+    reported ``cache_hits: 0`` forever, and ``replicas.AGG_KEYS`` summed two
+    structurally-zero fields across the pool. These cases drive real HTTP
+    requests (not the Metrics object directly) so a dead call site fails here.
+    """
+
+    def test_http_cache_hit_increments_cache_hits_and_received(self) -> None:
+        self._post({"text": "Counted."})            # miss -> one submit
+        before = self.engine.metrics.snapshot()
+        self.assertEqual(before["cache_hits"], 0)
+        resp = self._post({"text": "Counted."})     # hit -> no submit at all
+        self.assertEqual(resp.headers["x-cache"], "hit")
+        after = self.engine.metrics.snapshot()
+        self.assertEqual(after["cache_hits"], before["cache_hits"] + 1)
+        # The point of the counter: the hit is still a request we SERVED.
+        self.assertEqual(after["received"], before["received"] + 1)
+        self.assertEqual(len(self.engine.jobs), 1, "a hit must not synthesize")
+
+    def test_collapsed_requests_are_counted_as_collapses(self) -> None:
+        async def _drive():
+            return await asyncio.gather(*[
+                appmod.text_to_speech("alba", TTSRequest(text="Herd."),
+                                      output_format="wav_24000", emotion=None)
+                for _ in range(4)])
+
+        asyncio.run(_drive())
+        snap = self.engine.metrics.snapshot()
+        # One leader synthesized (its `received` came from submit); the other
+        # three rode its render and are counted as collapses, not as hits.
+        self.assertEqual(snap["collapsed"], 3)
+        self.assertEqual(snap["cache_hits"], 0)
+        self.assertEqual(snap["received"], 4)
+
+    def test_a_miss_is_not_counted_twice(self) -> None:
+        self._post({"text": "Once."})
+        snap = self.engine.metrics.snapshot()
+        self.assertEqual(snap["received"], 1)
+        self.assertEqual(snap["cache_hits"], 0)
+        self.assertEqual(snap["collapsed"], 0)
+
+    def test_bypass_is_a_render_not_a_cache_serve(self) -> None:
+        self.client.post(
+            "/v1/text-to-speech/alba", params={"output_format": "wav_24000"},
+            json={"text": "Skip it."}, headers={"Cache-Control": "no-store"})
+        snap = self.engine.metrics.snapshot()
+        self.assertEqual(snap["cache_hits"], 0)
+        self.assertEqual(snap["collapsed"], 0)
+        self.assertEqual(snap["received"], 1, "the bypass rendered, so submit counted it")
+
+
+class AggregatedMetricKeysAreRealTests(unittest.TestCase):
+    """No field in ``replicas.AGG_KEYS`` may be structurally zero.
+
+    Summing a counter nothing ever increments across N replicas produces a
+    confident zero, which is worse than an absent field.
+    """
+
+    def test_every_agg_key_has_a_production_writer(self) -> None:
+        import re
+        from pathlib import Path
+
+        from service import replicas
+
+        src = Path(replicas.__file__).parent
+        production = "\n".join(
+            p.read_text(encoding="utf-8")
+            for p in sorted(src.glob("*.py")))  # service/*.py only, never tests
+        # A counter is "real" if production CALLS the Metrics method that owns
+        # it. The leading "." makes these call patterns, so the `def` line in
+        # engine.py (which has no dot) can never satisfy one on its own.
+        writers = {
+            "cache_hits": r"\.on_cache_hit\(",
+            "collapsed": r"\.on_collapsed\(",
+            "received": r"\.on_received\(",
+            "rejected_429": r"\.on_rejected\(",
+            "errored": r"\.on_error\(",
+            "timeouts": r"\.on_timeout\(",
+            "abandoned": r"\.on_abandoned\(",
+            "completed": r"\.on_finish\(",
+            "audio_seconds_total": r"\.on_finish\(",
+            "in_flight": r"\.job_running\(",
+            "queued": r"\.on_enqueue\(",
+        }
+        for key in replicas.AGG_KEYS:
+            with self.subTest(key=key):
+                pattern = writers.get(key)
+                self.assertIsNotNone(
+                    pattern, f"AGG_KEYS gained {key!r} with no known writer — "
+                             f"add it here (and make sure it HAS one)")
+                self.assertTrue(
+                    re.search(pattern, production),
+                    f"{key!r} is aggregated across replicas but nothing in "
+                    f"production ever increments it — it sums to a confident 0")
+
+
 class SingleFlightTests(_Base):
     def test_concurrent_identical_requests_collapse_to_one_synthesis(self) -> None:
         async def _drive():

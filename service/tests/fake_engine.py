@@ -132,6 +132,12 @@ class _FakeMetrics:
 
     def __init__(self, engine: "FakeEngine | None" = None) -> None:
         self.timeouts = 0
+        # Mirrors engine.Metrics: a cache-served request never reaches submit,
+        # so the API layer counts it here. `received` must include them or it
+        # stops meaning "requests this replica served".
+        self.received = 0
+        self.cache_hits = 0
+        self.collapsed = 0
         self._engine = engine
 
     def counters(self) -> dict:
@@ -141,7 +147,9 @@ class _FakeMetrics:
         eng = self._engine
         in_flight = eng._cur if eng is not None else 0
         queued = max(0, eng._admitted - eng._cur) if eng is not None else 0
-        return {"in_flight": in_flight, "queued": queued, "timeouts": self.timeouts}
+        return {"in_flight": in_flight, "queued": queued, "timeouts": self.timeouts,
+                "received": self.received, "cache_hits": self.cache_hits,
+                "collapsed": self.collapsed}
 
     def snapshot(self) -> dict:
         # The real Metrics.snapshot is counters() plus percentiles; the 429 path
@@ -150,6 +158,17 @@ class _FakeMetrics:
 
     def on_timeout(self) -> None:
         self.timeouts += 1
+
+    def on_received(self) -> None:
+        self.received += 1
+
+    def on_cache_hit(self) -> None:
+        self.received += 1
+        self.cache_hits += 1
+
+    def on_collapsed(self) -> None:
+        self.received += 1
+        self.collapsed += 1
 
 
 class _FakeJob:
@@ -225,6 +244,9 @@ class FakeEngine:
 
     def submit(self, voice_id: str, text: str, overrides=None,
                max_tokens=None, frames_after_eos=None) -> _FakeJob:
+        # Mirrors TtsEngine.submit: `received` is bumped for every request that
+        # reaches the engine, admitted or rejected.
+        self.metrics.on_received()
         with self._lock:
             if self._admitted >= self.capacity:
                 raise AdmissionRejected(
