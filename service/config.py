@@ -211,6 +211,39 @@ class Settings:
     # Optional shared secret; if set, requests must send it as `xi-api-key`
     # (ElevenLabs-compatible header). Empty = open (local dev).
     api_key: str = _str("TTS_API_KEY", "")
+    # --- Browser access (CORS) ---------------------------------------------
+    # Which browser ORIGINS may call this API directly. The "drop-in
+    # ElevenLabs" claim only holds for browser clients if the preflight
+    # succeeds, so this is the knob that makes the JS SDK usable.
+    #
+    # DEFAULT IS CLOSED (empty). Nothing is allowed cross-origin until an
+    # operator names their origin — this service also mounts /v1/keys (key
+    # issuance) and /v1/ingest (clone uploads), and a wildcard default there
+    # would hand every page on the internet a free synthesis (and upload)
+    # endpoint. Server-to-server clients and the studio's own Next.js proxy
+    # are unaffected: CORS is a browser rule, not a firewall.
+    #
+    #   TTS_CORS_ORIGINS="https://studio.example.com,http://localhost:3000"
+    #     comma-separated EXACT origins (scheme + host + port, no path, no
+    #     trailing slash). This is the normal setting.
+    #   TTS_CORS_ORIGINS="*"
+    #     allowed, but logged as a warning at startup: any page anywhere may
+    #     spend this box's CPU. Only sane for a deliberately public,
+    #     rate-limited deployment.
+    #   TTS_CORS_ORIGIN_REGEX="https://.*\.example\.com"
+    #     for per-tenant subdomains; anchored by Starlette with fullmatch.
+    #   TTS_CORS_ALLOW_CREDENTIALS=1
+    #     only if a browser client must send COOKIES. API keys travel in the
+    #     xi-api-key / Authorization headers, which need no credentials mode,
+    #     and the CORS spec forbids credentials together with "*" — so this is
+    #     off by default and refused (with a warning) when origins is "*".
+    cors_origins: str = _str("TTS_CORS_ORIGINS", "")
+    cors_origin_regex: str = _str("TTS_CORS_ORIGIN_REGEX", "")
+    cors_allow_credentials: bool = _bool("TTS_CORS_ALLOW_CREDENTIALS", False)
+    # How long a browser may cache a preflight (seconds). Every cross-origin
+    # POST costs an extra OPTIONS round trip until it does.
+    cors_max_age: int = _int("TTS_CORS_MAX_AGE", 600)
+
     # How long a request will wait for a worker before giving up (seconds).
     request_timeout_s: float = float(_str("TTS_REQUEST_TIMEOUT_S", "120"))
     # Whole-request ceiling for a STREAMING synthesis (seconds).

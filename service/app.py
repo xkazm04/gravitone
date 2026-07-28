@@ -12,6 +12,13 @@ Request body mirrors ElevenLabs:
 `output_format` is a query param (elevenlabs-style): wav_24000 | mp3_24000_128 | pcm_24000.
 Auth: enforced when TTS_API_KEY is set (see service/auth.py) — the root key or
 a managed `/v1/keys` key via `xi-api-key` / `Authorization: Bearer`.
+
+Browser clients: CORS is CLOSED until an operator names their origins in
+`TTS_CORS_ORIGINS` (see `cors_policy` below and Settings' CORS block). With
+nothing set, cross-origin browser calls fail at the preflight exactly as they
+did before — server-to-server clients and the studio's server-side proxy are
+unaffected. Once set, the custom response headers (`X-Cache`,
+`X-Realtime-Factor`, ...) are exposed so the client can actually read them.
 """
 from __future__ import annotations
 
@@ -27,6 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -84,6 +92,66 @@ app = FastAPI(title="Pocket TTS Service", version="1.0.0", lifespan=lifespan)
 # Unhandled exceptions keep the {"detail"} JSON contract (sanitized request-id
 # body) instead of escaping to Starlette's plain-text page.
 errors.install_catch_all(app)
+
+# --- Browser access ---------------------------------------------------------
+# Headers a browser client is MEANT to read. Without expose_headers the fetch
+# response object hides every one of them even on a successful cross-origin
+# request, which silently breaks the cache/latency/fallback signals the API
+# publishes (X-Cache, X-Realtime-Factor, X-Emotion-Fallback, ...) and the
+# backoff hint on a 429 (Retry-After).
+CORS_EXPOSE_HEADERS = [
+    "Retry-After",
+    "X-Audio-Seconds", "X-Cache", "X-Character", "X-Emotion-Fallback",
+    "X-Emotion-Requested", "X-Emotion-Used", "X-Gravitone-Cache",
+    "X-Ignored-Settings", "X-Performance-Report", "X-Queue-Seconds",
+    "X-Realtime-Factor", "X-Sample-Rate", "X-Segments", "X-Stream",
+    "X-Stream-Segments", "X-Synth-Seconds", "X-Synth-Segments",
+]
+# What the API actually accepts. Named explicitly rather than "*": the
+# allow-list IS the policy, and a browser's preflight asks about exactly these.
+CORS_ALLOW_METHODS = ["GET", "HEAD", "OPTIONS", "POST", "PATCH", "DELETE"]
+CORS_ALLOW_HEADERS = ["xi-api-key", "Authorization", "Content-Type", "Accept"]
+
+
+def cors_policy(settings=SETTINGS) -> dict | None:
+    """The CORSMiddleware kwargs for this configuration, or None for CLOSED.
+
+    Closed is the default and the fail-safe: with no TTS_CORS_ORIGINS and no
+    regex there is no middleware at all, so the service behaves exactly as it
+    did before this existed (server-to-server and the studio's server-side
+    proxy work; browsers get no cross-origin access to a box that also mounts
+    /v1/keys and /v1/ingest).
+    """
+    origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
+    regex = settings.cors_origin_regex.strip()
+    if not origins and not regex:
+        return None
+    credentials = settings.cors_allow_credentials
+    if "*" in origins:
+        logger.warning(
+            "CORS: TTS_CORS_ORIGINS is '*' — every origin on the internet may "
+            "call this service from a browser. Name your origins instead.")
+        if credentials:
+            # The CORS spec forbids the pair; honouring both would make every
+            # browser reject the response anyway. Drop the weaker guarantee.
+            logger.warning("CORS: allow_credentials ignored — invalid with '*'")
+            credentials = False
+    return {
+        "allow_origins": origins,
+        "allow_origin_regex": regex or None,
+        "allow_credentials": credentials,
+        "allow_methods": CORS_ALLOW_METHODS,
+        "allow_headers": CORS_ALLOW_HEADERS,
+        "expose_headers": CORS_EXPOSE_HEADERS,
+        "max_age": settings.cors_max_age,
+    }
+
+
+_CORS = cors_policy()
+if _CORS is not None:
+    app.add_middleware(CORSMiddleware, **_CORS)
+    logger.info("CORS enabled for origins=%s regex=%s",
+                _CORS["allow_origins"] or "-", _CORS["allow_origin_regex"] or "-")
 
 
 @app.exception_handler(ShuttingDown)
