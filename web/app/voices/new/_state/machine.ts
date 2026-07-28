@@ -148,8 +148,18 @@ export function reducer(state: State, action: Action): State {
         // A failure mid-commit still has an intact review ledger to return to;
         // a failure during analyze has nothing, so land back on upload.
         const backTo: Phase = state.phase === "committing" ? "review" : "upload";
-        return { ...state, job, phase: backTo,
-          error: job.error ?? (backTo === "review" ? "commit failed" : "failed") };
+        const error = job.error ?? (backTo === "review" ? "commit failed" : "failed");
+        // Landing on upload used to keep `result`, `jobId` and the failed job:
+        // a dead ledger for a recording the server has already discarded, still
+        // readable by anything that asks (the Coverage Coach reads
+        // `result?.stems`) and a jobId whose previews 404. An error clears the
+        // state it invalidated; the ledger survives ONLY where it is still real.
+        if (backTo === "upload") {
+          return { ...state, phase: "upload", error,
+            job: null, jobId: null, result: null, selected: new Set(),
+            pendingCommit: null };
+        }
+        return { ...state, job, phase: "review", error };
       }
       const phase = statusToPhase(job);
       if (!phase) return { ...state, job };
@@ -199,19 +209,24 @@ export function reducer(state: State, action: Action): State {
       return { ...state, extendCid: action.cid };
 
     case "RESET": {
-      // ONE reset. Both start-over and scan-another clear the job, ledger,
-      // selection, error and pending commit identically. scan-another only
-      // additionally pre-arms "extend the character we just built".
-      const base: State = {
-        ...state,
-        jobId: null, job: null, result: null, created: [],
-        selected: new Set(), error: null, pendingCommit: null,
-        phase: "upload",
-      };
+      // ONE reset, and it is a REAL one. start-over returns the flow to the
+      // state it boots in — nothing of the previous recording, and nothing of
+      // the previous COMMIT either: `committedCid` used to survive it, so a
+      // brand-new flow could say "extending an existing character" about a
+      // character the user had walked away from.
+      //
+      // scan-another is the one continuation: it deliberately carries the
+      // just-committed character forward, pre-arming "add more emotions to it".
       if (action.kind === "scan-another") {
-        return { ...base, mode: "extend", extendCid: state.committedCid ?? state.extendCid };
+        return {
+          ...initialState,
+          selected: new Set(),
+          mode: "extend",
+          extendCid: state.committedCid ?? state.extendCid,
+          committedCid: state.committedCid,
+        };
       }
-      return base;
+      return { ...initialState, selected: new Set() };
     }
 
     default:

@@ -389,7 +389,12 @@ export default function NewCharacterPage() {
                 <div className="font-jetbrains mt-1 text-[11px] text-white/35">{LIMITS_HINT}</div>
               </div>
             </div>
-            {committedCid && <p className="font-jetbrains mt-3 text-[12px] text-cyan-300/80">Extending an existing character with more emotions.</p>}
+            {/* Driven by what this flow will actually DO (extend mode, armed
+                with a character) rather than by "a commit happened once" —
+                which RESET used to leave behind for a brand-new flow to read. */}
+            {mode === "extend" && extendCid && (
+              <p className="font-jetbrains mt-3 text-[12px] text-cyan-300/80">Extending an existing character with more emotions.</p>
+            )}
 
             {/* privacy mode */}
             <div className="glass-panel mt-4 rounded-2xl p-4">
