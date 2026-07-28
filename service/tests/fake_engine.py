@@ -134,7 +134,7 @@ class _FakeMetrics:
         self.timeouts = 0
         self._engine = engine
 
-    def snapshot(self) -> dict:
+    def counters(self) -> dict:
         # Report the LIVE counters. Hardcoded zeros made a busy engine
         # indistinguishable from an idle one, so any metrics assertion against
         # this fake was vacuous.
@@ -142,6 +142,11 @@ class _FakeMetrics:
         in_flight = eng._cur if eng is not None else 0
         queued = max(0, eng._admitted - eng._cur) if eng is not None else 0
         return {"in_flight": in_flight, "queued": queued, "timeouts": self.timeouts}
+
+    def snapshot(self) -> dict:
+        # The real Metrics.snapshot is counters() plus percentiles; the 429 path
+        # deliberately takes the cheap half, so the fake models both.
+        return dict(self.counters(), latency_p50_s=None, window_size=0)
 
     def on_timeout(self) -> None:
         self.timeouts += 1

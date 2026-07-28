@@ -424,19 +424,28 @@ class Metrics:
             self.errored += 1
 
     @staticmethod
-    def _pct(data, p):
-        if not data:
-            return None
-        s = sorted(data)
-        k = min(len(s) - 1, int(round((p / 100.0) * (len(s) - 1))))
-        return round(s[k], 4)
+    def _pct(ordered, p):
+        """Percentile of an ALREADY-SORTED sequence.
 
-    def snapshot(self) -> dict:
+        Sorting is the caller's job precisely so a snapshot sorts each window
+        once instead of once per percentile (it used to sort the 512-element
+        latency deque three times over).
+        """
+        if not ordered:
+            return None
+        k = min(len(ordered) - 1, int(round((p / 100.0) * (len(ordered) - 1))))
+        return round(ordered[k], 4)
+
+    def counters(self) -> dict:
+        """The cheap half of `snapshot`: counters and gauges, no percentiles.
+
+        O(1) under the lock. This is what the 429 backpressure response reports
+        — that path fires exactly when the box is saturated, which is the worst
+        possible moment to sort three 512-element windows on the event loop for
+        latency figures nobody reads off a rejection.
+        """
         with self._lock:
-            lat = list(self._latencies)
-            proc = list(self._proc)
-            audio = list(self._audio)
-            base = {
+            return {
                 "received": self.received,
                 "completed": self.completed,
                 "rejected_429": self.rejected,
@@ -449,6 +458,13 @@ class Metrics:
                 "queued": self.queued,
                 "audio_seconds_total": round(self.audio_seconds_total, 2),
             }
+
+    def snapshot(self) -> dict:
+        base = self.counters()
+        with self._lock:
+            lat = sorted(self._latencies)
+            proc = sorted(self._proc)
+            audio = list(self._audio)
         rtf = None
         if proc and audio and sum(audio) > 0:
             # >1.0 means faster than real-time (audio produced per second of compute)

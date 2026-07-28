@@ -3,8 +3,10 @@
 Endpoints (compatible with common ElevenLabs client code):
   POST /v1/text-to-speech/{voice_id}          -> audio bytes (wav|mp3)
   GET  /v1/voices                             -> list available voices
-  GET  /health                                -> readiness + live pool metrics
+  GET  /health                                -> readiness (config/metrics for
+                                                 observability-scope callers)
   GET  /metrics                               -> raw counters for the load test
+                                                 (scoped; loopback exempt)
 
 Request body mirrors ElevenLabs:
   { "text": "...", "model_id": "pocket_tts",
@@ -33,7 +35,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
@@ -41,7 +43,7 @@ from pydantic import BaseModel, Field
 import base64
 import json
 
-from service.auth import require_read_write, require_scope
+from service.auth import authorize_headers, optional_scope, require_read_write, require_scope
 from service import errors
 from service.cache import CachedAudio, SynthCache
 from service.config import SETTINGS
@@ -87,7 +89,26 @@ async def lifespan(app: FastAPI):
         None, ENGINE.stop, SETTINGS.drain_timeout_s)
 
 
-app = FastAPI(title="Pocket TTS Service", version="1.0.0", lifespan=lifespan)
+def docs_urls(settings=SETTINGS) -> dict:
+    """`docs_url`/`redoc_url`/`openapi_url` kwargs for this configuration.
+
+    FastAPI's defaults publish /docs, /redoc and /openapi.json to anyone. On a
+    key-protected deployment that is the complete interactive catalogue of
+    every route — /v1/keys included — served to unauthenticated visitors, so
+    the default policy ("auto") turns all three OFF the moment TTS_API_KEY is
+    set and leaves them ON for open local dev, where they are the point.
+    See Settings.docs for the "on"/"off" overrides.
+    """
+    mode = (settings.docs or "auto").strip().lower()
+    published = mode == "on" or (mode != "off" and not settings.api_key)
+    if published:
+        return {"docs_url": "/docs", "redoc_url": "/redoc",
+                "openapi_url": "/openapi.json"}
+    return {"docs_url": None, "redoc_url": None, "openapi_url": None}
+
+
+app = FastAPI(title="Pocket TTS Service", version="1.0.0", lifespan=lifespan,
+              **docs_urls())
 
 # Unhandled exceptions keep the {"detail"} JSON contract (sanitized request-id
 # body) instead of escaping to Starlette's plain-text page.
@@ -362,8 +383,13 @@ class _Backpressure(Exception):
 
 def _backpressure_response(exc: _Backpressure) -> JSONResponse:
     assert ENGINE is not None
+    # `counters()`, NOT `snapshot()`: this response is minted exactly when the
+    # box is saturated, and snapshot sorts the latency/synth windows to compute
+    # percentiles — work on the event loop that no rejected caller reads. The
+    # queue depth, in-flight count and rejection tally are what make a 429
+    # actionable, and they are O(1).
     return JSONResponse(status_code=429,
-                        content={"detail": str(exc), "queue": ENGINE.metrics.snapshot()},
+                        content={"detail": str(exc), "queue": ENGINE.metrics.counters()},
                         headers={"Retry-After": "1"})
 
 
@@ -1279,8 +1305,58 @@ async def performance(req: PerformanceRequest):
     )
 
 
+# Scope that unlocks the operational DETAIL on /health and /metrics: the engine
+# config (worker counts, thread budgets, quantization, the whole Arm tuning
+# dict) and the latency percentiles. "tts" rather than "admin" so a managed
+# monitoring key can be issued without handing out key management; the root key
+# passes it too, which is what the studio's proxy sends. In open mode (no
+# TTS_API_KEY) every caller holds it — local dev is unchanged.
+OBSERVABILITY_SCOPE = "tts"
+
+
+def _peer_is_loopback(request: Request) -> bool:
+    client = request.client
+    return bool(client) and client.host in ("127.0.0.1", "::1", "localhost")
+
+
+def _require_metrics_access(
+    request: Request,
+    xi_api_key: str | None = Header(default=None, alias="xi-api-key"),
+    authorization: str | None = Header(default=None),
+) -> None:
+    """/metrics is an operator surface, not a public one.
+
+    Deployment shape + live latency percentiles are exactly what an attacker
+    wants for free, so a configured key is required — with ONE exemption: an
+    unauthenticated caller on loopback, because the replica launcher aggregates
+    each replica's /metrics from the supervisor process with a stdlib urlopen
+    that has no credential to send (service/replicas.py). Turn the exemption
+    off with TTS_METRICS_ALLOW_LOOPBACK=0 where a same-host reverse proxy makes
+    every request look local.
+
+    NOT async: the key check reads api_keys.json from disk.
+    """
+    if SETTINGS.metrics_allow_loopback and _peer_is_loopback(request):
+        return
+    authorize_headers(xi_api_key, authorization, OBSERVABILITY_SCOPE)
+
+
 @app.get("/health")
-async def health():
+async def health(detail: bool = Depends(optional_scope(OBSERVABILITY_SCOPE))):
+    """Liveness for everyone; deployment detail for key holders.
+
+    The unauthenticated answer is deliberately boring — status plus the worker
+    census — because every orchestrator probe, the replica supervisor and the
+    studio's poller depend on reaching it without a credential
+    (deploy/helm .../deployment.yaml readinessProbe, deploy/bootstrap.sh,
+    benchmark_arm*.sh, service/loadtest.py, web/lib/useHealthPoll.ts). What
+    used to ride along with it — `config` (workers, torch threads, language,
+    quantize, the Arm `tuning` dict) and the full latency percentiles — is the
+    service's own private surface and now requires the observability scope.
+    The studio still sees it: its server-side proxy attaches the root key
+    (web/lib/backend.ts), and `config`/`metrics` were already optional in the
+    `Health` type it parses.
+    """
     if ENGINE is None:
         return JSONResponse(status_code=503, content={"status": "loading"})
     if not ENGINE.ready:
@@ -1303,8 +1379,10 @@ async def health():
         # Liveness is a TCP probe, so failing here removes us from the
         # Endpoints list without getting killed mid-drain.
         return JSONResponse(status_code=503, content={"status": "draining"})
-    body = {"status": "ready", "config": ENGINE.config(),
-            "metrics": ENGINE.metrics.snapshot()}
+    body = {"status": "ready"}
+    if detail:
+        body["config"] = ENGINE.config()
+        body["metrics"] = ENGINE.metrics.snapshot()
     live = getattr(ENGINE, "live_workers", None)
     if live is not None:  # real engine; fakes in tests don't model threads
         body["workers_live"] = live
@@ -1312,7 +1390,7 @@ async def health():
     return body
 
 
-@app.get("/metrics")
+@app.get("/metrics", dependencies=[Depends(_require_metrics_access)])
 async def metrics():
     if ENGINE is None:
         raise HTTPException(status_code=503, detail="engine not ready")

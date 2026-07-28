@@ -65,6 +65,43 @@ def require_scope(scope: str):
     return dep
 
 
+def authorize_headers(xi_api_key: str | None, authorization: str | None,
+                      scope: str) -> None:
+    """Raise the canonical 401 unless these headers carry `scope`.
+
+    The same check `require_scope` makes, for the handful of endpoints whose
+    policy is not "one dependency, one scope" — today `/metrics`, which also
+    honours a loopback exemption for the replica supervisor's aggregator. One
+    401 message for every surface: it is written once, here.
+    """
+    _authorize(_extract_secret(xi_api_key, authorization), scope)
+
+
+def optional_scope(scope: str):
+    """Dependency: reports WHETHER the caller holds `scope`, never 401s.
+
+    For a surface with a public part and a privileged part. `/health` is the
+    one: liveness must answer unauthenticated (orchestrator probes, the replica
+    supervisor, the studio's poller), while the config/tuning detail is only
+    for holders. In open mode (no TTS_API_KEY) this is True for everyone, so
+    local dev sees the full body exactly as before.
+
+    NOT async — same reason as require_scope: validate_key touches disk.
+    """
+
+    def dep(
+        xi_api_key: str | None = Header(default=None, alias="xi-api-key"),
+        authorization: str | None = Header(default=None),
+    ) -> bool:
+        try:
+            authorize_headers(xi_api_key, authorization, scope)
+            return True
+        except HTTPException:
+            return False
+
+    return dep
+
+
 def require_read_write(read_scope: str, write_scope: str):
     """Dependency: GET/HEAD/OPTIONS need `read_scope`, everything else needs
     `write_scope`. Lets a tts-scoped key list voices (ElevenLabs drop-in

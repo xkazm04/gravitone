@@ -211,6 +211,28 @@ class Settings:
     # Optional shared secret; if set, requests must send it as `xi-api-key`
     # (ElevenLabs-compatible header). Empty = open (local dev).
     api_key: str = _str("TTS_API_KEY", "")
+    # --- Private surface ---------------------------------------------------
+    # Interactive API docs (/docs, /redoc) and the OpenAPI schema
+    # (/openapi.json). FastAPI publishes all three by default, which on a
+    # key-protected deployment hands any anonymous visitor the complete
+    # catalogue of every route — including /v1/keys — with a Try-It-Out button.
+    #   "auto" (default) — ON in open mode (no TTS_API_KEY: local dev, where
+    #                      the docs are the point), OFF as soon as a key is set
+    #   "on"             — always published (a deliberately public API)
+    #   "off"            — never published
+    # The schema is what the docs pages render, so all three go together.
+    docs: str = _str("TTS_DOCS", "auto")
+    # Whether an unauthenticated LOOPBACK caller may read /metrics when a key
+    # IS configured. On by default because the shipped topology needs it: the
+    # replica launcher (service/replicas.py) aggregates each replica's /metrics
+    # from the supervisor process over 127.0.0.1 with a stdlib urlopen that
+    # carries no credential.
+    # Set to 0 when anything ELSE can originate a loopback request — most
+    # importantly a reverse proxy on the same host, which makes every request
+    # in the world look local. Off-host scrapers (KEDA, Prometheus) always need
+    # a key regardless of this setting.
+    metrics_allow_loopback: bool = _bool("TTS_METRICS_ALLOW_LOOPBACK", True)
+
     # --- Browser access (CORS) ---------------------------------------------
     # Which browser ORIGINS may call this API directly. The "drop-in
     # ElevenLabs" claim only holds for browser clients if the preflight

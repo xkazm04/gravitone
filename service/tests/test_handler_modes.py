@@ -44,6 +44,9 @@ class BlockingHandlersRunOffLoopTests(unittest.TestCase):
     def test_auth_dependencies_are_sync(self) -> None:
         # Both factories return the dependency callable FastAPI will invoke.
         for factory, dep in (("require_scope", auth.require_scope("tts")),
+                             ("optional_scope", auth.optional_scope("tts")),
+                             ("_require_metrics_access",
+                              appmod._require_metrics_access),
                              ("require_read_write",
                               auth.require_read_write("tts", "voices"))):
             with self.subTest(factory=factory):
