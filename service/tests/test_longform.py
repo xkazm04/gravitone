@@ -90,6 +90,59 @@ class SegmentationTests(_Base):
         # Nothing is dropped or reordered.
         self.assertEqual(" ".join(units), text.strip())
 
+    def test_max_length_body_never_outgrows_the_admission_window(self) -> None:
+        """The unit count of a BATCHED request is bounded, for real.
+
+        The fixed char budget alone does not bound it: greedy coalescing only
+        merges when the COMBINED length fits, so any sentence longer than half
+        the budget stays its own unit. At a 350-char budget an 8000-char body
+        of ~180-char sentences (ordinary prose) produced 44 units against a
+        33-slot admission window — i.e. a guaranteed 429 on a route that used
+        to submit exactly one job. The lengths below are the ones that broke it.
+        """
+        max_units = appmod._max_batch_units()
+        window = appmod.SETTINGS.workers + appmod.SETTINGS.queue_max
+        self.assertLessEqual(max_units, window // 2,
+                             "one request must not claim the whole window")
+        for sentence_len in (100, 176, 200, 250, 349, 800):
+            with self.subTest(sentence_len=sentence_len):
+                text = self._body_of_sentences(sentence_len, total=8000)
+                self.assertGreaterEqual(len(text), 7800)
+                self.assertLessEqual(len(text), 8000)  # the TTSRequest cap
+                units = appmod._chunk_text(text, max_units=max_units)
+                self.assertLessEqual(
+                    len(units), max_units,
+                    f"{sentence_len}-char sentences produced {len(units)} "
+                    f"units for a {window}-slot window")
+                # Widening the budget must not lose or reorder a single word.
+                self.assertEqual(" ".join(units), text)
+
+    def test_streaming_style_chunking_is_not_capped(self) -> None:
+        # No max_units: the streaming route submits in a rolling window, so its
+        # unit count costs no admission and finer units mean lower TTFB.
+        text = self._body_of_sentences(176, total=8000)
+        uncapped = appmod._chunk_text(text)
+        capped = appmod._chunk_text(text, max_units=appmod._max_batch_units())
+        self.assertGreater(len(uncapped), len(capped))
+        self.assertEqual(" ".join(uncapped), text)
+
+    @staticmethod
+    def _body_of_sentences(sentence_len: int, total: int) -> str:
+        """Exactly `total` chars of sentences each `sentence_len` long.
+
+        The remainder becomes one shorter trailing sentence, so the fixture is
+        a genuine max-length body however the length divides.
+        """
+        def _sentence(n: int) -> str:
+            return "w" * (n - 1) + "."
+
+        count = (total + 1) // (sentence_len + 1)  # +1 for the joining space
+        sentences = [_sentence(sentence_len)] * count
+        rest = total - (count * (sentence_len + 1) - 1)
+        if rest >= 5:  # +1 space, so the tail sentence is rest-1 chars
+            sentences.append(_sentence(rest - 1))
+        return " ".join(sentences)
+
     def test_segments_concat_in_request_order(self) -> None:
         self._chunk_every_sentence()
         eng = fake_engine.FakeEngine(workers=3, delay=0.02)

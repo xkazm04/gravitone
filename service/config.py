@@ -143,9 +143,12 @@ class Settings:
     # so a long body becomes several jobs that run on different workers instead
     # of one serial job. Text shorter than the budget stays a single unit and
     # takes exactly the pre-segmentation path (identical bytes, identical
-    # headers). Keep it high enough that a unit is a natural prosodic span and
-    # low enough that an 8000-char body (the request cap) stays well inside the
-    # admission window (workers + queue_max): 8000/350 = 23 units vs 33 slots.
+    # headers). This is a TARGET, not a bound on the number of units: greedy
+    # coalescing only merges when the combined length fits, so sentences longer
+    # than half the budget never merge and the count tracks sentence count. The
+    # route that submits its units all at once widens the budget until the count
+    # fits its own ceiling (app._max_batch_units) — set this for prosody, and
+    # let that ceiling own admission safety.
     chunk_chars: int = _int("TTS_CHUNK_CHARS", 350)
 
     # --- Synthesis result cache -------------------------------------------

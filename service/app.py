@@ -432,24 +432,32 @@ def _split_sentences(text: str) -> list[str]:
     return parts or [text]
 
 
-def _chunk_text(text: str) -> list[str]:
-    """Split text into the synthesis UNITS a request is submitted as.
+# Ceiling on the units ONE all-at-once batch may submit, whatever the queue
+# depth is. Past this, more segments buy little parallelism (a single process
+# has `workers` of them) while multiplying concat seams — and one caller should
+# never be able to claim a huge admission window on its own.
+_MAX_BATCH_UNITS = 16
 
-    Sentence-split (``_split_sentences``), then coalesce neighbouring sentences
-    up to ``SETTINGS.chunk_chars`` so a unit is a natural prosodic span rather
-    than a two-word fragment. Two properties the callers rely on:
 
-    * Text that fits the budget comes back as ONE unit — so a short request
-      takes exactly the pre-segmentation code path, byte for byte.
-    * The unit count is bounded by len(text)/budget, so the whole batch fits
-      the engine's admission window instead of scaling with sentence count.
+def _max_batch_units() -> int:
+    """How many units one BATCHED request may split into.
 
-    Order is preserved; units are re-joined for concatenation in this order.
+    The drop-in route submits every unit at once, so the unit count is an
+    admission cost: the `workers + queue_max` window is shared with every other
+    caller. Half of it, capped at ``_MAX_BATCH_UNITS``, leaves real headroom.
+    Never below 1 — with a tiny configured queue this degrades to the original
+    single-job request rather than turning long text into a certain 429.
+
+    The streaming route does NOT pass a cap: it submits in a rolling window
+    (see ``text_to_speech_stream``), so its unit count costs no admission and
+    smaller units buy lower time-to-first-byte.
     """
-    parts = _split_sentences(text)
-    if len(parts) <= 1:
-        return parts
-    budget = max(1, int(SETTINGS.chunk_chars))
+    window = max(1, SETTINGS.workers + SETTINGS.queue_max)
+    return max(1, min(_MAX_BATCH_UNITS, window // 2))
+
+
+def _coalesce(parts: list[str], budget: int) -> list[str]:
+    """Greedily merge neighbouring sentences up to ``budget`` characters."""
     chunks: list[str] = []
     cur = ""
     for part in parts:
@@ -463,6 +471,47 @@ def _chunk_text(text: str) -> list[str]:
     if cur:
         chunks.append(cur)
     return chunks
+
+
+def _chunk_text(text: str, max_units: int | None = None) -> list[str]:
+    """Split text into the synthesis UNITS a request is submitted as.
+
+    Sentence-split (``_split_sentences``), then coalesce neighbours up to
+    ``SETTINGS.chunk_chars`` so a unit is a natural prosodic span rather than a
+    two-word fragment. Order is preserved; units re-join in this order.
+
+    Text that fits the budget comes back as ONE unit — so a short request takes
+    exactly the pre-segmentation code path, byte for byte.
+
+    ``max_units`` is a HARD ceiling on the number of units, for callers that
+    submit the whole batch at once and therefore pay admission per unit. The
+    fixed budget alone does NOT bound the count: greedy packing only merges when
+    the COMBINED length fits, so sentences longer than budget/2 never merge with
+    a neighbour and the count degrades to one unit per sentence (~180-char
+    sentences — ordinary prose — gave 44 units of an 8000-char body at a
+    350-char budget). So when a cap is given the budget is DOUBLED until the
+    count actually fits. It always terminates: a budget of len(text) merges
+    everything into one unit. Starting from the configured budget (rather than
+    jumping straight to a length-derived one) keeps units as fine as the cap
+    allows, which is what parallelism wants — each doubling is one more linear
+    pass over a list that is at most a few hundred sentences.
+
+    Callers that submit incrementally (the streaming route) pass no cap and
+    keep sentence-grained units.
+    """
+    parts = _split_sentences(text)
+    if len(parts) <= 1:
+        return parts
+    budget = max(1, int(SETTINGS.chunk_chars))
+    if max_units is None:
+        return _coalesce(parts, budget)
+
+    max_units = max(1, int(max_units))
+    while True:
+        chunks = _coalesce(parts, budget)
+        if len(chunks) <= max_units:
+            return chunks
+        budget *= 2
 
 
 # How long a stream waits before retrying a refused segment submission. Short
@@ -592,7 +641,9 @@ async def text_to_speech(
     /v1/performance already get. The segments are re-joined with the engine's
     ``concat_wavs`` (the identical path /v1/speak uses, so seams behave the
     same). Text that fits ``SETTINGS.chunk_chars`` stays ONE unit and takes the
-    original single-job path unchanged, bytes and headers included.
+    original single-job path unchanged, bytes and headers included, and the
+    unit count is capped at ``_max_batch_units()`` so a long body can never
+    submit more jobs than the admission window has room for.
 
     Results are cached per process (``SYNTH_CACHE``) on the full request
     identity, and concurrent identical requests collapse onto one synthesis.
@@ -611,7 +662,9 @@ async def text_to_speech(
 
     async def _synthesize() -> CachedAudio:
         """Render this request from scratch, recording its true timings."""
-        units = _chunk_text(req.text)
+        # Batched submission: the unit count is capped, because every unit
+        # takes an admission slot at the same instant (_max_batch_units).
+        units = _chunk_text(req.text, max_units=_max_batch_units())
         if len(units) <= 1:
             # Single unit: identical to the pre-segmentation behaviour,
             # including the timing headers (X-Synth-Seconds stays the job's own
