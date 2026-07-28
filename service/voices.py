@@ -275,6 +275,29 @@ def _slug(name: str) -> str:
     return s or "character"
 
 
+def voice_file_path(voice_id: str, voices_dir: Path | None = None) -> Path:
+    """Where a Voice's embedding lives — PROVEN to be inside the voices dir.
+
+    Belt and braces against writing outside ``VOICES_DIR``. The first line of
+    defence is validating the *inputs* a voice_id is built from
+    (``emotions.normalize_emotion`` for the emotion, ``_slug`` for the character
+    id) — that is what every caller must do, and what makes a hostile pack
+    manifest a 400 rather than a sanitised surprise. This is the second line:
+    the *resolved* destination is re-checked immediately before the write, so a
+    future path-building bug still cannot escape the directory.
+
+    ``voices_dir`` is explicit because ``packs``/``ingest`` bind their own
+    ``VOICES_DIR`` at import; passing it keeps a test's patch honest.
+    Raises ValueError when the id would resolve anywhere but directly inside it.
+    """
+    base = VOICES_DIR if voices_dir is None else voices_dir
+    path = base / f"{voice_id}.safetensors"
+    if path.resolve().parent != base.resolve():
+        raise ValueError(
+            f"refusing to write outside the voices directory (voice id {voice_id!r})")
+    return path
+
+
 def _wav_seconds(path: Path) -> float | None:
     try:
         with wave.open(str(path), "rb") as w:
@@ -577,7 +600,10 @@ def create_voice(
 
     VOICES_DIR.mkdir(parents=True, exist_ok=True)
     voice_id = f"{cid}-{emotion}-{uuid.uuid4().hex[:6]}"
-    out_path = VOICES_DIR / f"{voice_id}.safetensors"
+    try:
+        out_path = voice_file_path(voice_id)
+    except ValueError as exc:  # unreachable: emotion + cid are both validated
+        raise HTTPException(400, str(exc))
 
     with tempfile.TemporaryDirectory(prefix="gravitone-clone-") as td:
         tmp = Path(td)

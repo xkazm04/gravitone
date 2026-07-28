@@ -64,7 +64,7 @@ import numpy as np
 from service.config import SETTINGS
 from service.emotions import BASELINE, EMOTION_SCALE
 from service.errors import UserFacing
-from service.voices import VOICES_DIR, _load_meta, _slug, mutate_meta
+from service.voices import VOICES_DIR, _load_meta, _slug, mutate_meta, voice_file_path
 
 ELEVEN_KEY = os.environ.get("ELEVEN_LABS_API_KEY", "")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
@@ -1318,7 +1318,8 @@ def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: st
         voice_id = f"{cid}-{emo}-{uuid.uuid4().hex[:6]}"
         plan.append({"emotion": emo, "src": str(sw), "seconds": seconds,
                      "voice_id": voice_id,
-                     "dst": str(VOICES_DIR / f"{voice_id}.safetensors")})
+                     # asserts the resolved destination is inside VOICES_DIR
+                     "dst": str(voice_file_path(voice_id, VOICES_DIR))})
 
     if not plan:
         if progress:

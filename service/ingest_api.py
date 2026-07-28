@@ -47,6 +47,7 @@ from pydantic import BaseModel
 
 from service import errors, ingest, voices
 from service.config import SETTINGS
+from service.emotions import normalize_emotion
 from service.errors import job_expired
 
 logger = logging.getLogger("gravitone")
@@ -649,6 +650,18 @@ def commit(job_id: str, req: CommitReq):
     """Kick off cloning as a background phase and return immediately. Progress
     (emotions_done / total / current) streams via `partial`; the job ends
     'committed' or 'error'. Poll GET /{job} to follow it."""
+    # Boundary validation, BEFORE admission: both fields are client-supplied and
+    # both end up in filenames downstream (ingest.commit builds
+    # `stem_{emotion}.wav` and the `{cid}-{emotion}-….safetensors` destination),
+    # so an unvalidated `..` here writes outside the voices directory. Same rule
+    # as every other write path: emotions go through `normalize_emotion`, and a
+    # character id must already be its own slug. Reject, never sanitise.
+    try:
+        emotions = [normalize_emotion(e) for e in req.emotions]
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    if req.character_id is not None and req.character_id != voices._slug(req.character_id):
+        raise HTTPException(400, "character_id is not a valid character id")
     _admit()  # cloning loads the TTS model in a child process — the heaviest phase
     with _LOCK:
         job = JOBS.get(job_id)
@@ -664,11 +677,11 @@ def commit(job_id: str, req: CommitReq):
         job["status"] = "committing"
         job["cancel"] = False
         job["committed"] = None
-        job["partial"] = {"emotions_done": 0, "emotions_total": len(req.emotions), "current": None}
+        job["partial"] = {"emotions_done": 0, "emotions_total": len(emotions), "current": None}
         _persist(job)
     threading.Thread(
         target=_do_commit,
-        args=(job_id, req.character.strip(), req.emotions, req.character_id, statement),
+        args=(job_id, req.character.strip(), emotions, req.character_id, statement),
         daemon=True).start()
     return {"status": "committing"}
 

@@ -28,9 +28,10 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 
+from service.emotions import BASELINE, normalize_emotion
 from service.voices import (
     VOICES_DIR, Character, _load_meta, _slug, find_character,
-    get_character_or_404, mutate_meta,
+    get_character_or_404, mutate_meta, voice_file_path,
 )
 
 router = APIRouter(tags=["packs"])
@@ -160,8 +161,26 @@ def import_pack(
     if cid in taken:
         raise HTTPException(409, f"character '{cid}' already exists — pass rename=<new name>")
 
+    # A pack is an UNTRUSTED file — the manifest is written by whoever built it,
+    # and stock deployments accept unsigned packs (TTS_PACK_SECRET is empty by
+    # default), so the sha256 entries prove nothing about intent: they check the
+    # blobs against the same manifest. Every string the manifest contributes to
+    # a filename or a registry row is therefore validated here, and REJECTED
+    # rather than sanitised on failure — quietly rewriting a hostile emotion
+    # would import a voice under a name the sender chose and the receiver never
+    # sees. `custom_emotions` gets the same treatment: it becomes a registry row
+    # and addressable slots.
+    custom_emotions: list[str] = []
+    for e in (src.get("custom_emotions") or []):
+        try:
+            slot = normalize_emotion(str(e))
+        except ValueError as exc:
+            raise HTTPException(400, f"pack rejected — invalid custom emotion {str(e)[:64]!r}: {exc}")
+        if slot not in custom_emotions:
+            custom_emotions.append(slot)
+
     # Verify every hash BEFORE writing anything; never trust member paths.
-    staged: list[tuple[dict, bytes]] = []
+    staged: list[tuple[dict, bytes, str]] = []
     total_bytes = 0
     for v in voices:
         arcname = str(v.get("file", ""))
@@ -183,7 +202,15 @@ def import_pack(
             raise HTTPException(400, f"{arcname} exceeds the {MAX_VOICE_BYTES // 2**20} MB limit")
         if hashlib.sha256(data).hexdigest() != v.get("sha256"):
             raise HTTPException(400, f"integrity check failed for {arcname} — pack is corrupted or tampered")
-        staged.append((v, data))
+        raw_emotion = v.get("emotion") or BASELINE
+        try:
+            emotion = normalize_emotion(str(raw_emotion))
+        except ValueError as exc:
+            raise HTTPException(
+                400,
+                f"pack rejected — {arcname} declares an invalid emotion "
+                f"{str(raw_emotion)[:64]!r}: {exc}")
+        staged.append((v, data, emotion))
 
     VOICES_DIR.mkdir(parents=True, exist_ok=True)
     created = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -193,20 +220,30 @@ def import_pack(
         # fail, but a concurrent import could have claimed the id since.
         if cid in {m.get("character_id") for m in meta["voices"].values()}:
             raise HTTPException(409, f"character '{cid}' already exists — pass rename=<new name>")
-        for v, data in staged:
-            emotion = str(v.get("emotion") or "baseline").strip().lower()
-            voice_id = f"{cid}-{emotion}-{uuid.uuid4().hex[:6]}"
-            (VOICES_DIR / f"{voice_id}.safetensors").write_bytes(data)
-            meta["voices"][voice_id] = {
-                "name": name, "character_id": cid, "emotion": emotion,
-                "created": v.get("created") or created,
-                "sample_seconds": v.get("sample_seconds"), "lang": src.get("lang", "EN"),
-                "imported": {"from": src.get("character_id"), "at": created},
-            }
+        # Files first, registry after — but if any write fails, roll the earlier
+        # ones back so a refused import leaves nothing behind (mutate_meta
+        # already skips the save when this raises, so the registry is untouched).
+        written: list = []
+        try:
+            for v, data, emotion in staged:
+                voice_id = f"{cid}-{emotion}-{uuid.uuid4().hex[:6]}"
+                path = voice_file_path(voice_id, VOICES_DIR)  # asserts containment
+                path.write_bytes(data)
+                written.append(path)
+                meta["voices"][voice_id] = {
+                    "name": name, "character_id": cid, "emotion": emotion,
+                    "created": v.get("created") or created,
+                    "sample_seconds": v.get("sample_seconds"), "lang": src.get("lang", "EN"),
+                    "imported": {"from": src.get("character_id"), "at": created},
+                }
+        except Exception:
+            for path in written:
+                path.unlink(missing_ok=True)
+            raise
         meta["characters"].setdefault(cid, {
             "name": name,
             "tags": list(src.get("tags") or []),
-            "custom_emotions": [e for e in (src.get("custom_emotions") or []) if isinstance(e, str)],
+            "custom_emotions": list(custom_emotions),
         })
 
     mutate_meta(_commit)
