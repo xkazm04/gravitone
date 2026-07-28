@@ -9,6 +9,7 @@ import EmotionArt from "@/components/ui/EmotionArt";
 import { apiJson, readDetail } from "@/lib/apiFetch";
 import { EMOTION_IDS, emotionMeta } from "@/lib/emotions";
 import { useAuth } from "@/lib/useAuth";
+import { useMounted } from "@/lib/useMounted";
 import { recordVoiceOwnership } from "@/lib/voiceVault";
 import { CONSENT_STATEMENT } from "@/lib/consent";
 import WaveformLab from "./_loaders/WaveformLab";
@@ -17,11 +18,40 @@ import {
   reducer, initialState, POLLING_PHASES,
   type Character, type Job, type ModeInfo,
 } from "./_state/machine";
+import {
+  ACCEPT_ATTR, LIMITS_HINT, checkBytes, checkDuration,
+} from "./_state/uploadLimits";
 import { useIngestJob } from "./_state/useIngestJob";
 
 // Phases where a scanned recording is on screen and the mode that produced it
 // is still load-bearing for what the user is reading.
 const SCAN_PHASES: ReadonlySet<string> = new Set(["processing", "speaker", "review"]);
+
+// Which mutating call is in flight. `submitting` (a ref) still owns the atomic
+// double-submit gate; this is the same fact made VISIBLE — a ref cannot put a
+// button into a pending state, and the scan kickoff is allowed 120 seconds.
+type Pending = null | "scan" | "commit" | `speaker:${string}`;
+
+// Backpressure, not failure: /scan, /speaker and /commit all pass through the
+// ingest admission gate (service/ingest_api.py::_admit), which answers 429 when
+// too many recordings are already being processed. Same shape the playground
+// uses for the engine's 429 (PlaygroundConsole busyNotice + Retry-After
+// countdown) — amber, with a retry that waits out the backoff window.
+type Backpressure = {
+  detail: string;
+  retryAfterSec: number;
+  stated: boolean;   // did the response actually carry a Retry-After?
+  action: { kind: "scan" } | { kind: "speaker"; sid: string } | { kind: "commit" };
+};
+
+/** Retry-After (delta-seconds form) → a number; 1s when it is absent/bad. */
+function retryAfterOf(r: Response): { sec: number; stated: boolean } {
+  const raw = r.headers.get("Retry-After");
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0
+    ? { sec: Math.ceil(n), stated: true }
+    : { sec: 1, stated: false };
+}
 
 export default function NewCharacterPage() {
   const { user } = useAuth();
@@ -48,7 +78,20 @@ export default function NewCharacterPage() {
   const fileRef = useRef<HTMLInputElement>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const submitting = useRef(false); // re-entrancy guard for scan/speaker/commit
+  const [pending, setPending] = useState<Pending>(null); // the same fact, visible
   const [playing, setPlaying] = useState<string | null>(null);
+  const mounted = useMounted();
+
+  // 429 from the ingest admission gate. Recoverable, so it never becomes the
+  // rose `error` — a full queue is "try again in a moment", not "it failed".
+  const [busyNotice, setBusyNotice] = useState<Backpressure | null>(null);
+  const [retryIn, setRetryIn] = useState(0);
+  useEffect(() => {
+    if (!busyNotice) { setRetryIn(0); return; }
+    setRetryIn(busyNotice.retryAfterSec);
+    const id = setInterval(() => setRetryIn((s) => (s <= 1 ? 0 : s - 1)), 1000);
+    return () => clearInterval(id);
+  }, [busyNotice]);
 
   // Cloneable characters change rarely; fetch on mount — plus once more when a
   // commit completes, so "scan another" offers the just-created character by
@@ -110,6 +153,29 @@ export default function NewCharacterPage() {
     }
   }, [phase, user, created, state.pendingCommit]);
 
+  /** Present a 429 as backpressure. Never touches `error` — that is rose. */
+  async function backpressure(r: Response, action: Backpressure["action"]) {
+    const { sec, stated } = retryAfterOf(r);
+    const detail = await readDetail(r);
+    if (!mounted.current) return;
+    dispatch({ type: "SET_ERROR", error: null });
+    setBusyNotice({
+      detail: detail ?? "other recordings are already being processed",
+      retryAfterSec: sec, stated, action,
+    });
+  }
+
+  /** Re-run the refused call through THIS render's handler (never a stale
+   *  closure captured when the 429 landed — the selection may have changed). */
+  function retryBusy() {
+    const b = busyNotice;
+    setBusyNotice(null);
+    if (!b) return;
+    if (b.action.kind === "scan") void startScan();
+    else if (b.action.kind === "speaker") void chooseSpeaker(b.action.sid);
+    else void commit();
+  }
+
   // Validate before we accept a file — no upload round-trip for a bad pick.
   async function acceptFile(f: File | undefined | null) {
     if (!f) return;
@@ -121,11 +187,14 @@ export default function NewCharacterPage() {
   async function startScan() {
     if (!file || submitting.current) return; // guard the double-click window
     submitting.current = true;
+    setPending("scan"); setBusyNotice(null);
     const fd = new FormData();
     fd.append("file", file, file.name);
     fd.append("mode", ingestMode);
     try {
       const r = await fetch("/api/ingest/scan", { method: "POST", body: fd });
+      // The ingest queue is full: the recording is fine and so is the backend.
+      if (r.status === 429) { await backpressure(r, { kind: "scan" }); return; }
       if (!r.ok) throw new Error((await readDetail(r)) ?? "scan failed to start");
       const j = await r.json();
       dispatch({ type: "SCAN_STARTED", jobId: j.job_id });
@@ -133,6 +202,7 @@ export default function NewCharacterPage() {
       dispatch({ type: "SET_ERROR", error: e instanceof Error ? e.message : "scan failed" });
     } finally {
       submitting.current = false;
+      if (mounted.current) setPending(null);
     }
   }
 
@@ -140,11 +210,15 @@ export default function NewCharacterPage() {
     if (submitting.current) return;
     audioRef.current?.pause(); setPlaying(null);
     submitting.current = true;
+    setPending(`speaker:${sid}`); setBusyNotice(null);
     try {
       // Verify the backend accepted the speaker before advancing the state
       // machine — an expired/rejected job would otherwise spin the Waveform Lab
       // while the server is still awaiting_speaker (or gone), with no error.
       const r = await fetch(`/api/ingest/${jobId}/speaker`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ speaker_id: sid }) });
+      // Still on the speaker screen, job untouched server-side — offer the pick
+      // again rather than reporting a session that "failed".
+      if (r.status === 429) { await backpressure(r, { kind: "speaker", sid }); return; }
       if (!r.ok) {
         const j = await r.json().catch(() => ({}));
         dispatch({ type: "SET_ERROR", error: j?.detail ?? "couldn't select that speaker — the session may have expired" });
@@ -155,6 +229,7 @@ export default function NewCharacterPage() {
       dispatch({ type: "SET_ERROR", error: "couldn't select that speaker — the backend may be offline" });
     } finally {
       submitting.current = false;
+      if (mounted.current) setPending(null);
     }
   }
 
@@ -177,11 +252,19 @@ export default function NewCharacterPage() {
     if (mode === "extend" && !extendCid) { dispatch({ type: "SET_ERROR", error: "Pick a character to extend" }); return; }
     const cid = character_id ?? slug(character);
     submitting.current = true;
+    setPending("commit"); setBusyNotice(null);
     dispatch({ type: "COMMIT_STARTED", character, cid, total: selected.size });
     try {
       // async commit: the backend returns immediately; the poller follows
       // per-emotion progress through to 'committed' / 'error'.
       const r = await fetch(`/api/ingest/${jobId}/commit`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ character, emotions: [...selected], character_id, attested: consented, statement: CONSENT_STATEMENT }) });
+      // Refused before any cloning started: the ledger is intact, so go back to
+      // it with NO error — the amber notice carries the whole truth.
+      if (r.status === 429) {
+        dispatch({ type: "COMMIT_FAILED", error: null });
+        await backpressure(r, { kind: "commit" });
+        return;
+      }
       // ok-check BEFORE parsing: an unguarded r.json() here once surfaced a raw
       // SyntaxError to the user when the proxy answered with a non-JSON body.
       if (!r.ok) throw new Error((await readDetail(r)) ?? "commit failed");
@@ -189,6 +272,7 @@ export default function NewCharacterPage() {
       dispatch({ type: "COMMIT_FAILED", error: e instanceof Error ? e.message : "commit failed" });
     } finally {
       submitting.current = false;
+      if (mounted.current) setPending(null);
     }
   }
 
@@ -200,12 +284,12 @@ export default function NewCharacterPage() {
   }
 
   function startOver() {
-    setFile(null);
+    setFile(null); setBusyNotice(null);
     dispatch({ type: "RESET", kind: "start-over" });
   }
 
   function scanAnother() {
-    setFile(null);
+    setFile(null); setBusyNotice(null);
     dispatch({ type: "RESET", kind: "scan-another" });
   }
 
@@ -237,6 +321,31 @@ export default function NewCharacterPage() {
         </p>
 
         {error && <ErrorBanner>{error}</ErrorBanner>}
+        {/* Backpressure, in the palette the repo reserves for recoverable:
+            nothing failed, the queue is full. The retry waits out the backoff
+            window, because retrying inside it only adds another rejection. */}
+        {busyNotice && (
+          <ErrorBanner severity="warning">
+            <span className="flex flex-wrap items-center justify-between gap-3">
+              <span>
+                {busyNotice.detail}.{" "}
+                {retryIn > 0
+                  ? busyNotice.stated
+                    ? `The backend asked for ${retryIn}s before the next attempt.`
+                    : `Retry unlocks in ${retryIn}s.`
+                  : "You can try again now."}
+              </span>
+              <button
+                onClick={retryBusy}
+                disabled={pending !== null || retryIn > 0}
+                title={retryIn > 0 ? `waiting ${retryIn}s before retrying` : "try again"}
+                className="shrink-0 cursor-pointer rounded-full border border-amber-400/40 bg-amber-400/10 px-3 py-1 text-amber-100 transition hover:bg-amber-400/20 disabled:cursor-default disabled:opacity-40"
+              >
+                {pending ? "retrying…" : retryIn > 0 ? `↻ retry in ${retryIn}s` : "↻ retry"}
+              </button>
+            </span>
+          </ErrorBanner>
+        )}
         {pollStalled && POLLING_PHASES.has(phase) && (
           <ErrorBanner severity="warning">
             connection to the studio is degraded — retrying. Your job keeps running server-side.
@@ -275,6 +384,9 @@ export default function NewCharacterPage() {
                 <div className="font-jetbrains mt-1 text-[12px] text-white/55">
                   {file ? `${(file.size / 1024 / 1024).toFixed(2)} MB` : "a minute+ of speech with emotional range works best"}
                 </div>
+                {/* The caps, printed from the same constants the pre-check
+                    uses — a user should learn the ceiling before the upload. */}
+                <div className="font-jetbrains mt-1 text-[11px] text-white/35">{LIMITS_HINT}</div>
               </div>
             </div>
             {committedCid && <p className="font-jetbrains mt-3 text-[12px] text-cyan-300/80">Extending an existing character with more emotions.</p>}
@@ -327,7 +439,11 @@ export default function NewCharacterPage() {
               </div>
             </div>
 
-            <Button onClick={startScan} disabled={!file} className="mt-5 cursor-pointer">Scan recording →</Button>
+            {/* The kickoff uploads the whole file and is allowed 120s by the
+                proxy — without a pending state the page looked inert. */}
+            <Button onClick={startScan} disabled={!file || pending !== null} className="mt-5 cursor-pointer">
+              {pending === "scan" ? "Uploading & starting…" : "Scan recording →"}
+            </Button>
           </div>
         )}
 
@@ -376,7 +492,10 @@ export default function NewCharacterPage() {
                       <div className="line-clamp-1 text-sm italic text-white/50">“{s.sample_text}”</div>
                     )}
                   </div>
-                  <Button onClick={() => chooseSpeaker(s.id)} className="shrink-0 cursor-pointer px-4 py-2 text-[13px]">Use this →</Button>
+                  <Button onClick={() => chooseSpeaker(s.id)} disabled={pending !== null}
+                    className="shrink-0 cursor-pointer px-4 py-2 text-[13px]">
+                    {pending === `speaker:${s.id}` ? "selecting…" : "Use this →"}
+                  </Button>
                 </div>
               ))}
             </div>
@@ -483,8 +602,10 @@ export default function NewCharacterPage() {
                     {characters.map((c) => <option key={c.character_id} value={c.character_id}>{c.name}</option>)}
                   </select>
                 )}
-                <Button onClick={commit} disabled={selected.size === 0 || !consented} className="ml-auto cursor-pointer">
-                  {mode === "new" ? "Create character" : "Add to character"} ({selected.size})
+                <Button onClick={commit} disabled={selected.size === 0 || !consented || pending !== null} className="ml-auto cursor-pointer">
+                  {pending === "commit"
+                    ? "Starting…"
+                    : `${mode === "new" ? "Create character" : "Add to character"} (${selected.size})`}
                 </Button>
               </div>
               <label className="mt-4 flex cursor-pointer items-start gap-2 text-[13px] text-white/70">
@@ -618,22 +739,19 @@ function slug(name: string): string {
 }
 
 // ── client-side upload pre-check ──────────────────────────────────────────────
-// Mirrors the backend gate (service/ingest_api.py) so a bad file is caught
-// before it uploads instead of after a full round-trip + 400.
-const MAX_UPLOAD_BYTES = 50 * 1024 * 1024; // 50 MB — matches MAX_UPLOAD_BYTES
-const MIN_CLIP_SECONDS = 3;                // matches MIN_CLIP_SECONDS
-// Full backend extension whitelist (_AUDIO_EXTS).
-const ACCEPTED_EXTS = [
-  ".mp3", ".wav", ".wave", ".m4a", ".m4b", ".mp4", ".mov", ".ogg", ".oga",
-  ".opus", ".flac", ".aac", ".webm", ".wma", ".aiff", ".aif", ".aifc",
-  ".amr", ".3gp", ".mkv",
-];
-// Picker accept: broad mime families + every accepted extension.
-const ACCEPT_ATTR = ["audio/*", "video/*", ...ACCEPTED_EXTS].join(",");
+// The rules and the numbers live in _state/uploadLimits.ts — ONE mirror of the
+// backend gate. Only the browser-side probing lives here.
 
-function extOf(name: string): string {
-  const i = name.lastIndexOf(".");
-  return i >= 0 ? name.slice(i).toLowerCase() : "";
+/** Can this browser decode the type at all? Decides what an unknown duration
+ *  MEANS: a broken file (it can, and still got nothing) or simply a container
+ *  the browser does not speak while ffprobe does (.amr, .wma, .mkv …). */
+function browserCanDecode(file: File): boolean {
+  if (!file.type) return false;
+  try {
+    return document.createElement("audio").canPlayType(file.type) !== "";
+  } catch {
+    return false; // no verdict available → the server's probe is the only one
+  }
 }
 
 // Probe duration by loading metadata into a throwaway <audio> element.
@@ -660,15 +778,9 @@ function probeDuration(file: File): Promise<number | null> {
 }
 
 async function validateUpload(file: File): Promise<string | null> {
-  if (file.size === 0) return "empty file — choose an audio recording";
-  if (file.size > MAX_UPLOAD_BYTES) return `file too large — keep it under ${MAX_UPLOAD_BYTES / (1024 * 1024)} MB`;
-  const mimeOk = /^(audio|video)\//.test(file.type);
-  if (!ACCEPTED_EXTS.includes(extOf(file.name)) && !mimeOk) {
-    return "unsupported file type — upload an audio or video recording";
-  }
-  const dur = await probeDuration(file);
-  if (dur !== null && dur < MIN_CLIP_SECONDS) {
-    return `clip too short — record at least ${MIN_CLIP_SECONDS} seconds of speech`;
-  }
-  return null;
+  const bytes = checkBytes(file);
+  if (bytes) return bytes;
+  // Floor AND ceiling, and fail-closed on a length the browser should have been
+  // able to read: a 20-minute recording used to upload 50 MB to earn a 400.
+  return checkDuration(await probeDuration(file), browserCanDecode(file));
 }

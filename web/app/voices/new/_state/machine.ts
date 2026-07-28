@@ -121,7 +121,10 @@ export type Action =
   | { type: "JOB_EXPIRED" }
   | { type: "SPEAKER_CHOSEN" }
   | { type: "COMMIT_STARTED"; character: string; cid: string; total: number }
-  | { type: "COMMIT_FAILED"; error: string }
+  // `error: null` is the backpressure case: the commit was refused before any
+  // cloning started, so the review ledger is returned to WITHOUT a failure
+  // message — the page states the recoverable truth separately (amber).
+  | { type: "COMMIT_FAILED"; error: string | null }
   | { type: "TOGGLE_EMOTION"; emotion: string }
   | { type: "SET_MODE"; mode: "new" | "extend" }
   | { type: "SET_CHAR_NAME"; name: string }
