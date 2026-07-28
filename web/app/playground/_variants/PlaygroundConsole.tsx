@@ -11,6 +11,7 @@
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { apiJson } from "@/lib/apiFetch";
 import { useCopyFeedback } from "@/lib/useCopyFeedback";
+import { useHealthPoll } from "@/lib/useHealthPoll";
 import { useMounted } from "@/lib/useMounted";
 import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
@@ -75,6 +76,15 @@ const FALLBACK_COPY: Record<"unreachable" | "draining" | "failed", string> = {
     "Gravitone is reachable but synthesis failed — spoke with your browser voice (metatags ignored).",
 };
 
+/** Human duration for the render clock: sub-minute renders read in tenths,
+ *  longer ones (a CPU-only script render) in m:ss. */
+function fmtElapsed(ms: number): string {
+  const s = ms / 1000;
+  if (s < 60) return `${s.toFixed(1)}s`;
+  const m = Math.floor(s / 60);
+  return `${m}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+}
+
 export default function PlaygroundConsole() {
   const [text, setText] = useState(DEFAULT_TEXT);
   const [characters, setCharacters] = useState<Character[]>([]);
@@ -91,6 +101,14 @@ export default function PlaygroundConsole() {
   // Backpressure (429): engine is up but busy — offer a retry, never fall to
   // the browser voice. null = no pending backpressure.
   const [busyNotice, setBusyNotice] = useState<{ retryAfterSec: number } | null>(null);
+  // Seconds left on the backend's Retry-After. The retry button used to fire
+  // instantly into the same full queue even though the wait was known.
+  const [retryIn, setRetryIn] = useState(0);
+  // Render clock: when the in-flight run started, and the ticking elapsed time.
+  // A CPU-only render takes seconds or minutes and the console showed the same
+  // decorative equalizer for both.
+  const [startedAt, setStartedAt] = useState<number | null>(null);
+  const [elapsedMs, setElapsedMs] = useState(0);
   // Transient error surface so generation failures are never silent.
   const [toast, setToast] = useState<string | null>(null);
   // Why the LAST generation dropped to the browser voice (null = it didn't).
@@ -123,6 +141,23 @@ export default function PlaygroundConsole() {
   const mounted = useMounted();
 
   const { playingId, paused, progress, toggle, stop } = useAudioPlayer();
+
+  // Engine state BEFORE the user commits to a render. The page most affected by
+  // a loading or draining engine used to discover that state only by failing a
+  // generate. Same shared poller the benchmarks view uses — faster cadence
+  // while a render is in flight so the queue reading stays current.
+  const { health, stale: healthStale } = useHealthPoll(busy ? 5_000 : 30_000);
+  const engineStatus = health?.status;                       // ready | loading | draining
+  const queued = Number(health?.metrics?.queued ?? 0);
+  const inFlight = Number(health?.metrics?.in_flight ?? 0);
+  // null = nothing worth saying. Every string states the CONSEQUENCE of
+  // generating right now, which is what the user is about to decide.
+  const engineNotice =
+    !health ? null
+    : engineStatus === "ready" ? null
+    : engineStatus === "loading" ? "Gravitone is still loading its model — generating now falls back to your browser voice."
+    : engineStatus === "draining" ? "Gravitone is restarting — generating now falls back to your browser voice."
+    : "Gravitone backend unreachable — generating now uses your browser voice (metatags ignored).";
 
   const [preferred, setPreferred] = useState<{ character_id: string | null; picks: number }>({ character_id: null, picks: 0 });
 
@@ -215,6 +250,26 @@ export default function PlaygroundConsole() {
   // The LAST run decides the notice: a 500 and an unplugged backend both drop
   // to the browser voice, but they are different events — and once a gravitone
   // take succeeds the notice is simply no longer true.
+  // --- render estimate ------------------------------------------------------
+  // estSec is estimated AUDIO seconds; what the user waits for is COMPUTE
+  // seconds. The bridge is the realtime factor (audio produced per second of
+  // compute): their own last render first (it measured THIS box under THIS
+  // load), the engine's live average second. With neither, there is nothing
+  // honest to estimate from and the UI says exactly that rather than inventing
+  // a number or drawing a progress bar for work whose progress is unobservable.
+  const estAudioSec = mode === "script"
+    ? Math.max(1.5, Math.round(scriptChars * 0.055 * 10) / 10)
+    : estSec;
+  const lastRtf = takes.find((t) => t.mode === "gravitone" && t.rtf > 0)?.rtf;
+  const liveRtfRaw = health?.metrics?.realtime_factor;
+  const liveRtf = typeof liveRtfRaw === "number" && liveRtfRaw > 0 ? liveRtfRaw : undefined;
+  const rtfBasis = lastRtf ?? liveRtf;
+  const etaSec = rtfBasis ? Math.max(1, Math.round(estAudioSec / rtfBasis)) : null;
+  const etaBasisLabel = lastRtf
+    ? `your last render ran at ${lastRtf}× realtime`
+    : liveRtf ? `the engine is averaging ${liveRtf}× realtime` : "";
+  const overEstimate = etaSec !== null && elapsedMs / 1000 > etaSec;
+
   const fallbackNotice = fallback && (
     fallback.detail
       ? `${FALLBACK_COPY[fallback.reason]} Backend said: ${fallback.detail}`
@@ -414,12 +469,31 @@ export default function PlaygroundConsole() {
   // request holding a worker slot for a page nobody is looking at.
   useEffect(() => () => runRef.current?.abort(), []);
 
+  // The render clock. Ticks only while a run is in flight and is cleared with
+  // it (including on cancel, which flips `busy` back).
+  useEffect(() => {
+    if (!busy || startedAt === null) return;
+    setElapsedMs(Date.now() - startedAt);
+    const id = setInterval(() => setElapsedMs(Date.now() - startedAt), 250);
+    return () => clearInterval(id);
+  }, [busy, startedAt]);
+
+  // Count the backend's Retry-After down so the retry button can wait for it.
+  useEffect(() => {
+    if (!busyNotice) { setRetryIn(0); return; }
+    setRetryIn(busyNotice.retryAfterSec);
+    const id = setInterval(() => setRetryIn((s) => (s <= 1 ? 0 : s - 1)), 1000);
+    return () => clearInterval(id);
+  }, [busyNotice]);
+
   /** Every generation starts from a clean slate of notices — a warning about
    *  the PREVIOUS run must never be read as a verdict on this one. */
   function clearNotices() {
     setBusyNotice(null);
     setToast(null);
     setFallback(null);
+    setStartedAt(Date.now());   // starts the render clock for this run
+    setElapsedMs(0);
   }
 
   /** Report a generation failure with what the backend actually said. Errors
@@ -538,15 +612,30 @@ export default function PlaygroundConsole() {
       {busyNotice && (
         <ErrorBanner severity="warning">
           <span className="flex flex-wrap items-center justify-between gap-3">
-            <span>Engine busy — the render queue is full. Retry in a moment{busyNotice.retryAfterSec > 0 ? ` (~${busyNotice.retryAfterSec}s)` : ""}.</span>
+            <span>
+              Engine busy — the render queue is full.{" "}
+              {retryIn > 0 ? `The backend asked for ${retryIn}s before the next attempt.` : "You can retry now."}
+            </span>
+            {/* Retrying inside the backend's own Retry-After window just adds
+                another rejection to the same full queue. */}
             <button
               onClick={() => void generate()}
-              disabled={busy}
+              disabled={busy || retryIn > 0}
+              title={retryIn > 0 ? `The backend asked for ${retryIn}s more` : "Retry this generation"}
               className="rounded-full border border-amber-400/40 bg-amber-400/10 px-3 py-1 text-amber-100 transition hover:bg-amber-400/20 disabled:opacity-40"
             >
-              {busy ? "retrying…" : "↻ retry"}
+              {busy ? "retrying…" : retryIn > 0 ? `↻ retry in ${retryIn}s` : "↻ retry"}
             </button>
           </span>
+        </ErrorBanner>
+      )}
+
+      {/* Engine state the user should know BEFORE pressing Generate. Suppressed
+          while a fallback notice is up — that one already reports the outcome. */}
+      {!fallbackNotice && engineNotice && (
+        <ErrorBanner severity="warning">
+          {engineNotice}
+          {healthStale && " (engine status may be out of date — the studio cannot reach it right now.)"}
         </ErrorBanner>
       )}
 
@@ -776,13 +865,40 @@ export default function PlaygroundConsole() {
         <AnimatePresence initial={false}>
           {busy && (
             <motion.div key="rendering" initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
-              className="glass-panel mb-2 flex items-center gap-4 rounded-xl px-5 py-4">
-              <span className="font-jetbrains shrink-0 text-[11px] text-cyan-300">rendering</span>
-              <div className="flex h-8 flex-1 items-end gap-[2px]">
-                {Array.from({ length: 48 }).map((_, i) => (
-                  <span key={i} className="eq-bar w-[2px] rounded-full bg-cyan-300/60" style={{ height: "100%", animationDelay: `${(i % 7) * 0.08}s` }} />
-                ))}
+              className="glass-panel mb-2 rounded-xl px-5 py-4">
+              <div className="flex items-center gap-4">
+                <span className="font-jetbrains shrink-0 text-[11px] text-cyan-300">rendering</span>
+                <div className="flex h-8 flex-1 items-end gap-[2px]" aria-hidden>
+                  {Array.from({ length: 48 }).map((_, i) => (
+                    <span key={i} className="eq-bar w-[2px] rounded-full bg-cyan-300/60" style={{ height: "100%", animationDelay: `${(i % 7) * 0.08}s` }} />
+                  ))}
+                </div>
+                {/* The one MEASURED number on this row. */}
+                <span className="font-jetbrains shrink-0 text-[12px] tabular-nums text-white/85" aria-live="off">
+                  {fmtElapsed(elapsedMs)}
+                </span>
               </div>
+              <p className="font-jetbrains mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-white/55">
+                {/* An estimate presented as a measurement is a lie, so it is
+                    always labelled, always sourced, and when it is exceeded it
+                    says so instead of stalling at "1s remaining". */}
+                {etaSec === null ? (
+                  <span>No estimate yet — the first render on this machine is what calibrates one.</span>
+                ) : overEstimate ? (
+                  <span className="text-amber-200/80">
+                    Past the ~{etaSec}s estimate — still rendering ({etaBasisLabel}; an estimate, not a measurement of this run).
+                  </span>
+                ) : (
+                  <span>Estimated ~{etaSec}s for ~{estAudioSec}s of audio — {etaBasisLabel}.</span>
+                )}
+                {queued > 0 && (
+                  <span title="Jobs waiting for a synthesis worker across the engine">
+                    · {queued} job{queued === 1 ? "" : "s"} queued ahead of the pool
+                  </span>
+                )}
+                {inFlight > 0 && <span title="Jobs a worker is synthesizing right now">· {inFlight} rendering</span>}
+                {healthStale && <span className="text-amber-200/70">· queue reading is stale</span>}
+              </p>
             </motion.div>
           )}
 
