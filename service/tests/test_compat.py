@@ -230,6 +230,124 @@ class IgnoredSettingsTests(_Base):
         self.assertNotIn("x-ignored-settings", r.headers)
 
 
+class PremiumRouteFormatTests(_Base):
+    """/v1/speak and /v1/performance honour the SAME output_format grammar.
+
+    The two routes that are Gravitone's actual differentiator were the two you
+    could not get an mp3 out of — which matters most for a multi-character
+    performance, the output someone would want to share. One parser
+    (``_parse_format``), one renderer (``_encode_audio``), three routes.
+    """
+
+    _EMAP = {"baseline": "v_base", "happy": "v_happy", "sad": "v_sad"}
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._orig_emap = appmod.emotion_map
+        appmod.emotion_map = lambda cid: dict(self._EMAP)
+
+    def tearDown(self) -> None:
+        appmod.emotion_map = self._orig_emap
+        super().tearDown()
+
+    def _speak(self, **params):
+        return self.client.post(
+            "/v1/speak", params=params,
+            json={"character_id": "sarah", "text": "[happy]Hello[/happy] [sad]World"})
+
+    def _performance(self, **params):
+        return self.client.post(
+            "/v1/performance", params=params,
+            json={"lines": [{"character_id": "sarah", "text": "[happy]Hello"},
+                            {"character_id": "sarah", "text": "[sad]World"}]})
+
+    def _fake_ffmpeg(self, captured: dict):
+        def fake_run(cmd, input=None, stdout=None, stderr=None, **kw):
+            captured["cmd"] = cmd
+            import types as _t
+            return _t.SimpleNamespace(returncode=0, stdout=b"MP3DATA", stderr=b"")
+
+        orig = enginemod.subprocess.run
+        enginemod.subprocess.run = fake_run
+        self.addCleanup(setattr, enginemod.subprocess, "run", orig)
+
+    def test_default_is_native_wav_on_both_routes(self) -> None:
+        # No output_format at all: byte-identical to before the parameter
+        # existed — a RIFF body at the native rate, no resample, no X-Sample-Rate.
+        import scipy.signal
+        for name, call in (("speak", self._speak), ("performance", self._performance)):
+            with self.subTest(route=name):
+                scipy.signal.resample_poly.calls.clear()
+                r = call()
+                self.assertEqual(r.status_code, 200)
+                self.assertEqual(r.headers["content-type"], "audio/wav")
+                self.assertEqual(r.content[:4], b"RIFF")
+                self.assertNotIn("x-sample-rate", r.headers)
+                self.assertEqual(scipy.signal.resample_poly.calls, [])
+
+    def test_mp3_is_transcoded_at_the_requested_bitrate(self) -> None:
+        for name, call in (("speak", self._speak), ("performance", self._performance)):
+            with self.subTest(route=name):
+                captured: dict = {}
+                self._fake_ffmpeg(captured)
+                r = call(output_format="mp3_24000_192")
+                self.assertEqual(r.status_code, 200)
+                self.assertEqual(r.headers["content-type"], "audio/mpeg")
+                self.assertEqual(r.content, b"MP3DATA")
+                cmd = captured["cmd"]
+                self.assertEqual(cmd[cmd.index("-b:a") + 1], "192k")
+                self.assertNotIn("-ar", cmd)  # native rate needs no ffmpeg -ar
+                # The report headers survive the format change.
+                self.assertIn("x-segments" if name == "speak"
+                              else "x-performance-report", r.headers)
+
+    def test_mp3_non_native_rate_sets_ar(self) -> None:
+        captured: dict = {}
+        self._fake_ffmpeg(captured)
+        r = self._performance(output_format="mp3_44100_128")
+        self.assertEqual(r.status_code, 200)
+        cmd = captured["cmd"]
+        self.assertEqual(cmd[cmd.index("-ar") + 1], "44100")
+
+    def test_pcm_strips_the_header_and_reports_the_rate(self) -> None:
+        import scipy.signal
+        for name, call in (("speak", self._speak), ("performance", self._performance)):
+            with self.subTest(route=name):
+                scipy.signal.resample_poly.calls.clear()
+                r = call(output_format="pcm_16000")
+                self.assertEqual(r.status_code, 200)
+                self.assertEqual(r.headers["content-type"],
+                                 "application/octet-stream")
+                self.assertEqual(r.headers["x-sample-rate"], "16000")
+                self.assertNotEqual(r.content[:4], b"RIFF")
+                # 24000 -> 16000 : up=2, down=3
+                self.assertTrue(
+                    any(c[1:] == (2, 3) for c in scipy.signal.resample_poly.calls))
+
+    def test_wav_non_native_resamples(self) -> None:
+        import scipy.signal
+        scipy.signal.resample_poly.calls.clear()
+        r = self._speak(output_format="wav_48000")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers["content-type"], "audio/wav")
+        self.assertEqual(r.content[:4], b"RIFF")
+        self.assertTrue(
+            any(c[1:] == (2, 1) for c in scipy.signal.resample_poly.calls))
+
+    def test_unsupported_format_400s_before_any_synthesis(self) -> None:
+        for name, call in (("speak", self._speak), ("performance", self._performance)):
+            with self.subTest(route=name):
+                eng = fake_engine.FakeEngine(workers=2, delay=0.01)
+                appmod.ENGINE.close()
+                appmod.ENGINE = eng
+                r = call(output_format="ogg_24000")
+                self.assertEqual(r.status_code, 400)
+                self.assertIn("Supported", r.json()["detail"])
+                # Early: a bad format must not burn a worker on audio nobody
+                # can be handed.
+                self.assertEqual(len(eng.jobs), 0)
+
+
 class StreamResampleTests(_Base):
     def test_stream_pcm_resamples_per_segment(self) -> None:
         import dataclasses

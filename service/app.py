@@ -12,6 +12,8 @@ Request body mirrors ElevenLabs:
   { "text": "...", "model_id": "pocket_tts",
     "voice_settings": { "temperature": 0.7 } }
 `output_format` is a query param (elevenlabs-style): wav_24000 | mp3_24000_128 | pcm_24000.
+The same grammar is honoured by the Gravitone routes /v1/speak and
+/v1/performance (one parser, `_parse_format`; one renderer, `_encode_audio`).
 Auth: enforced when TTS_API_KEY is set (see service/auth.py) — the root key or
 a managed `/v1/keys` key via `xi-api-key` / `Authorization: Bearer`.
 
@@ -824,6 +826,47 @@ def _parse_format(output_format: str) -> _AudioFormat:
     raise _bad_format(output_format)
 
 
+async def _encode_audio(fmt: _AudioFormat, wav_bytes: bytes,
+                        native_rate: int) -> tuple[bytes, dict[str, str]]:
+    """Render native-rate WAV bytes as ``fmt``; returns (body, extra headers).
+
+    The OUTPUT half of the format grammar, in one place, for every
+    non-streaming synthesis route (``/v1/text-to-speech``, ``/v1/speak``,
+    ``/v1/performance``) — ``_parse_format`` validates, this renders. Two copies
+    of this branch would be two answers to "what does pcm_16000 mean".
+
+    ``fmt.sample_rate == native_rate`` returns the WAV bytes UNCHANGED, so the
+    default ``wav_24000`` is byte-identical to no conversion at all.
+
+    Every transcode/resample goes through the executor: these are ``async def``
+    handlers, and mp3 encoding (an ffmpeg subprocess) or a resample on the event
+    loop stalls every other request in the process (repo law; guarded by
+    service/tests/test_handler_modes.py).
+    """
+    loop = asyncio.get_event_loop()
+    headers: dict[str, str] = {}
+    if fmt.kind == "mp3":
+        # Honour the requested bitrate and (via ffmpeg -ar) sample rate.
+        bitrate = f"{fmt.bitrate}k"
+        ar = fmt.sample_rate if fmt.sample_rate != native_rate else None
+        body = await loop.run_in_executor(
+            None, lambda: wav_bytes_to_mp3(wav_bytes, bitrate=bitrate, sample_rate=ar))
+    elif fmt.kind == "pcm":
+        wav = wav_bytes
+        if fmt.sample_rate != native_rate:
+            wav = await loop.run_in_executor(
+                None, resample_wav_bytes, wav, fmt.sample_rate)
+        # strip the 44-byte WAV header -> raw PCM16
+        body = wav[44:]
+        headers["X-Sample-Rate"] = str(fmt.sample_rate)
+    else:  # wav
+        body = wav_bytes
+        if fmt.sample_rate != native_rate:
+            body = await loop.run_in_executor(
+                None, resample_wav_bytes, body, fmt.sample_rate)
+    return body, headers
+
+
 @app.post("/v1/text-to-speech/{voice_id}", dependencies=[Depends(require_scope("tts"))])
 async def text_to_speech(
     voice_id: str,
@@ -961,26 +1004,8 @@ async def text_to_speech(
     native_rate = audio.sample_rate
     audio_seconds = audio.audio_seconds
 
-    loop = asyncio.get_event_loop()
-    if fmt.kind == "mp3":
-        # Honour the requested bitrate and (via ffmpeg -ar) sample rate.
-        bitrate = f"{fmt.bitrate}k"
-        ar = fmt.sample_rate if fmt.sample_rate != native_rate else None
-        body = await loop.run_in_executor(
-            None, lambda: wav_bytes_to_mp3(wav_bytes, bitrate=bitrate, sample_rate=ar))
-    elif fmt.kind == "pcm":
-        wav = wav_bytes
-        if fmt.sample_rate != native_rate:
-            wav = await loop.run_in_executor(
-                None, resample_wav_bytes, wav, fmt.sample_rate)
-        # strip the 44-byte WAV header -> raw PCM16
-        body = wav[44:]
-        extra_headers["X-Sample-Rate"] = str(fmt.sample_rate)
-    else:  # wav
-        body = wav_bytes
-        if fmt.sample_rate != native_rate:
-            body = await loop.run_in_executor(
-                None, resample_wav_bytes, body, fmt.sample_rate)
+    body, format_headers = await _encode_audio(fmt, wav_bytes, native_rate)
+    extra_headers.update(format_headers)
 
     return Response(
         content=body, media_type=fmt.content_type,
@@ -1203,6 +1228,7 @@ class SpeakRequest(BaseModel):
 @app.post("/v1/speak", dependencies=[Depends(require_scope("tts"))])
 async def speak(
     req: SpeakRequest,
+    output_format: str = Query("wav_24000"),
 ):
     """Speak metatagged text with one Character, switching Voices per emotion.
 
@@ -1223,8 +1249,15 @@ async def speak(
     Not cached: unlike the drop-in route, /v1/speak has no result cache, so
     there is no ``X-Cache`` header to report — a header that always said "miss"
     would be noise, not a diagnostic.
+
+    ``output_format`` is the SAME grammar the drop-in route honours
+    (``_parse_format``): mp3 bitrates, pcm and wav at any supported rate, with
+    an early 400 listing what IS supported. It defaults to ``wav_24000``, the
+    native rate, so a caller that never passes it gets exactly the bytes it got
+    before the parameter existed.
     """
     assert ENGINE is not None
+    fmt = _parse_format(output_format)  # 400s early on an unsupported format
 
     emap = emotion_map(req.character_id)
     if not emap:
@@ -1271,15 +1304,18 @@ async def speak(
             "fallback": fell_back, "voice_id": voice_id, "seconds": result.audio_seconds,
         })
 
-    body = await _offload(concat_wavs, wavs)
+    wav_bytes = await _offload(concat_wavs, wavs)
     # Wall-clock for the WHOLE request, not the sum of per-segment synth times:
     # the segments ran concurrently, so summing them would report a duration
     # that never elapsed (and a realtime factor that never was). Same shape as
-    # the drop-in route's batch path.
+    # the drop-in route's batch path. Measured before the format conversion, so
+    # it stays a claim about the MODEL and X-Realtime-Factor is comparable
+    # across output formats.
     synth_seconds = round(time.perf_counter() - t_start, 3)
     queue_seconds = round(max((r.queue_seconds for r in results), default=0.0), 3)
+    body, format_headers = await _encode_audio(fmt, wav_bytes, results[0].sample_rate)
     return Response(
-        content=body, media_type="audio/wav",
+        content=body, media_type=fmt.content_type,
         headers={
             "X-Audio-Seconds": str(round(total_audio, 2)),
             "X-Synth-Seconds": str(synth_seconds),
@@ -1288,6 +1324,7 @@ async def speak(
                                   if synth_seconds else "n/a"),
             "X-Segments": base64.b64encode(json.dumps(report).encode()).decode(),
             **({"X-Synth-Segments": str(len(results))} if len(results) > 1 else {}),
+            **format_headers,
             **_ignored_headers(req.voice_settings),
         },
     )
@@ -1305,7 +1342,8 @@ class PerformanceRequest(BaseModel):
 
 
 @app.post("/v1/performance", dependencies=[Depends(require_scope("performance"))])
-async def performance(req: PerformanceRequest):
+async def performance(req: PerformanceRequest,
+                      output_format: str = Query("wav_24000")):
     """Character Performance API — a multi-character script in one call.
 
     Each line names a Character; its text may use the same emotion metatags
@@ -1320,8 +1358,14 @@ async def performance(req: PerformanceRequest):
     per-segment sum is a duration that never elapsed), ``X-Queue-Seconds`` the
     worst segment's admission wait, ``X-Synth-Segments`` the job count. Not
     cached, so no ``X-Cache``.
+
+    ``output_format`` is the same grammar as the drop-in route and /v1/speak
+    (``_parse_format``), defaulting to ``wav_24000``. It matters most here: a
+    multi-character performance is the output someone actually wants to share,
+    and mp3 is how you share it.
     """
     assert ENGINE is not None
+    fmt = _parse_format(output_format)  # 400s early on an unsupported format
 
     ignored = sorted({s for line in req.lines for s in _ignored_settings(line.voice_settings)},
                      key=["similarity_boost", "style"].index)
@@ -1374,12 +1418,13 @@ async def performance(req: PerformanceRequest):
             "voice_id": voice_id, "seconds": result.audio_seconds,
         })
 
-    body = await _offload(concat_wavs, wavs)
+    wav_bytes = await _offload(concat_wavs, wavs)
     # Wall-clock, not the per-segment sum — see /v1/speak.
     synth_seconds = round(time.perf_counter() - t_start, 3)
     queue_seconds = round(max((r.queue_seconds for r in results), default=0.0), 3)
+    body, format_headers = await _encode_audio(fmt, wav_bytes, results[0].sample_rate)
     return Response(
-        content=body, media_type="audio/wav",
+        content=body, media_type=fmt.content_type,
         headers={
             "X-Audio-Seconds": str(round(total_audio, 2)),
             "X-Synth-Seconds": str(synth_seconds),
@@ -1388,6 +1433,7 @@ async def performance(req: PerformanceRequest):
                                   if synth_seconds else "n/a"),
             "X-Performance-Report": base64.b64encode(json.dumps(report).encode()).decode(),
             **({"X-Synth-Segments": str(len(results))} if len(results) > 1 else {}),
+            **format_headers,
             **({"X-Ignored-Settings": ",".join(ignored)} if ignored else {}),
         },
     )
