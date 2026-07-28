@@ -51,6 +51,10 @@ BUILTIN = [
     ("juergen", "DE"), ("rafael", "PT"), ("estelle", "FR"),
 ]
 
+# Built-in ids are ordinary first names, so a user WILL pick one for a clone.
+# See reject_builtin_collision / _build_characters for how that is handled.
+BUILTIN_IDS = frozenset(vid for vid, _ in BUILTIN)
+
 
 class Voice(BaseModel):
     voice_id: str
@@ -354,6 +358,31 @@ def list_characters() -> list[Character]:
         return chars
 
 
+def reject_builtin_collision(character_id: str, name: str) -> None:
+    """Refuse to create a cloned Character that would shadow a built-in.
+
+    THE rule for built-in id collisions, shared by every creation path so they
+    cannot disagree: **refuse up front, and let an already-created clone win in
+    the roster.** Built-in ids are ordinary first names (mary, jane, paul…), so
+    "clone my voice and call it Mary" is a name a real user picks; the roster
+    assembly used to overwrite the clone with the built-in, and the Character
+    vanished while its file and registry row stayed on disk.
+
+    Refusing (rather than letting the new clone shadow the built-in) keeps the
+    premade roster intact, and it is the honest answer: the id really is taken.
+    The second half of the rule lives in :func:`_build_characters` — a cloned
+    Character already on disk is NOT overwritten, so an install that predates
+    this check still shows the collided Character and can delete it.
+
+    Call before doing any work, so a refusal leaves no orphan embedding.
+    """
+    if character_id in BUILTIN_IDS:
+        raise HTTPException(
+            409,
+            f"'{name}' collides with the built-in character '{character_id}' — "
+            "pick a different name")
+
+
 def _build_characters() -> list[Character]:
     meta = _load_meta()
     chars: dict[str, Character] = {}
@@ -374,6 +403,19 @@ def _build_characters() -> list[Character]:
         c.voices.append(v)
 
     for vid, lang in BUILTIN:
+        if vid in chars:
+            # A cloned Character already owns this id. This loop used to assign
+            # unconditionally, which SILENTLY DELETED that Character from the
+            # roster — the clone returned 201, the .safetensors and the registry
+            # row were both on disk, and the user could neither see nor delete
+            # it. Cloned wins; the built-in yields. New collisions are refused
+            # at creation (reject_builtin_collision), so this only fires for a
+            # row created before that check existed — exactly the install that
+            # needs the Character back to be able to delete it.
+            logger.warning(
+                "cloned character '%s' shadows the built-in of the same name; "
+                "the built-in is unavailable until the clone is deleted", vid)
+            continue
         cm = meta["characters"].get(vid, {})
         chars[vid] = Character(
             character_id=vid, name=cm.get("name", vid.replace("_", " ").title()),
@@ -594,6 +636,9 @@ def create_voice(
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     cid = _slug(character)
+    # Before any work: a name that slugs onto a built-in id is refused, so the
+    # clone never gets made and no orphan embedding is left behind.
+    reject_builtin_collision(cid, character.strip() or cid)
 
     if emotion in emotion_map(cid):
         raise HTTPException(409, f"'{character}' already has a '{emotion}' voice")

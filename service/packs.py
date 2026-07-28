@@ -31,7 +31,7 @@ from fastapi.responses import Response
 from service.emotions import BASELINE, normalize_emotion
 from service.voices import (
     VOICES_DIR, Character, _load_meta, _slug, find_character,
-    get_character_or_404, mutate_meta, voice_file_path,
+    get_character_or_404, mutate_meta, reject_builtin_collision, voice_file_path,
 )
 
 router = APIRouter(tags=["packs"])
@@ -155,6 +155,12 @@ def import_pack(
     src = manifest.get("character") or {}
     name = (rename.strip() or src.get("name") or "Imported character").strip()
     cid = _slug(name)
+
+    # Same rule as create_voice: a pack whose name slugs onto a built-in id is
+    # refused here, before anything is read or written. The old code checked
+    # only cloned ids, so an imported "Mary" landed on disk and was then erased
+    # from the roster by the built-in of the same name.
+    reject_builtin_collision(cid, name)
 
     meta = _load_meta()
     taken = {m.get("character_id") for m in meta["voices"].values()}
