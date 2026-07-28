@@ -261,10 +261,21 @@ class BoundedSubmissionTests(_EngineCase):
 
     def test_bound_follows_workers_not_queue_depth(self) -> None:
         # A 2-worker box with a deep queue: the cap is 2 (real parallelism), so
-        # an engine with only 2 slots free serves a 6-segment script fine. If
-        # the cap were derived from workers+queue_max this would 429.
+        # a 6-segment script goes out in three waves of 2 and succeeds against
+        # an engine with only a HANDFUL of slots. If the cap were derived from
+        # workers+queue_max (34) the whole script would be submitted at once
+        # and refused, which is what this pins.
+        #
+        # capacity is 3, not 2, on purpose: a wave releases its permits on the
+        # fake's worker threads, so a capacity exactly EQUAL to the wave size
+        # leaves zero slack and the next wave races that release — the test
+        # then 429s a few runs in a hundred while the code is correct. One
+        # spare slot removes the race without weakening the assertion, because
+        # 3 is still far below the 6 an uncapped submission would need.
+        # Production has no such tension: the window is workers+queue_max (34
+        # here) against a wave of `workers`.
         self._configure(workers=2, queue_max=32)
-        eng = fake_engine.FakeEngine(workers=2, delay=0.02, capacity=2)
+        eng = fake_engine.FakeEngine(workers=2, delay=0.02, capacity=3)
         appmod.ENGINE = eng
         text = " ".join(f"[happy]s{i}[/happy]" for i in range(6))
         resp = self.client.post(
