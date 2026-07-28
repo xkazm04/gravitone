@@ -90,6 +90,10 @@ _RUNNING_TTL = 60 * 120
 # Bounded concurrency: nothing used to stop N uploads spawning N unbounded
 # fan-outs of ffmpeg + paid cloud calls. See Settings.ingest_max_jobs.
 MAX_ACTIVE_JOBS = SETTINGS.ingest_max_jobs
+# How long a refused caller is told to wait. Coarse on purpose: the work that
+# holds a slot is a whole scan or commit (minutes), so any precise-looking
+# number would be a guess dressed as an ETA. See `_admit`.
+ADMISSION_RETRY_AFTER_S = 5
 
 # One external-spend ledger per job, shared by its analyze and label phases so
 # the retry/escalation budgets are per JOB (the point of them) and the reported
@@ -288,13 +292,24 @@ def _active_count() -> int:
 def _admit() -> None:
     """Admission gate for every phase that starts real work. 429 rather than
     queue: the client is a poller that can retry, and silently queueing an
-    upload behind a 10-minute scan reads as a hang."""
+    upload behind a 10-minute scan reads as a hang.
+
+    `Retry-After` is set because a 429 without one makes the CLIENT invent the
+    wait: the studio's retry countdown has to fall back to its own backoff and
+    say so, rather than telling the user what this service actually asked for.
+    The engine's backpressure paths (service/app.py) have always sent it; this
+    one did not, so the two 429s in the product disagreed about whether a
+    caller is told when to come back. A scan is minutes long, so the hint is
+    deliberately coarse — it says "not instantly", not a real ETA, which is
+    the honest amount of information available here.
+    """
     with _LOCK:
         active = _active_count()
     if active >= MAX_ACTIVE_JOBS:
         raise HTTPException(
             429, f"{active} recordings are already being processed — "
-                 "try again in a moment")
+                 "try again in a moment",
+            headers={"Retry-After": str(ADMISSION_RETRY_AFTER_S)})
 
 
 def _gc_once() -> None:
