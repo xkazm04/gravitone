@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -144,13 +145,47 @@ class CharacterPatch(BaseModel):
 
 
 # ── meta store ────────────────────────────────────────────────────────────────
+class RegistryCorrupt(HTTPException):
+    """``voices/_meta.json`` could not be parsed — the registry is UNUSABLE.
+
+    Loud on purpose, and never repaired. :func:`_load_meta` used to answer a
+    ``JSONDecodeError`` with an empty skeleton, so a damaged registry read as
+    "you have no voices": every Character silently disappeared from the roster,
+    and the next :func:`mutate_meta` then loaded that same empty skeleton,
+    mutated it and saved it over the file — making the loss permanent.
+
+    Refusing keeps the bytes. The operator is told (server log) exactly which
+    file is damaged and that nothing has been written to it, so the JSON can be
+    repaired or moved aside by hand. There is deliberately NO automatic
+    recovery: quietly substituting a plausible registry is precisely how the
+    data was lost, and this service cannot know which voices *should* be there.
+
+    Modelled as an HTTPException because every caller is (directly or
+    indirectly) serving a request, and 503 is the honest code: the store is
+    temporarily unusable and a retry after repair will work.
+    """
+
+    def __init__(self, path: Path, cause: Exception) -> None:
+        logger.error(
+            "voice registry %s is not valid JSON (%s) — refusing to read or "
+            "overwrite it. The damaged file has been left EXACTLY as it is; "
+            "repair the JSON (or move it aside) and the service recovers.",
+            path, cause)
+        super().__init__(
+            503,
+            "the voice registry is unreadable; it has been left untouched "
+            "rather than replaced — see the server log for the file to repair")
+
+
 def _load_meta() -> dict:
     if not META_PATH.is_file():
         return {"voices": {}, "characters": {}}
     try:
         raw = json.loads(META_PATH.read_text("utf-8"))
-    except json.JSONDecodeError:
-        return {"voices": {}, "characters": {}}
+    except json.JSONDecodeError as exc:
+        # NOT an empty skeleton: that erased the roster and then got saved over
+        # the real file by the next mutation. See RegistryCorrupt.
+        raise RegistryCorrupt(META_PATH, exc) from exc
     if "voices" in raw or "characters" in raw:
         raw.setdefault("voices", {})
         raw.setdefault("characters", {})
@@ -668,47 +703,66 @@ def create_voice(
         seconds = _wav_seconds(clean)
         if seconds and seconds < 3:
             raise HTTPException(400, "recording too short — use at least 3 seconds (10–30s is best)")
+        # The embedding is exported into the TEMP dir, not straight into
+        # VOICES_DIR, and only moved into place once the registry row is
+        # committed. The roster is glob-driven (`_cloned_voices`), so a
+        # .safetensors sitting in VOICES_DIR with no registry row IS a
+        # character: exporting first meant a failed commit (a file_lock
+        # TimeoutError, an OSError in _save_meta, a 409 from the slot re-check)
+        # left a phantom Character slugged from the voice id, which the user
+        # never asked for. Staged here, that failure takes the file with it.
+        staged = tmp / f"{voice_id}.safetensors"
         ex = subprocess.run(
-            [sys.executable, "-m", "pocket_tts", "export-voice", str(clean), str(out_path)],
+            [sys.executable, "-m", "pocket_tts", "export-voice", str(clean), str(staged)],
             capture_output=True)
-        if ex.returncode != 0 or not out_path.is_file():
+        if ex.returncode != 0 or not staged.is_file():
             # Subprocess stderr is server internals — log it, hand the caller a
             # request id (same leak posture as the synthesis 500 in app.py).
             raise errors.sanitized_500(
                 "clone", errors.tail(ex.stderr.decode(errors="ignore")))
 
-    created = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        created = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-    def _commit(meta: dict) -> None:
-        # Re-check the emotion slot UNDER the registry lock. The check at the top
-        # of create_voice is a fast fail, but the multi-second clone subprocess
-        # widens the window — a concurrent clone of the same character+emotion
-        # could have committed since, and without this re-check both would write
-        # (duplicate/orphaned embeddings for one slot). Mirrors import_pack.
-        for existing in meta["voices"].values():
-            if existing.get("character_id") == cid and existing.get("emotion") == emotion:
-                # Drop the embedding we just cloned but will not register.
-                out_path.unlink(missing_ok=True)
-                raise HTTPException(409, f"'{character}' already has a '{emotion}' voice")
-        meta["voices"][voice_id] = {
-            "name": character.strip(), "character_id": cid, "emotion": emotion,
-            "created": created, "sample_seconds": seconds, "lang": "EN",
-            # Same consent-receipt shape ingest stamps (see ingest.commit).
-            "consent": {
-                "consented_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                "clip_sha256": clip_sha256, "statement": statement},
-        }
-        cm = meta["characters"].setdefault(cid, {"name": character.strip(), "tags": []})
-        for t in (t.strip().lower() for t in tags.split(",") if t.strip()):
-            if t not in cm["tags"]:
-                cm["tags"].append(t)
-        if emotion not in EMOTION_SCALE:  # novel emotion → custom slot on this Character
-            custom = list(cm.get("custom_emotions") or [])
-            if emotion not in custom:
-                custom.append(emotion)
-            cm["custom_emotions"] = custom
+        def _commit(meta: dict) -> None:
+            # Re-check the emotion slot UNDER the registry lock. The check at
+            # the top of create_voice is a fast fail, but the multi-second clone
+            # widens the window — a concurrent clone of the same
+            # character+emotion could have committed since, and without this
+            # re-check both would write (duplicate/orphaned embeddings for one
+            # slot). Mirrors import_pack. The embedding is still staged in the
+            # temp dir here, so this refusal has nothing to clean up.
+            for existing in meta["voices"].values():
+                if existing.get("character_id") == cid and existing.get("emotion") == emotion:
+                    raise HTTPException(409, f"'{character}' already has a '{emotion}' voice")
+            meta["voices"][voice_id] = {
+                "name": character.strip(), "character_id": cid, "emotion": emotion,
+                "created": created, "sample_seconds": seconds, "lang": "EN",
+                # Same consent-receipt shape ingest stamps (see ingest.commit).
+                "consent": {
+                    "consented_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "clip_sha256": clip_sha256, "statement": statement},
+            }
+            cm = meta["characters"].setdefault(cid, {"name": character.strip(), "tags": []})
+            for t in (t.strip().lower() for t in tags.split(",") if t.strip()):
+                if t not in cm["tags"]:
+                    cm["tags"].append(t)
+            if emotion not in EMOTION_SCALE:  # novel emotion → custom slot
+                custom = list(cm.get("custom_emotions") or [])
+                if emotion not in custom:
+                    custom.append(emotion)
+                cm["custom_emotions"] = custom
 
-    mutate_meta(_commit)
+        mutate_meta(_commit)
+
+        # Registry first, file second — then publish the embedding the row
+        # already promises. If THIS fails the row is retracted immediately, so
+        # a failed clone never leaves the registry claiming a file that is not
+        # there (and never leaves a file the registry has never heard of).
+        try:
+            shutil.move(str(staged), str(out_path))
+        except OSError as exc:
+            remove_voices([voice_id])
+            raise errors.sanitized_500("clone", exc)
 
     return Voice(voice_id=voice_id, character_id=cid, emotion=emotion,
                  name=f"{character.strip()} · {emotion}", category="cloned",
@@ -733,6 +787,40 @@ def patch_voice(voice_id: str, patch: VoicePatch) -> Voice:
     return mutate_meta(_mut)
 
 
+def _unlink_then_forget(meta: dict, voice_ids: list[str]) -> tuple[list[str], list[str]]:
+    """Delete embeddings, then drop ONLY the rows whose file is really gone.
+
+    THE deletion ordering, in one place, for every path that removes a Voice
+    (delete_voice, delete_character, remove_voices). Two rules:
+
+      * **File first, row second.** The roster is glob-driven, so a
+        .safetensors with no registry row is a phantom Character. Popping the
+        row first and unlinking after meant a file that refused to unlink came
+        back as a phantom the caller had already reported as deleted.
+      * **A file that could not be deleted keeps its row.** The Voice is then
+        still exactly what it was — visible, addressable, deletable again —
+        instead of the registry disagreeing with the disk.
+
+    Never raises: it runs inside a `mutate_meta` mutation fn, and raising there
+    skips the save, which would throw away the deletions that DID succeed and
+    leave the registry claiming files that are gone. Callers inspect the
+    returned ``(removed, failed)`` and decide what to tell the user.
+    """
+    removed: list[str] = []
+    failed: list[str] = []
+    for vid in voice_ids:
+        path = VOICES_DIR / f"{vid}.safetensors"
+        try:
+            path.unlink(missing_ok=True)  # already-missing counts as removed
+        except OSError as exc:
+            logger.warning("could not delete embedding %s: %s", path, exc)
+            failed.append(vid)
+            continue
+        meta["voices"].pop(vid, None)
+        removed.append(vid)
+    return removed, failed
+
+
 def remove_voices(voice_ids: list[str]) -> list[str]:
     """Delete specific cloned Voices — registry entries AND embedding files.
 
@@ -746,48 +834,50 @@ def remove_voices(voice_ids: list[str]) -> list[str]:
     character is a ghost row in the roster. Missing ids are ignored (the point
     is to converge on "not registered", not to assert what was there).
 
-    Returns the ids actually removed. Best-effort by design: it runs on a
-    teardown path, so a file that refuses to unlink is logged, not raised.
+    Returns the ids actually removed — file gone AND row gone. Best-effort by
+    design: it runs on a teardown path, so a file that refuses to unlink is
+    logged, not raised, and (per `_unlink_then_forget`) KEEPS its registry row.
+    The old order — pop the rows, unlink after — meant such a file came back as
+    a phantom Character while the caller had already logged "rolled back".
     """
     if not voice_ids:
         return []
-    wanted = set(voice_ids)
     removed: list[str] = []
 
     def _mut(meta: dict) -> None:
-        touched_characters = set()
-        for vid in wanted:
-            entry = meta["voices"].pop(vid, None)
-            if entry is None:
-                continue
-            removed.append(vid)
-            cid = entry.get("character_id")
-            if cid:
-                touched_characters.add(cid)
+        known = {vid: meta["voices"].get(vid, {}) for vid in dict.fromkeys(voice_ids)
+                 if vid in meta["voices"]}
+        gone, _failed = _unlink_then_forget(meta, list(known))
+        removed.extend(gone)
         # Drop characters this rollback emptied (an extend keeps its own).
-        for cid in touched_characters:
+        for cid in {(known[vid] or {}).get("character_id") for vid in gone} - {None}:
             still_has = any(m.get("character_id") == cid for m in meta["voices"].values())
             if not still_has:
                 meta["characters"].pop(cid, None)
 
     mutate_meta(_mut)
-
-    for vid in removed:
-        path = VOICES_DIR / f"{vid}.safetensors"
-        try:
-            path.unlink(missing_ok=True)
-        except OSError as exc:
-            logger.warning("rollback: could not delete %s: %s", path, exc)
     return removed
 
 
 @router.delete("/v1/voices/{voice_id}", status_code=204)
 def delete_voice(voice_id: str) -> None:
-    path = VOICES_DIR / f"{voice_id}.safetensors"
-    if not path.is_file():
-        raise HTTPException(404, "cloned voice not found (built-in voices cannot be deleted)")
-    path.unlink()
-    mutate_meta(lambda meta: meta["voices"].pop(voice_id, None))
+    # A cloned Voice is EITHER half on its own: the embedding file (which the
+    # glob-driven roster turns into a Character all by itself) or the registry
+    # row. This used to 404 whenever the FILE was missing, before it looked at
+    # the registry at all, so a row whose file vanished out-of-band — or was
+    # left behind by a half-failed delete — could never be removed through the
+    # API at all. Either half is enough to delete; neither is a 404.
+    def _mut(meta: dict) -> tuple[list[str], list[str]]:
+        if voice_id not in meta["voices"] and not (VOICES_DIR / f"{voice_id}.safetensors").is_file():
+            raise HTTPException(404, "cloned voice not found (built-in voices cannot be deleted)")
+        return _unlink_then_forget(meta, [voice_id])
+
+    _removed, failed = mutate_meta(_mut)
+    if failed:
+        # The embedding is still there, and so is its registry row: the Voice is
+        # unchanged rather than half-deleted. Say so instead of returning 204.
+        raise errors.sanitized_500(
+            "voice delete", f"could not delete embedding for {voice_id}")
 
 
 @router.patch("/v1/characters/{character_id}", response_model=Character)
@@ -805,13 +895,25 @@ def patch_character(character_id: str, patch: CharacterPatch) -> Character:
 
 @router.delete("/v1/characters/{character_id}", status_code=204)
 def delete_character(character_id: str) -> None:
-    def _mut(meta: dict) -> None:
+    def _mut(meta: dict) -> list[str]:
         ids = [vid for vid, m in meta["voices"].items() if m.get("character_id") == character_id]
         if not ids:
             raise HTTPException(404, "character has no cloned voices (built-ins cannot be deleted)")
-        for vid in ids:
-            (VOICES_DIR / f"{vid}.safetensors").unlink(missing_ok=True)
-            meta["voices"].pop(vid, None)
-        meta["characters"].pop(character_id, None)
+        # A mid-loop unlink failure used to RAISE out of the mutation fn, which
+        # skips the save: N-1 embeddings were already gone and the registry
+        # still claimed all N. `_unlink_then_forget` never raises, so the rows
+        # for the files that really went away are committed, the rows for the
+        # files that survived stay accurate, and the failure is reported after
+        # the save rather than instead of it.
+        _removed, failed = _unlink_then_forget(meta, ids)
+        if not failed:
+            meta["characters"].pop(character_id, None)
+        return failed
 
-    mutate_meta(_mut)
+    failed = mutate_meta(_mut)
+    if failed:
+        # Partially deleted: the surviving Voices are still registered and still
+        # usable. Never report 204 for that.
+        raise errors.sanitized_500(
+            "character delete",
+            f"could not delete {len(failed)} embedding(s) for {character_id}")
