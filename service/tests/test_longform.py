@@ -23,6 +23,10 @@ class _Base(unittest.TestCase):
     def setUp(self) -> None:
         self._orig_engine = appmod.ENGINE
         self._orig_settings = appmod.SETTINGS
+        # The synthesis cache is a process-wide singleton: without this, a case
+        # that re-uses another case's (voice, text, settings) is served from the
+        # previous test's engine and asserts nothing.
+        appmod.SYNTH_CACHE.clear()
         self.client = TestClient(appmod.app)
 
     def tearDown(self) -> None:

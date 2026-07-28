@@ -25,6 +25,7 @@ import numpy as np
 class _Base(unittest.TestCase):
     def setUp(self) -> None:
         self._orig = appmod.ENGINE
+        appmod.SYNTH_CACHE.clear()  # process-wide singleton — isolate cases
         appmod.ENGINE = fake_engine.FakeEngine(workers=2, delay=0.01)
         self.client = TestClient(appmod.app)
         import scipy.signal  # the fake shim installed by fake_engine

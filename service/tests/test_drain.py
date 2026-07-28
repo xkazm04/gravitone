@@ -142,6 +142,7 @@ class ShuttingDownHttpMappingTests(unittest.TestCase):
         import service.app as appmod
         self.appmod = appmod
         self._orig_engine = appmod.ENGINE
+        appmod.SYNTH_CACHE.clear()  # process-wide singleton — isolate cases
         from fastapi.testclient import TestClient
         self.client = TestClient(appmod.app, raise_server_exceptions=False)
 

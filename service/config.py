@@ -148,6 +148,17 @@ class Settings:
     # admission window (workers + queue_max): 8000/350 = 23 units vs 33 slots.
     chunk_chars: int = _int("TTS_CHUNK_CHARS", 350)
 
+    # --- Synthesis result cache -------------------------------------------
+    # Byte budget for the LRU of finished audio (see service/cache.py). 0
+    # disables the cache AND its single-flight collapsing.
+    #
+    # Defaults ON at 128 MiB. Rationale: re-rendering identical text is pure
+    # waste on a CPU-only box, the key includes a fingerprint of the voice's
+    # safetensors (so a re-clone can never serve stale audio), and the budget is
+    # small next to a loaded model. Note it is PER PROCESS — the service runs as
+    # N single-worker replicas, so plan for cache_bytes × replicas of RSS.
+    cache_bytes: int = _int("TTS_CACHE_BYTES", 128 * 1024 * 1024)
+
     # --- Server ------------------------------------------------------------
     host: str = _str("TTS_HOST", "127.0.0.1")
     port: int = _int("TTS_PORT", 8080)

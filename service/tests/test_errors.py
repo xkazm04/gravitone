@@ -19,6 +19,7 @@ class SanitizeErrorTests(unittest.TestCase):
     def setUp(self) -> None:
         self._orig_engine = appmod.ENGINE
         self._orig_settings = appmod.SETTINGS
+        appmod.SYNTH_CACHE.clear()  # process-wide singleton — isolate cases
         from fastapi.testclient import TestClient
         self.client = TestClient(appmod.app, raise_server_exceptions=False)
 
@@ -68,6 +69,7 @@ class CatchAllContractTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self._orig_engine = appmod.ENGINE
+        appmod.SYNTH_CACHE.clear()  # process-wide singleton — isolate cases
         from fastapi.testclient import TestClient
         self.client = TestClient(appmod.app, raise_server_exceptions=False)
 
@@ -103,6 +105,7 @@ class UnknownVoiceTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self._orig_engine = appmod.ENGINE
+        appmod.SYNTH_CACHE.clear()  # process-wide singleton — isolate cases
         self.engine = fake_engine.FakeEngine(workers=1, delay=0.01)
         appmod.ENGINE = self.engine
         from fastapi.testclient import TestClient

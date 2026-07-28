@@ -35,6 +35,7 @@ import json
 
 from service.auth import require_read_write, require_scope
 from service import errors
+from service.cache import CachedAudio, SynthCache
 from service.config import SETTINGS
 from service.demand import record_fallback
 from service.emotions import parse_segments, resolve
@@ -51,6 +52,11 @@ from service.packs import router as packs_router
 from service.takes import router as takes_router, reviews_router
 
 ENGINE: TtsEngine | None = None
+
+# Finished audio, keyed on full request identity (_cache_key). PER PROCESS: the
+# service runs as N single-worker replicas, so a hit here is a hit for this
+# replica only. See service/cache.py.
+SYNTH_CACHE = SynthCache(SETTINGS.cache_bytes)
 
 logger = logging.getLogger("gravitone")
 
@@ -311,6 +317,63 @@ def _require_known_voice(voice_id: str) -> None:
     raise HTTPException(status_code=404, detail=f"unknown voice '{voice_id}'")
 
 
+def _voice_fingerprint(voice_id: str) -> str:
+    """Identity of the BYTES behind a voice id: "{mtime_ns}:{size}".
+
+    Re-cloning a Character rewrites its .safetensors under the SAME voice id,
+    so without this a cached clip would outlive the voice that produced it and
+    the new voice would serve the old audio. Builtin voices have no file (the
+    weights are the model's own) and get a constant marker. Mirrors the lookup
+    order of ``_require_known_voice`` / ``engine._Worker._voice_state``.
+    """
+    for cand in (Path(SETTINGS.voices_dir) / f"{voice_id}.safetensors",
+                 Path(voice_id)):
+        try:
+            st = cand.stat()
+        except (OSError, ValueError):  # missing, or not a usable path
+            continue
+        return f"{st.st_mtime_ns}:{st.st_size}"
+    return "builtin"
+
+
+def _cache_key(voice_id: str, text: str, overrides: dict,
+               frames_after_eos: int | None) -> tuple:
+    """Everything that can change the audio, and nothing that can't.
+
+    Enumerated from the request surface:
+      * ``voice_id`` — the RESOLVED voice (``_resolve_emotion_address`` has
+        already turned "sarah:excited"/?emotion= into a concrete voice), never
+        the pre-resolution address: two addresses that resolve to the same
+        voice are the same audio, and one address that resolves differently
+        (an emotion added since) must not collide.
+      * ``_voice_fingerprint`` — the safetensors' mtime+size, so a re-cloned
+        voice invalidates its cached audio.
+      * ``text`` — verbatim (segmentation is derived from it).
+      * ``overrides`` — temp / noise_clamp / lsd_decode_steps, i.e. every
+        VoiceSettings field that reaches the model. similarity_boost and style
+        are deliberately absent: they are inert (see VoiceSettings) and
+        reported via X-Ignored-Settings, so they cannot change the audio.
+      * ``frames_after_eos`` — the request's trailing-frames control.
+      * ``max_tokens`` / ``language`` / ``quantize`` — process-wide generation
+        and model identity; included so a config change can't serve audio
+        rendered under the old one.
+    ``model_id`` is not in the key: it is accepted for ElevenLabs
+    compatibility and never reaches the engine. ``output_format`` is not in the
+    key either — the cache stores native-rate WAV and every format is derived
+    from it AFTER the lookup.
+    """
+    return (
+        voice_id,
+        _voice_fingerprint(voice_id),
+        text,
+        tuple(sorted(overrides.items())),
+        frames_after_eos,
+        SETTINGS.max_tokens,
+        SETTINGS.language,
+        SETTINGS.quantize,
+    )
+
+
 def _record_fallbacks(pairs: list[tuple[str, str]]) -> None:
     """Record a whole request's emotion fallbacks in ONE executor hop.
 
@@ -530,32 +593,38 @@ async def text_to_speech(
     ``concat_wavs`` (the identical path /v1/speak uses, so seams behave the
     same). Text that fits ``SETTINGS.chunk_chars`` stays ONE unit and takes the
     original single-job path unchanged, bytes and headers included.
+
+    Results are cached per process (``SYNTH_CACHE``) on the full request
+    identity, and concurrent identical requests collapse onto one synthesis.
+    Every response says which it was via ``X-Cache: hit|miss``; on a hit the
+    timing headers report the REAL (near-zero) numbers, never a replay of what
+    the original render cost.
     """
     assert ENGINE is not None
     fmt = _parse_format(output_format)  # 400s early on an unsupported format
     voice_id, emotion_headers = await _resolve_emotion_address(voice_id, emotion)
 
-    units = _chunk_text(req.text)
     overrides = _overrides(req.voice_settings)
     extra_headers: dict[str, str] = {}
+    timing: dict[str, float] = {}
+    t_request = time.perf_counter()
 
-    if len(units) <= 1:
-        # Single unit: identical to the pre-segmentation behaviour, including
-        # the timing headers (X-Synth-Seconds stays the job's own synthesis
-        # time, which for one job IS the request's synthesis wall-clock minus
-        # the queue wait already reported in X-Queue-Seconds).
-        try:
+    async def _synthesize() -> CachedAudio:
+        """Render this request from scratch, recording its true timings."""
+        units = _chunk_text(req.text)
+        if len(units) <= 1:
+            # Single unit: identical to the pre-segmentation behaviour,
+            # including the timing headers (X-Synth-Seconds stays the job's own
+            # synthesis time, which for one job IS the request's synthesis
+            # wall-clock minus the queue wait already in X-Queue-Seconds).
             result = await _submit_and_wait(voice_id, req.text, overrides,
                                             frames_after_eos=req.frames_after_eos)
-        except _Backpressure as exc:
-            # Backpressure: tell the client to retry — the queue cap was hit.
-            return _backpressure_response(exc)
-        wav_bytes = result.wav_bytes
-        native_rate = result.sample_rate
-        audio_seconds = result.audio_seconds
-        synth_seconds = result.synth_seconds
-        queue_seconds = result.queue_seconds
-    else:
+            timing["synth"] = result.synth_seconds
+            timing["queue"] = result.queue_seconds
+            return CachedAudio(wav_bytes=result.wav_bytes,
+                               sample_rate=result.sample_rate,
+                               audio_seconds=result.audio_seconds, segments=1)
+
         t_start = time.perf_counter()
         try:
             jobs = _submit_batch([(voice_id, unit, overrides) for unit in units],
@@ -563,17 +632,40 @@ async def text_to_speech(
         except AdmissionRejected as exc:
             # Admission is decided for the whole batch; _submit_batch already
             # abandoned the siblings that did get in.
-            return _backpressure_response(_Backpressure(str(exc)))
+            raise _Backpressure(str(exc))
         results = await _gather_results(jobs)
         wav_bytes = await _offload(concat_wavs, [r.wav_bytes for r in results])
-        native_rate = results[0].sample_rate
-        audio_seconds = round(sum(r.audio_seconds for r in results), 3)
         # Wall-clock for the WHOLE request, not the sum of per-segment synth
         # times: the segments ran concurrently, so summing them would report a
         # duration that never elapsed (and a realtime factor that never was).
-        synth_seconds = round(time.perf_counter() - t_start, 3)
-        queue_seconds = round(max(r.queue_seconds for r in results), 3)
-        extra_headers["X-Synth-Segments"] = str(len(units))
+        timing["synth"] = round(time.perf_counter() - t_start, 3)
+        timing["queue"] = round(max(r.queue_seconds for r in results), 3)
+        return CachedAudio(
+            wav_bytes=wav_bytes, sample_rate=results[0].sample_rate,
+            audio_seconds=round(sum(r.audio_seconds for r in results), 3),
+            segments=len(units))
+
+    key = _cache_key(voice_id, req.text, overrides, req.frames_after_eos)
+    try:
+        audio, was_cached = await SYNTH_CACHE.get_or_synthesize(key, _synthesize)
+    except _Backpressure as exc:
+        # Backpressure: tell the client to retry — the queue cap was hit.
+        return _backpressure_response(exc)
+
+    if was_cached:
+        # The truth, not a replayed number: what this request actually spent.
+        synth_seconds = round(time.perf_counter() - t_request, 6)
+        queue_seconds = 0.0
+    else:
+        synth_seconds = timing["synth"]
+        queue_seconds = timing["queue"]
+    extra_headers["X-Cache"] = "hit" if was_cached else "miss"
+    if audio.segments > 1:
+        extra_headers["X-Synth-Segments"] = str(audio.segments)
+
+    wav_bytes = audio.wav_bytes
+    native_rate = audio.sample_rate
+    audio_seconds = audio.audio_seconds
 
     loop = asyncio.get_event_loop()
     if fmt.kind == "mp3":
@@ -986,7 +1078,9 @@ async def health():
 async def metrics():
     if ENGINE is None:
         raise HTTPException(status_code=503, detail="engine not ready")
-    return {"config": ENGINE.config(), "metrics": ENGINE.metrics.snapshot()}
+    # `cache` is this PROCESS's synthesis cache (per replica, never global).
+    return {"config": ENGINE.config(), "metrics": ENGINE.metrics.snapshot(),
+            "cache": SYNTH_CACHE.stats()}
 
 
 def main():
