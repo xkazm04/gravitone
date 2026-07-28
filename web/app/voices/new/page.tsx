@@ -245,7 +245,7 @@ export default function NewCharacterPage() {
               </div>
               <p className="font-jetbrains mt-2 text-[11px] leading-relaxed text-white/50">
                 {ingestMode === "sovereign"
-                  ? "Local ffmpeg pipeline only: cleanup + speech detection on this box, no transcription, no third-party APIs. Emotions are recorded afterwards with the guided per-emotion capture."
+                  ? "Local ffmpeg pipeline only — nothing leaves this box. In exchange: one voice (everyone audible in the recording is cloned as the same speaker — there is no local diarization), one emotion (the neutral baseline; the rest are recorded afterwards with the guided per-emotion capture), and no transcript."
                   : "Uses ElevenLabs (diarize + isolate) and Gemini (emotion labels) when the backend has keys; falls back to local processing when it doesn't."}
               </p>
             </div>
