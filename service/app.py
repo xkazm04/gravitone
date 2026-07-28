@@ -374,6 +374,43 @@ def _cache_key(voice_id: str, text: str, overrides: dict,
     )
 
 
+_CACHE_CONTROL_HEADER = "cache-control"
+_CACHE_BYPASS_HEADER = "x-gravitone-cache"
+_CACHE_BYPASS_VALUES = ("bypass", "no-store", "off")
+
+
+def cache_bypass_requested(headers) -> bool:
+    """Whether THIS request asked to skip the synthesis cache entirely.
+
+    Why this exists: the cache is a real product win, but it also silently
+    turns any repeated-identical-request measurement (the load-test harness,
+    ``service.loadtest``) into a measurement of an LRU lookup. A benchmark must
+    be able to say "render it, don't replay it" without the operator having to
+    disable the cache service-wide (which would change what is being measured
+    for every OTHER caller too).
+
+    Two spellings, both honoured:
+      * the standard ``Cache-Control: no-store`` / ``no-cache`` request header;
+      * ``X-Gravitone-Cache: bypass`` (explicit, greppable in a har/proxy log).
+
+    A bypassed request does no lookup, does not collapse onto another request's
+    in-flight render, and does NOT store its result — so a benchmark corpus can
+    never evict real callers' cached audio. It still passes through admission
+    exactly like any other synthesis, so this is not a way around backpressure.
+    ``headers`` may be any mapping (or None, for direct in-process calls).
+    """
+    if not headers:
+        return False
+    try:
+        lowered = {str(k).lower(): str(v) for k, v in headers.items()}
+    except Exception:  # noqa: BLE001 - an exotic mapping must not 500 a request
+        return False
+    if lowered.get(_CACHE_BYPASS_HEADER, "").strip().lower() in _CACHE_BYPASS_VALUES:
+        return True
+    cc = lowered.get(_CACHE_CONTROL_HEADER, "").lower()
+    return "no-store" in cc or "no-cache" in cc
+
+
 def _record_fallbacks(pairs: list[tuple[str, str]]) -> None:
     """Record a whole request's emotion fallbacks in ONE executor hop.
 
@@ -632,6 +669,7 @@ async def text_to_speech(
     req: TTSRequest,
     output_format: str = Query("wav_24000"),
     emotion: str | None = Query(None, description="Gravitone extension: address a Character's emotion voice (or use {character_id}:{emotion} as the path voice_id)"),
+    request: Request = None,
 ):
     """Drop-in ElevenLabs synthesis.
 
@@ -647,9 +685,14 @@ async def text_to_speech(
 
     Results are cached per process (``SYNTH_CACHE``) on the full request
     identity, and concurrent identical requests collapse onto one synthesis.
-    Every response says which it was via ``X-Cache: hit|miss``; on a hit the
-    timing headers report the REAL (near-zero) numbers, never a replay of what
-    the original render cost.
+    Every response says which it was via ``X-Cache: hit|miss|bypass``; on a hit
+    the timing headers report the REAL (near-zero) serve cost, never a replay of
+    what the original render cost — and ``X-Realtime-Factor`` is ``n/a``,
+    because a cache lookup is not a measurement of the model (a hit's
+    audio/serve-time ratio is a number in the millions and means nothing).
+    ``Cache-Control: no-store`` / ``X-Gravitone-Cache: bypass`` renders from
+    scratch without reading or writing the cache — that is how the benchmark
+    harness measures synthesis (see ``cache_bypass_requested``).
     """
     assert ENGINE is not None
     fmt = _parse_format(output_format)  # 400s early on an unsupported format
@@ -698,9 +741,16 @@ async def text_to_speech(
             audio_seconds=round(sum(r.audio_seconds for r in results), 3),
             segments=len(units))
 
+    bypass = cache_bypass_requested(request.headers if request is not None else None)
     key = _cache_key(voice_id, req.text, overrides, req.frames_after_eos)
     try:
-        audio, was_cached = await SYNTH_CACHE.get_or_synthesize(key, _synthesize)
+        if bypass:
+            # No lookup, no single-flight collapse, no store: this request is
+            # rendered by the model or it fails. The benchmark depends on it.
+            SYNTH_CACHE.note_bypass()
+            audio, was_cached = await _synthesize(), False
+        else:
+            audio, was_cached = await SYNTH_CACHE.get_or_synthesize(key, _synthesize)
     except _Backpressure as exc:
         # Backpressure: tell the client to retry — the queue cap was hit.
         return _backpressure_response(exc)
@@ -712,7 +762,7 @@ async def text_to_speech(
     else:
         synth_seconds = timing["synth"]
         queue_seconds = timing["queue"]
-    extra_headers["X-Cache"] = "hit" if was_cached else "miss"
+    extra_headers["X-Cache"] = "bypass" if bypass else ("hit" if was_cached else "miss")
     if audio.segments > 1:
         extra_headers["X-Synth-Segments"] = str(audio.segments)
 
@@ -747,8 +797,14 @@ async def text_to_speech(
             "X-Audio-Seconds": str(audio_seconds),
             "X-Synth-Seconds": str(synth_seconds),
             "X-Queue-Seconds": str(queue_seconds),
-            "X-Realtime-Factor": str(round(audio_seconds / synth_seconds, 3))
-            if synth_seconds else "n/a",
+            # A realtime factor is a claim about the MODEL. A cache hit ran no
+            # model, so audio/serve-time (audio ÷ ~1e-6 s → millions) would be a
+            # fabricated number that a benchmark would happily average and a
+            # certificate would happily sign. Say "n/a" instead: X-Synth-Seconds
+            # still reports this request's true serve cost, and X-Cache says why.
+            "X-Realtime-Factor": "n/a" if was_cached else (
+                str(round(audio_seconds / synth_seconds, 3))
+                if synth_seconds else "n/a"),
             **extra_headers,
             **emotion_headers,
             **_ignored_headers(req.voice_settings),

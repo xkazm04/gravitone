@@ -26,15 +26,63 @@ import platform
 from datetime import datetime, timezone
 from pathlib import Path
 
-CERT_VERSION = "gravitone-cert/1"
+# v1 certificates were issued from load-test results that could not tell a
+# synthesis from a cache hit (the harness pre-dated the synthesis cache and
+# happily averaged X-Realtime-Factor values in the millions). They are NOT
+# comparable to v2 and must not be read as capacity claims — hence a new
+# version string rather than a silent behaviour change.
+CERT_VERSION = "gravitone-cert/2"
 CERT_SECRET = os.environ.get("GRAVITONE_CERT_SECRET", "")
+
+# Load-test result schema that is cache-aware (service.loadtest.SCHEMA_VERSION).
+# Anything older cannot substantiate that its numbers came from the model.
+MIN_RESULT_SCHEMA = 3
 
 # Certification bar: what "this box can serve Gravitone" means.
 THRESHOLDS = {
     "single_stream_rtf_min": 1.0,   # faster than realtime, one stream
     "recommended_cap_min": 1,       # at least one healthy concurrency level
     "errors_at_cap_max": 0,         # zero failures at the recommended cap
+    "cache_hits_max": 0,            # zero responses replayed from the cache
 }
+
+
+def measurement_status(result: dict) -> dict:
+    """Is this result a measurement of SYNTHESIS, and can it say so itself?
+
+    Three ways it is not, all fatal to a certificate:
+      * schema < 3 — produced before the harness knew the cache existed, so its
+        levels carry no cache accounting at all. Absence of evidence here is
+        not evidence of absence: such a run may be 100% cache hits.
+      * ``cache_mode`` other than bypass/off — the run deliberately let the
+        cache answer.
+      * any recorded ``cache_hits`` — the server served stored audio anyway.
+    """
+    schema = result.get("schema_version") or 1
+    rows = result.get("levels") or []
+    measurement = result.get("measurement") or {}
+    cache_mode = measurement.get("cache_mode") or result.get("cache_mode")
+    hits = measurement.get("cache_hits_total")
+    if hits is None:
+        hits = sum(int(r.get("cache_hits") or 0) for r in rows)
+    reasons = []
+    if schema < MIN_RESULT_SCHEMA:
+        reasons.append(
+            f"result schema v{schema} predates cache-aware benchmarking "
+            f"(need v{MIN_RESULT_SCHEMA}+): it cannot show whether its numbers "
+            f"came from the model or from the synthesis cache — re-run the load test")
+    if cache_mode not in (None, "bypass", "off") :
+        reasons.append(f"cache_mode={cache_mode!r}: the synthesis cache was allowed "
+                       f"to answer requests")
+    if hits > THRESHOLDS["cache_hits_max"]:
+        reasons.append(f"{hits} response(s) were served from the synthesis cache")
+    return {
+        "schema_version": schema,
+        "cache_mode": cache_mode,
+        "cache_hits_total": hits,
+        "measures_synthesis": not reasons,
+        "reasons": reasons,
+    }
 
 
 def gather_hardware() -> dict:
@@ -76,7 +124,18 @@ def evaluate(result: dict) -> dict:
     cap_errors = (at_cap.get("errors") or 0) + (at_cap.get("rejected_429") or 0)
     aud_per_s = at_cap.get("audio_s_per_wall_s") or 0.0
 
+    measurement = measurement_status(result)
+
     checks = [
+        # FIRST, because every number below it is meaningless without it: did
+        # this run actually exercise the model? A cached response returns in
+        # microseconds, so a contaminated run produces a spectacular — and
+        # entirely fictional — realtime factor and concurrency cap.
+        {"check": "measures_synthesis",
+         "want": "every sample rendered by the model (no cache hits)",
+         "got": ("yes" if measurement["measures_synthesis"]
+                 else "; ".join(measurement["reasons"])),
+         "pass": measurement["measures_synthesis"]},
         {"check": "realtime_single_stream",
          "want": f">= {THRESHOLDS['single_stream_rtf_min']}x",
          "got": single_rtf,
@@ -92,6 +151,7 @@ def evaluate(result: dict) -> dict:
     ]
     return {
         "checks": checks,
+        "measurement": measurement,
         "verdict": "certified" if all(c["pass"] for c in checks) else "failed",
         "capacity": {
             "single_stream_rtf": single_rtf,

@@ -22,7 +22,7 @@ class ReproMetadataTests(unittest.TestCase):
 
     def test_runtime_metadata_shape(self) -> None:
         meta = lt.runtime_metadata()
-        self.assertEqual(meta["schema_version"], 2)
+        self.assertEqual(meta["schema_version"], 3)
         self.assertIn("git_sha", meta)
         self.assertIn("torch_version", meta)          # None when torch absent
         self.assertIn("onednn_fpmath_mode", meta)     # None when env unset
@@ -58,7 +58,7 @@ class SampleSizeTests(unittest.TestCase):
 
 class BuildResultTests(unittest.TestCase):
     def _meta(self) -> dict:
-        return {"schema_version": 2, "git_sha": "abc1234",
+        return {"schema_version": 3, "git_sha": "abc1234",
                 "torch_version": "2.4.0", "onednn_fpmath_mode": "bf16"}
 
     def test_result_is_self_describing(self) -> None:
@@ -66,7 +66,7 @@ class BuildResultTests(unittest.TestCase):
             rows=[{"concurrency": 1, "ok": 12}], knee=None, recommended=1,
             route="synth", fmt="wav_24000", corpus="hello world",
             service_config={"workers": 1, "queue_max": 16}, meta=self._meta())
-        self.assertEqual(res["schema_version"], 2)
+        self.assertEqual(res["schema_version"], 3)
         self.assertEqual(res["git_sha"], "abc1234")
         self.assertEqual(res["torch_version"], "2.4.0")
         self.assertEqual(res["onednn_fpmath_mode"], "bf16")
@@ -84,6 +84,132 @@ class BuildResultTests(unittest.TestCase):
             fmt="wav_24000", corpus="x", service_config={}, meta=self._meta(),
             extra={"topology": {"mode": "single"}})
         self.assertEqual(res["topology"]["mode"], "single")
+
+
+# ---------------------------------------------------------------------------
+# The benchmark must measure the ENGINE, not the synthesis cache
+# ---------------------------------------------------------------------------
+class CacheModeTests(unittest.TestCase):
+    def test_bypass_is_the_default(self) -> None:
+        # An operator who never heard of the cache must still get honest numbers.
+        self.assertEqual(lt.DEFAULT_CACHE_MODE, "bypass")
+        h = lt.request_headers()
+        self.assertEqual(h.get("Cache-Control"), "no-store")
+        self.assertEqual(h.get("X-Gravitone-Cache"), "bypass")
+
+    def test_allow_mode_sends_no_bypass_headers(self) -> None:
+        self.assertEqual(lt.request_headers("allow"), {})
+
+    def test_cli_default_is_bypass(self) -> None:
+        # The flag itself, as argparse will see it — a default flipped by
+        # accident is exactly the regression this direction exists to stop.
+        import argparse
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--cache-mode", choices=lt.CACHE_MODES,
+                        default=lt.DEFAULT_CACHE_MODE)
+        self.assertEqual(ap.parse_args([]).cache_mode, "bypass")
+
+    def test_measurement_block_is_honest_about_hits(self) -> None:
+        clean = lt.measurement_block([{"cache_hits": 0}, {"cache_hits": 0}], "bypass")
+        self.assertTrue(clean["measures_synthesis"])
+        self.assertEqual(clean["cache_hits_total"], 0)
+
+        dirty = lt.measurement_block([{"cache_hits": 0}, {"cache_hits": 7}], "bypass")
+        self.assertFalse(dirty["measures_synthesis"])
+        self.assertEqual(dirty["cache_hits_total"], 7)
+        self.assertIn("cache", dirty["note"])
+
+        allowed = lt.measurement_block([{"cache_hits": 0}], "allow")
+        self.assertFalse(allowed["measures_synthesis"])  # cache was permitted
+
+    def test_result_carries_the_measurement_claim(self) -> None:
+        res = lt.build_result(
+            rows=[{"concurrency": 1, "ok": 12, "cache_hits": 0}], knee=None,
+            recommended=1, route="synth", fmt="wav_24000", corpus="x",
+            service_config={}, meta=lt.runtime_metadata(), cache_mode="bypass")
+        self.assertEqual(res["cache_mode"], "bypass")
+        self.assertTrue(res["measurement"]["measures_synthesis"])
+
+    def test_cache_hit_response_is_counted_not_averaged(self) -> None:
+        # A hit reports X-Realtime-Factor: n/a (see app.py), so nothing fake
+        # reaches results["rtf"] — but the sample IS tallied as contamination.
+        import asyncio
+
+        class _Resp:
+            status_code = 200
+            headers = {"X-Cache": "hit", "X-Realtime-Factor": "n/a",
+                       "X-Audio-Seconds": "3.0"}
+
+        class _Client:
+            async def post(self, *a, **k):
+                return _Resp()
+
+        results = {"lat": [], "ttfb": [], "rtf": [], "audio": [], "rejected": 0,
+                   "errors": 0, "timeouts": 0, "unsupported": 0, "cache_hits": 0}
+        asyncio.run(lt._one(_Client(), "http://x", "v", "hi", "wav_24000",
+                            results, lt.request_headers()))
+        self.assertEqual(results["cache_hits"], 1)
+        self.assertEqual(results["errors"], 0)
+        self.assertNotEqual(results["rtf"][0], results["rtf"][0])  # nan, dropped
+
+
+class BenchmarkReachesTheModelTests(unittest.TestCase):
+    """The load test's OWN request, against the real app + a fake engine.
+
+    This is the regression guard: the harness fires one constant text at every
+    level, so if the server ever serves those requests from its synthesis cache
+    again, the whole ramp measures an LRU lookup and this fails.
+    """
+
+    def setUp(self) -> None:
+        from service.tests import fake_engine  # installs shims before app import
+        import service.app as appmod
+        from fastapi.testclient import TestClient
+
+        self.appmod = appmod
+        self._orig_engine = appmod.ENGINE
+        appmod.SYNTH_CACHE.clear()
+        appmod.SYNTH_CACHE.resize(8 * 1024 * 1024)   # cache ON, as shipped
+        self.engine = fake_engine.FakeEngine(workers=2, delay=0.01)
+        appmod.ENGINE = self.engine
+        self.client = TestClient(appmod.app)
+
+    def tearDown(self) -> None:
+        self.engine.close()
+        self.appmod.ENGINE = self._orig_engine
+        self.appmod.SYNTH_CACHE.clear()
+        self.appmod.SYNTH_CACHE.resize(self.appmod.SETTINGS.cache_bytes)
+
+    def _fire(self, headers):
+        return self.client.post(
+            "/v1/text-to-speech/alba", params={"output_format": "wav_24000"},
+            json={"text": lt.TEXT_DEFAULT, "model_id": "pocket_tts"},
+            headers=headers)
+
+    def test_harness_headers_make_every_request_reach_the_engine(self) -> None:
+        headers = lt.request_headers()          # the default the harness sends
+        for _ in range(3):
+            r = self._fire(headers)
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.headers["x-cache"], "bypass")
+        self.assertEqual(len(self.engine.jobs), 3,
+                         "the benchmark corpus was served from cache — the ramp "
+                         "would measure an LRU lookup, not synthesis")
+        # A bypassed run must not pollute the cache real callers share.
+        self.assertEqual(self.appmod.SYNTH_CACHE.stats()["entries"], 0)
+        self.assertEqual(self.appmod.SYNTH_CACHE.stats()["bypassed"], 3)
+
+    def test_without_the_headers_the_same_corpus_is_a_cache_hit(self) -> None:
+        # Proves the guard above is testing something real (this IS the bug).
+        for _ in range(3):
+            self.assertEqual(self._fire({}).status_code, 200)
+        self.assertEqual(len(self.engine.jobs), 1)
+
+    def test_a_cache_hit_never_reports_a_realtime_factor(self) -> None:
+        self._fire({})
+        hit = self._fire({})
+        self.assertEqual(hit.headers["x-cache"], "hit")
+        self.assertEqual(hit.headers["x-realtime-factor"], "n/a")
 
 
 # ---------------------------------------------------------------------------

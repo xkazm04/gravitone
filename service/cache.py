@@ -78,6 +78,7 @@ class SynthCache:
         self.misses = 0
         self.evictions = 0
         self.collapsed = 0  # requests served by someone else's in-flight render
+        self.bypassed = 0   # requests that asked to skip the cache entirely
 
     # -- configuration ----------------------------------------------------
     @property
@@ -97,6 +98,18 @@ class SynthCache:
         self._entries.clear()
         self._bytes = 0
         self.hits = self.misses = self.evictions = self.collapsed = 0
+        self.bypassed = 0
+
+    def note_bypass(self) -> None:
+        """Record a request that skipped the cache on purpose (``Cache-Control:
+        no-store`` / ``X-Gravitone-Cache: bypass``).
+
+        The caller does the bypassing — this object never sees the request — so
+        the count would otherwise be invisible. It matters because it is how an
+        operator can tell "the cache is doing nothing" (a benchmark run, or a
+        client that disabled it) apart from "the cache is missing constantly".
+        """
+        self.bypassed += 1
 
     def stats(self) -> dict:
         return {
@@ -108,6 +121,7 @@ class SynthCache:
             "misses": self.misses,
             "evictions": self.evictions,
             "collapsed": self.collapsed,
+            "bypassed": self.bypassed,
             "in_flight": len(self._inflight),
         }
 

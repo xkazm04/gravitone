@@ -131,8 +131,25 @@ class CacheHonestTimingTests(_Base):
         # Audio duration is a property of the clip, so it stays accurate.
         self.assertEqual(hit.headers["x-audio-seconds"],
                          miss.headers["x-audio-seconds"])
-        self.assertEqual(hit.headers["x-realtime-factor"],
-                         str(round(float(hit.headers["x-audio-seconds"]) / hit_synth, 3)))
+        # A realtime factor is a claim about the MODEL, and the hit ran none:
+        # audio ÷ ~1e-6s would be a number in the millions that a benchmark
+        # would average and a certificate would sign. It must say "n/a".
+        self.assertEqual(hit.headers["x-realtime-factor"], "n/a")
+        self.assertNotEqual(miss.headers["x-realtime-factor"], "n/a")
+
+    def test_bypass_renders_and_stores_nothing(self) -> None:
+        first = self._post({"text": "Bypass me."})
+        self.assertEqual(first.headers["x-cache"], "miss")
+        entries = appmod.SYNTH_CACHE.stats()["entries"]
+        bypassed = self.client.post(
+            "/v1/text-to-speech/alba", params={"output_format": "wav_24000"},
+            json={"text": "Bypass me."}, headers={"Cache-Control": "no-store"})
+        self.assertEqual(bypassed.headers["x-cache"], "bypass")
+        # Rendered fresh: a real synth time and a real realtime factor.
+        self.assertEqual(float(bypassed.headers["x-synth-seconds"]), 0.02)
+        self.assertNotEqual(bypassed.headers["x-realtime-factor"], "n/a")
+        # ... and the shared cache is untouched by the bypassing caller.
+        self.assertEqual(appmod.SYNTH_CACHE.stats()["entries"], entries)
 
 
 class SingleFlightTests(_Base):

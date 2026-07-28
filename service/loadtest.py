@@ -20,6 +20,15 @@ Degradation is flagged when ANY of these trip vs the level-1 baseline:
   * any HTTP 429 (queue overflow), 504 (timeout), or other errors
   * host CPU >= --cpu-ceiling% AND server realtime_factor < 1.0 (slower than realtime)
 
+Honest cache accounting: the service caches finished synthesis per process
+(``service/cache.py``, ON by default), and this harness sends ONE constant text
+at every level — so without care every request after the first would be an LRU
+lookup and the whole ramp would measure the cache, not the model. Every request
+this tool fires therefore carries the cache-bypass headers by default
+(``--cache-mode bypass``): the server renders it or fails. ``--cache-mode
+allow`` is available to characterise the cache itself, and a run that recorded
+ANY cache hit is flagged per level (``cache_hits``) and refuses certification.
+
 Honest CPU accounting: co-locating the load generator with the server means a
 whole-host CPU number double-counts the driver. Pass ``--server-pid`` (the
 benchmark scripts know the PID they launched) to split the server's process-tree
@@ -50,8 +59,37 @@ TEXT_DEFAULT = (
 )
 
 # Result-JSON schema version. Bump when the shape changes so two result files
-# can be compared safely (v1 = the pre-versioned shape; v2 = self-describing).
-SCHEMA_VERSION = 2
+# can be compared safely (v1 = the pre-versioned shape; v2 = self-describing;
+# v3 = cache-aware — the run states its cache_mode and every level reports how
+# many responses were served from cache, so a v<=2 file CANNOT be trusted as a
+# measurement of synthesis: it was produced by a harness that had no idea the
+# synthesis cache existed and may be entirely cache hits).
+SCHEMA_VERSION = 3
+
+# How the harness treats the server's synthesis cache.
+#   bypass (default) — every request carries no-store/bypass headers, so the
+#     model renders it. This is what "measuring the engine" means.
+#   allow            — cache behaves normally; use ONLY to characterise the
+#     cache. Such a run is not a valid capacity measurement and certify refuses it.
+CACHE_MODES = ("bypass", "allow")
+DEFAULT_CACHE_MODE = "bypass"
+
+# Sent on every benchmark request in bypass mode. Both spellings, so the run is
+# honest against a proxy/build that understands only the standard one.
+CACHE_BYPASS_HEADERS = {
+    "Cache-Control": "no-store",
+    "X-Gravitone-Cache": "bypass",
+}
+
+
+def request_headers(cache_mode: str = DEFAULT_CACHE_MODE) -> dict:
+    """HTTP headers for one benchmark request.
+
+    Defaulted to bypass ON PURPOSE: an operator who never heard of the cache
+    must still get numbers that describe the model. Opting into cached numbers
+    has to be an explicit ``--cache-mode allow``.
+    """
+    return dict(CACHE_BYPASS_HEADERS) if cache_mode != "allow" else {}
 
 # Below this many successful samples per level, p95/p99 are statistically noisy
 # and get flagged rather than trusted.
@@ -241,13 +279,43 @@ def mark_low_confidence(row: dict, threshold: int = LOW_CONFIDENCE_N) -> dict:
     return row
 
 
+def cache_hits_total(rows) -> int:
+    """How many samples across the whole run were served from the cache."""
+    return sum(int(r.get("cache_hits") or 0) for r in rows)
+
+
+def measurement_block(rows, cache_mode: str) -> dict:
+    """What this run is a measurement OF — the claim the certificate rests on.
+
+    ``measures_synthesis`` is the only honest basis for a capacity number: it
+    is true when the run bypassed the cache AND no level recorded a hit.
+    """
+    hits = cache_hits_total(rows)
+    ok = cache_mode != "allow" and hits == 0
+    return {
+        "cache_mode": cache_mode,
+        "cache_hits_total": hits,
+        "measures_synthesis": ok,
+        "note": ("every request bypassed the synthesis cache; latency, "
+                 "throughput and realtime factor describe the model"
+                 if ok else
+                 f"cache_mode={cache_mode}, {hits} response(s) served from "
+                 f"cache — these numbers describe the cache in part, NOT the "
+                 f"model, and cannot certify hardware capacity"),
+    }
+
+
 def build_result(rows, knee, recommended, *, route, fmt, corpus,
-                 service_config, meta, extra=None) -> dict:
-    """Assemble the self-describing result document (schema v2).
+                 service_config, meta, cache_mode=DEFAULT_CACHE_MODE,
+                 extra=None) -> dict:
+    """Assemble the self-describing result document (schema v3).
 
     Everything needed to reproduce/compare a run travels WITH the numbers:
     schema version, git SHA, torch + fpmath mode, the server's own /health
-    config, and exactly what was sent (corpus/format/route).
+    config, exactly what was sent (corpus/format/route), and — since v3 — what
+    the run measured (``measurement``: cache mode + any cache hits). A v<=2
+    file predates the cache-awareness fix and must not be read as a synthesis
+    measurement.
     """
     result = {
         "schema_version": meta["schema_version"],
@@ -257,6 +325,8 @@ def build_result(rows, knee, recommended, *, route, fmt, corpus,
         "route": route,
         "format": fmt,
         "corpus": corpus,
+        "cache_mode": cache_mode,
+        "measurement": measurement_block(rows, cache_mode),
         "service_config": service_config,
         "levels": rows,
         "knee": knee,
@@ -406,19 +476,25 @@ def _safe_float(v, default: float) -> float:
         return default
 
 
-async def _one(client, url, voice, text, fmt, results):
+async def _one(client, url, voice, text, fmt, results, headers=None):
     t0 = time.perf_counter()
     try:
         r = await client.post(
             f"{url}/v1/text-to-speech/{voice}",
             params={"output_format": fmt},
             json={"text": text, "model_id": "pocket_tts"},
+            headers=headers or {},
             timeout=300,
         )
         dt = time.perf_counter() - t0
         bucket = classify_response(r.status_code)
         if bucket == "ok":
             results["lat"].append(dt)
+            # X-Cache: hit means the server replayed stored audio — that sample
+            # measured an LRU lookup, not the model. Count it so the level (and
+            # the certificate) can say so instead of averaging it in silently.
+            if (r.headers.get("X-Cache") or "").lower() == "hit":
+                results["cache_hits"] = results.get("cache_hits", 0) + 1
             # Parse the timing headers defensively: a malformed X-Realtime-Factor
             # / X-Audio-Seconds must NOT raise here — that would drop this
             # already-successful request into the `except` below, recording its
@@ -454,13 +530,14 @@ async def _measure_stream_timing(aiter, t0, clock=time.perf_counter):
     return ttfb, clock() - t0
 
 
-async def _one_stream(client, url, voice, text, fmt, results):
+async def _one_stream(client, url, voice, text, fmt, results, headers=None):
     t0 = time.perf_counter()
     try:
         async with client.stream(
             "POST", f"{url}/v1/text-to-speech/{voice}/stream",
             params={"output_format": fmt},
             json={"text": text, "model_id": "pocket_tts"},
+            headers=headers or {},
             timeout=300,
         ) as r:
             if r.status_code == 200:
@@ -519,9 +596,11 @@ async def _sample_resources(stop_evt, samples, server_pid=None):
 
 
 async def run_level(url, voice, text, fmt, concurrency, n_requests, route="synth",
-                    server_pid=None):
+                    server_pid=None, cache_mode=DEFAULT_CACHE_MODE):
     results = {"lat": [], "ttfb": [], "rtf": [], "audio": [],
-               "rejected": 0, "errors": 0, "timeouts": 0, "unsupported": 0}
+               "rejected": 0, "errors": 0, "timeouts": 0, "unsupported": 0,
+               "cache_hits": 0}
+    headers = request_headers(cache_mode)
     samples = {"cpu": [], "mem": [], "server": [], "driver": []}
     stop_evt = asyncio.Event()
     sampler = asyncio.create_task(_sample_resources(stop_evt, samples, server_pid))
@@ -534,7 +613,7 @@ async def run_level(url, voice, text, fmt, concurrency, n_requests, route="synth
     async with httpx.AsyncClient(limits=limits) as client:
         async def bounded():
             async with sem:
-                await one(client, url, voice, text, fmt, results)
+                await one(client, url, voice, text, fmt, results, headers)
         await asyncio.gather(*[bounded() for _ in range(n_requests)])
     wall = time.perf_counter() - wall0
 
@@ -575,6 +654,12 @@ async def run_level(url, voice, text, fmt, concurrency, n_requests, route="synth
         "driver_cpu_max_pct": driver_max,
         "driver_saturated": is_driver_saturated(driver_max),
         "mem_max_pct": round(max(samples["mem"]), 1) if samples["mem"] else None,
+        # What this level actually measured. cache_hits > 0 means some samples
+        # were LRU lookups, so the level's latency/throughput/rtf describe the
+        # cache in part — never silently, always in the JSON.
+        "cache_mode": cache_mode,
+        "cache_hits": results.get("cache_hits", 0),
+        "measures_synthesis": results.get("cache_hits", 0) == 0,
     }
     if route == "stream":
         # lat_* above ARE the total-response percentiles; add first-chunk (TTFB)
@@ -586,7 +671,7 @@ async def run_level(url, voice, text, fmt, concurrency, n_requests, route="synth
     return row
 
 
-async def warmup(url, voice, text, fmt, n):
+async def warmup(url, voice, text, fmt, n, cache_mode=DEFAULT_CACHE_MODE):
     """Fire N synth requests before the ramp so level 1 doesn't eat cold-start.
 
     These requests are thrown away — never recorded in any level's stats — so a
@@ -596,10 +681,11 @@ async def warmup(url, voice, text, fmt, n):
     if n <= 0:
         return 0
     results = {"lat": [], "rtf": [], "audio": [], "rejected": 0, "errors": 0,
-               "timeouts": 0}
+               "timeouts": 0, "cache_hits": 0}
+    headers = request_headers(cache_mode)
     async with httpx.AsyncClient() as client:
         for _ in range(n):
-            await _one(client, url, voice, text, fmt, results)
+            await _one(client, url, voice, text, fmt, results, headers)
     return len(results["lat"])
 
 
@@ -677,6 +763,7 @@ async def run_ramp(args, levels, n_per_level, *, scrape=None):
     knee = None
     route = getattr(args, "route", "synth")
     server_pid = getattr(args, "server_pid", None)
+    cache_mode = getattr(args, "cache_mode", DEFAULT_CACHE_MODE)
 
     if route == "stream":
         # Stream mode leads with TTFB (first-chunk latency), the headline number;
@@ -696,7 +783,8 @@ async def run_ramp(args, levels, n_per_level, *, scrape=None):
     for c in levels:
         before = await scrape() if scrape is not None else None
         row = await run_level(args.url, args.voice, args.text, args.format, c,
-                              n_per_level, route=route, server_pid=server_pid)
+                              n_per_level, route=route, server_pid=server_pid,
+                              cache_mode=cache_mode)
         after = await scrape() if scrape is not None else None
         mark_low_confidence(row)
         rows.append(row)
@@ -729,6 +817,12 @@ async def run_ramp(args, levels, n_per_level, *, scrape=None):
                   f"{row['driver_cpu_max_pct']}% (>= {DRIVER_SATURATION_PCT}% of one "
                   f"core) — the driver may be the bottleneck at conc={c}; reduce "
                   f"concurrency or run the load generator off-box")
+        if row.get("cache_hits"):
+            print(f"     ^ CACHE CONTAMINATED: {row['cache_hits']} of {row['ok']} "
+                  f"response(s) came from the server's synthesis cache (X-Cache: "
+                  f"hit), so this level did NOT measure the model. Run with "
+                  f"--cache-mode bypass (the default) against a build that "
+                  f"honours Cache-Control: no-store.")
         if row.get("low_confidence"):
             print(f"     ^ low confidence: only {row['ok']} sample(s) < {LOW_CONFIDENCE_N}; "
                   f"treat p95/p99 as indicative, not exact")
@@ -765,6 +859,10 @@ def _write_result(args, result) -> None:
     with open(args.out, "w") as f:
         json.dump(result, f, indent=2)
     print(f"wrote {args.out}")
+    m = result.get("measurement") or {}
+    if not m.get("measures_synthesis", False):
+        print(f"!! this run is NOT a synthesis measurement: {m.get('note')}")
+        print("   `python -m service.certify` will refuse it.")
     print_plan(result)
 
 
@@ -809,7 +907,8 @@ async def run_replicas_mode(args, levels, n_per_level) -> None:
             args.server_pid = proc.pid
         if args.warmup > 0:
             print(f"warming up: {args.warmup} discarded synth request(s) ...")
-            warmed = await warmup(args.url, args.voice, args.text, args.format, args.warmup)
+            warmed = await warmup(args.url, args.voice, args.text, args.format,
+                                  args.warmup, cache_mode=args.cache_mode)
             print(f"warmup complete ({warmed}/{args.warmup} ok)")
 
         async def scrape():
@@ -825,6 +924,7 @@ async def run_replicas_mode(args, levels, n_per_level) -> None:
             rows, knee, recommended,
             route=args.route, fmt=args.format, corpus=args.text,
             service_config=service_config, meta=runtime_metadata(),
+            cache_mode=args.cache_mode,
             extra={"topology": topology_block("replicas", args.replicas, per_level),
                    "cpu_accounting": cpu_accounting_note(args.server_pid)})
         _write_result(args, result)
@@ -863,6 +963,12 @@ async def main():
                          "driver's driver_cpu_*), so a co-located run doesn't "
                          "credit the load generator to the server. Auto-detected "
                          "in --replicas mode. Without it, only host CPU is reported.")
+    ap.add_argument("--cache-mode", choices=CACHE_MODES, default=DEFAULT_CACHE_MODE,
+                    help="bypass (default): every request carries "
+                         "Cache-Control: no-store so the MODEL renders it — the "
+                         "only mode that measures synthesis. allow: let the "
+                         "server's synthesis cache serve repeats; use it to "
+                         "characterise the cache, never to certify hardware.")
     ap.add_argument("--degrade-factor", type=float, default=2.0)
     ap.add_argument("--cpu-ceiling", type=float, default=95.0)
     ap.add_argument("--out", default="service/loadtest_result.json")
@@ -907,7 +1013,8 @@ async def main():
     # Warm the model so level 1's baseline isn't polluted by cold-start.
     if args.warmup > 0:
         print(f"warming up: {args.warmup} discarded synth request(s) ...")
-        warmed = await warmup(args.url, args.voice, args.text, args.format, args.warmup)
+        warmed = await warmup(args.url, args.voice, args.text, args.format,
+                              args.warmup, cache_mode=args.cache_mode)
         print(f"warmup complete ({warmed}/{args.warmup} ok)")
 
     # Single mode now also scrapes the server's own GET /metrics before/after
@@ -922,6 +1029,7 @@ async def main():
         rows, knee, recommended,
         route=args.route, fmt=args.format, corpus=args.text,
         service_config=service_config, meta=runtime_metadata(),
+        cache_mode=args.cache_mode,
         extra={"topology": topology_block("single", 1, per_level),
                "cpu_accounting": cpu_accounting_note(args.server_pid)})
     _write_result(args, result)
