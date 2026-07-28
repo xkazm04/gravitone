@@ -121,7 +121,11 @@ class Settings:
     # Fallback built-in voice if a requested voice_id isn't found.
     default_voice: str = _str("TTS_DEFAULT_VOICE", "alba")
 
-    # --- Generation defaults (overridable per request) --------------------
+    # --- Generation defaults ----------------------------------------------
+    # Passed to TTSModel.generate_audio(max_tokens=...) for EVERY job. No HTTP
+    # route exposes it (engine.submit's max_tokens parameter has no caller), so
+    # despite the old "overridable per request" wording this is a process-wide
+    # constant today; change it with the env var, not a request field.
     max_tokens: int = _int("TTS_MAX_TOKENS", 50)
 
     # --- External encoder --------------------------------------------------
@@ -132,6 +136,17 @@ class Settings:
     # libmp3lame is single-threaded anyway, so 1 costs nothing.
     #   0 — let ffmpeg decide (the pre-Arm-pass behaviour)
     ffmpeg_threads: int = _int("TTS_FFMPEG_THREADS", 1)
+
+    # --- Long-form segmentation -------------------------------------------
+    # Target size, in characters, of ONE synthesis unit. Long text is
+    # sentence-split and neighbouring sentences are coalesced up to this budget,
+    # so a long body becomes several jobs that run on different workers instead
+    # of one serial job. Text shorter than the budget stays a single unit and
+    # takes exactly the pre-segmentation path (identical bytes, identical
+    # headers). Keep it high enough that a unit is a natural prosodic span and
+    # low enough that an 8000-char body (the request cap) stays well inside the
+    # admission window (workers + queue_max): 8000/350 = 23 units vs 33 slots.
+    chunk_chars: int = _int("TTS_CHUNK_CHARS", 350)
 
     # --- Server ------------------------------------------------------------
     host: str = _str("TTS_HOST", "127.0.0.1")

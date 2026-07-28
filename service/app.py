@@ -19,6 +19,7 @@ import asyncio
 import logging
 import re
 import struct
+import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -229,18 +230,23 @@ def _abandon_all(jobs) -> None:
             abandoned.set()
 
 
-def _submit_batch(specs: list[tuple[str, str, dict]]) -> list:
+def _submit_batch(specs: list[tuple[str, str, dict]],
+                  frames_after_eos: int | None = None) -> list:
     """Submit a whole batch up front (concurrency, not N× serial latency).
 
     Admission is decided here, so a mid-list rejection means the request fails
     with 429 — but the jobs already submitted must be ABANDONED rather than left
     to synthesize into a response that will never be sent.
+
+    ``frames_after_eos`` applies to every job in the batch (the drop-in route
+    carries one per request; /v1/speak and /v1/performance don't expose it).
     """
     jobs = []
     try:
         for voice_id, text, overrides in specs:
             jobs.append(ENGINE.submit(voice_id=voice_id, text=text,
-                                      overrides=overrides))
+                                      overrides=overrides,
+                                      frames_after_eos=frames_after_eos))
     except AdmissionRejected:
         _abandon_all(jobs)
         raise
@@ -362,6 +368,39 @@ def _split_sentences(text: str) -> list[str]:
     return parts or [text]
 
 
+def _chunk_text(text: str) -> list[str]:
+    """Split text into the synthesis UNITS a request is submitted as.
+
+    Sentence-split (``_split_sentences``), then coalesce neighbouring sentences
+    up to ``SETTINGS.chunk_chars`` so a unit is a natural prosodic span rather
+    than a two-word fragment. Two properties the callers rely on:
+
+    * Text that fits the budget comes back as ONE unit — so a short request
+      takes exactly the pre-segmentation code path, byte for byte.
+    * The unit count is bounded by len(text)/budget, so the whole batch fits
+      the engine's admission window instead of scaling with sentence count.
+
+    Order is preserved; units are re-joined for concatenation in this order.
+    """
+    parts = _split_sentences(text)
+    if len(parts) <= 1:
+        return parts
+    budget = max(1, int(SETTINGS.chunk_chars))
+    chunks: list[str] = []
+    cur = ""
+    for part in parts:
+        if not cur:
+            cur = part
+        elif len(cur) + 1 + len(part) <= budget:
+            cur = f"{cur} {part}"
+        else:
+            chunks.append(cur)
+            cur = part
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
 def _wav_stream_header(sample_rate: int, channels: int = 1, bits: int = 16) -> bytes:
     """A 44-byte PCM WAV header for a stream of unknown total length.
 
@@ -461,28 +500,69 @@ async def text_to_speech(
     output_format: str = Query("wav_24000"),
     emotion: str | None = Query(None, description="Gravitone extension: address a Character's emotion voice (or use {character_id}:{emotion} as the path voice_id)"),
 ):
+    """Drop-in ElevenLabs synthesis.
+
+    Long text is segmented (``_chunk_text``) and the units are submitted as ONE
+    batch, so an N-unit body occupies up to N workers concurrently instead of
+    serialising on a single worker — the same treatment /v1/speak and
+    /v1/performance already get. The segments are re-joined with the engine's
+    ``concat_wavs`` (the identical path /v1/speak uses, so seams behave the
+    same). Text that fits ``SETTINGS.chunk_chars`` stays ONE unit and takes the
+    original single-job path unchanged, bytes and headers included.
+    """
     assert ENGINE is not None
     fmt = _parse_format(output_format)  # 400s early on an unsupported format
     voice_id, emotion_headers = await _resolve_emotion_address(voice_id, emotion)
 
-    try:
-        result = await _submit_and_wait(voice_id, req.text, _overrides(req.voice_settings),
-                                        frames_after_eos=req.frames_after_eos)
-    except _Backpressure as exc:
-        # Backpressure: tell the client to retry — the queue cap was hit.
-        return _backpressure_response(exc)
-
-    native_rate = result.sample_rate
+    units = _chunk_text(req.text)
+    overrides = _overrides(req.voice_settings)
     extra_headers: dict[str, str] = {}
+
+    if len(units) <= 1:
+        # Single unit: identical to the pre-segmentation behaviour, including
+        # the timing headers (X-Synth-Seconds stays the job's own synthesis
+        # time, which for one job IS the request's synthesis wall-clock minus
+        # the queue wait already reported in X-Queue-Seconds).
+        try:
+            result = await _submit_and_wait(voice_id, req.text, overrides,
+                                            frames_after_eos=req.frames_after_eos)
+        except _Backpressure as exc:
+            # Backpressure: tell the client to retry — the queue cap was hit.
+            return _backpressure_response(exc)
+        wav_bytes = result.wav_bytes
+        native_rate = result.sample_rate
+        audio_seconds = result.audio_seconds
+        synth_seconds = result.synth_seconds
+        queue_seconds = result.queue_seconds
+    else:
+        t_start = time.perf_counter()
+        try:
+            jobs = _submit_batch([(voice_id, unit, overrides) for unit in units],
+                                 frames_after_eos=req.frames_after_eos)
+        except AdmissionRejected as exc:
+            # Admission is decided for the whole batch; _submit_batch already
+            # abandoned the siblings that did get in.
+            return _backpressure_response(_Backpressure(str(exc)))
+        results = await _gather_results(jobs)
+        wav_bytes = await _offload(concat_wavs, [r.wav_bytes for r in results])
+        native_rate = results[0].sample_rate
+        audio_seconds = round(sum(r.audio_seconds for r in results), 3)
+        # Wall-clock for the WHOLE request, not the sum of per-segment synth
+        # times: the segments ran concurrently, so summing them would report a
+        # duration that never elapsed (and a realtime factor that never was).
+        synth_seconds = round(time.perf_counter() - t_start, 3)
+        queue_seconds = round(max(r.queue_seconds for r in results), 3)
+        extra_headers["X-Synth-Segments"] = str(len(units))
+
     loop = asyncio.get_event_loop()
     if fmt.kind == "mp3":
         # Honour the requested bitrate and (via ffmpeg -ar) sample rate.
         bitrate = f"{fmt.bitrate}k"
         ar = fmt.sample_rate if fmt.sample_rate != native_rate else None
         body = await loop.run_in_executor(
-            None, lambda: wav_bytes_to_mp3(result.wav_bytes, bitrate=bitrate, sample_rate=ar))
+            None, lambda: wav_bytes_to_mp3(wav_bytes, bitrate=bitrate, sample_rate=ar))
     elif fmt.kind == "pcm":
-        wav = result.wav_bytes
+        wav = wav_bytes
         if fmt.sample_rate != native_rate:
             wav = await loop.run_in_executor(
                 None, resample_wav_bytes, wav, fmt.sample_rate)
@@ -490,7 +570,7 @@ async def text_to_speech(
         body = wav[44:]
         extra_headers["X-Sample-Rate"] = str(fmt.sample_rate)
     else:  # wav
-        body = result.wav_bytes
+        body = wav_bytes
         if fmt.sample_rate != native_rate:
             body = await loop.run_in_executor(
                 None, resample_wav_bytes, body, fmt.sample_rate)
@@ -498,11 +578,11 @@ async def text_to_speech(
     return Response(
         content=body, media_type=fmt.content_type,
         headers={
-            "X-Audio-Seconds": str(result.audio_seconds),
-            "X-Synth-Seconds": str(result.synth_seconds),
-            "X-Queue-Seconds": str(result.queue_seconds),
-            "X-Realtime-Factor": str(round(result.audio_seconds / result.synth_seconds, 3))
-            if result.synth_seconds else "n/a",
+            "X-Audio-Seconds": str(audio_seconds),
+            "X-Synth-Seconds": str(synth_seconds),
+            "X-Queue-Seconds": str(queue_seconds),
+            "X-Realtime-Factor": str(round(audio_seconds / synth_seconds, 3))
+            if synth_seconds else "n/a",
             **extra_headers,
             **emotion_headers,
             **_ignored_headers(req.voice_settings),
