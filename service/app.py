@@ -21,6 +21,7 @@ import re
 import struct
 import time
 import uuid
+from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -401,6 +402,26 @@ def _chunk_text(text: str) -> list[str]:
     return chunks
 
 
+# How long a stream waits before retrying a refused segment submission. Short
+# enough to pick a freed slot up promptly, long enough not to spin the loop.
+_ADMISSION_RETRY_S = 0.05
+
+
+def _stream_window() -> int:
+    """How many segments of one stream may sit in the engine at a time.
+
+    Auto (``stream_window=0``) is ``workers + 1``: enough to keep every worker
+    of this process fed with one in reserve, so the stream never stalls waiting
+    for its own next segment, while the rest of the admission window stays
+    available to other callers. Never below 2 — a window of 1 would serialise
+    the stream and lose the concurrency the route exists for.
+    """
+    configured = int(SETTINGS.stream_window)
+    if configured > 0:
+        return max(2, configured)
+    return max(2, SETTINGS.workers + 1)
+
+
 def _wav_stream_header(sample_rate: int, channels: int = 1, bits: int = 16) -> bytes:
     """A 44-byte PCM WAV header for a stream of unknown total length.
 
@@ -600,12 +621,19 @@ async def text_to_speech_stream(
 ):
     """Low-latency streaming synthesis (ElevenLabs' headline feature).
 
-    The text is sentence-split, every sentence is submitted to the worker pool
-    up front (so admission — the 429 backpressure decision — happens BEFORE any
-    bytes are streamed, never mid-stream), and audio is streamed back IN ORDER
-    as each segment finishes. Because segments synthesize concurrently across
-    workers, the first chunk leaves before the last segment is done — latency to
-    first byte drops from full-synthesis time to first-sentence time.
+    The text is segmented (``_chunk_text``) and submitted to the worker pool in
+    a bounded ROLLING WINDOW: the first window is submitted before the response
+    starts (so admission — the 429 backpressure decision — happens BEFORE any
+    bytes are streamed, never mid-stream) and each further segment is submitted
+    as an earlier one is consumed. Audio streams back IN ORDER as each segment
+    finishes; because the window keeps several segments in flight, the first
+    chunk leaves before the last segment is done — latency to first byte drops
+    from full-synthesis time to first-segment time.
+
+    Script length therefore no longer decides admission. Submitting every
+    sentence up front meant any script longer than the admission window
+    (workers + queue_max, 33 by default) was rejected with 429 before a byte
+    streamed — the failure scaled exactly with the input people demo with.
 
     Formats: `pcm_*` streams raw PCM16 chunks; `wav_*` streams a single
     streaming WAV header then raw PCM16 samples; `mp3_*` returns 501 (MP3 needs
@@ -618,8 +646,10 @@ async def text_to_speech_stream(
     numbers cannot be known when the headers go out. Only pre-stream headers
     (X-Stream, X-Stream-Segments, emotion resolution) are emitted.
 
-    A script with more sentences than the pool admission window (workers +
-    queue_max) is rejected with 429 up front rather than truncated mid-stream.
+    A genuinely saturated engine still rejects the request with 429 up front
+    (the first window can't be admitted) rather than truncating mid-stream. The
+    whole response is bounded by ONE deadline (``stream_deadline_s``); when it
+    expires the stream ends and every un-consumed segment is abandoned.
     """
     assert ENGINE is not None
     fmt = _parse_format(output_format)  # 400s early on an unsupported format
@@ -632,49 +662,91 @@ async def text_to_speech_stream(
         )
     voice_id, emotion_headers = await _resolve_emotion_address(voice_id, emotion)
 
-    sentences = _split_sentences(req.text)
+    chunks = _chunk_text(req.text)
     overrides = _overrides(req.voice_settings)
+    window = min(len(chunks), _stream_window())
 
-    # Submit every segment up front: this decides admission (429) before we
+    # Submit the FIRST WINDOW up front: this decides admission (429) before we
     # commit to a streaming response, keeping backpressure semantics identical
-    # to the non-stream route. Workers pick them up concurrently.
-    jobs = []
+    # to the non-stream route. Workers pick the window up concurrently; the
+    # rest is submitted as segments are consumed.
     try:
-        for text in sentences:
-            jobs.append(ENGINE.submit(voice_id=voice_id, text=text,
-                                      overrides=overrides,
-                                      frames_after_eos=req.frames_after_eos))
+        submitted = _submit_batch([(voice_id, text, overrides)
+                                   for text in chunks[:window]],
+                                  frames_after_eos=req.frames_after_eos)
     except AdmissionRejected as exc:
         return _backpressure_response(_Backpressure(str(exc)))
 
+    pending = deque(chunks[window:])
+    total = len(chunks)
     loop = asyncio.get_event_loop()
 
     async def _audio_stream():
         header_sent = False
         consumed = 0
+        deadline = time.monotonic() + SETTINGS.stream_deadline_s
         try:
-            for job in jobs:
+            while True:
+                # Keep the rolling window full. A refusal here is NOT the
+                # caller's 429 (the status is long gone) — it just means the
+                # engine is busy, so we retry after the next segment.
+                while pending and (len(submitted) - consumed) < window:
+                    try:
+                        submitted.append(ENGINE.submit(
+                            voice_id=voice_id, text=pending[0],
+                            overrides=overrides,
+                            frames_after_eos=req.frames_after_eos))
+                    except AdmissionRejected:
+                        break
+                    except ShuttingDown:
+                        logger.info("stream stopped submitting at segment "
+                                    "%d/%d: server shutting down",
+                                    len(submitted) + 1, total)
+                        pending.clear()
+                        break
+                    pending.popleft()
+
+                if consumed >= len(submitted):
+                    if not pending:
+                        return  # whole script delivered
+                    # Nothing of ours is in flight and the engine is full of
+                    # someone else's work: wait for a slot, bounded by the one
+                    # whole-request deadline.
+                    if time.monotonic() >= deadline:
+                        logger.error("stream deadline (%ss) exceeded waiting "
+                                     "for admission at segment %d/%d; "
+                                     "truncating stream",
+                                     SETTINGS.stream_deadline_s, consumed + 1,
+                                     total)
+                        return
+                    await asyncio.sleep(_ADMISSION_RETRY_S)
+                    continue
+
+                job = submitted[consumed]
+                remaining = deadline - time.monotonic()
                 try:
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError
                     result = await asyncio.wait_for(
-                        asyncio.wrap_future(job.future),
-                        timeout=SETTINGS.request_timeout_s,
-                    )
+                        asyncio.wrap_future(job.future), timeout=remaining)
                 except asyncio.TimeoutError:
+                    # ONE deadline for the whole response, not one per segment.
                     # Status is already sent; the only client signal left is
                     # closing the stream (short clip / reset connection).
                     if ENGINE is not None:
                         ENGINE.metrics.on_timeout()
-                    logger.error("stream segment %d/%d timed out; truncating "
-                                 "stream", consumed + 1, len(jobs))
+                    logger.error("stream deadline (%ss) exceeded at segment "
+                                 "%d/%d; truncating stream",
+                                 SETTINGS.stream_deadline_s, consumed + 1, total)
                     return
                 except ShuttingDown:
                     logger.info("stream truncated by graceful shutdown at "
-                                "segment %d/%d", consumed + 1, len(jobs))
+                                "segment %d/%d", consumed + 1, total)
                     return
                 except Exception as exc:  # noqa: BLE001 - status already sent
                     request_id = uuid.uuid4().hex[:8]
                     logger.error("stream segment %d/%d failed [request %s]: %s",
-                                 consumed + 1, len(jobs), request_id, exc,
+                                 consumed + 1, total, request_id, exc,
                                  exc_info=True)
                     return
                 consumed += 1
@@ -692,15 +764,14 @@ async def text_to_speech_stream(
                     header_sent = True
                 yield samples
         finally:
-            # Stream over early (segment timeout/error, or the client hung up —
-            # GeneratorExit lands here): whatever is still queued will never be
-            # read, so mark it abandoned and let the workers skip it un-run.
-            for job in jobs[consumed:]:
-                job.abandoned.set()
+            # Stream over early (deadline, segment error, or the client hung up
+            # — GeneratorExit lands here): whatever is still queued will never
+            # be read, so mark it abandoned and let the workers skip it un-run.
+            _abandon_all(submitted[consumed:])
 
     stream_headers = {
         "X-Stream": "true",
-        "X-Stream-Segments": str(len(jobs)),
+        "X-Stream-Segments": str(total),
         **emotion_headers,
         **_ignored_headers(req.voice_settings),
     }

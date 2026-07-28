@@ -21,10 +21,16 @@ from fastapi.testclient import TestClient
 class StreamingTests(unittest.TestCase):
     def setUp(self) -> None:
         self._orig = appmod.ENGINE
+        self._orig_settings = appmod.SETTINGS
+        # These cases exercise per-SEGMENT mechanics, so pin one segment per
+        # sentence: with the production chunk budget (350 chars) their short
+        # fixtures would coalesce into a single unit and prove nothing.
+        appmod.SETTINGS = dataclasses.replace(appmod.SETTINGS, chunk_chars=1)
         self.client = TestClient(appmod.app)
 
     def tearDown(self) -> None:
         appmod.ENGINE = self._orig
+        appmod.SETTINGS = self._orig_settings
 
     def test_first_chunk_before_last_segment_finishes(self) -> None:
         # seg0 is fast, the rest are slow -> the first chunk must leave the
@@ -136,16 +142,17 @@ class StreamingTests(unittest.TestCase):
         self.assertTrue(eng.jobs[1].abandoned.is_set())
         self.assertTrue(eng.jobs[2].abandoned.is_set())
 
-    def test_midstream_timeout_counts_and_truncates(self) -> None:
-        # A segment that outlives request_timeout_s mid-stream must increment
-        # the same timeout metric the non-stream path counts (it was skipped
-        # entirely before) and truncate the stream.
+    def test_whole_request_deadline_counts_and_truncates(self) -> None:
+        # ONE deadline bounds the whole response (it used to be
+        # request_timeout_s per segment, so an N-segment stream could run N ×
+        # 120s). Exceeding it must increment the same timeout metric the
+        # non-stream path counts and truncate the stream.
         eng = fake_engine.FakeEngine(
             workers=1, delays={"One.": 0.01, "Two.": 0.6, "Three.": 0.01})
         appmod.ENGINE = eng
         orig_settings = appmod.SETTINGS  # frozen dataclass — swap a copy in
         appmod.SETTINGS = dataclasses.replace(orig_settings,
-                                              request_timeout_s=0.15)
+                                              stream_deadline_s=0.15)
 
         async def _drive():
             resp = await appmod.text_to_speech_stream(
@@ -162,10 +169,12 @@ class StreamingTests(unittest.TestCase):
 
         self.assertEqual(len(chunks), 1)
         self.assertEqual(eng.metrics.timeouts, 1)
-        self.assertIn("stream segment 2/3 timed out", "\n".join(captured.output))
+        self.assertIn("stream deadline (0.15s) exceeded at segment 2/3",
+                      "\n".join(captured.output))
 
     def test_backpressure_returns_429_before_streaming(self) -> None:
-        # capacity 1 but two sentences -> the second submit is rejected up front.
+        # capacity 1 but a 2-segment window -> the second submit of the FIRST
+        # window is rejected up front, before any byte is committed.
         appmod.ENGINE = fake_engine.FakeEngine(workers=2, delay=0.02, capacity=1)
         resp = self.client.post(
             "/v1/text-to-speech/alba/stream",
@@ -174,6 +183,83 @@ class StreamingTests(unittest.TestCase):
         )
         self.assertEqual(resp.status_code, 429)
         self.assertEqual(resp.headers["retry-after"], "1")
+        # 429 means NO body was streamed: backpressure never truncates.
+        self.assertNotIn("x-stream", resp.headers)
+
+
+class RollingWindowTests(unittest.TestCase):
+    """Script length must not decide admission.
+
+    Submitting every sentence up front capped a script at the pool's admission
+    window (workers + queue_max = 33 by default): anything longer was a
+    guaranteed 429 before a byte streamed. Segments are now submitted in a
+    bounded rolling window instead.
+    """
+
+    def setUp(self) -> None:
+        self._orig = appmod.ENGINE
+        self._orig_settings = appmod.SETTINGS
+        appmod.SETTINGS = dataclasses.replace(appmod.SETTINGS, chunk_chars=1)
+        self.client = TestClient(appmod.app)
+
+    def tearDown(self) -> None:
+        eng = appmod.ENGINE
+        if isinstance(eng, fake_engine.FakeEngine):
+            eng.close()
+        appmod.ENGINE = self._orig
+        appmod.SETTINGS = self._orig_settings
+
+    def test_200_sentence_script_streams_to_completion(self) -> None:
+        # Default config: workers=1, queue_max=32 -> 33 admission slots. This
+        # script is 200 segments; up-front submission made it a certain 429.
+        eng = fake_engine.FakeEngine(workers=1, delay=0.0, capacity=33)
+        appmod.ENGINE = eng
+        text = " ".join(f"Sentence number {i}." for i in range(200))
+        with self.client.stream(
+            "POST", "/v1/text-to-speech/alba/stream",
+            params={"output_format": "pcm_24000"},
+            json={"text": text},
+        ) as resp:
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(resp.headers["x-stream-segments"], "200")
+            body = resp.read()
+        # Every segment delivered, none dropped.
+        self.assertEqual(len(body), 200 * 480)
+        self.assertEqual(len(eng.jobs), 200)
+
+    def test_window_bounds_concurrent_admission(self) -> None:
+        # capacity 2 == the auto window (workers=1 -> 2). A 10-segment script
+        # completes anyway, which is only possible if the stream never holds
+        # more than the window in the engine at once.
+        eng = fake_engine.FakeEngine(workers=1, delay=0.0, capacity=2)
+        appmod.ENGINE = eng
+        text = " ".join(f"Line {i}." for i in range(10))
+        with self.client.stream(
+            "POST", "/v1/text-to-speech/alba/stream",
+            params={"output_format": "pcm_24000"},
+            json={"text": text},
+        ) as resp:
+            self.assertEqual(resp.status_code, 200)
+            body = resp.read()
+        self.assertEqual(len(body), 10 * 480)
+        self.assertEqual(eng.submit_order,
+                         [f"Line {i}." for i in range(10)])  # in order
+
+    def test_segments_stream_in_request_order(self) -> None:
+        eng = fake_engine.FakeEngine(workers=3, delays={
+            "Alpha.": 0.12, "Beta.": 0.01, "Gamma.": 0.01})
+        appmod.ENGINE = eng
+        with self.client.stream(
+            "POST", "/v1/text-to-speech/alba/stream",
+            params={"output_format": "pcm_24000"},
+            json={"text": "Alpha. Beta. Gamma."},
+        ) as resp:
+            body = resp.read()
+        # Alpha is the slowest yet must still be the first 480 bytes.
+        for i, job in enumerate(eng.jobs):
+            self.assertEqual(body[i * 480:(i + 1) * 480],
+                             job.future.result().wav_bytes[44:],
+                             f"segment {i} out of order")
 
 
 if __name__ == "__main__":

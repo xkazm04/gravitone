@@ -231,7 +231,13 @@ class IgnoredSettingsTests(_Base):
 
 class StreamResampleTests(_Base):
     def test_stream_pcm_resamples_per_segment(self) -> None:
+        import dataclasses
         import scipy.signal
+        # One segment per sentence: at the production chunk budget (350 chars)
+        # this two-sentence fixture is a single unit and couldn't show
+        # PER-SEGMENT resampling, which is what this pins.
+        self.addCleanup(setattr, appmod, "SETTINGS", appmod.SETTINGS)
+        appmod.SETTINGS = dataclasses.replace(appmod.SETTINGS, chunk_chars=1)
         scipy.signal.resample_poly.calls.clear()
         with self.client.stream(
             "POST", "/v1/text-to-speech/alba/stream",

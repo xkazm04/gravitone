@@ -156,6 +156,20 @@ class Settings:
     api_key: str = _str("TTS_API_KEY", "")
     # How long a request will wait for a worker before giving up (seconds).
     request_timeout_s: float = float(_str("TTS_REQUEST_TIMEOUT_S", "120"))
+    # Whole-request ceiling for a STREAMING synthesis (seconds).
+    # request_timeout_s is a per-job ceiling; applied per segment it bounded
+    # nothing at the request level — a 20-segment stream could legitimately run
+    # 20 × 120s. This is the one deadline the streaming route enforces: when it
+    # expires the response is terminated and every un-consumed segment is
+    # abandoned. Sized for a full script (the request cap is 8000 chars), not
+    # for a single utterance.
+    stream_deadline_s: float = float(_str("TTS_STREAM_DEADLINE_S", "600"))
+    # How many segments of ONE stream may sit in the engine at a time. 0 = auto
+    # (workers + 1: enough to keep every worker fed plus one in reserve, while
+    # leaving the rest of the admission window for other callers). A stream
+    # submits in this rolling window instead of all at once, so script length no
+    # longer decides admission — see text_to_speech_stream.
+    stream_window: int = _int("TTS_STREAM_WINDOW", 0)
     # How long graceful shutdown waits for in-flight generations to finish.
     # This is ONE link in a chain that must be ordered longest-last:
     #   drain_timeout_s  <  container stop grace (docker stop -t / k8s
