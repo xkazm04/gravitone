@@ -39,6 +39,31 @@ describe("speak — why we fell back", () => {
     expect(r.fallbackReason).toBe("draining");
   });
 
+  it("carries the backend's sanitized detail (request id) onto the take", async () => {
+    // The whole point of service/errors.py::sanitized_500 is the correlation
+    // id; dropping it left every failure reading as one generic sentence.
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ detail: "synthesis failed (request ab12)" }), { status: 500 })));
+    const r = await speak("hi", "sarah", EXPR);
+    expect(r.fallbackDetail).toBe("synthesis failed (request ab12)");
+  });
+
+  it("reads a proxy 'backend unreachable' 503 apart from a draining engine", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ detail: "backend unreachable" }), { status: 503 })));
+    expect((await speak("hi", "sarah", EXPR)).fallbackReason).toBe("unreachable");
+  });
+
+  it("throws on a 404 unknown character instead of faking a browser take", async () => {
+    // Silently speaking the line in a browser voice hid a roster that no longer
+    // matches the backend — the user must be told the Character is gone.
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ detail: "unknown character 'sarah'" }), { status: 404 })));
+    await expect(speak("hi", "sarah", EXPR)).rejects.toMatchObject({
+      name: "ApiError", status: 404, message: "unknown character 'sarah'",
+    });
+  });
+
   it("throws EngineBusyError on 429 instead of falling back at all", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
       new Response("{}", { status: 429, headers: { "Retry-After": "3" } })));
@@ -90,6 +115,12 @@ describe("perform — same contract as speak", () => {
     const err = new DOMException("aborted", "AbortError");
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(err));
     await expect(perform(LINES, EXPR, AbortSignal.abort())).rejects.toBe(err);
+  });
+
+  it("throws on a 404 unknown character in a line", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ detail: "unknown character 'sarah' (line 0)" }), { status: 404 })));
+    await expect(perform(LINES, EXPR)).rejects.toMatchObject({ status: 404 });
   });
 });
 

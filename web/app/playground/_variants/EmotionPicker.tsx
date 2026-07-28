@@ -3,7 +3,8 @@
 // Emotion Wheel — reborn as a Playground helper. A radial picker (the Wheel
 // direction from the voices round) that inserts an [emotion]…[/emotion] metatag
 // into the composer. Each spoke is the emotion's generated art; emotions the
-// active Character lacks are dimmed and marked "→ baseline".
+// active Character lacks are dimmed and marked as substituted (the backend
+// picks the nearest recorded emotion first, and only then baseline).
 
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
@@ -95,7 +96,7 @@ export default function EmotionPicker({
                       initial={{ opacity: 0, scale: 0.8 }} animate={{ opacity: 1, scale: 1 }}
                       transition={{ duration: 0.35, ease: EASE, delay: i * 0.04 }}
                       onClick={() => { onPick(e.id); onClose(); }}
-                      title={has ? `${e.label} — available` : `${e.label} — not recorded, falls back to baseline`}
+                      title={has ? `${e.label} — available` : `${e.label} — not recorded: the nearest recorded emotion is used, then baseline`}
                       className="group flex w-24 cursor-pointer flex-col items-center"
                     >
                       <span

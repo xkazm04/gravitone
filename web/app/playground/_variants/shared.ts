@@ -1,5 +1,6 @@
 // Playground model. A take is spoken by ONE Character; metatags switch its
-// emotion Voices mid-sentence, falling back to baseline where missing.
+// emotion Voices mid-sentence. A missing emotion is substituted with the
+// nearest recorded one, and only then baseline (service/emotions.py::resolve).
 
 export type Segment = {
   text: string;
@@ -27,6 +28,10 @@ export type Take = {
   // "draining" or "failed". Optional: takes restored from before this field
   // existed have none.
   fallbackReason?: "unreachable" | "draining" | "failed";
+  // What the backend actually said about the failure (its sanitized `detail`,
+  // which carries the request-correlation id). Browser takes only, and only
+  // when the engine answered at all.
+  fallbackDetail?: string;
   url?: string;
   peaks: number[];
   seconds: number;

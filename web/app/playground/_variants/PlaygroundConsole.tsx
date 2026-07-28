@@ -5,10 +5,13 @@
 //   * Expression panel exposes the model's REAL knobs (temperature / stability /
 //     quality). Pocket TTS has no emotion or speed parameter — expression lives
 //     in the reference audio, which is why emotions are Voices, not sliders.
-//   * Missing emotions fall back to baseline; the take shows what actually ran.
+//   * A missing emotion is substituted with the nearest recorded one, then
+//     baseline; the take's segment ribbon shows what actually ran.
 
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { apiJson } from "@/lib/apiFetch";
+import { useCopyFeedback } from "@/lib/useCopyFeedback";
+import { useMounted } from "@/lib/useMounted";
 import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { AnimatePresence, motion } from "framer-motion";
@@ -17,7 +20,7 @@ import { EASE } from "@/components/ui/tokens";
 import { EMOTION_IDS, emotionMeta, wrapWithTag } from "@/lib/emotions";
 import EmotionArt from "@/components/ui/EmotionArt";
 import { DEFAULT_EXPRESSION, DEFAULT_TEXT, stripTags, type Expression, type PerfLine, type Take } from "./shared";
-import { speak, perform, uploadTake, EngineBusyError, isAbort } from "./engine";
+import { speak, perform, uploadTake, EngineBusyError, isAbort, type FallbackReason } from "./engine";
 import { putTake, getRecentTakes, deleteTake } from "@/lib/takeStore";
 import { useAudioPlayer } from "./useAudioPlayer";
 import EmotionPicker from "./EmotionPicker";
@@ -90,14 +93,24 @@ export default function PlaygroundConsole() {
   const [busyNotice, setBusyNotice] = useState<{ retryAfterSec: number } | null>(null);
   // Transient error surface so generation failures are never silent.
   const [toast, setToast] = useState<string | null>(null);
+  // Why the LAST generation dropped to the browser voice (null = it didn't).
+  // Derived from the take list this used to scan for *any* browser take ever
+  // made, so the banner stayed pinned across later successful renders and
+  // across a session restore.
+  const [fallback, setFallback] = useState<{ reason: FallbackReason; detail?: string } | null>(null);
   const [takes, setTakes] = useState<Take[]>([]);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [codeFor, setCodeFor] = useState<string | null>(null); // take id with the code panel open
   // take id → shared state: publishing / share id / failed
   const [shares, setShares] = useState<Record<string, string | "pending" | "error">>({});
-  // take id → the clipboard refused (permission denied / insecure context).
-  // Published is not the same as copied; the button must not claim otherwise.
-  const [copyFailed, setCopyFailed] = useState<Record<string, boolean>>({});
+  // Clipboard truth for both copy affordances (per-take share link, keyed by
+  // take id; the review link under the key "review"). Published is not the
+  // same as copied and the labels must not claim otherwise.
+  const { copy, copied, failed: copyFailed } = useCopyFeedback<string>(2500);
+  // A take that could not be written to IndexedDB (quota, private mode) is NOT
+  // durable — saying nothing would leave the "survives a refresh" promise
+  // silently broken.
+  const [storageErr, setStorageErr] = useState<string | null>(null);
   // client-review link: selected take ids → /r/{id}
   const [reviewSel, setReviewSel] = useState<Set<string>>(new Set());
   const [reviewBusy, setReviewBusy] = useState(false);
@@ -107,6 +120,7 @@ export default function PlaygroundConsole() {
   const areaRef = useRef<HTMLTextAreaElement>(null);
   // In-flight generation, so it can be cancelled (or aborted on unmount).
   const runRef = useRef<AbortController | null>(null);
+  const mounted = useMounted();
 
   const { playingId, paused, progress, toggle, stop } = useAudioPlayer();
 
@@ -158,7 +172,13 @@ export default function PlaygroundConsole() {
           return [...current, ...restored.filter((t) => !known.has(t.id))];
         });
       })
-      .catch(() => {});
+      .catch((e) => {
+        // A restore that failed is not "no takes yet" — say the log could not
+        // be read rather than rendering a false empty state.
+        if (cancelled) return;
+        const why = e instanceof Error ? e.message : "storage unavailable";
+        setStorageErr(`Saved takes from your last session could not be restored (${why}).`);
+      });
     return () => { cancelled = true; };
   }, []);
 
@@ -192,11 +212,14 @@ export default function PlaygroundConsole() {
   );
   const scriptChars = scriptLines.reduce((n, l) => n + stripTags(l.text).length, 0);
   const canGenerate = mode === "script" ? scriptLines.length > 0 : (!!plain && !!character);
-  // The most recent browser take decides the notice: a 500 and an unplugged
-  // backend both drop to the browser voice, but they are different events and
-  // the banner used to report every one of them as "backend unreachable".
-  const lastFallback = takes.find((t) => t.mode === "browser");
-  const fallbackNotice = lastFallback && FALLBACK_COPY[lastFallback.fallbackReason ?? "unreachable"];
+  // The LAST run decides the notice: a 500 and an unplugged backend both drop
+  // to the browser voice, but they are different events — and once a gravitone
+  // take succeeds the notice is simply no longer true.
+  const fallbackNotice = fallback && (
+    fallback.detail
+      ? `${FALLBACK_COPY[fallback.reason]} Backend said: ${fallback.detail}`
+      : FALLBACK_COPY[fallback.reason]
+  );
 
   function insertEmotion(emotion: string) {
     if (mode === "script") {
@@ -280,15 +303,10 @@ export default function PlaygroundConsole() {
     return p;
   }
 
-  /** Copy a share link, recording whether the clipboard actually accepted it.
-   *  The button used to claim "✓ link copied" after a denied permission. */
+  /** Copy a share link. useCopyFeedback owns the "did the clipboard accept it"
+   *  question (and the timer cleanup) for every copy affordance in the app. */
   async function copyShareLink(takeId: string, shareId: string) {
-    try {
-      await navigator.clipboard.writeText(`${window.location.origin}/t/${shareId}`);
-      setCopyFailed((s) => { const { [takeId]: _, ...rest } = s; return rest; });
-    } catch {
-      setCopyFailed((s) => ({ ...s, [takeId]: true }));
-    }
+    await copy(`${window.location.origin}/t/${shareId}`, takeId);
   }
 
   /** Persist a take server-side, mint its /t/{id} page, copy the link. */
@@ -329,27 +347,37 @@ export default function PlaygroundConsole() {
     try {
       const chosen = takes.filter((t) => reviewSel.has(t.id));
       const ids = await Promise.all(chosen.map(ensureShared));
-      const r = await fetch("/api/reviews", {
+      const j = await apiJson<{ review_id: string }>("/api/reviews", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: `${chosen[0].characterName} — pick a take`, take_ids: ids }),
-      });
-      const j = await r.json().catch(() => ({}));
-      if (!r.ok) throw new Error(j?.detail ?? "could not create the review");
+      }, "could not create the review");
+      if (!mounted.current) return;
       const url = `${window.location.origin}/r/${j.review_id}`;
       setReviewUrl(url);
       setReviewSel(new Set());
-      await navigator.clipboard.writeText(url).catch(() => {});
+      // The banner reports the copy's TRUE outcome (see reviewUrl below) — it
+      // used to claim "✓ review link copied" after a swallowed rejection.
+      await copy(url, "review");
     } catch (e) {
+      if (!mounted.current) return;
       setReviewErr(e instanceof Error ? e.message : "could not create the review");
-    } finally { setReviewBusy(false); }
+    } finally { if (mounted.current) setReviewBusy(false); }
   }
 
-  /** Persist a take (audio blob + metadata) so it survives a refresh. */
+  /** Persist a take (audio blob + metadata) so it survives a refresh.
+   *  A failure here (quota exceeded, storage blocked) does not lose the take —
+   *  but it DOES break the durability the log promises, so it is reported
+   *  rather than swallowed. */
   async function persistTake(t: Take) {
     try {
       const blob = t.url ? await (await fetch(t.url)).blob() : null;
       await putTake(t, blob);
-    } catch { /* best-effort — the take still lives in state */ }
+      if (mounted.current) setStorageErr(null);
+    } catch (e) {
+      if (!mounted.current) return;
+      const why = e instanceof Error ? e.message : "storage unavailable";
+      setStorageErr(`This take is in the log but could NOT be saved for after a refresh (${why}). Download the wav to keep it.`);
+    }
   }
 
   /** Delete a take: revoke its object URL, drop it from the store + all state. */
@@ -386,6 +414,23 @@ export default function PlaygroundConsole() {
   // request holding a worker slot for a page nobody is looking at.
   useEffect(() => () => runRef.current?.abort(), []);
 
+  /** Every generation starts from a clean slate of notices — a warning about
+   *  the PREVIOUS run must never be read as a verdict on this one. */
+  function clearNotices() {
+    setBusyNotice(null);
+    setToast(null);
+    setFallback(null);
+  }
+
+  /** Report a generation failure with what the backend actually said. Errors
+   *  from the apiFetch contract carry the sanitized `detail` (request id
+   *  included), which is exactly what support needs and what the old single
+   *  generic sentence destroyed. */
+  function reportFailure(e: unknown) {
+    const detail = e instanceof Error && e.message ? e.message : null;
+    setToast(detail ? `Generation failed — ${detail}` : "Generation failed — the backend returned an error. Please try again.");
+  }
+
   /** Dispatch to the active composer mode; wired to ⌘↵ and the retry button. */
   function generate() {
     if (mode === "script") void generateScript();
@@ -395,12 +440,12 @@ export default function PlaygroundConsole() {
   async function generateScript() {
     if (busy || scriptLines.length === 0) return;
     setBusy(true);
-    setBusyNotice(null);
-    setToast(null);
+    clearNotices();
     const lines: PerfLine[] = scriptLines.map((l) => ({ character_id: l.characterId, text: l.text.trim() }));
     const ctrl = newRun();
     try {
       const r = await perform(lines, expr, ctrl.signal);
+      if (!mounted.current) return;
       seq.current += 1;
       const distinct = [...new Set(lines.map((l) => l.character_id))];
       const label = distinct.length === 1 ? charName(distinct[0]) : `Ensemble · ${distinct.length} voices`;
@@ -408,52 +453,59 @@ export default function PlaygroundConsole() {
       const take: Take = {
         id: `take-${Date.now()}-${seq.current}`, text: transcript,
         characterId: lines[0].character_id, characterName: label,
-        mode: r.mode, fallbackReason: r.fallbackReason, url: r.url, peaks: r.peaks, seconds: r.seconds, kb: r.kb, rtf: r.rtf,
+        mode: r.mode, fallbackReason: r.fallbackReason, fallbackDetail: r.fallbackDetail,
+        url: r.url, peaks: r.peaks, seconds: r.seconds, kb: r.kb, rtf: r.rtf,
         synthSeconds: r.synthSeconds, queueSeconds: r.queueSeconds,
         ignoredSettings: r.ignoredSettings, segments: r.segments, expr: { ...expr },
         createdAt: Date.now(), lines,
       };
       setTakes((t) => [take, ...t]);
+      setFallback(r.mode === "browser" ? { reason: r.fallbackReason ?? "unreachable", detail: r.fallbackDetail } : null);
       void persistTake(take);
     } catch (e) {
+      if (!mounted.current) return;
       if (isAbort(e)) { /* user cancelled — no take, no error */ }
       else if (e instanceof EngineBusyError) setBusyNotice({ retryAfterSec: e.retryAfterSec });
-      else setToast("Generation failed — the backend returned an error. Please try again.");
-    } finally { setBusy(false); }
+      else reportFailure(e);
+    } finally { if (mounted.current) setBusy(false); }
   }
 
   async function generateSolo() {
     if (!plain || busy || !character) return;
     setBusy(true);
-    setBusyNotice(null);
-    setToast(null);
+    clearNotices();
     const ctrl = newRun();
     try {
       const r = await speak(text, character.character_id, expr, ctrl.signal);
+      if (!mounted.current) return;
       seq.current += 1;
       // Timestamped id so restored takes (which keep their stored ids) never
       // collide with freshly generated ones.
       const take: Take = {
         id: `take-${Date.now()}-${seq.current}`, text: text.trim(),
         characterId: character.character_id, characterName: character.name,
-        mode: r.mode, fallbackReason: r.fallbackReason, url: r.url, peaks: r.peaks, seconds: r.seconds, kb: r.kb, rtf: r.rtf,
+        mode: r.mode, fallbackReason: r.fallbackReason, fallbackDetail: r.fallbackDetail,
+        url: r.url, peaks: r.peaks, seconds: r.seconds, kb: r.kb, rtf: r.rtf,
         synthSeconds: r.synthSeconds, queueSeconds: r.queueSeconds,
         ignoredSettings: r.ignoredSettings, segments: r.segments, expr: { ...expr },
         createdAt: Date.now(),
       };
       setTakes((t) => [take, ...t]);
+      setFallback(r.mode === "browser" ? { reason: r.fallbackReason ?? "unreachable", detail: r.fallbackDetail } : null);
       void persistTake(take);
     } catch (e) {
+      if (!mounted.current) return;
       // Backpressure keeps the engine reachable — offer a retry. Anything else
-      // is a genuine failure that must be visible, not swallowed.
+      // (a gone Character, an unexpected throw) is a genuine failure that must
+      // be visible, in the backend's own words.
       if (isAbort(e)) {
         // The user pressed Cancel: not a failure, so no toast and no take.
       } else if (e instanceof EngineBusyError) {
         setBusyNotice({ retryAfterSec: e.retryAfterSec });
       } else {
-        setToast("Generation failed — the backend returned an error. Please try again.");
+        reportFailure(e);
       }
-    } finally { setBusy(false); }
+    } finally { if (mounted.current) setBusy(false); }
   }
 
   return (
@@ -472,35 +524,40 @@ export default function PlaygroundConsole() {
       <p className="mt-2 max-w-2xl text-base text-white/70">
         Pick a <span className="text-white">Character</span>, then use{" "}
         <span className="font-jetbrains text-cyan-300">[emotion]…[/emotion]</span> to switch its{" "}
-        <span className="text-white">Voices</span> mid-sentence. Missing emotions fall back to baseline.
+        <span className="text-white">Voices</span> mid-sentence. A missing emotion uses the nearest
+        recorded one, and only then baseline.
       </p>
 
       {rosterErr && <ErrorBanner>{rosterErr}</ErrorBanner>}
 
-      {fallbackNotice && (
-        <p className="font-jetbrains mt-4 rounded-lg border border-amber-400/25 bg-amber-400/5 px-4 py-2 text-[11px] text-amber-200/90">
-          {fallbackNotice}
-        </p>
-      )}
+      {/* The take exists but is degraded → warning (amber). */}
+      {fallbackNotice && <ErrorBanner severity="warning">{fallbackNotice}</ErrorBanner>}
+
+      {storageErr && <ErrorBanner severity="warning">{storageErr}</ErrorBanner>}
 
       {busyNotice && (
-        <div className="font-jetbrains mt-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-400/30 bg-amber-400/5 px-4 py-2 text-[11px] text-amber-200/90">
-          <span>Engine busy — the render queue is full. Retry in a moment{busyNotice.retryAfterSec > 0 ? ` (~${busyNotice.retryAfterSec}s)` : ""}.</span>
-          <button
-            onClick={() => void generate()}
-            disabled={busy}
-            className="rounded-full border border-amber-400/40 bg-amber-400/10 px-3 py-1 text-amber-100 transition hover:bg-amber-400/20 disabled:opacity-40"
-          >
-            {busy ? "retrying…" : "↻ retry"}
-          </button>
-        </div>
+        <ErrorBanner severity="warning">
+          <span className="flex flex-wrap items-center justify-between gap-3">
+            <span>Engine busy — the render queue is full. Retry in a moment{busyNotice.retryAfterSec > 0 ? ` (~${busyNotice.retryAfterSec}s)` : ""}.</span>
+            <button
+              onClick={() => void generate()}
+              disabled={busy}
+              className="rounded-full border border-amber-400/40 bg-amber-400/10 px-3 py-1 text-amber-100 transition hover:bg-amber-400/20 disabled:opacity-40"
+            >
+              {busy ? "retrying…" : "↻ retry"}
+            </button>
+          </span>
+        </ErrorBanner>
       )}
 
+      {/* Nothing was produced → error (rose). */}
       {toast && (
-        <div className="font-jetbrains mt-4 flex items-center justify-between gap-3 rounded-lg border border-rose-400/30 bg-rose-400/5 px-4 py-2 text-[11px] text-rose-200/90">
-          <span>{toast}</span>
-          <button onClick={() => setToast(null)} aria-label="Dismiss" className="text-rose-200/70 transition hover:text-rose-100">✕</button>
-        </div>
+        <ErrorBanner>
+          <span className="flex items-center justify-between gap-3">
+            <span>{toast}</span>
+            <button onClick={() => setToast(null)} aria-label="Dismiss" className="shrink-0 text-rose-200/70 transition hover:text-rose-100">✕</button>
+          </span>
+        </ErrorBanner>
       )}
 
       {/* character rail */}
@@ -616,7 +673,7 @@ export default function PlaygroundConsole() {
                 const custom = !EMOTION_IDS.includes(id);
                 return (
                   <button key={id} onClick={() => insertEmotion(id)}
-                    title={has ? `${e.label} — available` : `${e.label} — not recorded, falls back to baseline`}
+                    title={has ? `${e.label} — available` : `${e.label} — not recorded: the nearest recorded emotion is used, then baseline`}
                     className={`font-jetbrains inline-flex items-center gap-1.5 rounded-full py-1 pl-1 pr-2.5 text-[11px] transition ${
                       has ? `border bg-white/5 text-white/85 ${custom ? "border-violet-400/30 hover:border-violet-400/60" : "border-white/15 hover:border-cyan-400/40"}`
                           : `border border-dashed text-white/60 ${custom ? "border-violet-400/20" : "border-white/12"}`}`}>
@@ -693,9 +750,19 @@ export default function PlaygroundConsole() {
 
         {reviewUrl && (
           <p className="font-jetbrains mb-3 rounded-lg border border-emerald-400/25 bg-emerald-400/5 px-4 py-2 text-[11px] text-emerald-200/90">
-            ✓ review link copied —{" "}
+            {/* The link is created either way; only the CLIPBOARD's outcome
+                varies, and claiming "copied" after a refusal left users pasting
+                whatever was there before. */}
+            {copyFailed === "review"
+              ? "Review link created — your browser blocked the clipboard, so copy it here: "
+              : copied === "review"
+                ? "✓ review link copied — "
+                : "Review link created — "}
             <a href={reviewUrl} target="_blank" rel="noreferrer" className="underline underline-offset-2">{reviewUrl}</a>{" "}
             (no login; the client picks one take)
+            {copied !== "review" && copyFailed !== "review" && (
+              <button onClick={() => void copy(reviewUrl, "review")} className="ml-2 underline underline-offset-2">copy</button>
+            )}
           </p>
         )}
         {reviewErr && <ErrorBanner className="mb-3">{reviewErr}</ErrorBanner>}
@@ -767,8 +834,9 @@ export default function PlaygroundConsole() {
                   >
                     {shares[t.id] === "pending" ? "sharing…"
                       : shares[t.id] === "error" ? "✗ failed"
-                      : shares[t.id] && copyFailed[t.id] ? "published — copy failed"
-                      : shares[t.id] ? "✓ link copied"
+                      : shares[t.id] && copyFailed === t.id ? "published — copy failed"
+                      : shares[t.id] && copied === t.id ? "✓ link copied"
+                      : shares[t.id] ? "↗ copy link"
                       : "↗ share"}
                   </button>
                   <button

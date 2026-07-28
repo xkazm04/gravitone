@@ -1,5 +1,6 @@
 "use client";
 
+import { readDetail, throwDetail } from "@/lib/apiFetch";
 import { stripTags, waveHeights, type Expression, type PerfLine, type Segment, type Take } from "./shared";
 
 // One module-level AudioContext shared across every peak computation. Browsers
@@ -89,6 +90,12 @@ export type SpeakResult = {
   segments: Segment[];
   // Set only when mode === "browser".
   fallbackReason?: FallbackReason;
+  // The backend's sanitized `detail` for the failure that caused the fallback.
+  // service/errors.py::sanitized_500 writes a request-correlation id into it —
+  // throwing that away left every failure reading as one generic sentence and
+  // left support with nothing to correlate. Absent for transport failures
+  // (there is no response) and for a proxy that answered non-JSON.
+  fallbackDetail?: string;
 };
 
 /**
@@ -105,12 +112,13 @@ export function isAbort(e: unknown): boolean {
 }
 
 /** The browser-speech take, tagged with WHY we fell back to it. */
-function browserFallback(plain: string, reason: FallbackReason): SpeakResult {
+function browserFallback(plain: string, reason: FallbackReason, detail?: string): SpeakResult {
   const seconds = Math.max(1.5, Math.round(plain.length * 0.055 * 10) / 10);
   return {
     mode: "browser", peaks: waveHeights(plain.length * 31 + 7, 56),
     seconds, kb: 0, rtf: 0, synthSeconds: 0, queueSeconds: 0,
     ignoredSettings: [], segments: [], fallbackReason: reason,
+    fallbackDetail: detail,
   };
 }
 
@@ -165,6 +173,40 @@ function decodePerformanceReport(header: string | null): Segment[] {
   }
 }
 
+/**
+ * Triage a non-OK synthesis response — the ONE place speak() and perform()
+ * decide "fall back" vs "tell the user". Everything goes through the apiFetch
+ * contract (`readDetail`/`throwDetail`) so the backend's user-showable `detail`
+ * — request id included — survives instead of being replaced by a generic
+ * sentence.
+ *
+ * Throws (no browser take at all) for the two statuses the fallback would lie
+ * about:
+ *   429 — the engine is up and will accept a retry (EngineBusyError)
+ *   404 — the Character is GONE. Speaking the line in a browser voice hid a
+ *         roster that no longer matches the backend; the user must be told.
+ * Everything else keeps the deliberate browser-voice fallback and returns the
+ * reason + detail to report alongside it.
+ */
+async function triageFailure(res: Response): Promise<{ reason: FallbackReason; detail?: string }> {
+  if (res.status === 429) {
+    throw new EngineBusyError(parseRetryAfter(res.headers.get("Retry-After")));
+  }
+  if (res.status === 404) {
+    await throwDetail(res, "that Character no longer exists on the backend");
+  }
+  const detail = await readDetail(res);
+  // A 503 is two different events: the studio's own proxy answers "backend
+  // unreachable" when it cannot reach the engine at all, while the engine
+  // itself answers 503 only while draining. Read them apart instead of
+  // reporting a dead backend as "restarting".
+  const unreachable = res.status === 503 && detail?.includes("unreachable");
+  return {
+    reason: res.status === 503 ? (unreachable ? "unreachable" : "draining") : "failed",
+    detail,
+  };
+}
+
 /** Build a gravitone SpeakResult from a successful audio response. */
 async function gravitoneResult(res: Response, segments: Segment[], seed: number): Promise<SpeakResult> {
   const blob = await res.blob();
@@ -198,15 +240,18 @@ async function gravitoneResult(res: Response, segments: Segment[], seed: number)
 }
 
 /**
- * Speak metatagged text with one Character. Emotions the Character lacks fall
- * back to baseline; the per-segment report says what actually happened.
- * Falls back to browser speech (tags stripped) when the backend is unreachable.
+ * Speak metatagged text with one Character. Emotions the Character lacks are
+ * substituted with the nearest recorded emotion, then baseline (see
+ * service/emotions.py::resolve); the per-segment report says what actually
+ * happened. Falls back to browser speech (tags stripped) when synthesis fails;
+ * 429 backpressure and a 404 unknown Character throw instead.
  */
 export async function speak(text: string, characterId: string, expr: Expression,
                             signal?: AbortSignal): Promise<SpeakResult> {
   const trimmed = text.trim();
   let res: Response | null = null;
   let reason: FallbackReason = "unreachable";
+  let detail: string | undefined;
   try {
     res = await fetch("/api/speak", {
       method: "POST",
@@ -228,20 +273,16 @@ export async function speak(text: string, characterId: string, expr: Expression,
   }
 
   if (res) {
-    // Backpressure is up-but-busy, not down: surface it distinctly so the UI
-    // offers a retry rather than silently substituting the browser voice.
-    if (res.status === 429) {
-      throw new EngineBusyError(parseRetryAfter(res.headers.get("Retry-After")));
-    }
     if (res.ok) {
       return gravitoneResult(res, decodeSegments(res.headers.get("X-Segments")), trimmed.length * 31 + 7);
     }
-    // Still falls back to the browser voice, but record what actually
-    // happened: a reachable engine that errored is not an unreachable one.
-    reason = res.status === 503 ? "draining" : "failed";
+    // Backpressure (429) and a gone Character (404) throw out of here; anything
+    // else still falls back to the browser voice, carrying WHAT the backend
+    // said so the user gets more than "something went wrong".
+    ({ reason, detail } = await triageFailure(res));
   }
 
-  return browserFallback(stripTags(trimmed), reason);
+  return browserFallback(stripTags(trimmed), reason, detail);
 }
 
 /**
@@ -249,7 +290,8 @@ export async function speak(text: string, characterId: string, expr: Expression,
  * Character speaks its (optionally metatagged) text, Voices switching per
  * character and per emotion. Returns a single concatenated take whose segments
  * carry who spoke what. Falls back to browser speech (whole script, tags
- * stripped) when the backend is unreachable; 429 backpressure throws distinctly.
+ * stripped) when synthesis fails; 429 backpressure and a 404 unknown Character
+ * throw distinctly (see triageFailure).
  */
 export async function perform(lines: PerfLine[], expr: Expression,
                               signal?: AbortSignal): Promise<SpeakResult> {
@@ -262,6 +304,7 @@ export async function perform(lines: PerfLine[], expr: Expression,
   };
   let res: Response | null = null;
   let reason: FallbackReason = "unreachable";
+  let detail: string | undefined;
   try {
     res = await fetch("/api/performance", {
       method: "POST",
@@ -275,15 +318,12 @@ export async function perform(lines: PerfLine[], expr: Expression,
   }
 
   if (res) {
-    if (res.status === 429) {
-      throw new EngineBusyError(parseRetryAfter(res.headers.get("Retry-After")));
-    }
     if (res.ok) {
       const seed = lines.reduce((n, l) => n + l.text.length, 0) * 31 + 7;
       return gravitoneResult(res, decodePerformanceReport(res.headers.get("X-Performance-Report")), seed);
     }
-    reason = res.status === 503 ? "draining" : "failed";
+    ({ reason, detail } = await triageFailure(res));
   }
 
-  return browserFallback(stripTags(lines.map((l) => l.text).join(" ")), reason);
+  return browserFallback(stripTags(lines.map((l) => l.text).join(" ")), reason, detail);
 }
