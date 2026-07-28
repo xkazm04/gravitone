@@ -26,6 +26,7 @@ import {
 } from "./shared";
 // Composer durability — the same IndexedDB mechanism the take log uses.
 import { loadComposer, reconcileCharacters, saveComposer, type ComposerState } from "@/lib/composerStore";
+import { DEFAULT_OUTPUT_FORMAT, OUTPUT_FORMATS, formatMeta, type OutputFormat } from "@/lib/audioFormats";
 import { speak, perform, uploadTake, refinePeaks, EngineBusyError, isAbort, type FallbackReason } from "./engine";
 // ONE character-list data layer, shared with the voices module — the playground
 // used to fetch /api/characters itself, so the app had two truths about the
@@ -160,6 +161,10 @@ export default function PlaygroundConsole() {
   // Composer mode: Solo = one Character throughout (current flow); Script = a
   // multi-character performance rendered as one take via /v1/performance.
   const [mode, setMode] = useState<"solo" | "script">("solo");
+  // What the next take is rendered as. It sits beside Generate rather than in
+  // the expression panel because it is a decision about the FILE you keep, not
+  // about how the voice sounds.
+  const [format, setFormat] = useState<OutputFormat>(DEFAULT_OUTPUT_FORMAT);
   const [script, setScript] = useState<ScriptLine[]>([]);
   const [activeLine, setActiveLine] = useState(0); // emotion tags target this line
   const lineRefs = useRef<Array<HTMLTextAreaElement | null>>([]);
@@ -799,7 +804,7 @@ export default function PlaygroundConsole() {
     const lines: PerfLine[] = scriptLines.map((l) => ({ character_id: l.characterId, text: l.text.trim() }));
     const ctrl = newRun();
     try {
-      const r = await perform(lines, expr, ctrl.signal);
+      const r = await perform(lines, expr, ctrl.signal, format);
       if (!mounted.current) return;
       seq.current += 1;
       const distinct = [...new Set(lines.map((l) => l.character_id))];
@@ -812,7 +817,7 @@ export default function PlaygroundConsole() {
         url: r.url, blob: r.blob, peaks: r.peaks, seconds: r.seconds, kb: r.kb, rtf: r.rtf,
         synthSeconds: r.synthSeconds, queueSeconds: r.queueSeconds,
         ignoredSettings: r.ignoredSettings, segments: r.segments, expr: { ...expr },
-        createdAt: Date.now(), lines,
+        createdAt: Date.now(), format: r.format, lines,
       };
       addTake(take);
       setFallback(r.mode === "browser" ? { reason: r.fallbackReason ?? "unreachable", detail: r.fallbackDetail } : null);
@@ -830,7 +835,7 @@ export default function PlaygroundConsole() {
     clearNotices();
     const ctrl = newRun();
     try {
-      const r = await speak(text, character.character_id, expr, ctrl.signal);
+      const r = await speak(text, character.character_id, expr, ctrl.signal, format);
       if (!mounted.current) return;
       seq.current += 1;
       // Timestamped id so restored takes (which keep their stored ids) never
@@ -842,7 +847,7 @@ export default function PlaygroundConsole() {
         url: r.url, blob: r.blob, peaks: r.peaks, seconds: r.seconds, kb: r.kb, rtf: r.rtf,
         synthSeconds: r.synthSeconds, queueSeconds: r.queueSeconds,
         ignoredSettings: r.ignoredSettings, segments: r.segments, expr: { ...expr },
-        createdAt: Date.now(),
+        createdAt: Date.now(), format: r.format,
       };
       addTake(take);
       setFallback(r.mode === "browser" ? { reason: r.fallbackReason ?? "unreachable", detail: r.fallbackDetail } : null);
@@ -1138,9 +1143,21 @@ export default function PlaygroundConsole() {
             <span className={`font-jetbrains text-[11px] ${blocked ? "text-rose-300" : "text-white/60"}`}>
               {blocked
                 ? blocked
-                : mode === "script" ? "⌘↵ · one take from the whole script · 24kHz wav" : "⌘↵ to generate · exports 24kHz wav"}
+                : mode === "script" ? "⌘↵ · one take from the whole script" : "⌘↵ to generate"}
             </span>
             <div className="flex items-center gap-2">
+              <div role="group" aria-label="Export format"
+                className="flex items-center gap-0.5 rounded-lg border border-white/12 p-0.5">
+                {OUTPUT_FORMATS.map((f) => (
+                  <button key={f.id} onClick={() => setFormat(f.id)} title={f.hint}
+                    aria-pressed={format === f.id}
+                    className={`font-jetbrains cursor-pointer rounded-md px-2 py-1 text-[11px] transition ${
+                      format === f.id ? "bg-cyan-400/15 text-cyan-200" : "text-white/55 hover:text-white/85"
+                    }`}>
+                    {f.label}
+                  </button>
+                ))}
+              </div>
               {busy && (
                 <button
                   onClick={cancelGenerate}
@@ -1242,7 +1259,7 @@ export default function PlaygroundConsole() {
                   <input
                     type="checkbox"
                     checked={reviewSel.has(t.id)}
-                    disabled={t.mode === "browser"}
+                    disabled={t.mode === "browser" || formatMeta(t.format).ext !== "wav"}
                     onChange={(e) =>
                       setReviewSel((s) => {
                         const n = new Set(s);
@@ -1250,7 +1267,10 @@ export default function PlaygroundConsole() {
                         return n;
                       })
                     }
-                    title={t.mode === "browser" ? "Browser-fallback take — cannot be reviewed" : "Select for a client review link (max 6)"}
+                    title={t.mode === "browser" ? "Browser-fallback take — cannot be reviewed"
+                      : formatMeta(t.format).ext !== "wav"
+                        ? "Review links host wav takes — re-render this take as wav to include it"
+                        : "Select for a client review link (max 6)"}
                     aria-label="Select take for client review"
                     className="h-4 w-4 shrink-0 accent-cyan-300 disabled:opacity-30"
                   />
@@ -1274,8 +1294,11 @@ export default function PlaygroundConsole() {
 
                   <button
                     onClick={() => void share(t)}
-                    disabled={t.mode === "browser" || shares[t.id] === "pending"}
-                    title={t.mode === "browser" ? "Browser-speech fallback — nothing to share" : "Publish this take at a public /t/… link (copies the URL)"}
+                    disabled={t.mode === "browser" || shares[t.id] === "pending" || formatMeta(t.format).ext !== "wav"}
+                    title={t.mode === "browser" ? "Browser-speech fallback — nothing to share"
+                      : formatMeta(t.format).ext !== "wav"
+                        ? "Voice Cards are published as wav — re-render this take as wav to share it at a /t/… link"
+                        : "Publish this take at a public /t/… link (copies the URL)"}
                     className="font-jetbrains shrink-0 rounded-lg border border-white/15 px-3 py-1.5 text-[11px] text-white/80 transition hover:bg-white/5 disabled:cursor-not-allowed disabled:border-white/10 disabled:text-white/50"
                   >
                     {shares[t.id] === "pending" ? "sharing…"
@@ -1306,11 +1329,12 @@ export default function PlaygroundConsole() {
                     {"</>"} code
                   </button>
                   {t.url ? (
-                    <a href={t.url} download={`gravitone-${t.characterId}-${t.id}.wav`}
-                      className="font-jetbrains shrink-0 rounded-lg border border-white/15 px-3 py-1.5 text-[11px] text-white/80 transition hover:bg-white/5">↓ wav</a>
+                    <a href={t.url} download={`gravitone-${t.characterId}-${t.id}.${formatMeta(t.format).ext}`}
+                      title={`Download this take as ${formatMeta(t.format).ext}`}
+                      className="font-jetbrains shrink-0 rounded-lg border border-white/15 px-3 py-1.5 text-[11px] text-white/80 transition hover:bg-white/5">↓ {formatMeta(t.format).ext}</a>
                   ) : (
-                    <span title="Connect a Gravitone endpoint to export WAV"
-                      className="font-jetbrains shrink-0 cursor-not-allowed rounded-lg border border-white/10 px-3 py-1.5 text-[11px] text-white/50">↓ wav</span>
+                    <span title="Connect a Gravitone endpoint to export audio"
+                      className="font-jetbrains shrink-0 cursor-not-allowed rounded-lg border border-white/10 px-3 py-1.5 text-[11px] text-white/50">↓ {formatMeta(t.format).ext}</span>
                   )}
                   <button
                     onClick={() => removeTake(t.id)}

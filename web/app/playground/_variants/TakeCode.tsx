@@ -12,6 +12,7 @@ import { useAuth } from "@/lib/useAuth";
 import { getStoredKey } from "@/lib/mintKey";
 import { useCopyFeedback } from "@/lib/useCopyFeedback";
 import { DEFAULT_BASE_URL, KEY_PLACEHOLDER, SNIPPET_LANGS, type SnippetLang } from "@/lib/switchkit";
+import { formatMeta } from "@/lib/audioFormats";
 import type { Take } from "./shared";
 
 const voiceSettings = (t: Take) => ({
@@ -41,7 +42,13 @@ function performanceBody(t: Take): string {
 function buildSnippet(lang: SnippetLang, t: Take, apiKey: string): string {
   const base = DEFAULT_BASE_URL;
   const isPerf = !!t.lines?.length;
-  const path = isPerf ? "/v1/performance" : "/v1/speak";
+  // Both premium routes take the same `output_format` grammar as the drop-in
+  // route. The snippet names the format this take was actually rendered as, so
+  // pasting it reproduces the file the user is holding — and teaches the
+  // parameter, which is where the rest of the grammar (pcm, other rates and
+  // bitrates) lives.
+  const fmt = formatMeta(t.format);
+  const path = `${isPerf ? "/v1/performance" : "/v1/speak"}?output_format=${fmt.id}`;
   const body = isPerf ? performanceBody(t) : speakBody(t);
   const reportComment = isPerf
     ? `# per-line/segment report: X-Performance-Report header (base64 JSON)`
@@ -52,7 +59,7 @@ function buildSnippet(lang: SnippetLang, t: Take, apiKey: string): string {
         `curl -X POST "${base}${path}" \\`,
         `  -H "xi-api-key: ${apiKey}" -H "Content-Type: application/json" \\`,
         `  -d '${body.replace(/'/g, "'\\''")}' \\`,
-        `  --output take.wav`,
+        `  --output take.${fmt.ext}`,
         reportComment,
       ].join("\n");
     case "python":
@@ -64,7 +71,7 @@ function buildSnippet(lang: SnippetLang, t: Take, apiKey: string): string {
         `    headers={"xi-api-key": "${apiKey}"},`,
         `    json=${body.replace(/\n/g, "\n    ")},`,
         `)`,
-        `open("take.wav", "wb").write(r.content)`,
+        `open("take.${fmt.ext}", "wb").write(r.content)`,
       ].join("\n");
     case "javascript":
       return [
@@ -73,7 +80,7 @@ function buildSnippet(lang: SnippetLang, t: Take, apiKey: string): string {
         `  headers: { "xi-api-key": "${apiKey}", "Content-Type": "application/json" },`,
         `  body: JSON.stringify(${body.replace(/\n/g, "\n  ")}),`,
         `});`,
-        `const audio = await res.arrayBuffer(); // wav`,
+        `const audio = await res.arrayBuffer(); // ${fmt.mime}`,
       ].join("\n");
   }
 }

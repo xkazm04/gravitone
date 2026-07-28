@@ -2,6 +2,8 @@
 // emotion Voices mid-sentence. A missing emotion is substituted with the
 // nearest recorded one, and only then baseline (service/emotions.py::resolve).
 
+import type { OutputFormat } from "@/lib/audioFormats";
+
 export type Segment = {
   text: string;
   requested: string;
@@ -57,6 +59,10 @@ export type Take = {
   expr: Expression;
   // Epoch ms the take was rendered — the sort key for session restore.
   createdAt: number;
+  // The output format this take was rendered as (lib/audioFormats). Optional:
+  // takes restored from before the choice existed have none, and read as wav —
+  // which is exactly what they are.
+  format?: OutputFormat;
   // Performance takes only: the directed script that produced this take. Drives
   // the /v1/performance code export and survives session restore. Absent (undefined)
   // for solo takes.

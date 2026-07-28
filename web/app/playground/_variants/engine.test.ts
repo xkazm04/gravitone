@@ -195,3 +195,54 @@ describe("uploadTake", () => {
     expect(f).not.toHaveBeenCalled();
   });
 });
+
+describe("output format", () => {
+  // jsdom has no object-URL support; the result builder mints one for every
+  // successful take.
+  const stubObjectUrl = () =>
+    vi.stubGlobal("URL", { ...URL, createObjectURL: () => "blob:x", revokeObjectURL: () => {} });
+
+  it("asks /api/speak for the requested format and stamps it on the take", async () => {
+    const f = vi.fn().mockResolvedValue(new Response(new Uint8Array(4), {
+      status: 200, headers: { "Content-Type": "audio/mpeg", "X-Audio-Seconds": "2" },
+    }));
+    vi.stubGlobal("fetch", f);
+    stubObjectUrl();
+    const r = await speak("hi", "sarah", EXPR, undefined, "mp3_24000_128");
+    expect(String(f.mock.calls[0][0])).toBe("/api/speak?output_format=mp3_24000_128");
+    expect(r.format).toBe("mp3_24000_128");
+  });
+
+  it("defaults to wav_24000 so an unchanged caller renders unchanged audio", async () => {
+    const f = vi.fn().mockResolvedValue(wavResponse());
+    vi.stubGlobal("fetch", f);
+    stubObjectUrl();
+    const r = await speak("hi", "sarah", EXPR);
+    expect(String(f.mock.calls[0][0])).toBe("/api/speak?output_format=wav_24000");
+    expect(r.format).toBe("wav_24000");
+  });
+
+  it("carries the format through a performance too", async () => {
+    const f = vi.fn().mockResolvedValue(new Response(new Uint8Array(4), {
+      status: 200, headers: { "Content-Type": "audio/mpeg" },
+    }));
+    vi.stubGlobal("fetch", f);
+    stubObjectUrl();
+    const r = await perform([{ character_id: "sarah", text: "hi" }], EXPR, undefined, "mp3_24000_128");
+    expect(String(f.mock.calls[0][0])).toBe("/api/performance?output_format=mp3_24000_128");
+    expect(r.format).toBe("mp3_24000_128");
+  });
+
+  it("reports the browser fallback as wav — it has no file at all", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("network")));
+    expect((await speak("hi", "sarah", EXPR, undefined, "mp3_24000_128")).format).toBe("wav_24000");
+  });
+
+  it("decodes X-Synth-Segments now that the proxy forwards it", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(new Uint8Array(44), {
+      status: 200, headers: { "Content-Type": "audio/wav", "X-Synth-Segments": "6" },
+    })));
+    stubObjectUrl();
+    expect((await speak("hi", "sarah", EXPR)).synthSegments).toBe(6);
+  });
+});

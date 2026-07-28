@@ -110,6 +110,45 @@ describe("/api/speak — failure surfaces", () => {
   });
 });
 
+describe("/api/speak — output_format", () => {
+  it("forwards output_format to the service", async () => {
+    const fetchMock = stubFetch(new Response(new Uint8Array(4), {
+      status: 200, headers: { "Content-Type": "audio/mpeg" },
+    }));
+    const res = await speakPOST(post({ character_id: "sarah", text: "hi" },
+      "http://studio.local/api/speak?output_format=mp3_24000_128"));
+    expect(String(fetchMock.mock.calls[0][0])).toContain("/v1/speak?output_format=mp3_24000_128");
+    // The response says what it IS. Hardcoded audio/wav mislabelled the mp3.
+    expect(res.headers.get("Content-Type")).toBe("audio/mpeg");
+  });
+
+  it("builds the SAME upstream URL as before when no format is asked for", async () => {
+    const fetchMock = stubFetch(upstreamWav());
+    await speakPOST(post({ character_id: "sarah", text: "hi" }));
+    expect(String(fetchMock.mock.calls[0][0])).toMatch(/\/v1\/speak$/);
+  });
+
+  it("ignores query parameters outside the forwarded allowlist", async () => {
+    const fetchMock = stubFetch(upstreamWav());
+    await speakPOST(post({ character_id: "sarah", text: "hi" },
+      "http://studio.local/api/speak?output_format=wav_24000&debug=1&voice_id=evil"));
+    const url = String(fetchMock.mock.calls[0][0]);
+    expect(url).toContain("output_format=wav_24000");
+    expect(url).not.toContain("debug");
+    expect(url).not.toContain("voice_id");
+  });
+
+  it("lets the service reject an unsupported format instead of guessing", async () => {
+    // _parse_format 400s with the list of what IS supported; the proxy must
+    // pass that answer through rather than substituting a format nobody asked for.
+    stubFetch(new Response(JSON.stringify({ detail: "unsupported output_format 'flac'" }), { status: 400 }));
+    const res = await speakPOST(post({ character_id: "sarah", text: "hi" },
+      "http://studio.local/api/speak?output_format=flac"));
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ detail: "unsupported output_format 'flac'" });
+  });
+});
+
 describe("/api/performance", () => {
   it("hits /v1/performance and forwards its report header", async () => {
     const fetchMock = stubFetch(upstreamWav({ "X-Performance-Report": "W10=", "X-Synth-Segments": "9" }));
@@ -119,5 +158,16 @@ describe("/api/performance", () => {
     expect(String(fetchMock.mock.calls[0][0])).toContain("/v1/performance");
     expect(res.headers.get("X-Performance-Report")).toBe("W10=");
     expect(res.headers.get("X-Synth-Segments")).toBe("9");
+  });
+
+  it("forwards output_format on the route that makes the biggest files", async () => {
+    const fetchMock = stubFetch(new Response(new Uint8Array(4), {
+      status: 200, headers: { "Content-Type": "audio/mpeg" },
+    }));
+    const res = await performancePOST(post({ lines: [{ character_id: "sarah", text: "hi" }] },
+      "http://studio.local/api/performance?output_format=mp3_24000_128"));
+    expect(String(fetchMock.mock.calls[0][0]))
+      .toContain("/v1/performance?output_format=mp3_24000_128");
+    expect(res.headers.get("Content-Type")).toBe("audio/mpeg");
   });
 });

@@ -14,6 +14,10 @@ import { proxyWavPost } from "@/lib/backend";
 // (lib/serviceHeaders, mirroring the service's CORS_EXPOSE_HEADERS), not a
 // literal kept here by hand: the local copy silently omitted X-Synth-Segments,
 // which /v1/speak has always emitted for a multi-segment script.
+//
+// `output_format` is forwarded to the service, which owns the grammar and 400s
+// on anything outside it (mp3 bitrates, pcm and wav at the supported rates).
+// Absent, the upstream URL is exactly what it was and the answer is wav_24000.
 export async function POST(req: NextRequest) {
-  return proxyWavPost(req, "/v1/speak");
+  return proxyWavPost(req, "/v1/speak", { forwardQuery: ["output_format"] });
 }

@@ -1,6 +1,7 @@
 "use client";
 
 import { apiJson, readDetail, throwDetail } from "@/lib/apiFetch";
+import { DEFAULT_OUTPUT_FORMAT, formatMeta, type OutputFormat } from "@/lib/audioFormats";
 import { stripTags, waveHeights, type Expression, type PerfLine, type Segment, type Take } from "./shared";
 
 // One module-level AudioContext shared across every peak computation. Browsers
@@ -71,7 +72,9 @@ export async function uploadTake(t: Take): Promise<string> {
   if (!t.blob) throw new Error("browser-fallback takes cannot be shared");
   const blob = t.blob;
   const fd = new FormData();
-  fd.append("file", blob, "take.wav");
+  // The filename carries the take's real extension — an mp3 posted as
+  // "take.wav" would be a second lie on top of the one the backend rejects.
+  fd.append("file", blob, `take.${formatMeta(t.format).ext}`);
   fd.append("meta", JSON.stringify({
     character_id: t.characterId, character_name: t.characterName,
     text: t.text, seconds: t.seconds, rtf: t.rtf, segments: t.segments,
@@ -124,6 +127,10 @@ export type SpeakResult = {
   // used to) and because the ribbon is best-effort — a report that fails to
   // decode leaves this as the only evidence the take was multi-segment.
   synthSegments: number;
+  // The format this take was rendered as. Drives the download's extension and
+  // the code export's `output_format`; wav for the browser fallback, which is
+  // spoken locally and has no file at all.
+  format: OutputFormat;
   // Set only when mode === "browser".
   fallbackReason?: FallbackReason;
   // The backend's sanitized `detail` for the failure that caused the fallback.
@@ -153,7 +160,8 @@ function browserFallback(plain: string, reason: FallbackReason, detail?: string)
   return {
     mode: "browser", peaks: waveHeights(plain.length * 31 + 7, 56),
     seconds, kb: 0, rtf: 0, synthSeconds: 0, queueSeconds: 0,
-    ignoredSettings: [], segments: [], synthSegments: 0, fallbackReason: reason,
+    ignoredSettings: [], segments: [], synthSegments: 0,
+    format: DEFAULT_OUTPUT_FORMAT, fallbackReason: reason,
     fallbackDetail: detail,
   };
 }
@@ -244,7 +252,8 @@ async function triageFailure(res: Response): Promise<{ reason: FallbackReason; d
 }
 
 /** Build a gravitone SpeakResult from a successful audio response. */
-async function gravitoneResult(res: Response, segments: Segment[], seed: number): Promise<SpeakResult> {
+async function gravitoneResult(res: Response, segments: Segment[], seed: number,
+                                format: OutputFormat): Promise<SpeakResult> {
   const blob = await res.blob();
   const url = URL.createObjectURL(blob);
   const hdrSec = Number(res.headers.get("X-Audio-Seconds"));
@@ -265,6 +274,7 @@ async function gravitoneResult(res: Response, segments: Segment[], seed: number)
     ignoredSettings: decodeIgnored(res.headers.get("X-Ignored-Settings")),
     segments,
     synthSegments: Math.max(0, Number(res.headers.get("X-Synth-Segments")) || 0),
+    format,
   };
 }
 
@@ -276,13 +286,14 @@ async function gravitoneResult(res: Response, segments: Segment[], seed: number)
  * 429 backpressure and a 404 unknown Character throw instead.
  */
 export async function speak(text: string, characterId: string, expr: Expression,
-                            signal?: AbortSignal): Promise<SpeakResult> {
+                            signal?: AbortSignal,
+                            format: OutputFormat = DEFAULT_OUTPUT_FORMAT): Promise<SpeakResult> {
   const trimmed = text.trim();
   let res: Response | null = null;
   let reason: FallbackReason = "unreachable";
   let detail: string | undefined;
   try {
-    res = await fetch("/api/speak", {
+    res = await fetch(`/api/speak?output_format=${encodeURIComponent(format)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -303,7 +314,8 @@ export async function speak(text: string, characterId: string, expr: Expression,
 
   if (res) {
     if (res.ok) {
-      return gravitoneResult(res, decodeSegments(res.headers.get("X-Segments")), trimmed.length * 31 + 7);
+      return gravitoneResult(res, decodeSegments(res.headers.get("X-Segments")),
+                             trimmed.length * 31 + 7, format);
     }
     // Backpressure (429) and a gone Character (404) throw out of here; anything
     // else still falls back to the browser voice, carrying WHAT the backend
@@ -323,7 +335,8 @@ export async function speak(text: string, characterId: string, expr: Expression,
  * throw distinctly (see triageFailure).
  */
 export async function perform(lines: PerfLine[], expr: Expression,
-                              signal?: AbortSignal): Promise<SpeakResult> {
+                              signal?: AbortSignal,
+                              format: OutputFormat = DEFAULT_OUTPUT_FORMAT): Promise<SpeakResult> {
   const body = {
     lines: lines.map((l) => ({
       character_id: l.character_id,
@@ -335,7 +348,7 @@ export async function perform(lines: PerfLine[], expr: Expression,
   let reason: FallbackReason = "unreachable";
   let detail: string | undefined;
   try {
-    res = await fetch("/api/performance", {
+    res = await fetch(`/api/performance?output_format=${encodeURIComponent(format)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -349,7 +362,8 @@ export async function perform(lines: PerfLine[], expr: Expression,
   if (res) {
     if (res.ok) {
       const seed = lines.reduce((n, l) => n + l.text.length, 0) * 31 + 7;
-      return gravitoneResult(res, decodePerformanceReport(res.headers.get("X-Performance-Report")), seed);
+      return gravitoneResult(res, decodePerformanceReport(res.headers.get("X-Performance-Report")),
+                             seed, format);
     }
     ({ reason, detail } = await triageFailure(res));
   }

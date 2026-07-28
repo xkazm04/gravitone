@@ -86,17 +86,23 @@ export async function proxyJson(
  *
  *  Headers come from ONE list (lib/serviceHeaders) rather than a per-route
  *  literal — see that module for why three hand-kept subsets was the bug.
+ *
+ *  `forwardQuery` names the query parameters a caller may pass THROUGH to the
+ *  service (`output_format` today). It lives here rather than in one route
+ *  because both premium routes gained the same format grammar in the service;
+ *  a route that forwards nothing builds exactly the URL it built before.
  */
 export async function proxyWavPost(
   req: Request,
   backendPath: string,
+  opts: { forwardQuery?: readonly string[] } = {},
 ): Promise<Response> {
   const body = await readCappedText(req);
   if (body instanceof Response) return body;
 
   let upstream: Response;
   try {
-    upstream = await backendFetch(backendPath, {
+    upstream = await backendFetch(withForwardedQuery(req.url, backendPath, opts.forwardQuery), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body,
@@ -113,9 +119,34 @@ export async function proxyWavPost(
     return new Response(await upstream.text(), { status: upstream.status, headers });
   }
 
+  // The response says what it ACTUALLY is. Hardcoding audio/wav mislabelled an
+  // mp3 the caller explicitly asked for, and a mislabelled blob is one a
+  // browser may refuse to decode and a download that saves under a lie.
   const headers = forwardExposedHeaders(
-    upstream.headers, new Headers({ "Content-Type": "audio/wav" }));
+    upstream.headers,
+    new Headers({ "Content-Type": upstream.headers.get("Content-Type") ?? "audio/wav" }),
+  );
   return new Response(await upstream.arrayBuffer(), { status: 200, headers });
+}
+
+/** `backendPath` plus the allowlisted query parameters the caller supplied.
+ *  Returns `backendPath` UNCHANGED when nothing is allowlisted or nothing was
+ *  passed, so an existing caller's upstream URL is byte-identical. */
+function withForwardedQuery(
+  reqUrl: string,
+  backendPath: string,
+  allow?: readonly string[],
+): string {
+  if (!allow?.length) return backendPath;
+  const incoming = new URL(reqUrl).searchParams;
+  const out = new URLSearchParams();
+  for (const key of allow) {
+    const v = incoming.get(key);
+    if (v !== null) out.set(key, v);
+  }
+  const qs = out.toString();
+  if (!qs) return backendPath;
+  return `${backendPath}${backendPath.includes("?") ? "&" : "?"}${qs}`;
 }
 
 /** Stream an immutable ingest audio asset (a stem or speaker preview) through.
