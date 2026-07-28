@@ -52,19 +52,20 @@ class ParallelLabelingTests(unittest.TestCase):
         cur = {"n": 0, "max": 0}
         lock = threading.Lock()
 
-        def fake_label(wav_path):
+        def fake_label(wav_paths, spend=None):
             with lock:
                 cur["n"] += 1
                 cur["max"] = max(cur["max"], cur["n"])
             time.sleep(0.05)
             with lock:
                 cur["n"] -= 1
-            return {"emotion": "happy", "confidence": 0.9, "cue": "c", "model": "flash"}
+            return [{"emotion": "happy", "confidence": 0.9, "cue": "c", "model": "flash"}
+                    for _ in wav_paths]
 
         with TemporaryDirectory() as td:
             wd = self._setup_work(td, n)
             with mock.patch.object(ingest, "to_wav", side_effect=lambda src, dst, a=None, b=None: _write_wav(Path(dst), 240)), \
-                 mock.patch.object(ingest, "label_emotion", side_effect=fake_label):
+                 mock.patch.object(ingest, "label_emotions", side_effect=fake_label):
                 res = ingest.label_and_stem(wd, "speaker_0", mode="cloud")
         # More than one segment occupied the pool at once (serial would be 1),
         # but never more than the bounded pool.
@@ -76,15 +77,17 @@ class ParallelLabelingTests(unittest.TestCase):
         n = 6
         emos = ["calm", "happy", "excited", "sad", "angry", "whisper"]
 
-        def fake_label(wav_path):
-            i = int(Path(wav_path).stem.split("_")[1])
-            time.sleep(0.02 * (n - i))  # earlier indices finish LAST
-            return {"emotion": emos[i], "confidence": 0.9, "cue": f"c{i}", "model": "flash"}
+        def fake_label(wav_paths, spend=None):
+            first = int(Path(wav_paths[0]).stem.split("_")[1])
+            time.sleep(0.02 * (n - first))  # earlier batches finish LAST
+            return [{"emotion": emos[int(Path(p).stem.split("_")[1])],
+                     "confidence": 0.9, "cue": "c", "model": "flash"}
+                    for p in wav_paths]
 
         with TemporaryDirectory() as td:
             wd = self._setup_work(td, n)
             with mock.patch.object(ingest, "to_wav", side_effect=lambda src, dst, a=None, b=None: _write_wav(Path(dst), 240)), \
-                 mock.patch.object(ingest, "label_emotion", side_effect=fake_label):
+                 mock.patch.object(ingest, "label_emotions", side_effect=fake_label):
                 res = ingest.label_and_stem(wd, "speaker_0", mode="cloud")
         self.assertEqual([s["emotion"] for s in res["segments"]], emos)
 
@@ -92,16 +95,21 @@ class ParallelLabelingTests(unittest.TestCase):
         n = 5
         partials: list[dict] = []
 
-        def fake_label(wav_path):
-            i = int(Path(wav_path).stem.split("_")[1])
-            if i == 2:
-                raise RuntimeError("gemini boom")
-            return {"emotion": "happy", "confidence": 0.9, "cue": f"c{i}", "model": "flash"}
+        def fake_label(wav_paths, spend=None):
+            # The classifier answered, but said nothing about segment 2 — the
+            # per-clip degradation path.
+            out = []
+            for p in wav_paths:
+                i = int(Path(p).stem.split("_")[1])
+                out.append(None if i == 2 else
+                           {"emotion": "happy", "confidence": 0.9, "cue": f"c{i}",
+                            "model": "flash"})
+            return out
 
         with TemporaryDirectory() as td:
             wd = self._setup_work(td, n)
             with mock.patch.object(ingest, "to_wav", side_effect=lambda src, dst, a=None, b=None: _write_wav(Path(dst), 240)), \
-                 mock.patch.object(ingest, "label_emotion", side_effect=fake_label):
+                 mock.patch.object(ingest, "label_emotions", side_effect=fake_label):
                 res = ingest.label_and_stem(wd, "speaker_0", mode="cloud",
                                             partial=lambda d: partials.append(d))
         segs = res["segments"]

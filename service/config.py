@@ -128,6 +128,31 @@ class Settings:
     # as N single-worker replicas and JOBS is not shared (deploy/README.md,
     # "Ingest is replica-affine"), so the fleet-wide ceiling is this × replicas.
     ingest_max_jobs: int = _int("INGEST_MAX_JOBS", 2)
+    # Longest recording accepted for ingest. Enforced by /scan BEFORE anything
+    # is paid for: Scribe and the Isolator both bill by duration, so an
+    # unbounded clip is an unbounded invoice (there was a floor but no ceiling).
+    # 15 min is generous next to the 50 MB upload cap and the 40-segment
+    # labelling limit. A recording whose duration cannot be probed is REJECTED,
+    # not waved through — the gate fails closed.
+    ingest_max_clip_seconds: float = float(_str("INGEST_MAX_CLIP_SECONDS", "900"))
+    # How many segments one Gemini labelling request carries. Labelling used to
+    # be one request per segment (40 per job); batching cuts that by ~this
+    # factor. The effective size shrinks so that a small job still fills the
+    # label pool (see ingest._batches).
+    ingest_label_batch: int = _int("INGEST_LABEL_BATCH", 8)
+    # Attempts per external call (1 = no retry) on transient failures only —
+    # 429/5xx/timeouts. A 4xx that means "this request is wrong" is permanent
+    # and is never retried.
+    ingest_retry_attempts: int = _int("INGEST_RETRY_ATTEMPTS", 3)
+    # Retries allowed across a WHOLE ingest job, shared by every provider. The
+    # per-call attempt count alone would let a genuinely-down provider multiply
+    # the job's spend by `retry_attempts`; this is the circuit breaker that
+    # makes a failing provider fail fast instead of expensively.
+    ingest_job_retry_budget: int = _int("INGEST_JOB_RETRY_BUDGET", 12)
+    # How many low-confidence segments a job may escalate to the (much dearer)
+    # pro model. Escalation was uncapped and uncounted: every segment under the
+    # confidence threshold silently doubled its own bill.
+    ingest_escalation_budget: int = _int("INGEST_ESCALATION_BUDGET", 12)
     # Fallback built-in voice if a requested voice_id isn't found.
     default_voice: str = _str("TTS_DEFAULT_VOICE", "alba")
 

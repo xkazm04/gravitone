@@ -6,8 +6,15 @@ CLOUD ("quality" — richest results, audio leaves the machine):
   1. INGEST   ffmpeg extracts audio.
   2. MAP      ElevenLabs Scribe → diarized words + timestamps → pick target speaker.
   3. ISOLATE  ElevenLabs Voice Isolator → clean studio track (timing preserved).
-  4. LABEL    Gemini 3.5-flash classifies each segment into our emotion scale;
-              low-confidence segments escalate to gemini-3.1-pro-preview.
+  4. LABEL    Gemini 3.5-flash classifies segments into our emotion scale, a
+              BATCH of clips per request; low-confidence clips escalate to
+              gemini-3.1-pro-preview within a per-job budget.
+
+Every call to either provider goes through `_call`: retries on transient
+failures only (429/5xx/timeouts), bounded backoff, and a per-JOB retry budget so
+a provider that is genuinely down fails fast instead of expensively. `Spend` is
+the ledger — attempts per provider, retries, escalations — and it rides on the
+job so the studio can show what a scan actually cost.
   5. STEM     group segments by emotion → splice (level-matched, crossfaded) →
               one clean sample/emotion. The baseline (neutral) stem is built from
               baseline-labelled audio ONLY; see plan_baseline for the stated
@@ -40,6 +47,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import uuid
 import wave
 from concurrent.futures import ThreadPoolExecutor
@@ -51,6 +59,7 @@ import numpy as np
 
 from service.config import SETTINGS
 from service.emotions import BASELINE, EMOTION_SCALE
+from service.errors import UserFacing
 from service.voices import VOICES_DIR, _load_meta, _slug, mutate_meta
 
 ELEVEN_KEY = os.environ.get("ELEVEN_LABS_API_KEY", "")
@@ -76,6 +85,7 @@ CLEANUP_FILTER = "highpass=f=80,afftdn=nf=-25,loudnorm"
 # below it ineligible and commit refuses to clone them (unless allow_short).
 MIN_STEM_SECONDS = 4.0
 
+import urllib.error  # noqa: E402
 import urllib.request  # noqa: E402
 
 
@@ -282,6 +292,163 @@ def _wav_seconds(path: Path) -> float:
         return w.getnframes() / w.getframerate()
 
 
+# ── external calls: retries, budget, accounting ───────────────────────────────
+# A cloud clone is 2 ElevenLabs calls plus one classifier call per batch of
+# segments, and NONE of it used to be retried, counted or capped:
+#   * one transient 500 from the Isolator failed the whole scan AFTER Scribe had
+#     already been paid for;
+#   * one transient 429 from Gemini silently degraded that segment to baseline —
+#     the user got a worse voice and was never told why;
+#   * the pro-model escalation fired on every segment under the confidence
+#     threshold, uncapped and uncounted.
+# The policy below is deliberately small and boring: retry only what is
+# transient, back off, and STOP — per call and, more importantly, per JOB.
+RETRY_ATTEMPTS = SETTINGS.ingest_retry_attempts
+RETRY_BASE_S = 1.0
+RETRY_MAX_S = 20.0
+# Transient by definition: rate limiting, request timeout, and every 5xx. Any
+# other 4xx is the request itself being wrong (bad key, bad file, too long) —
+# retrying it burns money to get the identical answer, so it stays permanent.
+RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+
+class ExternalError(RuntimeError):
+    """A cloud call that failed for good (after any retries it was allowed).
+
+    Carries the provider and HTTP status so callers can be specific; the
+    message may quote the provider's response, so it is operator-facing and
+    reaches clients only through `errors.sanitize_detail`.
+    """
+
+    def __init__(self, provider: str, status: int | None, detail: str) -> None:
+        super().__init__(f"{provider} call failed"
+                         + (f" (HTTP {status})" if status else "")
+                         + (f": {detail}" if detail else ""))
+        self.provider = provider
+        self.status = status
+
+
+class Spend:
+    """One job's external-call ledger AND its budgets.
+
+    Everything expensive in ingest goes through here, for two reasons that are
+    really one: cost was invisible (nobody could say what a scan cost without
+    reading an invoice) and unbounded (retries and escalations multiplied it
+    with no ceiling). Counting and capping are the same act.
+
+    The budgets are per JOB, not per call: `take_retry` is what stops a
+    genuinely-down provider from being retried `RETRY_ATTEMPTS` times on every
+    one of 40 segments. Thread-safe — labelling runs on a pool.
+    """
+
+    def __init__(self, retry_budget: int | None = None,
+                 escalation_budget: int | None = None) -> None:
+        self._lock = threading.Lock()
+        self.calls: dict[str, int] = {}
+        self.retries = 0
+        self.retry_budget = (SETTINGS.ingest_job_retry_budget
+                             if retry_budget is None else retry_budget)
+        self.escalated = 0
+        self.escalation_budget = (SETTINGS.ingest_escalation_budget
+                                  if escalation_budget is None else escalation_budget)
+        self.escalations_failed = 0
+        self.escalations_skipped = 0
+
+    def charge(self, provider: str) -> None:
+        """One HTTP attempt made against `provider` — retries included, because
+        a retry costs the same as the call it repeats."""
+        with self._lock:
+            self.calls[provider] = self.calls.get(provider, 0) + 1
+
+    def take_retry(self) -> bool:
+        with self._lock:
+            if self.retries >= self.retry_budget:
+                return False
+            self.retries += 1
+            return True
+
+    def take_escalations(self, want: int) -> int:
+        """Grant up to `want` escalations; the shortfall is recorded as skipped
+        so the job can SAY it hit the cap instead of quietly labelling worse."""
+        with self._lock:
+            granted = max(0, min(want, self.escalation_budget - self.escalated))
+            self.escalated += granted
+            self.escalations_skipped += want - granted
+            return granted
+
+    def note_escalation_failure(self, n: int) -> None:
+        with self._lock:
+            self.escalations_failed += n
+
+    def snapshot(self) -> dict:
+        """JSON-safe view for the job's `partial`/`result` — what this job has
+        actually spent, so cost is read rather than inferred."""
+        with self._lock:
+            return {"calls": dict(self.calls),
+                    "total_calls": sum(self.calls.values()),
+                    "retries": self.retries, "retry_budget": self.retry_budget,
+                    "escalated": self.escalated,
+                    "escalation_budget": self.escalation_budget,
+                    "escalations_failed": self.escalations_failed,
+                    "escalations_skipped": self.escalations_skipped}
+
+
+def _retry_after(headers, cap: float = RETRY_MAX_S) -> float | None:
+    """Honour a provider's own Retry-After (seconds form), capped — an
+    unbounded server-chosen sleep would wedge the phase thread."""
+    try:
+        raw = headers.get("Retry-After") if headers else None
+        return min(float(raw), cap) if raw else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _backoff(attempt: int, retry_after: float | None) -> float:
+    if retry_after is not None:
+        return retry_after
+    return min(RETRY_MAX_S, RETRY_BASE_S * (2 ** (attempt - 1)))
+
+
+def _call(req: "urllib.request.Request", timeout: float, provider: str,
+          spend: "Spend | None") -> bytes:
+    """Make one external request, retrying ONLY transient failures.
+
+    Deterministic backoff (no jitter): the fan-out is at most LABEL_WORKERS
+    wide, so there is no thundering herd to spread, and a predictable schedule
+    is a testable one. Every attempt is charged to `spend`, and a retry must
+    also win a token from the job-wide budget — so a provider that is simply
+    down costs a bounded number of calls per job, not per segment.
+    """
+    ledger = spend or Spend()
+    last: BaseException | None = None
+    status: int | None = None
+    for attempt in range(1, max(1, RETRY_ATTEMPTS) + 1):
+        ledger.charge(provider)
+        wait: float | None = None
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.read()
+        except urllib.error.HTTPError as exc:      # subclass of URLError: first
+            last, status = exc, exc.code
+            if exc.code not in RETRYABLE_STATUS:
+                raise ExternalError(provider, exc.code,
+                                    _body_tail(exc)) from exc
+            wait = _retry_after(getattr(exc, "headers", None))
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last, status = exc, None               # connect/read timeout, DNS…
+        if attempt >= max(1, RETRY_ATTEMPTS) or not ledger.take_retry():
+            break
+        time.sleep(_backoff(attempt, wait))
+    raise ExternalError(provider, status, str(last)) from last
+
+
+def _body_tail(exc: "urllib.error.HTTPError", limit: int = 200) -> str:
+    try:
+        return exc.read().decode(errors="ignore")[-limit:]
+    except Exception:  # noqa: BLE001 - the body is a nicety, never a failure
+        return ""
+
+
 # ── ElevenLabs ────────────────────────────────────────────────────────────────
 def _multipart(fields: dict[str, str], file_field: str, path: Path) -> tuple[bytes, str]:
     boundary = "----gvt" + uuid.uuid4().hex
@@ -295,59 +462,153 @@ def _multipart(fields: dict[str, str], file_field: str, path: Path) -> tuple[byt
     return body, boundary
 
 
-def scribe(path: Path) -> dict:
+ELEVEN = "elevenlabs"
+
+
+def scribe(path: Path, spend: "Spend | None" = None) -> dict:
     body, boundary = _multipart(
         {"model_id": "scribe_v1", "diarize": "true", "timestamps_granularity": "word",
          "tag_audio_events": "true"}, "file", path)
     req = urllib.request.Request(
         "https://api.elevenlabs.io/v1/speech-to-text", data=body,
         headers={"xi-api-key": ELEVEN_KEY, "Content-Type": f"multipart/form-data; boundary={boundary}"})
-    with urllib.request.urlopen(req, timeout=300) as r:
-        return json.load(r)
+    return json.loads(_call(req, 300, ELEVEN, spend))
 
 
-def voice_isolate(path: Path, dst_mp3: Path) -> None:
+def voice_isolate(path: Path, dst_mp3: Path, spend: "Spend | None" = None) -> None:
     body, boundary = _multipart({}, "audio", path)
     req = urllib.request.Request(
         "https://api.elevenlabs.io/v1/audio-isolation", data=body,
         headers={"xi-api-key": ELEVEN_KEY, "Content-Type": f"multipart/form-data; boundary={boundary}"})
-    with urllib.request.urlopen(req, timeout=300) as r:
-        dst_mp3.write_bytes(r.read())
+    dst_mp3.write_bytes(_call(req, 300, ELEVEN, spend))
 
 
 # ── Gemini emotion ────────────────────────────────────────────────────────────
-def _gemini(model: str, wav: Path) -> dict:
-    audio = base64.b64encode(wav.read_bytes()).decode()
+GEMINI = "gemini"
+# How many clips ride in one request. Labelling used to be ONE request per
+# segment — 40 per job, each re-handshaking TLS and re-sending the same
+# instructions. See `_batches` for why the effective size can be smaller.
+LABEL_BATCH = SETTINGS.ingest_label_batch
+
+
+def _batches(n: int, size: int | None = None, workers: int = LABEL_WORKERS) -> list[list[int]]:
+    """Split `n` segment indices into request-sized groups.
+
+    The size shrinks so a SMALL job still fills the pool: batching 8 segments
+    into one request would turn an 8-segment job into a single serial call and
+    make it slower than before. Never fewer groups than workers while `n`
+    allows, never more than `size` clips in a request.
+    """
+    if n <= 0:
+        return []
+    size = LABEL_BATCH if size is None else size
+    size = max(1, min(size, -(-n // max(1, workers))))
+    return [list(range(i, min(i + size, n))) for i in range(0, n, size)]
+
+
+def _gemini(model: str, wavs: list[Path], spend: "Spend | None" = None) -> list[dict | None]:
+    """Classify a BATCH of clips in one request; one result slot per input.
+
+    A slot is None when the model returned nothing usable for that clip — the
+    caller degrades exactly that segment rather than the batch. Clips are
+    numbered in the prompt AND matched back by the index the model echoes, so a
+    reordered or short reply cannot silently shift labels onto the wrong audio.
+    """
+    if not wavs:
+        return []
     prompt = (
-        "Listen to the audio. Classify the speaker's EMOTIONAL DELIVERY (vocal tone/prosody, "
-        f"not the words) into EXACTLY one of: {', '.join(EMOTIONS)}. "
-        "Reply ONLY as compact JSON: {\"emotion\":\"...\",\"confidence\":0-1,\"cue\":\"<=8 words\"}.")
+        f"You will hear {len(wavs)} audio clips, numbered 0 to {len(wavs) - 1} in the order "
+        "given. For EACH clip, classify the speaker's EMOTIONAL DELIVERY (vocal tone/prosody, "
+        f"not the words) into EXACTLY one of: {', '.join(EMOTIONS)}. Judge each clip on its "
+        "own — they are unrelated excerpts, not a conversation. Reply ONLY as compact JSON: "
+        "{\"labels\":[{\"index\":0,\"emotion\":\"...\",\"confidence\":0-1,\"cue\":\"<=8 words\"}]} "
+        "with exactly one entry per clip.")
+    parts: list[dict] = [{"text": prompt}]
+    for i, wav in enumerate(wavs):
+        parts.append({"text": f"Clip {i}:"})
+        parts.append({"inline_data": {"mime_type": "audio/wav",
+                                      "data": base64.b64encode(wav.read_bytes()).decode()}})
     body = json.dumps({
-        "contents": [{"parts": [{"text": prompt}, {"inline_data": {"mime_type": "audio/wav", "data": audio}}]}],
+        "contents": [{"parts": parts}],
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0},
     }).encode()
     req = urllib.request.Request(
         f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}",
         data=body, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=120) as r:
-        out = json.load(r)
-    d = json.loads(out["candidates"][0]["content"]["parts"][0]["text"])
-    emo = str(d.get("emotion", "")).lower().strip()
-    return {"emotion": emo if emo in EMOTIONS else BASELINE,
-            "confidence": float(d.get("confidence", 0)), "cue": d.get("cue", "")}
+    raw = _call(req, 120 + 30 * len(wavs), GEMINI, spend)
+    out = json.loads(raw)
+    parsed = json.loads(out["candidates"][0]["content"]["parts"][0]["text"])
+    rows = parsed.get("labels", parsed) if isinstance(parsed, dict) else parsed
+    if isinstance(rows, dict):        # a lone object for a lone clip
+        rows = [rows]
+    if not isinstance(rows, list):
+        raise ExternalError(GEMINI, None, "classifier reply was not a list of labels")
 
-
-def label_emotion(wav: Path, escalate_below: float = 0.7) -> dict:
-    res = _gemini(FLASH_MODEL, wav)
-    res["model"] = FLASH_MODEL
-    if res["confidence"] < escalate_below:
+    res: list[dict | None] = [None] * len(wavs)
+    for pos, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
         try:
-            pro = _gemini(PRO_MODEL, wav)
-            pro["model"] = PRO_MODEL
-            return pro
-        except Exception:  # noqa: BLE001
-            pass
+            idx = int(row.get("index", pos))
+        except (TypeError, ValueError):
+            idx = pos
+        if not 0 <= idx < len(wavs) or res[idx] is not None:
+            continue
+        emo = str(row.get("emotion", "")).lower().strip()
+        try:
+            conf = float(row.get("confidence", 0))
+        except (TypeError, ValueError):
+            conf = 0.0
+        res[idx] = {"emotion": emo if emo in EMOTIONS else BASELINE,
+                    "confidence": conf, "cue": str(row.get("cue", ""))[:60]}
     return res
+
+
+def label_emotions(wavs: list[Path], spend: "Spend | None" = None,
+                   escalate_below: float = 0.7) -> list[dict | None]:
+    """Label a batch: one flash request, then at most ONE pro request for the
+    low-confidence clips inside it.
+
+    Escalation is budgeted (`Spend.take_escalations`) — it used to fire on every
+    unsure segment, uncapped, doubling that segment's bill silently. What the
+    result now always tells the truth about is its SOURCE: an escalation that
+    was skipped for budget or that FAILED leaves the flash label in place and
+    says so (`escalation: "skipped" | "failed"`), where the old code swallowed
+    the exception and returned a label indistinguishable from a confident one.
+    """
+    ledger = spend or Spend()
+    flash = _gemini(FLASH_MODEL, wavs, ledger)
+    for r in flash:
+        if r is not None:
+            r["model"] = FLASH_MODEL
+
+    low = [i for i, r in enumerate(flash)
+           if r is not None and r["confidence"] < escalate_below]
+    if not low:
+        return flash
+    granted = ledger.take_escalations(len(low))
+    for i in low[granted:]:
+        flash[i]["escalation"] = "skipped"      # budget exhausted — say so
+    pick = low[:granted]
+    if not pick:
+        return flash
+    try:
+        pro = _gemini(PRO_MODEL, [wavs[i] for i in pick], ledger)
+    except Exception as exc:  # noqa: BLE001 - a failed escalation is not a failed batch
+        ledger.note_escalation_failure(len(pick))
+        _log(f"label: escalation to {PRO_MODEL} failed for {len(pick)} clip(s): {exc}")
+        for i in pick:
+            flash[i]["escalation"] = "failed"
+        return flash
+    for j, i in enumerate(pick):
+        if pro[j] is None:
+            ledger.note_escalation_failure(1)
+            flash[i]["escalation"] = "failed"
+            continue
+        pro[j]["model"] = PRO_MODEL
+        pro[j]["escalation"] = "escalated"
+        flash[i] = pro[j]
+    return flash
 
 
 # ── sovereign mode (local-only, ffmpeg — audio never leaves the machine) ─────
@@ -457,7 +718,8 @@ def build_segments(words: list[dict], min_gap: float = 0.6, min_dur: float = 1.2
 def analyze(audio: Path, work_dir: Path,
             progress: Callable[[str, str], None] | None = None,
             partial: Callable[[dict], None] | None = None,
-            should_cancel: Callable[[], bool] | None = None) -> dict:
+            should_cancel: Callable[[], bool] | None = None,
+            spend: "Spend | None" = None) -> dict:
     """Steps 1-2 + per-speaker stats. Saves clean.wav, segments.json, and a
     preview clip per speaker. Returns { duration, transcript, speakers:[...] }.
 
@@ -472,9 +734,10 @@ def analyze(audio: Path, work_dir: Path,
         if progress:
             progress(k, s)
 
+    ledger = spend or Spend()
     _check(should_cancel)
     prog("transcribe", "active")
-    tr = scribe(audio)
+    tr = scribe(audio, ledger)
     words = tr.get("words", [])
     duration = tr.get("audio_duration_secs", 0)
     transcript = (tr.get("text") or "")[:600]
@@ -482,13 +745,13 @@ def analyze(audio: Path, work_dir: Path,
     if partial:
         partial({"words": sum(1 for w in words if w.get("type") == "word"),
                  "speakers": sorted({s["speaker"] for s in all_segs}),
-                 "transcript": transcript})
+                 "transcript": transcript, "spend": ledger.snapshot()})
     prog("transcribe", "done")
 
     _check(should_cancel)          # the isolator is the second paid call
     prog("isolate", "active")
     iso = work_dir / "iso.mp3"
-    voice_isolate(audio, iso)
+    voice_isolate(audio, iso, ledger)
     clean = work_dir / "clean.wav"
     clean_audio(iso, clean)  # canonical cleanup (adds loudnorm) after isolation
     prog("isolate", "done")
@@ -506,7 +769,8 @@ def analyze(audio: Path, work_dir: Path,
         speakers.append({"id": sid, "utterances": len(ss), "seconds": secs,
                          "sample_text": longest["text"][:80]})
     speakers.sort(key=lambda s: -s["seconds"])
-    return {"duration": duration, "transcript": transcript, "speakers": speakers}
+    return {"duration": duration, "transcript": transcript, "speakers": speakers,
+            "spend": ledger.snapshot()}
 
 
 # ── baseline (neutral) stem composition ───────────────────────────────────────
@@ -600,7 +864,8 @@ def label_and_stem(work_dir: Path, target: str, min_stem: float = MIN_STEM_SECON
                    progress: Callable[[str, str], None] | None = None,
                    partial: Callable[[dict], None] | None = None,
                    mode: str = "cloud",
-                   should_cancel: Callable[[], bool] | None = None) -> dict:
+                   should_cancel: Callable[[], bool] | None = None,
+                   spend: "Spend | None" = None) -> dict:
     """Classify each segment of `target`, then splice one stem per emotion.
 
     `should_cancel` is polled on entry, by every pooled task before it does any
@@ -619,50 +884,85 @@ def label_and_stem(work_dir: Path, target: str, min_stem: float = MIN_STEM_SECON
 
     prog("label", "active")
     todo = tsegs[:limit]
-    # Each segment is extracted + classified on a bounded pool; results are
-    # written back BY INDEX so the final order is identical to serial labeling.
+    ledger = spend or Spend()
+    # Segments are extracted and classified in BATCHES on a bounded pool: each
+    # task extracts its own clips (ffmpeg, local, one process per clip) and then
+    # classifies them in ONE request. Results are written back BY INDEX so the
+    # order is identical to serial labelling.
     results: list[dict | None] = [None] * len(todo)
     counts: dict[str, int] = {}
-    state = {"done": 0, "errors": 0}
+    state = {"done": 0, "errors": 0, "extract_errors": 0, "classify_errors": 0}
     prog_lock = threading.Lock()
 
-    def _label_seg(i: int, s: dict) -> None:
-        """Extract + classify one segment. A failure (ffmpeg extract OR the
-        classifier) degrades THIS segment to baseline and is counted, without
-        killing the batch. A cancelled job skips the segment entirely — the
-        queued tasks drain instantly instead of spending on a job nobody is
-        waiting for, and none of them writes into the deleted workdir."""
-        if should_cancel and should_cancel():
-            return
-        seg_wav = work_dir / f"seg_{i:03d}.wav"
-        failed = False
-        try:
-            to_wav(clean, seg_wav, s["start"], s["end"])
-            if mode == "sovereign":
-                # No cloud classifier: everything is baseline. Emotions get added
-                # afterwards via the studio's guided per-emotion recorder.
-                lab = {"emotion": BASELINE, "confidence": 1.0, "cue": "", "model": "local"}
-            else:
-                lab = label_emotion(seg_wav)
-        except Exception:  # noqa: BLE001 - one segment must not fail the batch
-            failed = True
+    def _settle(i: int, s: dict, lab: dict | None, failure: str | None) -> None:
+        """Record ONE segment's outcome. `failure` names WHY it degraded —
+        "extract" (ffmpeg could not decode this span) and "classify" (the
+        classifier failed or said nothing about this clip) used to be collapsed
+        into the same silent fallback to baseline, which is how a provider
+        outage looked exactly like a quiet recording."""
+        if lab is None:
             lab = {"emotion": BASELINE, "confidence": 0.0, "cue": "", "model": "error"}
+        seg_wav = work_dir / f"seg_{i:03d}.wav"
         lab.update({"i": i, "dur": round(s["end"] - s["start"], 2),
                     "text": s["text"][:60], "wav": str(seg_wav),
-                    "ok": (not failed) and seg_wav.is_file()})
+                    "failure": failure,
+                    # An unlabelled segment is UNUSED, not baseline audio: we do
+                    # not know its emotion, and guessing "neutral" would quietly
+                    # pollute the one stem that must stay pure.
+                    "ok": failure is None and seg_wav.is_file()})
         with prog_lock:
             results[i] = lab
             counts[lab["emotion"]] = counts.get(lab["emotion"], 0) + 1
             state["done"] += 1
-            if failed:
+            if failure:
                 state["errors"] += 1
+                state[f"{failure}_errors"] += 1
             if partial:
                 partial({"segments_total": len(todo), "segments_done": state["done"],
-                         "emotion_counts": dict(counts), "label_errors": state["errors"]})
+                         "emotion_counts": dict(counts), "label_errors": state["errors"],
+                         "extract_errors": state["extract_errors"],
+                         "classify_errors": state["classify_errors"],
+                         "spend": ledger.snapshot()})
+
+    def _label_batch(idxs: list[int]) -> None:
+        """Extract then classify one batch. A cancelled job skips it entirely —
+        queued tasks drain instantly instead of spending on a job nobody is
+        waiting for, and none of them writes into the deleted workdir."""
+        if should_cancel and should_cancel():
+            return
+        ready: list[int] = []
+        for i in idxs:
+            s = todo[i]
+            try:
+                to_wav(clean, work_dir / f"seg_{i:03d}.wav", s["start"], s["end"])
+            except Exception:  # noqa: BLE001 - one clip must not fail the batch
+                _settle(i, s, None, "extract")
+                continue
+            ready.append(i)
+        if not ready:
+            return
+        if mode == "sovereign":
+            # No cloud classifier: everything is baseline. Emotions get added
+            # afterwards via the studio's guided per-emotion recorder.
+            for i in ready:
+                _settle(i, todo[i], {"emotion": BASELINE, "confidence": 1.0,
+                                     "cue": "", "model": "local"}, None)
+            return
+        if should_cancel and should_cancel():
+            return
+        try:
+            labs = label_emotions([work_dir / f"seg_{i:03d}.wav" for i in ready], ledger)
+        except Exception as exc:  # noqa: BLE001 - one batch must not fail the job
+            _log(f"label: batch of {len(ready)} failed: {exc}")
+            labs = [None] * len(ready)
+        for pos, i in enumerate(ready):
+            lab = labs[pos] if pos < len(labs) else None
+            _settle(i, todo[i], lab, None if lab else "classify")
 
     if todo:
-        with ThreadPoolExecutor(max_workers=min(LABEL_WORKERS, len(todo))) as pool:
-            for fut in [pool.submit(_label_seg, i, s) for i, s in enumerate(todo)]:
+        groups = _batches(len(todo))
+        with ThreadPoolExecutor(max_workers=min(LABEL_WORKERS, len(groups))) as pool:
+            for fut in [pool.submit(_label_batch, g) for g in groups]:
                 fut.result()  # re-raise only truly unexpected errors (not per-seg)
     _check(should_cancel)   # a cancelled batch is abandoned, never spliced
     labelled = [r for r in results if r is not None]
@@ -672,6 +972,16 @@ def label_and_stem(work_dir: Path, target: str, min_stem: float = MIN_STEM_SECON
     # Only segments whose wav was actually written can feed a stem; a segment
     # that failed extraction is still labelled/counted but contributes no audio.
     usable = [l for l in labelled if l.get("ok")]
+    if todo and not usable:
+        # Every segment failed. Splicing nothing raises "no speech detected in
+        # the clip" — which would be a LIE when the truth is that the classifier
+        # was unreachable or the audio would not decode. Say which.
+        raise UserFacing(
+            f"none of the {len(todo)} speech segments could be prepared — "
+            f"{state['extract_errors']} could not be decoded and "
+            f"{state['classify_errors']} could not be classified. "
+            "If this keeps happening the emotion classifier may be unavailable; "
+            "try again in a few minutes.")
     by_emotion: dict[str, list[dict]] = {}
     for lab in usable:
         by_emotion.setdefault(lab["emotion"], []).append(lab)
@@ -700,8 +1010,11 @@ def label_and_stem(work_dir: Path, target: str, min_stem: float = MIN_STEM_SECON
     prog("stem", "done")
 
     return {"target": target, "utterances": len(tsegs), "min_stem": min_stem, "stems": stems,
+            "spend": ledger.snapshot(),
             "segments": [{"emotion": l["emotion"], "confidence": l["confidence"], "cue": l["cue"],
-                          "dur": l["dur"], "text": l["text"], "model": l["model"]} for l in labelled]}
+                          "dur": l["dur"], "text": l["text"], "model": l["model"],
+                          "failure": l.get("failure"),
+                          "escalation": l.get("escalation")} for l in labelled]}
 
 
 def resolve_mode(mode: str = "auto") -> str:
@@ -716,11 +1029,15 @@ def scan(audio: Path, work_dir: Path, speaker: str = "auto", min_stem: float = M
          limit: int = 40, progress: Callable[[str, str], None] | None = None,
          mode: str = "auto") -> dict:
     mode = resolve_mode(mode)
-    a = (sovereign_analyze if mode == "sovereign" else analyze)(audio, work_dir, progress)
+    ledger = Spend()   # ONE budget for the whole one-shot run, both phases
+    if mode == "sovereign":
+        a = sovereign_analyze(audio, work_dir, progress)
+    else:
+        a = analyze(audio, work_dir, progress, spend=ledger)
     if not a["speakers"]:
         raise RuntimeError("no speech detected in the clip")
     target = a["speakers"][0]["id"] if speaker == "auto" else speaker
-    r = label_and_stem(work_dir, target, min_stem, limit, progress, mode=mode)
+    r = label_and_stem(work_dir, target, min_stem, limit, progress, mode=mode, spend=ledger)
     return {"duration": a["duration"], "speakers": [s["id"] for s in a["speakers"]],
             "mode": mode, **r}
 

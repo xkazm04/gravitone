@@ -84,6 +84,28 @@ class ValidationTests(unittest.TestCase):
         with mock.patch("service.ingest_api.subprocess.run", return_value=fake):
             self.assertIsNone(ingest_api.probe_duration(Path("x")))
 
+    def test_probe_duration_none_when_ffprobe_is_missing(self):
+        with mock.patch("service.ingest_api.subprocess.run",
+                        side_effect=FileNotFoundError("ffprobe")):
+            self.assertIsNone(ingest_api.probe_duration(Path("x")))
+
+    def test_duration_gate_accepts_a_normal_clip(self):
+        self.assertIsNone(ingest_api.check_duration(30.0))
+
+    def test_duration_gate_rejects_short(self):
+        msg = ingest_api.check_duration(1.0) or ""
+        self.assertIn("too short", msg)
+
+    def test_duration_gate_rejects_long_before_anything_is_paid_for(self):
+        # There was a floor and no ceiling; both ElevenLabs calls bill by length.
+        msg = ingest_api.check_duration(ingest_api.MAX_CLIP_SECONDS + 1) or ""
+        self.assertIn("too long", msg)
+
+    def test_duration_gate_fails_closed_when_unknown(self):
+        # `dur is None` used to disable the gate entirely and wave the upload
+        # straight through to the transcriber.
+        self.assertIsNotNone(ingest_api.check_duration(None))
+
 
 def _make_job(root: Path, jid: str, status: str, created: float) -> dict:
     wd = root / jid

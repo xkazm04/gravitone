@@ -336,12 +336,18 @@ class StemAssemblyTests(unittest.TestCase):
             i = int(Path(dst).stem.split("_")[1])
             _write_tone(Path(dst), 300.0 + 100 * i, dur)
 
-        def fake_label(wav_path):
-            i = int(Path(wav_path).stem.split("_")[1])
-            return {"emotion": layout[i], "confidence": 0.9, "cue": f"c{i}", "model": "flash"}
+        def fake_label(wav_paths, spend=None):
+            # Labelling is BATCHED: one call carries several clips and returns
+            # one result per clip, in order.
+            out = []
+            for p in wav_paths:
+                i = int(Path(p).stem.split("_")[1])
+                out.append({"emotion": layout[i], "confidence": 0.9,
+                            "cue": f"c{i}", "model": "flash"})
+            return out
 
         with mock.patch.object(ingest, "to_wav", side_effect=fake_to_wav), \
-             mock.patch.object(ingest, "label_emotion", side_effect=fake_label):
+             mock.patch.object(ingest, "label_emotions", side_effect=fake_label):
             res = ingest.label_and_stem(wd, "speaker_0", min_stem=min_stem, mode="cloud")
         return wd, res, {s["emotion"]: s for s in res["stems"]}
 

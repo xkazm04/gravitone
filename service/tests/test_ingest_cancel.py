@@ -55,25 +55,25 @@ class LabelCancelTests(unittest.TestCase):
         lock = threading.Lock()
         flag = {"cancel": False}
 
-        def fake_label(wav_path):
+        def fake_label(wav_paths, spend=None):
             with lock:
-                calls.append(1)
-                if len(calls) >= 4:
-                    flag["cancel"] = True      # the DELETE lands here
-            return {"emotion": "happy", "confidence": 0.9, "cue": "c", "model": "flash"}
+                calls.extend(wav_paths)
+                flag["cancel"] = True          # the DELETE lands on batch one
+            return [{"emotion": "happy", "confidence": 0.9, "cue": "c",
+                     "model": "flash"} for _ in wav_paths]
 
         with TemporaryDirectory() as td:
             wd = self._work(td, n)
             with mock.patch.object(ingest, "to_wav",
                                    side_effect=lambda src, dst, a=None, b=None: _write_wav(Path(dst), 240)), \
-                 mock.patch.object(ingest, "label_emotion", side_effect=fake_label):
+                 mock.patch.object(ingest, "label_emotions", side_effect=fake_label):
                 with self.assertRaises(ingest.Cancelled):
                     ingest.label_and_stem(wd, "speaker_0", mode="cloud",
                                           should_cancel=lambda: flag["cancel"])
-            # Only the segments already in flight finished; the queued ones were
-            # not paid for. (Bounded by the pool, hence the generous margin.)
+            # Only the batches already in flight were paid for; the queued ones
+            # drained without a call. (Bounded by the pool, hence the margin.)
             self.assertLess(len(calls), n)
-            self.assertLessEqual(len(calls), 4 + ingest.LABEL_WORKERS)
+            self.assertLessEqual(len(calls), ingest.LABEL_WORKERS * ingest.LABEL_BATCH)
             # Nothing was spliced into the (already torn-down) workdir.
             self.assertEqual(list(wd.glob("stem_*.wav")), [])
 
@@ -81,7 +81,7 @@ class LabelCancelTests(unittest.TestCase):
         with TemporaryDirectory() as td:
             wd = self._work(td, 8)
             with mock.patch.object(ingest, "to_wav") as to_wav, \
-                 mock.patch.object(ingest, "label_emotion") as lab:
+                 mock.patch.object(ingest, "label_emotions") as lab:
                 with self.assertRaises(ingest.Cancelled):
                     ingest.label_and_stem(wd, "speaker_0", mode="cloud",
                                           should_cancel=lambda: True)
@@ -95,7 +95,7 @@ class LabelCancelTests(unittest.TestCase):
             wd = Path(td)
             flag = {"cancel": False}
 
-            def fake_scribe(path):
+            def fake_scribe(path, spend=None):
                 flag["cancel"] = True
                 return {"words": [], "audio_duration_secs": 5, "text": "hi"}
 

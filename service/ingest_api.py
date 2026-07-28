@@ -91,9 +91,17 @@ _RUNNING_TTL = 60 * 120
 # fan-outs of ffmpeg + paid cloud calls. See Settings.ingest_max_jobs.
 MAX_ACTIVE_JOBS = SETTINGS.ingest_max_jobs
 
+# One external-spend ledger per job, shared by its analyze and label phases so
+# the retry/escalation budgets are per JOB (the point of them) and the reported
+# cost is the whole job's. Per process, exactly like JOBS.
+_SPEND: dict[str, ingest.Spend] = {}
+
 # ── upload validation ─────────────────────────────────────────────────────────
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 MIN_CLIP_SECONDS = 3.0
+# Both ElevenLabs calls bill by duration, so the floor without a ceiling bounded
+# nothing that costs money. See Settings.ingest_max_clip_seconds.
+MAX_CLIP_SECONDS = SETTINGS.ingest_max_clip_seconds
 _AUDIO_EXTS = {
     ".mp3", ".wav", ".wave", ".m4a", ".m4b", ".mp4", ".mov", ".ogg", ".oga",
     ".opus", ".flac", ".aac", ".webm", ".wma", ".aiff", ".aif", ".aifc",
@@ -130,17 +138,52 @@ def validate_upload_bytes(data: bytes, filename: str) -> str | None:
 
 
 def probe_duration(path: Path) -> float | None:
-    """Clip length via ffprobe; None when it can't be determined."""
-    r = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
-        capture_output=True)
+    """Clip length via ffprobe; None when it can't be determined.
+
+    None is not "fine, carry on": `check_duration` treats it as a REJECTION,
+    because the duration gate is the only thing standing between an upload and
+    two duration-billed cloud calls. A missing ffprobe binary (OSError) lands
+    here too — the whole pipeline needs ffmpeg, so failing closed is honest."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True)
+    except OSError:
+        return None
     if r.returncode != 0:
         return None
     try:
         return float(r.stdout.decode(errors="ignore").strip())
     except ValueError:
         return None
+
+
+def check_duration(dur: float | None) -> str | None:
+    """Human error string when a clip's length disqualifies it, else None.
+
+    Runs BEFORE any paid call. There used to be a floor and no ceiling, and an
+    unreadable duration disabled even the floor: `dur is None` waved the upload
+    straight through to Scribe."""
+    if dur is None:
+        return ("couldn't read this recording's length — re-export it as WAV or MP3 "
+                "and try again")
+    if dur < MIN_CLIP_SECONDS:
+        return f"clip too short — record at least {MIN_CLIP_SECONDS:.0f} seconds of speech"
+    if dur > MAX_CLIP_SECONDS:
+        return (f"recording too long — keep it under {MAX_CLIP_SECONDS / 60:.0f} minutes "
+                "(trim to the part you want cloned)")
+    return None
+
+
+def _spend_for(job_id: str) -> ingest.Spend:
+    with _LOCK:
+        led = _SPEND.get(job_id)
+        if led is None:
+            led = _SPEND[job_id] = ingest.Spend()
+        return led
+
+
 
 
 # ── state persistence (all callers hold _LOCK) ────────────────────────────────
@@ -265,6 +308,7 @@ def _gc_once() -> None:
             JOBS[jid]["cancel"] = True
             shutil.rmtree(JOBS[jid]["work_dir"], ignore_errors=True)
             JOBS.pop(jid, None)
+            _SPEND.pop(jid, None)
         live = {v["work_dir"] for v in JOBS.values()}
     # orphan workdirs with no live job (e.g. left by a crash) age out too
     if WORK_ROOT.is_dir():
@@ -335,9 +379,12 @@ def _analyze(job_id: str, audio: Path) -> None:
                 audio, Path(job["work_dir"]),
                 progress=lambda k, s: _mk_step(job, k, s),
                 partial=lambda d: _partial(job, d),
-                should_cancel=cancelled)
+                should_cancel=cancelled, spend=_spend_for(job_id))
         if not res.get("speakers"):
             raise errors.UserFacing("no speech detected in the clip")
+        # What this phase actually spent — zeros in sovereign mode, which is
+        # itself worth showing (the audio never left the machine).
+        _partial(job, {"spend": _spend_for(job_id).snapshot()})
         _update(job, speakers=res["speakers"], duration=res["duration"],
                 status="awaiting_speaker")
     except ingest.Cancelled:
@@ -360,7 +407,7 @@ def _label(job_id: str, target: str) -> None:
             progress=lambda k, s: _mk_step(job, k, s),
             partial=lambda d: _partial(job, d),
             mode=job["mode"],
-            should_cancel=_canceller(job))
+            should_cancel=_canceller(job), spend=_spend_for(job_id))
         _update(job, result={"duration": job.get("duration", 0),
                              "speakers": [s["id"] for s in job.get("speakers", [])],
                              "mode": job["mode"], **res},
@@ -468,10 +515,10 @@ def start_scan(file: UploadFile = File(...), mode: str = Form("auto")) -> dict:
     src = work_dir / f"src-{safe_name}"
     src.write_bytes(data)
 
-    dur = probe_duration(src)
-    if dur is not None and dur < MIN_CLIP_SECONDS:
+    bad = check_duration(probe_duration(src))
+    if bad:
         shutil.rmtree(work_dir, ignore_errors=True)
-        raise HTTPException(400, f"clip too short — record at least {MIN_CLIP_SECONDS:.0f} seconds of speech")
+        raise HTTPException(400, bad)
 
     job = {
         "id": job_id, "status": "running", "step": None, "mode": resolved,
@@ -593,6 +640,7 @@ def cancel_job(job_id: str):
         job["status"] = "cancelled"
         work_dir = job["work_dir"]
         JOBS.pop(job_id, None)
+        _SPEND.pop(job_id, None)
     shutil.rmtree(work_dir, ignore_errors=True)
     return {"status": "cancelled"}
 
