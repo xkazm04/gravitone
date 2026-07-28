@@ -14,7 +14,19 @@ Durability: every job owns a subdir under INGEST_WORK_DIR holding its files and 
 `state.json` mirror of the job dict. All JOBS mutations + persistence happen under a
 single lock. On import we rehydrate finished/awaiting jobs (marking any job caught
 mid-flight by the restart as errored) and start a background GC thread that expires
-old jobs (and orphan workdirs) on a timer.
+IDLE jobs (and orphan workdirs) on a timer — a job that is actively working only
+ages out on the far longer wedged threshold, so GC never deletes a workdir under
+a running thread.
+
+Abandonment: `job["cancel"]` is the single teardown flag, and EVERY phase honours
+it — analyze polls it before each paid call, labelling before each segment,
+commit between emotions. A commit that is cancelled OR that fails rolls back the
+Voices it had already registered (`_rollback`), because registration happens per
+stem and both paths otherwise leave a partial Character behind. Phase failures
+reach the client through `errors.sanitize_detail`, never as raw tool output.
+
+Admission: `Settings.ingest_max_jobs` bounds how many jobs may be working at
+once; the phase-starting routes answer 429 above it.
 """
 from __future__ import annotations
 
@@ -27,12 +39,13 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from typing import Callable
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from service import ingest, voices
+from service import errors, ingest, voices
 from service.config import SETTINGS
 from service.errors import job_expired
 
@@ -61,8 +74,22 @@ STEPS_BY_MODE = {
 JOBS: dict[str, dict] = {}
 _LOCK = threading.RLock()          # guards every JOBS mutation + state persistence
 WORK_ROOT = Path(SETTINGS.ingest_work_dir)
-_TTL = 60 * 30                     # jobs (and their workdirs) expire after 30 min
+_TTL = 60 * 30                     # idle jobs (and their workdirs) expire after 30 min
 _GC_INTERVAL = 60 * 5             # background GC sweep cadence
+
+# Statuses that mean "a thread is doing work for this job right now". They are
+# what the admission gate counts and what GC refuses to reap on the idle TTL.
+ACTIVE_STATUSES = ("running", "committing")
+# The only TTL an ACTIVE job can hit. Expiry is measured from the last state
+# mutation (`touched`), not from creation: a cloud scan of a long recording, or
+# a commit started 25 minutes after the scan, used to be reaped mid-phase by the
+# creation-age TTL — the workdir was deleted out from under a thread that was
+# still writing into it. A job that has genuinely made no progress for this long
+# is wedged, and IS reaped (with the cancel flag set first, as always).
+_RUNNING_TTL = 60 * 120
+# Bounded concurrency: nothing used to stop N uploads spawning N unbounded
+# fan-outs of ffmpeg + paid cloud calls. See Settings.ingest_max_jobs.
+MAX_ACTIVE_JOBS = SETTINGS.ingest_max_jobs
 
 # ── upload validation ─────────────────────────────────────────────────────────
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
@@ -125,6 +152,9 @@ def _persist(job: dict) -> None:
     # persist.
     if not wd.is_dir():
         return
+    # Every state change is a heartbeat: GC ages a job from its last mutation,
+    # so a job that is visibly progressing is never reaped mid-phase.
+    job["touched"] = time.time()
     try:
         tmp = wd / "state.json.tmp"
         tmp.write_text(json.dumps(job), "utf-8")
@@ -196,10 +226,38 @@ def _rehydrate() -> None:
         JOBS[job["id"]] = job
 
 
+def _is_expired(job: dict, now: float) -> bool:
+    """Age a job from its last state mutation, against a TTL chosen by STATUS.
+
+    Age alone reaped jobs that were mid-flight and healthy (a long cloud scan
+    hit the 30-minute mark and had its workdir deleted under the running
+    thread). An actively-working job now only expires on the far longer wedged
+    threshold, and only if it has stopped reporting progress."""
+    age = now - max(job.get("touched", 0), job.get("created", 0))
+    return age > (_RUNNING_TTL if job.get("status") in ACTIVE_STATUSES else _TTL)
+
+
+def _active_count() -> int:
+    """Jobs currently occupying CPU / external spend. Caller holds _LOCK."""
+    return sum(1 for v in JOBS.values() if v.get("status") in ACTIVE_STATUSES)
+
+
+def _admit() -> None:
+    """Admission gate for every phase that starts real work. 429 rather than
+    queue: the client is a poller that can retry, and silently queueing an
+    upload behind a 10-minute scan reads as a hang."""
+    with _LOCK:
+        active = _active_count()
+    if active >= MAX_ACTIVE_JOBS:
+        raise HTTPException(
+            429, f"{active} recordings are already being processed — "
+                 "try again in a moment")
+
+
 def _gc_once() -> None:
     now = time.time()
     with _LOCK:
-        for jid in [j for j, v in JOBS.items() if now - v.get("created", 0) > _TTL]:
+        for jid in [j for j, v in JOBS.items() if _is_expired(v, now)]:
             # Set the cancel flag BEFORE deleting anything — same teardown
             # protocol as cancel_job. Without it a phase thread that outlived
             # the TTL keeps working against a deleted workdir (and _persist
@@ -233,23 +291,61 @@ def _gc_loop() -> None:
 
 
 # ── background phases ─────────────────────────────────────────────────────────
+def _canceller(job: dict) -> Callable[[], bool]:
+    """The one cancellation predicate handed to the pipeline. Reads the flag
+    under _LOCK — cancel_job/GC set it on this same dict after popping the job
+    from JOBS, so the thread keeps seeing it."""
+    def cancelled() -> bool:
+        with _LOCK:
+            return bool(job.get("cancel"))
+    return cancelled
+
+
+def _fail(job: dict, action: str, exc: BaseException) -> None:
+    """Terminal failure of a background phase, told honestly but without
+    internals. Phase exceptions routinely wrap ffmpeg/pocket-tts stderr and
+    absolute paths; `errors.sanitize_detail` logs the raw cause against a
+    request id and leaves the client the id (only `errors.UserFacing` messages,
+    authored for humans, pass through)."""
+    _update(job, status="error", error=errors.sanitize_detail(action, exc))
+
+
 def _analyze(job_id: str, audio: Path) -> None:
     job = _get_job(job_id)
     if job is None:  # cancelled between Thread.start() and here
         audio.unlink(missing_ok=True)
         return
-    analyze_fn = ingest.sovereign_analyze if job["mode"] == "sovereign" else ingest.analyze
+    cancelled = _canceller(job)
+    sovereign = job["mode"] == "sovereign"
     try:
-        res = analyze_fn(
-            audio, Path(job["work_dir"]),
-            progress=lambda k, s: _mk_step(job, k, s),
-            partial=lambda d: _partial(job, d))
+        if sovereign:
+            # Local-only phase: no paid calls, no fan-out. Cancellation is
+            # honoured at its edges (the expensive fan-out in BOTH modes is the
+            # labelling phase, which polls per segment).
+            if cancelled():
+                raise ingest.Cancelled()
+            res = ingest.sovereign_analyze(
+                audio, Path(job["work_dir"]),
+                progress=lambda k, s: _mk_step(job, k, s),
+                partial=lambda d: _partial(job, d))
+            if cancelled():
+                raise ingest.Cancelled()
+        else:
+            res = ingest.analyze(
+                audio, Path(job["work_dir"]),
+                progress=lambda k, s: _mk_step(job, k, s),
+                partial=lambda d: _partial(job, d),
+                should_cancel=cancelled)
         if not res.get("speakers"):
-            raise RuntimeError("no speech detected in the clip")
+            raise errors.UserFacing("no speech detected in the clip")
         _update(job, speakers=res["speakers"], duration=res["duration"],
                 status="awaiting_speaker")
+    except ingest.Cancelled:
+        # Not a failure: the job is already torn down and `_update` would
+        # no-op anyway. Say so in the log so a vanished job is explicable.
+        logger.info("ingest job %s: analyze abandoned (cancelled)", job_id)
     except Exception as exc:  # noqa: BLE001
-        _update(job, status="error", error=str(exc)[:400])
+        _fail(job, "recording analysis", exc)
     finally:
         audio.unlink(missing_ok=True)
 
@@ -263,13 +359,16 @@ def _label(job_id: str, target: str) -> None:
             Path(job["work_dir"]), target,
             progress=lambda k, s: _mk_step(job, k, s),
             partial=lambda d: _partial(job, d),
-            mode=job["mode"])
+            mode=job["mode"],
+            should_cancel=_canceller(job))
         _update(job, result={"duration": job.get("duration", 0),
                              "speakers": [s["id"] for s in job.get("speakers", [])],
                              "mode": job["mode"], **res},
                 status="done")
+    except ingest.Cancelled:
+        logger.info("ingest job %s: labelling abandoned (cancelled)", job_id)
     except Exception as exc:  # noqa: BLE001
-        _update(job, status="error", error=str(exc)[:400])
+        _fail(job, "emotion labelling", exc)
 
 
 def _commit_progress(job: dict, done: int, total: int, current: str | None) -> None:
@@ -280,56 +379,71 @@ def _commit_progress(job: dict, done: int, total: int, current: str | None) -> N
         _persist(job)
 
 
+def _rollback(job_id: str, created: list[dict], why: str) -> None:
+    """Undo a half-finished clone. ONE rollback for both abandonment paths.
+
+    `ingest.commit` registers each Voice as it goes, and tearing down the
+    WORKDIR does not touch VOICES_DIR — so every emotion that finished before a
+    cancel OR before an exception is a live, registered Voice: exactly the
+    partial Character the user never agreed to. Only the ids this commit
+    created are removed, so a cancelled *extend* keeps the character's
+    pre-existing Voices. Teardown must not raise: a failed rollback is logged
+    loudly (the voices really are still live) and the job still ends terminal.
+    """
+    ids = [v.get("voice_id") for v in created
+           if isinstance(v, dict) and v.get("voice_id")]
+    if not ids:
+        return
+    try:
+        removed = voices.remove_voices(ids)
+        logger.warning("ingest job %s %s mid-clone; rolled back %d/%d "
+                       "voice(s): %s", job_id, why, len(removed), len(ids), removed)
+    except Exception as exc:  # noqa: BLE001 - teardown must not raise
+        logger.error(
+            "ingest job %s %s but ROLLBACK FAILED — these voices remain "
+            "registered and must be removed by hand: %s (%s)",
+            job_id, why, ids, exc)
+
+
 def _do_commit(job_id: str, character: str, emotions: list[str], character_id: str | None,
                statement: str) -> None:
     job = _get_job(job_id)
     if job is None:  # cancelled between Thread.start() and here
         return
     total = len(emotions)
+    cancelled = _canceller(job)
 
-    def cancelled() -> bool:
-        with _LOCK:
-            return bool(job.get("cancel"))
+    # Ledger of what was actually REGISTERED, kept as it happens: on the
+    # exception path there is no return value to inspect, and the voices
+    # already written are precisely what has to be undone.
+    registered: list[dict] = []
 
+    failure: BaseException | None = None
     try:
         created = ingest.commit(
             Path(job["work_dir"]), character, emotions, character_id,
             consent=statement, clip_sha256=job.get("clip_sha256"),
             progress=lambda done, cur: _commit_progress(job, done, total, cur),
-            should_cancel=cancelled)
+            should_cancel=cancelled, on_voice=registered.append)
     except Exception as exc:  # noqa: BLE001
-        _update(job, status="error", error=f"commit failed: {str(exc)[:300]}")
-        return
+        created, failure = registered, exc
+
     with _LOCK:
         was_cancelled = bool(job.get("cancel"))
-        if not was_cancelled:
+        if not was_cancelled and failure is None:
             job["committed"] = created
             job["partial"] = {"emotions_done": total, "emotions_total": total,
                               "current": None}
             job["status"] = "committed"
             _persist(job)
 
-    if was_cancelled:
-        # DELETE/GC tore the job down mid-clone. Tearing down the WORKDIR does
-        # not touch VOICES_DIR, so every emotion that finished before the
-        # cancel is a live, registered Voice — a partial Character the user
-        # never agreed to. Undo exactly what this commit created (an extend
-        # keeps the character's pre-existing Voices).
-        ids = [v.get("voice_id") for v in created
-               if isinstance(v, dict) and v.get("voice_id")]
-        if ids:
-            try:
-                removed = voices.remove_voices(ids)
-                logger.warning(
-                    "ingest job %s cancelled mid-clone; rolled back %d/%d "
-                    "voice(s): %s", job_id, len(removed), len(ids), removed)
-            except Exception as exc:  # noqa: BLE001 - teardown must not raise
-                # Never leave this silent: the voices are live and the user
-                # thinks they cancelled.
-                logger.error(
-                    "ingest job %s cancelled but ROLLBACK FAILED — these "
-                    "voices remain registered and must be removed by hand: "
-                    "%s (%s)", job_id, ids, exc)
+    if failure is not None:
+        # Reach a terminal state FIRST (a poller must never hang on a failed
+        # commit), then undo. `_update` no-ops if the job was also cancelled.
+        _fail(job, "voice cloning", failure)
+        _rollback(job_id, registered, "failed")
+    elif was_cancelled:
+        _rollback(job_id, created, "cancelled")
 
 
 # ── endpoints ─────────────────────────────────────────────────────────────────
@@ -340,6 +454,7 @@ def start_scan(file: UploadFile = File(...), mode: str = Form("auto")) -> dict:
     # threadpool, not the event loop (every other route in this file is `def`).
     if mode not in ("auto", "cloud", "sovereign"):
         raise HTTPException(400, "mode must be auto, cloud or sovereign")
+    _admit()  # before the 50 MB read: a rejected upload should cost nothing
     data = file.file.read()  # sync read — we're on the threadpool
     err = validate_upload_bytes(data, file.filename or "")
     if err:
@@ -402,6 +517,7 @@ class SpeakerReq(BaseModel):
 
 @router.post("/{job_id}/speaker")
 def choose_speaker(job_id: str, req: SpeakerReq) -> dict:
+    _admit()  # labelling is the biggest fan-out in the pipeline
     with _LOCK:
         job = JOBS.get(job_id)
         if not job:
@@ -441,6 +557,7 @@ def commit(job_id: str, req: CommitReq):
     """Kick off cloning as a background phase and return immediately. Progress
     (emotions_done / total / current) streams via `partial`; the job ends
     'committed' or 'error'. Poll GET /{job} to follow it."""
+    _admit()  # cloning loads the TTS model in a child process — the heaviest phase
     with _LOCK:
         job = JOBS.get(job_id)
         if not job:

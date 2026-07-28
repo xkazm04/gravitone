@@ -10,7 +10,10 @@ plus two structured variants that are part of the public contract:
 
 Server-side failures never leak internals: :func:`sanitized_500` logs the raw
 cause against a short request id and hands the caller only the id — the same
-pattern ``app.py`` established for synthesis failures. :func:`install_catch_all`
+pattern ``app.py`` established for synthesis failures; :func:`sanitize_detail` is
+the same guarantee for background phases that store a failure string on a job
+instead of raising, with :class:`UserFacing` as the explicit opt-out for
+messages authored for humans. :func:`install_catch_all`
 extends that guarantee to *unhandled* exceptions, which previously escaped to
 Starlette's plain-text ``Internal Server Error`` and broke the JSON contract.
 """
@@ -32,6 +35,31 @@ DETAIL_LIMIT = 300
 def tail(text: str, limit: int = DETAIL_LIMIT) -> str:
     """Last ``limit`` chars — the informative end of ffmpeg/subprocess stderr."""
     return text[-limit:]
+
+
+class UserFacing(Exception):
+    """An error whose message was WRITTEN for the end user.
+
+    Everything else that reaches a client goes through :func:`sanitize_detail`
+    and comes back as a request id, because a raw exception string in this
+    codebase routinely carries subprocess stderr, absolute paths or API
+    responses. Raising ``UserFacing`` is the explicit, greppable opt-out: it
+    says "I authored this sentence for a human and it contains no internals".
+    """
+
+
+def sanitize_detail(action: str, cause: BaseException) -> str:
+    """The detail string for a background-phase failure.
+
+    Background phases (ingest analyze/label/commit) cannot ``raise`` an
+    HTTPException — they store their failure on the job and a poller reads it —
+    so they need the *string* half of the sanitized-500 contract. Authored
+    messages (:class:`UserFacing`) pass through; anything else is logged
+    against a request id and the caller gets only the id.
+    """
+    if isinstance(cause, UserFacing):
+        return str(cause)[:DETAIL_LIMIT]
+    return str(sanitized_500(action, cause).detail)
 
 
 def sanitized_500(action: str, cause: BaseException | str) -> HTTPException:

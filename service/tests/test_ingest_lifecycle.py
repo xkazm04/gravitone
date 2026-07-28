@@ -176,12 +176,53 @@ class GcTests(unittest.TestCase):
         # (cancel_job has always done this; GC used to skip the protocol.)
         with TemporaryDirectory() as td:
             root = Path(td)
-            old = _make_job(root, "old", "committing",
+            old = _make_job(root, "old", "done",
                             time.time() - ingest_api._TTL - 10)
             ingest_api.JOBS["old"] = old
             with mock.patch.object(ingest_api, "WORK_ROOT", root):
                 ingest_api._gc_once()
             self.assertTrue(old["cancel"], "GC must flag the job it tears down")
+
+    def test_gc_leaves_a_running_job_alone(self):
+        # The bug: expiry looked only at age, so a long cloud scan that outran
+        # the idle TTL had its workdir deleted from under the running thread.
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            for status in ingest_api.ACTIVE_STATUSES:
+                job = _make_job(root, status, status,
+                                time.time() - ingest_api._TTL - 60)
+                job["touched"] = time.time()      # still reporting progress
+                ingest_api.JOBS[status] = job
+            with mock.patch.object(ingest_api, "WORK_ROOT", root):
+                ingest_api._gc_once()
+            for status in ingest_api.ACTIVE_STATUSES:
+                self.assertIn(status, ingest_api.JOBS)
+                self.assertTrue((root / status).is_dir())
+                self.assertFalse(ingest_api.JOBS[status]["cancel"])
+
+    def test_gc_still_reaps_a_wedged_running_job(self):
+        # Status-aware expiry must not become "never expires": a job that has
+        # made no progress for the wedged threshold is still torn down.
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            job = _make_job(root, "wedged", "running",
+                            time.time() - ingest_api._RUNNING_TTL - 60)
+            job["touched"] = job["created"]
+            ingest_api.JOBS["wedged"] = job
+            with mock.patch.object(ingest_api, "WORK_ROOT", root):
+                ingest_api._gc_once()
+            self.assertNotIn("wedged", ingest_api.JOBS)
+            self.assertTrue(job["cancel"])
+
+    def test_idle_job_ages_from_last_activity_not_creation(self):
+        # `touched` is the heartbeat every state mutation writes.
+        with TemporaryDirectory() as td:
+            old_created = time.time() - ingest_api._TTL - 60
+            job = _make_job(Path(td), "x", "awaiting_speaker", old_created)
+            job["touched"] = time.time()
+            self.assertFalse(ingest_api._is_expired(job, time.time()))
+            job["touched"] = old_created
+            self.assertTrue(ingest_api._is_expired(job, time.time()))
 
     def test_persist_does_not_resurrect_a_reaped_workdir(self):
         # _persist used to mkdir(parents=True), recreating a directory GC or
@@ -260,14 +301,18 @@ class CommitLifecycleTests(unittest.TestCase):
             ingest_api.JOBS["c1"] = job
 
             def fake_commit(work_dir, character, emotions, cid, *, consent=None,
-                            clip_sha256=None, progress=None, should_cancel=None):
+                            clip_sha256=None, progress=None, should_cancel=None,
+                            on_voice=None):
                 out = []
                 for idx, emo in enumerate(emotions):
                     if should_cancel and should_cancel():
                         break
                     if progress:
                         progress(idx, emo)
-                    out.append({"voice_id": f"v-{emo}", "emotion": emo, "seconds": 5})
+                    v = {"voice_id": f"v-{emo}", "emotion": emo, "seconds": 5}
+                    out.append(v)
+                    if on_voice:
+                        on_voice(v)
                     if progress:
                         progress(idx + 1, None)
                 return out
@@ -286,7 +331,8 @@ class CommitLifecycleTests(unittest.TestCase):
             ingest_api.JOBS["c2"] = job
 
             def fake_commit(work_dir, character, emotions, cid, *, consent=None,
-                            clip_sha256=None, progress=None, should_cancel=None):
+                            clip_sha256=None, progress=None, should_cancel=None,
+                            on_voice=None):
                 out = []
                 for idx, emo in enumerate(emotions):
                     if should_cancel and should_cancel():
@@ -313,7 +359,8 @@ class CommitLifecycleTests(unittest.TestCase):
             ingest_api.JOBS["c3"] = job
 
             def fake_commit(work_dir, character, emotions, cid, *, consent=None,
-                            clip_sha256=None, progress=None, should_cancel=None):
+                            clip_sha256=None, progress=None, should_cancel=None,
+                            on_voice=None):
                 job["cancel"] = True          # cancel lands mid-clone
                 return [{"voice_id": "v-happy", "emotion": "happy", "seconds": 5}]
 

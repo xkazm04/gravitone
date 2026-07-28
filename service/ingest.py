@@ -83,6 +83,25 @@ def _log(m: str) -> None:
     print(m, flush=True)
 
 
+class Cancelled(Exception):
+    """The job was torn down (DELETE or GC) while this phase was running.
+
+    Distinct from a failure: nothing went wrong, the work simply must stop and
+    the phase must write NOTHING further — the workdir it was using has already
+    been rmtree'd. Every phase that accepts `should_cancel` raises this rather
+    than returning a half-built result, so a caller can never mistake an
+    abandoned phase for a finished one.
+    """
+
+
+def _check(should_cancel: Callable[[], bool] | None) -> None:
+    """Cancellation checkpoint. Placed before each EXPENSIVE step (a paid cloud
+    call, a batch of ffmpeg extracts) — cancel latency is therefore one step,
+    not one phase."""
+    if should_cancel and should_cancel():
+        raise Cancelled()
+
+
 # ── ffmpeg ────────────────────────────────────────────────────────────────────
 def clean_audio(src: Path, dst: Path, sr: int = 24000) -> None:
     """Canonical clip cleanup → mono `sr`Hz wav using CLEANUP_FILTER. This is the
@@ -437,9 +456,15 @@ def build_segments(words: list[dict], min_gap: float = 0.6, min_dur: float = 1.2
 # ── ANALYZE (transcribe + isolate; stop for speaker pick) ─────────────────────
 def analyze(audio: Path, work_dir: Path,
             progress: Callable[[str, str], None] | None = None,
-            partial: Callable[[dict], None] | None = None) -> dict:
+            partial: Callable[[dict], None] | None = None,
+            should_cancel: Callable[[], bool] | None = None) -> dict:
     """Steps 1-2 + per-speaker stats. Saves clean.wav, segments.json, and a
-    preview clip per speaker. Returns { duration, transcript, speakers:[...] }."""
+    preview clip per speaker. Returns { duration, transcript, speakers:[...] }.
+
+    `should_cancel` is polled before each of the two PAID calls (Scribe, the
+    Isolator) and before the local preview pass; a cancel raises `Cancelled`.
+    Before this the only cancellable phase was commit, so pressing cancel during
+    a scan stopped nothing — the isolator call still ran, and still billed."""
     assert ELEVEN_KEY and GEMINI_KEY, "ELEVEN_LABS_API_KEY / GEMINI_API_KEY missing"
     work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -447,6 +472,7 @@ def analyze(audio: Path, work_dir: Path,
         if progress:
             progress(k, s)
 
+    _check(should_cancel)
     prog("transcribe", "active")
     tr = scribe(audio)
     words = tr.get("words", [])
@@ -459,6 +485,7 @@ def analyze(audio: Path, work_dir: Path,
                  "transcript": transcript})
     prog("transcribe", "done")
 
+    _check(should_cancel)          # the isolator is the second paid call
     prog("isolate", "active")
     iso = work_dir / "iso.mp3"
     voice_isolate(audio, iso)
@@ -467,6 +494,7 @@ def analyze(audio: Path, work_dir: Path,
     prog("isolate", "done")
 
     # per-speaker stats + a preview clip (their longest utterance, capped)
+    _check(should_cancel)          # one ffmpeg extract per speaker follows
     (work_dir / "segments.json").write_text(json.dumps(all_segs), "utf-8")
     speakers: list[dict] = []
     for sid in sorted({s["speaker"] for s in all_segs}):
@@ -571,11 +599,20 @@ def baseline_note(plan: BaselinePlan, seconds: float, min_stem: float) -> str | 
 def label_and_stem(work_dir: Path, target: str, min_stem: float = MIN_STEM_SECONDS, limit: int = 40,
                    progress: Callable[[str, str], None] | None = None,
                    partial: Callable[[dict], None] | None = None,
-                   mode: str = "cloud") -> dict:
+                   mode: str = "cloud",
+                   should_cancel: Callable[[], bool] | None = None) -> dict:
+    """Classify each segment of `target`, then splice one stem per emotion.
+
+    `should_cancel` is polled on entry, by every pooled task before it does any
+    work, and once the pool drains — so a cancel stops the labelling fan-out
+    (up to `limit` ffmpeg extracts and paid classifier calls) within one
+    in-flight segment per worker instead of running the batch to completion
+    against a workdir that has already been torn down."""
     def prog(k: str, s: str) -> None:
         if progress:
             progress(k, s)
 
+    _check(should_cancel)
     all_segs = json.loads((work_dir / "segments.json").read_text("utf-8"))
     tsegs = [s for s in all_segs if s["speaker"] == target]
     clean = work_dir / "clean.wav"
@@ -592,7 +629,11 @@ def label_and_stem(work_dir: Path, target: str, min_stem: float = MIN_STEM_SECON
     def _label_seg(i: int, s: dict) -> None:
         """Extract + classify one segment. A failure (ffmpeg extract OR the
         classifier) degrades THIS segment to baseline and is counted, without
-        killing the batch."""
+        killing the batch. A cancelled job skips the segment entirely — the
+        queued tasks drain instantly instead of spending on a job nobody is
+        waiting for, and none of them writes into the deleted workdir."""
+        if should_cancel and should_cancel():
+            return
         seg_wav = work_dir / f"seg_{i:03d}.wav"
         failed = False
         try:
@@ -623,6 +664,7 @@ def label_and_stem(work_dir: Path, target: str, min_stem: float = MIN_STEM_SECON
         with ThreadPoolExecutor(max_workers=min(LABEL_WORKERS, len(todo))) as pool:
             for fut in [pool.submit(_label_seg, i, s) for i, s in enumerate(todo)]:
                 fut.result()  # re-raise only truly unexpected errors (not per-seg)
+    _check(should_cancel)   # a cancelled batch is abandoned, never spliced
     labelled = [r for r in results if r is not None]
     prog("label", "done")
 
@@ -688,6 +730,7 @@ def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: st
            *, consent: str | None = None, clip_sha256: str | None = None,
            progress: Callable[[int, str | None], None] | None = None,
            should_cancel: Callable[[], bool] | None = None,
+           on_voice: Callable[[dict], None] | None = None,
            allow_short: bool = False) -> list[dict]:
     """Clone each accepted stem into a Voice.
 
@@ -699,6 +742,13 @@ def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: st
     `should_cancel()` between emotions (a cancel terminates the child after the
     current line). When `consent` (the attestation statement) is given, a consent
     receipt is stamped into each created Voice's metadata.
+
+    `on_voice` is called with each entry the MOMENT it is registered, before the
+    next stem is cloned. The return value only exists on the success path, so a
+    caller that must undo a half-finished clone (ingest_api's rollback) cannot
+    learn from it what an EXCEPTION left behind — registration happens per stem
+    via `mutate_meta`, so a raise mid-batch leaves live Voices the return value
+    never mentions. This callback is that caller's ledger.
 
     Eligibility: a stem shorter than MIN_STEM_SECONDS clones poorly, so it is
     SKIPPED (never cloned) and reported — the whole commit does not fail. Pass
@@ -803,7 +853,10 @@ def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: st
             meta["voices"][vid] = entry
             meta["characters"].setdefault(cid, {"name": name, "tags": ["ingested"]})
         mutate_meta(_add)
-        created.append({"voice_id": p["voice_id"], "emotion": emo, "seconds": p["seconds"]})
+        made = {"voice_id": p["voice_id"], "emotion": emo, "seconds": p["seconds"]}
+        created.append(made)
+        if on_voice:
+            on_voice(made)
         done += 1
         if progress:
             progress(done, None)

@@ -118,6 +118,16 @@ class Settings:
     # Durable working dir for ingest jobs (per-job subdir + state.json). Kept
     # off OS tempdirs so jobs survive a restart and are GC'd on a TTL timer.
     ingest_work_dir: str = _str("INGEST_WORK_DIR", str(REPO_ROOT / "ingest_jobs"))
+    # How many ingest jobs may be doing WORK (analyzing, labelling, cloning) at
+    # once. Nothing used to bound this: every upload spawned a raw thread, and
+    # each running job fans out to LABEL_WORKERS ffmpeg extracts plus one paid
+    # cloud call per segment (up to ~40) — so N simultaneous uploads multiplied
+    # both the CPU load on an Arm box and the external bill by N. Over the limit
+    # the ingest routes answer 429 (retry), they do not queue.
+    # PER PROCESS, like every other in-memory ingest structure: the service runs
+    # as N single-worker replicas and JOBS is not shared (deploy/README.md,
+    # "Ingest is replica-affine"), so the fleet-wide ceiling is this × replicas.
+    ingest_max_jobs: int = _int("INGEST_MAX_JOBS", 2)
     # Fallback built-in voice if a requested voice_id isn't found.
     default_voice: str = _str("TTS_DEFAULT_VOICE", "alba")
 
