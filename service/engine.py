@@ -14,6 +14,8 @@ degradation knee.
 """
 from __future__ import annotations
 
+import contextlib
+import functools
 import io
 import logging
 import os
@@ -324,6 +326,8 @@ class Metrics:
         self.errored = 0
         self.timeouts = 0     # 504s (synthesis exceeded request_timeout_s)
         self.abandoned = 0    # jobs skipped un-run because the caller gave up
+        self.cache_hits = 0   # requests served from the synthesis cache
+        self.collapsed = 0    # requests served by another's in-flight render
         self.in_flight = 0    # currently inside generate()
         self.queued = 0       # admitted but not yet being processed
         self._latencies: deque[float] = deque(maxlen=window)   # end-to-end seconds
@@ -345,12 +349,33 @@ class Metrics:
         with self._lock:
             self.timeouts += 1
 
-    def on_abandoned(self):
-        # A queued job the caller already gave up on (504/disconnect): it was
-        # admitted (queued++) but never started (no on_start), so undo the
-        # queue count and tally it as abandoned rather than errored/completed.
+    def on_cache_hit(self):
+        """A request served from the synthesis cache: no admission, no worker.
+
+        ``received`` is bumped here (and in ``on_collapsed``) because it means
+        "requests this replica served". Once the cache started answering
+        requests without going through ``submit``, ``received`` silently stopped
+        counting them and every ratio computed from it was wrong.
+        """
         with self._lock:
-            self.queued -= 1
+            self.received += 1
+            self.cache_hits += 1
+
+    def on_collapsed(self):
+        """A request served by ANOTHER request's in-flight render (single
+        flight): also never admitted, also a request this replica served."""
+        with self._lock:
+            self.received += 1
+            self.collapsed += 1
+
+    def on_abandoned(self):
+        # A queued job the caller gave up on (504/disconnect): it was admitted
+        # (queued++) but never started, so undo the queue count and tally it as
+        # abandoned rather than errored/completed. Floored at zero: a gauge that
+        # can go negative is a gauge nobody can act on, and the only cost of the
+        # floor is that a miscount shows as 0 instead of as nonsense.
+        with self._lock:
+            self.queued = max(0, self.queued - 1)
             self.abandoned += 1
 
     def on_drain(self):
@@ -358,20 +383,35 @@ class Metrics:
         # count. Kept distinct from on_abandoned (no counter bump) — draining is
         # an operator action, not caller behaviour.
         with self._lock:
-            self.queued -= 1
+            self.queued = max(0, self.queued - 1)
 
     def on_enqueue(self):
         with self._lock:
             self.queued += 1
 
-    def on_start(self):
+    @contextlib.contextmanager
+    def job_running(self):
+        """Own the ``in_flight`` gauge for the duration of one job.
+
+        The ONLY place ``in_flight`` moves. It goes up on entry and comes down
+        exactly once on exit — in a ``finally``, so it survives a BaseException
+        that kills the worker thread. When ``on_start``/``on_error`` moved it
+        from opposite ends, a worker dying at the wrong instant inflated the
+        gauge permanently, and an inflated gauge is what an operator (and the
+        load-test knee finder) reads as "the pool is busy".
+        """
         with self._lock:
-            self.queued -= 1
+            self.queued = max(0, self.queued - 1)
             self.in_flight += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self.in_flight = max(0, self.in_flight - 1)
 
     def on_finish(self, latency_s: float, proc_s: float, audio_s: float):
+        # in_flight is NOT touched here — job_running owns it.
         with self._lock:
-            self.in_flight -= 1
             self.completed += 1
             self._latencies.append(latency_s)
             self._proc.append(proc_s)
@@ -379,8 +419,8 @@ class Metrics:
             self.audio_seconds_total += audio_s
 
     def on_error(self):
+        # in_flight is NOT touched here — job_running owns it.
         with self._lock:
-            self.in_flight -= 1
             self.errored += 1
 
     @staticmethod
@@ -403,6 +443,8 @@ class Metrics:
                 "errored": self.errored,
                 "timeouts": self.timeouts,
                 "abandoned": self.abandoned,
+                "cache_hits": self.cache_hits,
+                "collapsed": self.collapsed,
                 "in_flight": self.in_flight,
                 "queued": self.queued,
                 "audio_seconds_total": round(self.audio_seconds_total, 2),
@@ -425,6 +467,30 @@ class Metrics:
 # ----------------------------------------------------------------------------
 # Job + worker
 # ----------------------------------------------------------------------------
+class _AbandonFlag(threading.Event):
+    """The "caller gave up" signal (504 timeout or client disconnect).
+
+    Setting it does not merely MARK the job: it runs the engine hook that
+    releases the job's admission permit immediately. Before, the permit was held
+    until a worker eventually dequeued the job and noticed the flag — with the
+    shipped single worker and a deep queue that is minutes of capacity held for
+    a caller who is gone, at exactly the moment the service is most loaded.
+
+    The hook is idempotent (it goes through ``Job.claim``), so a double ``set``
+    or a race between two setters can never double-release.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._on_abandon = None  # set by TtsEngine.submit before enqueueing
+
+    def set(self):  # noqa: D102 - see class docstring
+        super().set()
+        hook = self._on_abandon
+        if hook is not None:
+            hook()
+
+
 @dataclass
 class Job:
     voice_id: str
@@ -438,12 +504,35 @@ class Job:
     future: Future = field(default_factory=Future)
     t_enqueue: float = field(default_factory=time.perf_counter)
     # Set by the API layer when the caller has given up (504 timeout or client
-    # disconnect). The worker checks this BEFORE starting synthesis and skips
-    # the job if set — no wasted generation, permit released immediately. There
-    # is no mid-generation cancellation: generate_audio is a single atomic C/
-    # torch call with no cooperative cancel point, so a job already inside the
-    # model runs to completion; only jobs still queued can be skipped.
-    abandoned: threading.Event = field(default_factory=threading.Event)
+    # disconnect). Setting it releases the admission permit AT THAT MOMENT (see
+    # _AbandonFlag / TtsEngine._release_abandoned) and leaves the job in the
+    # queue as a tombstone the next worker discards. There is no mid-generation
+    # cancellation: generate_audio is a single atomic C/torch call with no
+    # cooperative cancel point, so a job already inside the model runs to
+    # completion; only jobs still queued can be skipped.
+    abandoned: _AbandonFlag = field(default_factory=_AbandonFlag)
+    # --- the claim (see claim()) -----------------------------------------
+    _claim_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _claimed: bool = field(default=False, repr=False)
+
+    def claim(self) -> bool:
+        """Take exclusive ownership of this job's ONE permit and ONE future.
+
+        Three paths can end a job — a worker about to run it, the abandon hook,
+        the shutdown drain — and exactly one of them may release its admission
+        permit and resolve its future. Whoever wins this claim owns those two
+        actions; every later caller gets False and must do nothing at all.
+
+        That is what makes "released early, dequeued later" structurally safe
+        rather than a comment: once the abandon hook has claimed a job, no
+        worker can run it, re-release its permit or re-resolve its future, no
+        matter how the timing falls.
+        """
+        with self._claim_lock:
+            if self._claimed:
+                return False
+            self._claimed = True
+            return True
 
 
 @dataclass
@@ -582,11 +671,19 @@ class _Worker(threading.Thread):
             return True
         if job is None:  # shutdown sentinel
             return False
+        if not job.claim():
+            # A tombstone: the abandon hook (or the drain) already resolved this
+            # job's future and released its permit. Touching either again would
+            # double-release a permit — the queue entry is all that is left, so
+            # drop it and move on. Structural, not a check we can forget.
+            self.engine._queue.task_done()
+            return True
+        # From here the job is OURS: exactly one release, exactly one resolve.
         if job.abandoned.is_set():
-            # Caller already gave up (504/disconnect): skip synthesis
-            # entirely rather than burn a full generation on a result no
-            # one will read. Release the admission permit immediately and
-            # resolve the future as cancelled (not errored).
+            # The caller gave up between our claim and now (or while the job was
+            # queued and the hook lost the claim race): skip synthesis rather
+            # than burn a full generation on a result no one will read, release
+            # the permit and resolve the future as cancelled (not errored).
             self.engine.metrics.on_abandoned()
             job.future.cancel()
             self.engine._admit.release()
@@ -609,7 +706,10 @@ class _Worker(threading.Thread):
         """Synthesize one admitted job. The future ALWAYS resolves and the
         admission permit ALWAYS releases, including on a BaseException that goes
         on to kill this worker thread."""
-        self.engine.metrics.on_start()
+        with self.engine.metrics.job_running():
+            self._synthesize(job)
+
+    def _synthesize(self, job: "Job") -> None:
         t_start = time.perf_counter()
         prev: dict = {}
         try:
@@ -826,11 +926,34 @@ class TtsEngine:
             if job is None:  # a shutdown sentinel — nothing to resolve
                 self._queue.task_done()
                 continue
+            if not job.claim():
+                # Already settled by the abandon hook (permit released, future
+                # cancelled) or by a worker: a tombstone, nothing to drain.
+                self._queue.task_done()
+                continue
             if not job.future.done():
                 job.future.set_exception(ShuttingDown("server shutting down"))
             self.metrics.on_drain()
             self._admit.release()
             self._queue.task_done()
+
+    def _release_abandoned(self, job: "Job") -> None:
+        """Hook fired by ``job.abandoned.set()`` (504 timeout / disconnect).
+
+        Frees the admission permit AT THE MOMENT the caller gives up instead of
+        whenever a worker finally dequeues the job — a disconnected client stops
+        costing capacity immediately. The job stays in the queue as a tombstone
+        that the next worker discards (see ``_Worker._serve_once``).
+
+        Safe to call any number of times, and safe to race a worker or the
+        drain: the claim decides the single owner, and a caller that loses it
+        does nothing.
+        """
+        if not job.claim():
+            return  # already running, drained, or already abandoned
+        self.metrics.on_abandoned()
+        job.future.cancel()
+        self._admit.release()
 
     @property
     def live_workers(self) -> int:
@@ -895,6 +1018,9 @@ class TtsEngine:
             max_tokens=max_tokens or SETTINGS.max_tokens,
             frames_after_eos=frames_after_eos,
         )
+        # Wired BEFORE the job is reachable by anyone else, so there is no
+        # window in which abandoning it would silently keep the permit.
+        job.abandoned._on_abandon = functools.partial(self._release_abandoned, job)
         # Re-check _stopping while enqueuing so this can't race the shutdown
         # drain: if stop() won the flag, release the permit and refuse cleanly
         # instead of putting a job no worker will ever dequeue.

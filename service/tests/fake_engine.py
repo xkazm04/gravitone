@@ -103,8 +103,12 @@ def _install_shims() -> None:
 
 _install_shims()
 
-# Safe to import now that the shims are in place.
-from service.engine import AdmissionRejected, SynthResult  # noqa: E402
+# Safe to import now that the shims are in place. `_AbandonFlag` is imported
+# (not re-implemented) on purpose: the fake must abandon jobs the same way the
+# real engine does, or an HTTP-level test proves nothing about production.
+from service.engine import (  # noqa: E402
+    AdmissionRejected, SynthResult, _AbandonFlag,
+)
 
 
 def make_wav(marker: int, frames: int = 240, sample_rate: int = 24000) -> bytes:
@@ -144,15 +148,28 @@ class _FakeMetrics:
 
 
 class _FakeJob:
-    __slots__ = ("future", "text", "voice_id", "abandoned")
+    __slots__ = ("future", "text", "voice_id", "abandoned",
+                 "_claimed", "_claim_lock")
 
     def __init__(self, future: Future, text: str, voice_id: str) -> None:
         self.future = future
         self.text = text
         self.voice_id = voice_id
-        # The real engine's Job carries an Event the streaming route sets on
-        # jobs it will never consume (app.py `_audio_stream` finally block).
-        self.abandoned = threading.Event()
+        # The real engine's Job carries this flag; the API layer sets it on a
+        # 504/disconnect (app.py `_await_result`, `_abandon_all`) and setting it
+        # releases the admission slot IMMEDIATELY via the engine hook.
+        self.abandoned = _AbandonFlag()
+        self._claimed = False
+        self._claim_lock = threading.Lock()
+
+    def claim(self) -> bool:
+        """Same claim protocol as engine.Job: exactly one of {run, abandon}
+        owns the slot and the future."""
+        with self._claim_lock:
+            if self._claimed:
+                return False
+            self._claimed = True
+            return True
 
 
 class FakeEngine:
@@ -187,6 +204,19 @@ class FakeEngine:
         self._cur = 0
         self.max_concurrent = 0
         self.submit_order: list[str] = []
+        # Texts that a worker ACTUALLY ran (abandoned jobs never appear here).
+        self.executed: list[str] = []
+
+    def _abandon(self, job: _FakeJob) -> None:
+        """Mirror of ``TtsEngine._release_abandoned``: the caller gave up, so
+        free the admission slot NOW and cancel the future. The claim makes
+        double-release and double-run impossible; the job is left in the pool
+        as a tombstone its worker discards."""
+        if not job.claim():
+            return  # already running or already abandoned
+        job.future.cancel()
+        with self._lock:
+            self._admitted -= 1
 
     def submit(self, voice_id: str, text: str, overrides=None,
                max_tokens=None, frames_after_eos=None) -> _FakeJob:
@@ -198,8 +228,20 @@ class FakeEngine:
             self.submit_order.append(text)
         future: Future = Future()
         delay = self.delays.get(text, self.delay)
+        job = _FakeJob(future, text, voice_id)
+        job.abandoned._on_abandon = lambda: self._abandon(job)
 
         def _work() -> None:
+            if not job.claim():
+                return  # tombstone: abandoned before a worker reached it
+            if job.abandoned.is_set():
+                # Abandoned after we claimed it: skip the synthesis and hand the
+                # slot back, exactly as the real worker loop does.
+                job.future.cancel()
+                with self._lock:
+                    self._admitted -= 1
+                return
+            self.executed.append(text)
             with self._lock:
                 self._cur += 1
                 self.max_concurrent = max(self.max_concurrent, self._cur)
@@ -229,7 +271,6 @@ class FakeEngine:
                     self._admitted -= 1
 
         self._pool.submit(_work)
-        job = _FakeJob(future, text, voice_id)
         self.jobs.append(job)
         return job
 

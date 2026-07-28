@@ -75,7 +75,8 @@ IS_LINUX = sys.platform.startswith("linux")
 # every replica but one.
 AGG_KEYS = (
     "received", "completed", "rejected_429", "errored", "timeouts",
-    "abandoned", "in_flight", "queued", "audio_seconds_total",
+    "abandoned", "cache_hits", "collapsed", "in_flight", "queued",
+    "audio_seconds_total",
 )
 
 # What an aggregated /metrics document is a measurement OF.

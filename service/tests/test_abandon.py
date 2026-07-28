@@ -126,28 +126,38 @@ class AbandonSkipTests(unittest.TestCase):
 
         # Job B is now stuck behind A in the queue. The caller gives up.
         job_b = self.eng.submit(voice_id="vb", text="B")
+        self.assertEqual(self.eng.available_permits(),
+                         self.eng._max_inflight - 2)
         job_b.abandoned.set()
 
-        # Release A; the worker finishes it, then reaches B and skips it.
+        # The permit comes back AT THAT MOMENT — not when a worker eventually
+        # dequeues B. A is still gated inside generate_audio, so if the release
+        # waited for the dequeue this would still be one permit short.
+        self.assertTrue(job_b.future.cancelled(),
+                        "abandoned future must be cancelled immediately")
+        self.assertEqual(self.eng.available_permits(),
+                         self.eng._max_inflight - 1,
+                         "abandoning a queued job must free its permit at once")
+
+        # Release A; the worker finishes it, then reaches B's tombstone and
+        # discards it without running it or double-releasing its permit.
         self.model.gate.set()
 
         deadline = time.time() + 5
-        while not job_b.future.done() and time.time() < deadline:
+        while not job_a.future.done() and time.time() < deadline:
             time.sleep(0.01)
-
-        self.assertTrue(job_b.future.done())
-        self.assertTrue(job_b.future.cancelled(), "abandoned future must be cancelled")
+        self.assertTrue(job_a.future.done())
         # B never ran through the model; only A did.
         self.assertEqual(self.model.generated, ["A"])
         # Counted as abandoned, not errored/completed.
         self.assertEqual(self.eng.metrics.abandoned, 1)
         self.assertEqual(self.eng.metrics.errored, 0)
         self.assertEqual(self.eng.metrics.completed, 1)
-        # Both admission permits released -> semaphore fully restored.
-        # The worker cancels the future BEFORE releasing the permit, so
-        # future.done() is NOT a happens-before edge for the release: asserting
-        # on the instant races the worker (flaky "permit leak" that isn't real).
-        # Poll to a deadline, and read it through the public accessor.
+        # Both admission permits released -> semaphore fully restored, and NOT
+        # over-restored: the worker releasing A's permit while B's tombstone is
+        # discarded must total exactly _max_inflight. Poll to a deadline (the
+        # worker's release is not ordered against future.done()) and read it
+        # through the public accessor.
         deadline = time.time() + 5
         while (self.eng.available_permits() < self.eng._max_inflight
                and time.time() < deadline):
@@ -158,6 +168,8 @@ class AbandonSkipTests(unittest.TestCase):
         self.assertIn("abandoned", snap)
         self.assertIn("timeouts", snap)
         self.assertEqual(snap["abandoned"], 1)
+        self.assertEqual(snap["queued"], 0)
+        self.assertEqual(snap["in_flight"], 0)
 
 
 if __name__ == "__main__":
