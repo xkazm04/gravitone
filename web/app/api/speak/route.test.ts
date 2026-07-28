@@ -83,6 +83,40 @@ describe("/api/speak — header forwarding", () => {
   });
 });
 
+describe("/api/speak — the body streams through", () => {
+  it("answers before the upstream body has finished arriving", async () => {
+    // The proxy used to `await upstream.arrayBuffer()`, so nothing left this
+    // process until the WHOLE take — up to a 64-line performance — was held in
+    // it. If that regresses, this test never resolves: the response is awaited
+    // while the upstream stream is still open.
+    let push!: (b: Uint8Array) => void;
+    let finish!: () => void;
+    const body = new ReadableStream<Uint8Array>({
+      start(c) { push = (b) => c.enqueue(b); finish = () => c.close(); },
+    });
+    stubFetch(new Response(body, {
+      status: 200, headers: { "Content-Type": "audio/wav", "X-Audio-Seconds": "12" },
+    }));
+
+    const res = await speakPOST(post({ character_id: "sarah", text: "hi" }));
+    expect(res.status).toBe(200);
+    expect(res.headers.get("X-Audio-Seconds")).toBe("12");
+
+    // Only now do the bytes exist — and they still arrive complete and in order.
+    push(new Uint8Array([1, 2, 3]));
+    push(new Uint8Array([4, 5]));
+    finish();
+    expect(new Uint8Array(await res.arrayBuffer())).toEqual(new Uint8Array([1, 2, 3, 4, 5]));
+  });
+
+  it("delivers the identical bytes for an ordinary buffered upstream", async () => {
+    const bytes = new Uint8Array([82, 73, 70, 70, 9, 9]);
+    stubFetch(new Response(bytes, { status: 200, headers: { "Content-Type": "audio/wav" } }));
+    const res = await speakPOST(post({ character_id: "sarah", text: "hi" }));
+    expect(new Uint8Array(await res.arrayBuffer())).toEqual(bytes);
+  });
+});
+
 describe("/api/speak — failure surfaces", () => {
   it("preserves a 429 and its Retry-After instead of flattening it", async () => {
     stubFetch(new Response(JSON.stringify({ detail: "queue full" }), {

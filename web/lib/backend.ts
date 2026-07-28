@@ -126,7 +126,16 @@ export async function proxyWavPost(
     upstream.headers,
     new Headers({ "Content-Type": upstream.headers.get("Content-Type") ?? "audio/wav" }),
   );
-  return new Response(await upstream.arrayBuffer(), { status: 200, headers });
+  // STREAM, don't buffer. `await upstream.arrayBuffer()` held the entire take in
+  // this process before writing a byte of it — and the largest thing this
+  // product makes (a 64-line performance) is held on the same box that just
+  // spent its RAM synthesizing it. The sibling helper below has always streamed;
+  // this is the same shape.
+  //
+  // This is NOT streamed playback: the studio still awaits res.blob() before the
+  // take joins the log, so the take, its blob, its peaks and its download are
+  // byte-for-byte what they were. Only the proxy's own memory changes.
+  return new Response(upstream.body, { status: 200, headers });
 }
 
 /** `backendPath` plus the allowlisted query parameters the caller supplied.
