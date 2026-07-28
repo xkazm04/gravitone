@@ -2,6 +2,25 @@
 # 429-driven autoscaling: the engine's admission queue depth (the signal that
 # precedes every 429) is polled straight from the JSON /metrics endpoint —
 # no Prometheus required. Needs KEDA installed: https://keda.sh
+#
+# /metrics REQUIRES A CREDENTIAL when TTS_API_KEY is set (it publishes the
+# deployment shape and live latency percentiles). This scaler runs in the KEDA
+# operator pod and reaches the service over cluster DNS, so it is NOT loopback
+# and cannot use the launcher's loopback exemption — it has to authenticate, or
+# autoscaling silently stops while every other probe keeps passing. The
+# TriggerAuthentication below hands it the same root key the pods already hold.
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: {{ include "gravitone.fullname" . }}-metrics
+  labels:
+    {{- include "gravitone.labels" . | nindent 4 }}
+spec:
+  secretTargetRef:
+    - parameter: apiKey
+      name: {{ include "gravitone.secretName" . }}
+      key: TTS_API_KEY
+---
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
@@ -20,4 +39,9 @@ spec:
         url: "http://{{ include "gravitone.fullname" . }}:{{ .Values.service.port }}/metrics"
         valueLocation: "metrics.queued"
         targetValue: {{ .Values.autoscaling.keda.queuedTarget | quote }}
+        authMode: "apiKey"
+        method: "header"
+        keyParamName: "xi-api-key"
+      authenticationRef:
+        name: {{ include "gravitone.fullname" . }}-metrics
 {{- end }}
