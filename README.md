@@ -121,7 +121,20 @@ git clone https://github.com/xkazm04/gravitone.git && cd gravitone
 bash benchmark_arm.sh          # installs deps, warms the model, sweeps
                                # configs + process-scaling, prints a summary.
 # Uses the built-in "alba" voice → no HuggingFace token needed.
+
+bash benchmark_arm_ab.sh       # A/B each Arm inference setting on its own
+                               # (inference_mode, flush-denormal, interop
+                               # threads, oneDNN bf16 fast-math, int8 +
+                               # qnnpack, ffmpeg thread cap) and print the
+                               # realtime factor each one bought ON THIS BOX.
 ```
+
+Every one of those settings is applied by default and individually revertible
+from the environment (`TTS_INFERENCE_MODE`, `TTS_FLUSH_DENORMAL`,
+`TTS_TORCH_INTEROP_THREADS`, `TTS_QUANTIZE` / `TTS_QUANTIZED_ENGINE`,
+`TTS_FFMPEG_THREADS`, `ONEDNN_DEFAULT_FPMATH_MODE`) — see `service/config.py`
+for what each default is and why. The repo quotes no speedup figures: run the
+A/B on your hardware and use its numbers.
 
 ### Option B — native venv
 

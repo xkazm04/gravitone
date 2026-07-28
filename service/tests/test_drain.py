@@ -8,6 +8,7 @@ every admission permit, and further submits are refused.
 """
 from __future__ import annotations
 
+import dataclasses
 import sys
 import threading
 import time
@@ -62,12 +63,12 @@ class DrainShutdownTests(unittest.TestCase):
         self._orig_wav = enginemod.audio_to_wav_bytes
         self._orig_tts = sys.modules["pocket_tts"].TTSModel
         real = self._orig_settings
-        enginemod.SETTINGS = types.SimpleNamespace(
-            workers=1, queue_max=8, torch_threads=1,
-            language=real.language, quantize=real.quantize,
-            default_voice=real.default_voice, voices_dir=real.voices_dir,
-            max_tokens=real.max_tokens,
-        )
+        # dataclasses.replace, NOT SimpleNamespace: the engine reads more
+        # SETTINGS fields than this test cares about (the CPU-tuning knobs
+        # arrived later), and a hand-listed namespace turns every new field
+        # into a fake AttributeError failure.
+        enginemod.SETTINGS = dataclasses.replace(
+            real, workers=1, queue_max=8, torch_threads=1)
         enginemod.audio_to_wav_bytes = lambda audio, sr: b"WAV"
         self.model = _GatedModel()
         sys.modules["pocket_tts"].TTSModel = types.SimpleNamespace(

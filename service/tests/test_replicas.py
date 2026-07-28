@@ -85,6 +85,17 @@ class PureHelperTests(unittest.TestCase):
                     "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
             self.assertEqual(env[var], "4")
 
+    def test_replica_env_sets_onednn_bf16_fastmath(self) -> None:
+        # It used to live ONLY in the Dockerfile, so a bare-metal replica run
+        # silently lost the biggest Neoverse inference lever. oneDNN reads this
+        # at import, so only the launcher can set it.
+        env = rep.replica_env(2, 8, base={})
+        self.assertEqual(env[rep.FPMATH_ENV_VAR], rep.FPMATH_DEFAULT)
+
+    def test_replica_env_respects_an_explicit_fpmath_override(self) -> None:
+        env = rep.replica_env(2, 8, base={rep.FPMATH_ENV_VAR: "any"})
+        self.assertEqual(env[rep.FPMATH_ENV_VAR], "any")
+
     def test_serving_ports(self) -> None:
         self.assertEqual(rep.serving_ports(8000, 3, reuse_port=True), [8000, 8000, 8000])
         self.assertEqual(rep.serving_ports(8000, 3, reuse_port=False), [8000, 8001, 8002])

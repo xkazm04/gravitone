@@ -62,11 +62,57 @@ class Settings:
     queue_max: int = _int("TTS_QUEUE_MAX", 32)
     # torch intra-op threads (process-global). Rule of thumb to avoid CPU
     # oversubscription: workers * torch_threads ~= physical cores.
+    #
+    # The default is a conservative 4 and is NOT derived from os.cpu_count():
+    # the shipped topology sizes this per replica (replicas.per_replica_threads
+    # splits the cores N ways and exports TTS_TORCH_THREADS before the child
+    # imports torch). Raise it only for a single-process run on a bigger box.
     torch_threads: int = _int("TTS_TORCH_THREADS", 4)
+    # torch INTER-op threads (the parallel-region scheduler pool). Distinct
+    # from torch_threads, and never set before: the default is one pool sized
+    # to every core, which on the replica topology means N replicas x cores
+    # scheduler threads fighting over cores that were deliberately pinned.
+    # A replica runs ONE generation at a time and pocket-tts is a sequential
+    # decode loop, so inter-op parallelism buys nothing here.
+    #   1  (default) — one scheduler thread, no oversubscription
+    #   0            — leave torch's default untouched (the pre-Arm-pass path)
+    # Applied best-effort: torch only accepts it before the first parallel
+    # region, so a late call is logged and ignored (see engine._apply_cpu_tuning).
+    torch_interop_threads: int = _int("TTS_TORCH_INTEROP_THREADS", 1)
+    # Flush denormal floats to zero. Denormals arise in the near-silent tails of
+    # generated audio and cost 10-100x on a normal FPU path; the output
+    # difference is far below the 16-bit PCM quantization step. Set
+    # TTS_FLUSH_DENORMAL=0 to revert to IEEE-exact denormal handling.
+    flush_denormal: bool = _bool("TTS_FLUSH_DENORMAL", True)
+    # Wrap generation in torch.inference_mode() (cheaper than no_grad: skips
+    # version counters and view tracking as well as autograd). Set
+    # TTS_INFERENCE_MODE=0 to fall back to plain torch.no_grad(). The engine
+    # ALSO falls back on its own if the model turns out to cache tensors across
+    # calls in a way inference_mode rejects — see engine._generation_context.
+    inference_mode: bool = _bool("TTS_INFERENCE_MODE", True)
 
     # --- Model -------------------------------------------------------------
     language: str = _str("TTS_LANGUAGE", "english")
-    quantize: bool = _bool("TTS_QUANTIZE", False)  # int8; ~27% faster on x86
+    # Dynamic int8 quantization of the model, off by default.
+    #
+    # What is actually known: the ~27% figure this comment used to quote came
+    # from an x86 (fbgemm) run and says nothing about this product's target.
+    # On aarch64 the int8 kernels come from a DIFFERENT backend (qnnpack /
+    # XNNPACK) than the fp32 path (oneDNN + Arm Compute Library, plus KleidiAI
+    # on recent builds), so the x86 ratio does not transfer in either
+    # direction. No Arm measurement exists yet, so the flag stays OFF: shipping
+    # a quantized default we have not measured would trade audio quality for an
+    # unverified speedup. `benchmark_arm_ab.sh` measures it; flip this on for a
+    # box only once its A/B row shows a win.
+    quantize: bool = _bool("TTS_QUANTIZE", False)
+    # Backend that serves those int8 kernels when quantize=True. torch's default
+    # engine is chosen at build time and on some aarch64 wheels is still the
+    # x86-oriented one, which silently means slow (or unsupported) int8 ops.
+    #   "auto" (default) — prefer qnnpack on aarch64 if the build supports it
+    #   ""               — leave torch's own choice alone
+    #   "<name>"         — force a specific engine (qnnpack, onednn, fbgemm, x86)
+    # Ignored entirely when quantize is off.
+    quantized_engine: str = _str("TTS_QUANTIZED_ENGINE", "auto")
     # Directory of pre-exported voice embeddings (*.safetensors) to preload.
     voices_dir: str = _str("TTS_VOICES_DIR", str(REPO_ROOT / "voices"))
     # Durable working dir for ingest jobs (per-job subdir + state.json). Kept
@@ -77,6 +123,15 @@ class Settings:
 
     # --- Generation defaults (overridable per request) --------------------
     max_tokens: int = _int("TTS_MAX_TOKENS", 50)
+
+    # --- External encoder --------------------------------------------------
+    # Threads ffmpeg may use for the mp3 encode. The launcher pins each
+    # replica's inference thread budget to a slice of the cores; ffmpeg,
+    # spawned per mp3 request, otherwise defaults to "as many threads as there
+    # are cores" and oversubscribes exactly those pinned cores mid-generation.
+    # libmp3lame is single-threaded anyway, so 1 costs nothing.
+    #   0 — let ffmpeg decide (the pre-Arm-pass behaviour)
+    ffmpeg_threads: int = _int("TTS_FFMPEG_THREADS", 1)
 
     # --- Server ------------------------------------------------------------
     host: str = _str("TTS_HOST", "127.0.0.1")

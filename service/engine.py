@@ -15,6 +15,8 @@ degradation knee.
 from __future__ import annotations
 
 import io
+import logging
+import platform
 import queue
 import subprocess
 import threading
@@ -32,6 +34,120 @@ import scipy.signal
 import torch
 
 from service.config import SETTINGS
+
+logger = logging.getLogger("gravitone.engine")
+
+
+# ----------------------------------------------------------------------------
+# CPU / inference-path tuning (Arm pass)
+# ----------------------------------------------------------------------------
+# Gravitone is positioned as Arm-native CPU-only TTS, but the inference path
+# had never been tuned for it. Everything below is applied ONCE per process and
+# every knob is individually revertible from the environment (see
+# service/config.py for each default and how to turn it off) — nothing here
+# changes behaviour silently, and `benchmark_arm_ab.sh` A/Bs them one at a time
+# through the existing loadtest harness.
+IS_AARCH64 = platform.machine().lower() in ("aarch64", "arm64")
+
+# Flipped to False if inference_mode turns out to be incompatible with the
+# model at runtime; from then on generation uses the proven torch.no_grad()
+# path. Also starts False when TTS_INFERENCE_MODE=0.
+_INFERENCE_MODE_OK = SETTINGS.inference_mode
+
+
+def _select_quantized_engine() -> str | None:
+    """The int8 backend to use, or None to leave torch's own choice alone.
+
+    Only consulted when SETTINGS.quantize is on. "auto" prefers qnnpack on
+    aarch64 — the fp32 path there is oneDNN + Arm Compute Library, but the int8
+    kernels come from qnnpack/XNNPACK, and some aarch64 wheels still default
+    the quantized engine to an x86-oriented backend.
+    """
+    want = (SETTINGS.quantized_engine or "").strip().lower()
+    if not want:
+        return None
+    supported = [str(e) for e in getattr(torch.backends.quantized,
+                                         "supported_engines", [])]
+    if want == "auto":
+        if not IS_AARCH64:
+            return None  # not our platform to second-guess
+        return "qnnpack" if "qnnpack" in supported else None
+    if supported and want not in supported:
+        logger.warning("TTS_QUANTIZED_ENGINE=%s is not supported by this torch "
+                       "build (%s); leaving the default engine", want, supported)
+        return None
+    return want
+
+
+def _apply_cpu_tuning() -> dict:
+    """Apply the process-global CPU settings. Returns what actually took effect
+    (surfaced on /metrics) so an operator can see the truth, not the intent."""
+    applied: dict = {}
+
+    torch.set_num_threads(SETTINGS.torch_threads)
+    applied["torch_threads"] = torch.get_num_threads()
+
+    if SETTINGS.torch_interop_threads > 0:
+        try:
+            torch.set_num_interop_threads(SETTINGS.torch_interop_threads)
+        except RuntimeError as exc:
+            # torch only accepts this before the first parallel region. Losing
+            # it is a missed optimization, never a correctness problem, so log
+            # and carry on rather than failing start-up.
+            logger.warning("could not set interop threads to %d (%s)",
+                           SETTINGS.torch_interop_threads, exc)
+    applied["torch_interop_threads"] = torch.get_num_interop_threads()
+
+    if SETTINGS.flush_denormal:
+        # False = this CPU/build has no FTZ control; report what happened.
+        applied["flush_denormal"] = bool(torch.set_flush_denormal(True))
+    else:
+        applied["flush_denormal"] = False
+
+    applied["quantized_engine"] = None
+    if SETTINGS.quantize:
+        engine = _select_quantized_engine()
+        if engine:
+            try:
+                torch.backends.quantized.engine = engine
+            except (RuntimeError, AttributeError) as exc:
+                logger.warning("could not select quantized engine %s (%s)",
+                               engine, exc)
+        applied["quantized_engine"] = getattr(torch.backends.quantized,
+                                              "engine", None)
+
+    applied["inference_mode"] = _INFERENCE_MODE_OK
+    applied["aarch64"] = IS_AARCH64
+    logger.info("cpu tuning applied: %s", applied)
+    return applied
+
+
+def _generation_context():
+    """Grad-free context for a generate call.
+
+    ``inference_mode`` is strictly cheaper than ``no_grad`` (it also skips
+    version counters and view tracking), but it produces *inference tensors*
+    that some models refuse to reuse across calls. ``_note_inference_failure``
+    demotes us to the proven ``no_grad`` path if that ever happens, so the
+    optimization can never turn into an outage.
+    """
+    return torch.inference_mode() if _INFERENCE_MODE_OK else torch.no_grad()
+
+
+def _note_inference_failure(exc: BaseException) -> bool:
+    """True if `exc` looks like an inference_mode incompatibility AND we just
+    demoted to no_grad — the caller should retry the generation once."""
+    global _INFERENCE_MODE_OK
+    if not _INFERENCE_MODE_OK:
+        return False
+    text = str(exc).lower()
+    if "inference" not in text:  # e.g. "Inference tensors cannot be ..."
+        return False
+    _INFERENCE_MODE_OK = False
+    logger.warning("torch.inference_mode is incompatible with this model (%s); "
+                   "falling back to torch.no_grad for the rest of this process. "
+                   "Set TTS_INFERENCE_MODE=0 to skip this probe entirely.", exc)
+    return True
 
 
 # ----------------------------------------------------------------------------
@@ -83,8 +199,18 @@ def wav_bytes_to_mp3(wav_bytes: bytes, bitrate: str = "128k",
     requested ``mp3_{sr}_{bitrate}`` bitrate is honoured instead of a hardcoded
     128k. ``sample_rate`` (e.g. 44100), when given, is passed to ffmpeg ``-ar``
     so ffmpeg resamples to the requested rate as part of the encode."""
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
-           "-i", "pipe:0", "-f", "mp3", "-b:a", bitrate]
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+    # Cap the encoder's thread pool BEFORE it competes with the inference
+    # threads the launcher just pinned (SETTINGS.ffmpeg_threads; 0 = ffmpeg's
+    # own default, which is one thread per core). `-threads` is a per-stream
+    # option, so it is given once for the input decoder and once for the mp3
+    # encoder; `-filter_threads` covers the (possible) resample filter graph.
+    if SETTINGS.ffmpeg_threads > 0:
+        n = str(SETTINGS.ffmpeg_threads)
+        cmd += ["-threads", n, "-filter_threads", n, "-i", "pipe:0", "-threads", n]
+    else:
+        cmd += ["-i", "pipe:0"]
+    cmd += ["-f", "mp3", "-b:a", bitrate]
     if sample_rate is not None:
         cmd += ["-ar", str(sample_rate)]
     cmd.append("pipe:1")
@@ -336,6 +462,21 @@ class _Worker(threading.Thread):
             self._voice_cache.popitem(last=False)  # evict least-recently-used
         return st
 
+    # -- generation --------------------------------------------------------
+    def _generate(self, state: dict, job: "Job"):
+        """One generate_audio call inside the grad-free context.
+
+        Autograd bookkeeping is pure overhead here — we never call backward —
+        but it was never actually turned off on this path.
+        """
+        with _generation_context():
+            return self.model.generate_audio(
+                state, job.text,
+                max_tokens=job.max_tokens,
+                frames_after_eos=job.frames_after_eos,
+                copy_state=True,  # reuse the cached voice state safely
+            )
+
     def run(self):
         from pocket_tts import TTSModel  # imported in-thread to avoid fork issues
         self.model = TTSModel.load_model(
@@ -384,12 +525,17 @@ class _Worker(threading.Thread):
                 for k, v in job.overrides.items():
                     prev[k] = getattr(self.model, k)
                     setattr(self.model, k, v)
-                audio = self.model.generate_audio(
-                    state, job.text,
-                    max_tokens=job.max_tokens,
-                    frames_after_eos=job.frames_after_eos,
-                    copy_state=True,  # reuse the cached voice state safely
-                )
+                try:
+                    audio = self._generate(state, job)
+                except RuntimeError as exc:
+                    # inference_mode is an optimization, never a contract: if
+                    # this model can't live with it, demote to no_grad and run
+                    # the SAME call again on the proven path. generate_audio is
+                    # atomic w.r.t. model state (copy_state=True), so retrying
+                    # is safe. Any other RuntimeError propagates untouched.
+                    if not _note_inference_failure(exc):
+                        raise
+                    audio = self._generate(state, job)
                 synth_s = time.perf_counter() - t_start
                 wav = audio_to_wav_bytes(audio, self.model.sample_rate)
                 audio_s = audio.detach().squeeze().numel() / self.model.sample_rate
@@ -427,7 +573,9 @@ class ShuttingDown(Exception):
 
 class TtsEngine:
     def __init__(self):
-        torch.set_num_threads(SETTINGS.torch_threads)
+        # Process-global CPU tuning, applied before any worker (and therefore
+        # any model) starts. Records what actually took effect for /metrics.
+        self.tuning = _apply_cpu_tuning()
         self.metrics = Metrics()
         self._queue: "queue.Queue[Optional[Job]]" = queue.Queue()
         # Admission slots = workers (in-flight) + queue_max (waiting).
@@ -555,4 +703,10 @@ class TtsEngine:
             "torch_threads": SETTINGS.torch_threads,
             "language": SETTINGS.language,
             "quantize": SETTINGS.quantize,
+            "ffmpeg_threads": SETTINGS.ffmpeg_threads,
+            # What the CPU tuning ACTUALLY achieved (not what was requested):
+            # set_flush_denormal can refuse, interop threads can be too late,
+            # and inference_mode demotes itself on incompatibility. The A/B
+            # script reads this back to label each run honestly.
+            "tuning": dict(self.tuning, inference_mode=_INFERENCE_MODE_OK),
         }

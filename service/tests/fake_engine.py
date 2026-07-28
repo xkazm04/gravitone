@@ -23,7 +23,51 @@ from concurrent.futures import Future, ThreadPoolExecutor
 def _install_shims() -> None:
     if "torch" not in sys.modules:
         torch = types.ModuleType("torch")
-        torch.set_num_threads = lambda n: None
+        # Thread/CPU tuning surface used by engine._apply_cpu_tuning. The
+        # setters record into `torch._tuning` so tests can assert the engine
+        # asked for what config said, and the getters read it back — the same
+        # "what actually took effect" contract the real torch has.
+        torch._tuning = {"threads": None, "interop": None, "flush_denormal": None}
+
+        def _set_threads(n):
+            torch._tuning["threads"] = n
+
+        def _set_interop(n):
+            torch._tuning["interop"] = n
+
+        def _set_flush_denormal(on):
+            torch._tuning["flush_denormal"] = bool(on)
+            return True
+
+        torch.set_num_threads = _set_threads
+        torch.get_num_threads = lambda: torch._tuning["threads"] or 0
+        torch.set_num_interop_threads = _set_interop
+        torch.get_num_interop_threads = lambda: torch._tuning["interop"] or 0
+        torch.set_flush_denormal = _set_flush_denormal
+        backends = types.ModuleType("torch.backends")
+        quantized = types.ModuleType("torch.backends.quantized")
+        quantized.engine = "none"
+        quantized.supported_engines = ["none", "qnnpack"]
+        backends.quantized = quantized
+        torch.backends = backends
+        sys.modules["torch.backends"] = backends
+        sys.modules["torch.backends.quantized"] = quantized
+
+        # inference_mode / no_grad — real context managers so the engine's
+        # grad-free wrapper (and its fallback) can be exercised without torch.
+        class _NullCtx:
+            def __init__(self, name):
+                self.name = name
+
+            def __enter__(self):
+                torch._tuning["entered"] = self.name
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        torch.inference_mode = lambda: _NullCtx("inference_mode")
+        torch.no_grad = lambda: _NullCtx("no_grad")
         torch.Tensor = object
         sys.modules["torch"] = torch
     if "scipy" not in sys.modules:

@@ -71,6 +71,15 @@ _THREAD_ENV_VARS = (
     "MKL_NUM_THREADS",
 )
 
+# oneDNN bf16 fast-math — the single biggest Arm (Neoverse) inference lever,
+# and it must be in the ENVIRONMENT before torch is imported, so only the
+# launcher can set it. It used to live ONLY in the Dockerfile, which meant a
+# bare-metal `python -m service.replicas` run silently lost it and did not
+# match the container it was supposed to represent. setdefault, so an operator
+# exporting a different value (or "any" to disable) still wins.
+FPMATH_ENV_VAR = "ONEDNN_DEFAULT_FPMATH_MODE"
+FPMATH_DEFAULT = "bf16"
+
 
 # ---------------------------------------------------------------------------
 # Pure helpers (fully unit-testable without spawning anything)
@@ -86,12 +95,16 @@ def replica_env(replicas: int, cores: int, base: Optional[dict] = None) -> dict:
     The math libraries (OpenMP / OpenBLAS / MKL) and torch must ALL be pinned
     before the process starts — they read these vars once at import — so the
     launcher sets them here rather than relying on the child to self-limit.
+    ``ONEDNN_DEFAULT_FPMATH_MODE`` is read at import time too, which is why it
+    belongs here and not in the service: this is the only place that can make a
+    bare-metal run match the shipped container.
     """
     env = dict(os.environ if base is None else base)
     env["TTS_WORKERS"] = "1"
     per = str(per_replica_threads(replicas, cores))
     for var in _THREAD_ENV_VARS:
         env[var] = per
+    env.setdefault(FPMATH_ENV_VAR, FPMATH_DEFAULT)
     return env
 
 

@@ -20,7 +20,11 @@ RUN pip install --no-cache-dir \
 COPY service/ ./service/
 COPY voices/ ./voices/
 
-# Arm inference optimizations (see SUBMISSION.md). Tune WORKERS/THREADS per box;
+# Arm inference optimizations. ONEDNN_DEFAULT_FPMATH_MODE is ALSO applied by
+# service/replicas.py::replica_env (setdefault) so a bare-metal replica run
+# matches this image instead of silently losing bf16 fast-math; keeping it here
+# covers the plain `python -m service.app` CMD below.
+# Tune WORKERS/THREADS per box;
 # for full-core utilization run multiple single-worker replicas instead.
 # Ingest jobs are DURABLE by design (per-job workdir + state.json, rehydrated
 # on restart). That only holds if the directory outlives the container, so it
