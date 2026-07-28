@@ -22,8 +22,12 @@ job so the studio can show what a scan actually cost.
 
 SOVEREIGN (audio NEVER leaves the machine — ffmpeg only, no API keys):
   1. CLEAN    ffmpeg highpass + afftdn denoise + loudnorm → clean.wav.
-  2. DETECT   ffmpeg silencedetect → speech spans (single-speaker assumption —
-              the normal case when cloning your own recording; no diarization).
+  2. DETECT   the clip's own noise floor is MEASURED (20 ms frame RMS) and the
+              silence threshold derived from it, then ffmpeg silencedetect
+              (inverted) → speech spans. Single-speaker assumption; no
+              diarization. Every degenerate outcome — silent, unbroken, too
+              short — is named and explained rather than falling through to
+              "use the whole file". See `SpeechScan` / `SOVEREIGN_LIMITS`.
   3. LABEL    everything is baseline (no cloud classifier); emotions are added
               afterwards via the studio's guided per-emotion recorder.
   4. STEM     one baseline stem, same review/commit flow as cloud mode.
@@ -612,40 +616,147 @@ def label_emotions(wavs: list[Path], spend: "Spend | None" = None,
 
 
 # ── sovereign mode (local-only, ffmpeg — audio never leaves the machine) ─────
+# What sovereign mode CANNOT do. These are not caveats to bury: the mode is
+# offered next to the cloud path as an equal choice, and a user who picks it
+# gets a materially different result. Stated wherever the mode speaks.
+SOVEREIGN_LIMITS = (
+    "one emotion only — there is no local emotion classifier, so every segment "
+    "becomes the baseline (neutral) voice; the other emotions are recorded "
+    "afterwards with the guided per-emotion capture",
+    "single speaker — there is no local diarization, so every detected span is "
+    "treated as the same person; anyone else audible in the recording is cloned "
+    "into the same voice",
+    "no transcript — speech is found by level, not by words, so nothing is "
+    "transcribed and no text ever leaves (or is written on) this machine",
+)
+
+
+def sovereign_note() -> str:
+    """The one-line honest summary of the above, for a progress/partial slot."""
+    return ("sovereign mode — audio stayed on this machine. No transcription, "
+            "no diarization (single speaker assumed) and no emotion classifier: "
+            "this scan produces the baseline voice only.")
+
+
 def clean_local(src: Path, dst: Path) -> None:
     """Local stand-in for the Voice Isolator: rumble filter + spectral denoise
     + loudness normalization (the canonical CLEANUP_FILTER). Not studio
-    isolation, but honest local cleanup — audio never leaves the machine."""
+    isolation, but honest local cleanup — audio never leaves the machine.
+
+    Deliberately the SAME filter chain as every other clone path — a sovereign
+    clone must not be conditioned differently from a cloud one, or the two modes
+    would produce voices that differ for a reason nobody could name. Note that
+    single-pass `loudnorm` is byte-reproducible for a given input (measured:
+    three runs of the same 60 s clip, identical sha256), so the two-pass form
+    buys determinism we already have at ~1.6x the wall clock.
+    """
     clean_audio(src, dst)
 
 
-def detect_speech(wav: Path, noise_db: float = -35.0, min_silence: float = 0.5,
-                  min_dur: float = 1.2, max_dur: float = 15.0) -> list[dict]:
-    """Speech spans via ffmpeg silencedetect (inverted), single speaker.
-    Long spans are split at max_dur so stem concatenation stays balanced."""
-    import re
+# ── speech detection: measure the clip, then threshold it ────────────────────
+# The old detector asked ffmpeg for "anything under -35 dBFS is silence" — a
+# constant, on a recording whose level it had never looked at. That constant is
+# wrong in both directions and fails SILENTLY in both:
+#   * a QUIET recording (speech below -35) is entirely "silence", so no spans
+#     survive and the fallback hands back the whole file as one take;
+#   * a NOISY recording (room tone above -35) has no silence anywhere, so
+#     silencedetect reports nothing and the fallback hands back the whole file
+#     as one take.
+# Two opposite failures, one indistinguishable outcome, and no way for the user
+# to know either happened. So: measure the clip's own level distribution first
+# (20 ms frame RMS), put the threshold a margin above ITS noise floor, and give
+# every degenerate case a name and a sentence instead of a shared fallback.
+_FRAME_SECONDS = 0.02
+_FLOOR_PCT = 10.0          # the quiet tenth of the clip ≈ its background
+_SPEECH_PCT = 95.0         # the loud twentieth ≈ its speech, robust to clicks
+_NOISE_MARGIN_DB = 8.0     # threshold sits this far ABOVE the measured floor…
+_SPEECH_HEADROOM_DB = 6.0  # …and never closer than this to the speech level
+_MIN_RANGE_DB = 8.0        # floor and speech this close = nothing to gate on
+_SILENT_DBFS = -55.0       # louder than this is audio; quieter is silence
+_DB_FLOOR = -90.0          # log floor for digital silence
+# Sanity rails on the derived threshold. The low end still leaves ~15 dB above
+# 16-bit dither, so a genuinely quiet (far-mic) recording is gated on its own
+# floor rather than crushed back towards the old constant.
+_THRESHOLD_CLAMP = (-75.0, -12.0)
+# Used only when the level distribution cannot be measured (a wav that is not
+# the 24 kHz mono 16-bit this pipeline produces): the old fixed constant, now
+# an explicit fallback rather than the policy.
+FALLBACK_NOISE_DB = -35.0
 
+
+def _num(v: float) -> float | None:
+    """JSON-safe: NaN/inf (an unmeasurable level) becomes None, not `NaN`."""
+    return None if v != v or v in (float("inf"), float("-inf")) else v
+
+
+class Levels(NamedTuple):
+    """A clip's own loudness, in dBFS. `measured` is False when the file was not
+    in a form we can read, in which case `threshold_db` is the fixed fallback."""
+    floor_db: float
+    speech_db: float
+    threshold_db: float
+    measured: bool
+
+
+class SpeechScan(NamedTuple):
+    """What detection FOUND, not merely what it returns.
+
+    `outcome` is the honest name of the result:
+      "spans"     — pauses were found and speech was cut at them (the good case)
+      "unbroken"  — no pause anywhere above the threshold; the whole recording is
+                    one take, which is a fact about the recording, not a success
+      "silent"    — nothing above the silence level; there is no speech here
+      "too_short" — real audio, but shorter than one usable span
+    `note` is a sentence for the user (empty only for "spans").
+    """
+    segments: list[dict]
+    outcome: str
+    note: str | None
+    levels: Levels
+    spans: int
+    speech_seconds: float
+    total_seconds: float
+
+
+def _frame_levels(wav: Path) -> "np.ndarray":
+    """Per-frame RMS in dBFS. Empty when the file is not 16-bit mono (the only
+    shape this pipeline produces — see to_wav/clean_audio)."""
+    out: list[np.ndarray] = []
     with wave.open(str(wav), "rb") as w:
-        total = w.getnframes() / w.getframerate()
-    r = subprocess.run(
-        ["ffmpeg", "-i", str(wav),
-         "-af", f"silencedetect=noise={noise_db}dB:d={min_silence}", "-f", "null", "-"],
-        capture_output=True)
-    text = r.stderr.decode(errors="ignore")
-    starts = [float(x) for x in re.findall(r"silence_start:\s*([0-9.]+)", text)]
-    ends = [float(x) for x in re.findall(r"silence_end:\s*([0-9.]+)", text)]
+        if w.getsampwidth() != 2 or w.getnchannels() != 1:
+            return np.zeros(0, dtype=np.float32)
+        n = max(1, int(_FRAME_SECONDS * w.getframerate()))
+        while True:  # streamed: a 15 min clip must not become 170 MB of float32
+            raw = w.readframes(n * 3000)
+            if not raw:
+                break
+            a = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+            usable = (a.size // n) * n
+            if usable == 0:
+                break
+            out.append(np.sqrt(np.mean(np.square(a[:usable].reshape(-1, n)), axis=1)))
+    if not out:
+        return np.zeros(0, dtype=np.float32)
+    rms = np.concatenate(out)
+    return 20.0 * np.log10(np.maximum(rms, 10.0 ** (_DB_FLOOR / 20.0)))
 
-    spans: list[tuple[float, float]] = []
-    pos = 0.0
-    for i, st in enumerate(starts):
-        if st - pos >= min_dur:
-            spans.append((pos, st))
-        pos = ends[i] if i < len(ends) else total
-    if total - pos >= min_dur:
-        spans.append((pos, total))
-    if not spans and total >= min_dur:  # no silence found at all — one big span
-        spans = [(0.0, total)]
 
+def measure_levels(wav: Path) -> Levels:
+    """Derive this clip's silence threshold from this clip."""
+    frames = _frame_levels(wav)
+    if frames.size < 4:
+        return Levels(float("nan"), float("nan"), FALLBACK_NOISE_DB, False)
+    floor = float(np.percentile(frames, _FLOOR_PCT))
+    speech = float(np.percentile(frames, _SPEECH_PCT))
+    thr = min(floor + _NOISE_MARGIN_DB, speech - _SPEECH_HEADROOM_DB)
+    thr = min(max(thr, _THRESHOLD_CLAMP[0]), _THRESHOLD_CLAMP[1])
+    return Levels(round(floor, 1), round(speech, 1), round(thr, 1), True)
+
+
+def _chunk_spans(spans: list[tuple[float, float]], min_dur: float,
+                 max_dur: float) -> list[dict]:
+    """Cut speech spans into segments no longer than max_dur, so stem
+    concatenation stays balanced. Single speaker by construction."""
     segs: list[dict] = []
     for a, b in spans:
         cur = a
@@ -657,10 +768,91 @@ def detect_speech(wav: Path, noise_db: float = -35.0, min_silence: float = 0.5,
     return segs
 
 
+def detect_speech(wav: Path, noise_db: float | None = None, min_silence: float = 0.5,
+                  min_dur: float = 1.2, max_dur: float = 15.0) -> SpeechScan:
+    """Find speech spans by level, adapting the threshold to THIS clip.
+
+    `noise_db` overrides the derived threshold (the escape hatch, and how the
+    tests pin the old fixed-constant behaviour for comparison); None — the
+    default and the shipped path — measures the clip and derives it.
+    """
+    import re
+
+    with wave.open(str(wav), "rb") as w:
+        total = w.getnframes() / w.getframerate()
+    lv = measure_levels(wav)
+    threshold = lv.threshold_db if noise_db is None else float(noise_db)
+
+    def scan(outcome: str, note: str | None, spans: list[tuple[float, float]]) -> SpeechScan:
+        segs = _chunk_spans(spans, min_dur, max_dur)
+        return SpeechScan(segs, outcome, note, lv, len(spans),
+                          round(sum(b - a for a, b in spans), 2), round(total, 2))
+
+    if lv.measured and lv.speech_db <= _SILENT_DBFS:
+        return scan("silent", (
+            f"this recording is silence — its loudest moment is {lv.speech_db:.0f} dBFS. "
+            "Nothing can be cloned from it; check the microphone input and record again."
+        ), [])
+    if total < min_dur:
+        return scan("too_short", (
+            f"this recording is {total:.1f}s long, under the {min_dur:.1f}s minimum for "
+            "a usable speech span. Record at least a few seconds of continuous speech."
+        ), [])
+
+    whole = [(0.0, total)]
+    unbroken = (
+        "no pauses were found in this recording, so the whole of it is used as one "
+        "take. If it contains background noise, music or another voice, that is "
+        "cloned too — record with pauses between sentences for a cleaner result.")
+    if lv.measured and (lv.speech_db - lv.floor_db) < _MIN_RANGE_DB:
+        # Level is flat end to end: there is no floor to separate speech from.
+        return scan("unbroken", unbroken, whole)
+
+    r = subprocess.run(
+        ["ffmpeg", "-i", str(wav),
+         "-af", f"silencedetect=noise={threshold}dB:d={min_silence}", "-f", "null", "-"],
+        capture_output=True)
+    text = r.stderr.decode(errors="ignore")
+    starts = [float(x) for x in re.findall(r"silence_start:\s*([0-9.]+)", text)]
+    ends = [float(x) for x in re.findall(r"silence_end:\s*([0-9.]+)", text)]
+
+    spans: list[tuple[float, float]] = []
+    silent_seconds = 0.0
+    pos = 0.0
+    for i, st in enumerate(starts):
+        if st - pos >= min_dur:
+            spans.append((pos, st))
+        end = ends[i] if i < len(ends) else total
+        silent_seconds += max(0.0, min(end, total) - min(st, total))
+        pos = end
+    if total - pos >= min_dur:
+        spans.append((pos, total))
+
+    if silent_seconds >= 0.95 * total:
+        # The threshold gated the entire recording away. The old code answered
+        # this with the whole file — the exact opposite of what it just measured.
+        return scan("silent", (
+            "no speech could be separated from the background in this recording: "
+            "every part of it sits at the background level. Record closer to the "
+            "microphone, or in a quieter room."
+        ), [])
+    if not spans:
+        return scan("unbroken", unbroken, whole)
+    if len(spans) == 1 and (spans[0][1] - spans[0][0]) >= 0.95 * total:
+        return scan("unbroken", unbroken, spans)
+    return scan("spans", None, spans)
+
+
 def sovereign_analyze(audio: Path, work_dir: Path,
                       progress: Callable[[str, str], None] | None = None,
                       partial: Callable[[dict], None] | None = None) -> dict:
-    """Local-only analyze: same outputs/shape as analyze(), no network I/O."""
+    """Local-only analyze: same outputs/shape as analyze(), no network I/O.
+
+    Raises `errors.UserFacing` when detection found nothing to clone. That used
+    to be silent — a silent or unusable recording produced zero speakers and the
+    caller said "no speech detected in the clip" for every cause alike; the
+    scan now says WHICH thing went wrong and what to do about it.
+    """
     work_dir.mkdir(parents=True, exist_ok=True)
 
     def prog(k: str, s: str) -> None:
@@ -673,24 +865,41 @@ def sovereign_analyze(audio: Path, work_dir: Path,
     prog("isolate", "done")
 
     prog("transcribe", "active")
-    segs = detect_speech(clean)
+    scan = detect_speech(clean)
     with wave.open(str(clean), "rb") as w:
         duration = round(w.getnframes() / w.getframerate(), 2)
     if partial:
-        partial({"words": 0, "speakers": ["speaker_0"],
-                 "transcript": "(sovereign mode — no transcription, audio stayed on this machine)"})
+        partial({"words": 0, "speakers": ["speaker_0"], "transcript": sovereign_note()})
     prog("transcribe", "done")
 
-    (work_dir / "segments.json").write_text(json.dumps(segs), "utf-8")
-    speakers: list[dict] = []
-    if segs:
-        secs = round(sum(s["end"] - s["start"] for s in segs), 1)
-        longest = max(segs, key=lambda s: s["end"] - s["start"])
-        pv = work_dir / "speaker_speaker_0.wav"
-        to_wav(clean, pv, longest["start"], min(longest["end"], longest["start"] + 6))
-        speakers.append({"id": "speaker_0", "utterances": len(segs), "seconds": secs,
-                         "sample_text": "(local mode — no transcript)"})
-    return {"duration": duration, "transcript": "", "speakers": speakers}
+    if not scan.segments:
+        raise UserFacing(scan.note or "no speech detected in the clip")
+
+    (work_dir / "segments.json").write_text(json.dumps(scan.segments), "utf-8")
+    segs = scan.segments
+    secs = round(sum(s["end"] - s["start"] for s in segs), 1)
+    longest = max(segs, key=lambda s: s["end"] - s["start"])
+    pv = work_dir / "speaker_speaker_0.wav"
+    to_wav(clean, pv, longest["start"], min(longest["end"], longest["start"] + 6))
+    # `sample_text` is the one line the speaker-pick screen renders per speaker.
+    # In sovereign mode there is no transcript to put there, so it carries the
+    # thing the user actually needs to know at that moment instead of a shrug.
+    sample = (f"sovereign mode — {len(segs)} speech segment(s), single speaker assumed "
+              "(no diarization); baseline voice only")
+    if scan.outcome == "unbroken":
+        sample = "sovereign mode — no pauses found, the whole recording is one take"
+    speakers = [{"id": "speaker_0", "utterances": len(segs), "seconds": secs,
+                 "sample_text": sample}]
+    return {"duration": duration, "transcript": "", "speakers": speakers,
+            "note": scan.note, "limits": list(SOVEREIGN_LIMITS),
+            "detection": {"outcome": scan.outcome, "spans": scan.spans,
+                          "speech_seconds": scan.speech_seconds,
+                          # NaN is not JSON — an unmeasured level is None, and
+                          # this dict is persisted to job state and served.
+                          "noise_floor_db": _num(scan.levels.floor_db),
+                          "speech_db": _num(scan.levels.speech_db),
+                          "threshold_db": _num(scan.levels.threshold_db),
+                          "adaptive": scan.levels.measured}}
 
 
 # ── segmentation ──────────────────────────────────────────────────────────────
@@ -1017,11 +1226,23 @@ def label_and_stem(work_dir: Path, target: str, min_stem: float = MIN_STEM_SECON
                           "escalation": l.get("escalation")} for l in labelled]}
 
 
+def have_cloud_keys() -> bool:
+    """Both cloud providers are configured. Whitespace-only values are NOT keys —
+    a `.env` line like `GEMINI_API_KEY= ` used to auto-select cloud mode and then
+    fail inside analyze() with an assertion the user could not act on."""
+    return bool(ELEVEN_KEY.strip() and GEMINI_KEY.strip())
+
+
 def resolve_mode(mode: str = "auto") -> str:
-    """auto → cloud when both API keys exist, else sovereign (local-only)."""
+    """auto → cloud when both API keys exist, else sovereign (local-only).
+
+    An EXPLICIT mode is always honoured, including "cloud" without keys: the
+    caller asked for it by name, and analyze() is where that is refused. Only
+    "auto" is a decision this function makes.
+    """
     if mode in ("cloud", "sovereign"):
         return mode
-    return "cloud" if (ELEVEN_KEY and GEMINI_KEY) else "sovereign"
+    return "cloud" if have_cloud_keys() else "sovereign"
 
 
 # ── one-shot scan (CLI convenience: analyze → auto speaker → label) ────────────
