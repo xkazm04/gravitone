@@ -10,6 +10,7 @@ import { apiJson, readDetail } from "@/lib/apiFetch";
 import { EMOTION_IDS, emotionMeta } from "@/lib/emotions";
 import { useAuth } from "@/lib/useAuth";
 import { useMounted } from "@/lib/useMounted";
+import { characterSlug } from "@/lib/slugs";
 import { recordVoiceOwnership } from "@/lib/voiceVault";
 import { CONSENT_STATEMENT } from "@/lib/consent";
 import WaveformLab from "./_loaders/WaveformLab";
@@ -250,7 +251,7 @@ export default function NewCharacterPage() {
     const character_id = mode === "extend" ? extendCid : undefined;
     if (mode === "new" && !character) { dispatch({ type: "SET_ERROR", error: "Name the character" }); return; }
     if (mode === "extend" && !extendCid) { dispatch({ type: "SET_ERROR", error: "Pick a character to extend" }); return; }
-    const cid = character_id ?? slug(character);
+    const cid = character_id ?? characterSlug(character);
     submitting.current = true;
     setPending("commit"); setBusyNotice(null);
     dispatch({ type: "COMMIT_STARTED", character, cid, total: selected.size });
@@ -737,10 +738,6 @@ export default function NewCharacterPage() {
       </div>
     </AppFrame>
   );
-}
-
-function slug(name: string): string {
-  return name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "character";
 }
 
 // ── client-side upload pre-check ──────────────────────────────────────────────

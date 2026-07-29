@@ -106,7 +106,8 @@ export default function CharacterVoices({ characterId }: { characterId: string }
 
       <div className="mt-8">
         <EmotionRack
-          name={character.name} slots={slots} coverage={coverage} total={total}
+          name={character.name} characterId={character.character_id}
+          slots={slots} coverage={coverage} total={total}
           busySlot={busySlot} addVoice={addVoiceWithConsent} removeVoice={removeVoice}
           onRecord={setRecording}
           addCustomEmotion={addCustomEmotion} removeCustomEmotion={removeCustomEmotion}
