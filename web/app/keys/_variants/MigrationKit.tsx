@@ -4,8 +4,19 @@
 // The freshly minted secret is pre-filled into base-URL-swap snippets, and a
 // compatibility check replays a real ElevenLabs-shaped request against this
 // Gravitone deployment and reports the timing headers.
+//
+// WHAT THE CHECK ACTUALLY PROVES: it goes through the studio's own server-side
+// proxy (/api/tts), which is the only path a browser has — CORS is closed by
+// default (service/app.py::cors_policy), so a direct call from this page would
+// die at the preflight. That makes the green tick evidence that the deployment
+// SERVES an ElevenLabs-shaped request, and no evidence at all that a browser
+// can reach it. It says so rather than letting a green tick sit next to a
+// browser snippet that would fail. Loosening CORS is NOT the fix — the
+// default-closed posture was chosen deliberately.
 
 import { useEffect, useState } from "react";
+import { readDetail } from "@/lib/apiFetch";
+import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { migrationSnippet, SNIPPET_LANGS, type SnippetLang } from "@/lib/switchkit";
 import { useCopyFeedback } from "@/lib/useCopyFeedback";
 
@@ -29,8 +40,9 @@ export default function MigrationKit({ apiKey }: { apiKey: string }) {
 
   const copy = () => copyText(snippet);
 
-  // Replays the same request shape an ElevenLabs client sends (via the
-  // studio proxy, so it works from the browser without CORS).
+  // Replays the same request shape an ElevenLabs client sends, server-to-server
+  // through the studio proxy — see the module header for what that does and
+  // does not prove.
   const runCheck = async () => {
     setCheck({ phase: "running" });
     try {
@@ -40,7 +52,14 @@ export default function MigrationKit({ apiKey }: { apiKey: string }) {
         body: JSON.stringify({ text: "Compatibility check: one base URL, zero code changes.", voiceId: "alba" }),
       });
       if (!r.ok) {
-        setCheck({ phase: "fail", reason: r.status === 503 ? "backend unreachable" : `upstream ${r.status}` });
+        // The backend's own detail ("no such voice", "engine not ready", a 401
+        // naming the missing scope) is the whole diagnostic value of a failed
+        // check. Collapsing every non-OK to `upstream {status}` threw it away.
+        const detail = await readDetail(r);
+        setCheck({
+          phase: "fail",
+          reason: detail ?? (r.status === 503 ? "Gravitone backend unreachable" : `upstream ${r.status}`),
+        });
         return;
       }
       await r.arrayBuffer(); // drain the audio
@@ -96,10 +115,31 @@ export default function MigrationKit({ apiKey }: { apiKey: string }) {
             ✓ ElevenLabs-shaped request served — {check.audioSeconds}s audio at {check.rtf}× realtime
           </span>
         )}
+        {/* Rose, not amber: a failed check is a failure, and the repo reserves
+            amber for a caveat (components/ui/ErrorBanner). */}
         {check.phase === "fail" && (
-          <span className="font-jetbrains text-[11px] text-amber-300">✗ {check.reason}</span>
+          <span className="font-jetbrains text-[11px] text-rose-300">✗ {check.reason}</span>
         )}
       </div>
+
+      {/* Say which path was checked, in the same breath as the result — a green
+          tick with no path named is what let it stand in for the browser call
+          the snippet next to it makes. */}
+      {check.phase === "pass" && (
+        <p className="font-jetbrains mt-2 text-[10px] leading-relaxed text-white/50">
+          Checked server-to-server through this studio&apos;s proxy — the path the curl and Python snippets take.
+          It does not prove a <span className="text-white/70">browser</span> can call your deployment: that needs
+          CORS, which is closed until <span className="text-white/70">TTS_CORS_ORIGINS</span> names your origin.
+        </p>
+      )}
+
+      {lang === "javascript" && (
+        <ErrorBanner severity="warning" className="mt-3">
+          This snippet runs in a browser, and the check above never exercised that path. On a default deployment
+          the preflight fails before your key is even sent — set TTS_CORS_ORIGINS to your origin, or run this
+          server-side (Node, an edge function, your own API), where it works as written.
+        </ErrorBanner>
+      )}
     </div>
   );
 }

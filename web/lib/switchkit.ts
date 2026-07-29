@@ -165,7 +165,15 @@ export function migrationSnippet(
         `    text="Same request, no per-character bill.")`,
       ].join("\n");
     case "javascript":
+      // The CORS caveat is part of the snippet, not a footnote: pasted into a
+      // browser this dies at the preflight on a default deployment (CORS is
+      // closed until TTS_CORS_ORIGINS names an origin — service/app.py
+      // ::cors_policy), and the failure happens before the key is ever sent,
+      // which reads like a broken deployment rather than a policy.
       return [
+        `// Run this server-side (Node, an edge function, your own API).`,
+        `// From a browser it needs TTS_CORS_ORIGINS to name your origin —`,
+        `// CORS is closed by default, so the preflight fails first.`,
         `const res = await fetch(`,
         `  "${base}/v1/text-to-speech/alba", // ← was api.elevenlabs.io`,
         `  {`,
