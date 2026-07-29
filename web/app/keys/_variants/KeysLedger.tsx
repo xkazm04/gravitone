@@ -1,7 +1,14 @@
 "use client";
 
 // LEDGER — dense operations table. Inline create bar, one row per key with
-// prefix / scopes / created / last-used / rotate / revoke. Practical, scales.
+// prefix / scopes / created / last-used / rotate / revoke / destroy.
+//
+// Two kill actions, and the difference is the point: REVOKE stops the key
+// authenticating but keeps the row (dimmed, struck through — the same language
+// the Voice Vault uses for a revoked clone), so the audit trail survives; it is
+// the default for a leaked key. DESTROY deletes the key AND its audit record,
+// so it is labelled destructive and confirmed. Every label names the request it
+// sends.
 
 import { useState } from "react";
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
@@ -10,13 +17,17 @@ import SecretReveal from "./SecretReveal";
 import { SCOPES, relTime, useKeys, type ApiKeyWithSecret } from "./data";
 
 export default function KeysLedger() {
-  const { keys, loading, error, createKey, rotateKey, deleteKey } = useKeys();
+  const { keys, loading, error, createKey, rotateKey, revokeKey, destroyKey } = useKeys();
   const [name, setName] = useState("");
   const [scopes, setScopes] = useState<string[]>(["tts"]);
   const [busy, setBusy] = useState(false);
   const [reveal, setReveal] = useState<ApiKeyWithSecret | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [rotating, setRotating] = useState<string | null>(null);
+  // In-flight gate for the kill actions, keyed `${id}:revoke` / `${id}:destroy`:
+  // a double-click used to fire two requests, and a request that kills a
+  // credential must not be sent twice.
+  const [killing, setKilling] = useState<string | null>(null);
 
   const toggleScope = (s: string) => setScopes((cur) => (cur.includes(s) ? cur.filter((x) => x !== s) : [...cur, s]));
 
@@ -28,6 +39,23 @@ export default function KeysLedger() {
       setName("");
     } catch (e) { setErr(e instanceof Error ? e.message : "create failed"); }
     finally { setBusy(false); }
+  }
+
+  async function kill(id: string, kind: "revoke" | "destroy") {
+    if (killing) return;
+    setKilling(`${id}:${kind}`); setErr(null);
+    try { await (kind === "revoke" ? revokeKey(id) : destroyKey(id)); }
+    finally { setKilling(null); }
+  }
+
+  // Destroying takes the audit record with it, so it asks first — the same
+  // window.confirm gate the Voice Vault uses before a revoke there.
+  function confirmDestroy(id: string, name: string) {
+    if (!window.confirm(
+      `Destroy "${name}"? The key AND its audit record (scopes, last used) are deleted permanently. ` +
+      `If this key leaked, cancel and use revoke instead — that kills it while keeping the record.`,
+    )) return;
+    void kill(id, "destroy");
   }
 
   return (
@@ -83,8 +111,14 @@ export default function KeysLedger() {
             {loading && <tr><td colSpan={6} className="px-3 py-8 text-center text-sm text-white/60">Loading keys…</td></tr>}
             {!loading && keys.length === 0 && <tr><td colSpan={6} className="px-3 py-8 text-center text-sm text-white/60">No keys yet — create one above.</td></tr>}
             {keys.map((k) => (
-              <tr key={k.id} className="border-b border-white/5 transition hover:bg-white/[0.03]">
-                <td className="px-3 py-2.5 text-sm font-medium text-white">{k.name}</td>
+              // Revoked keys STAY listed — keeping them auditable is what
+              // revoke is for. Dimmed + struck through + labelled, matching
+              // profile/MyVoices' revoked clone rows.
+              <tr key={k.id} className={`border-b border-white/5 transition hover:bg-white/[0.03] ${k.revoked ? "opacity-50" : ""}`}>
+                <td className="px-3 py-2.5 text-sm font-medium text-white">
+                  {k.revoked ? <s>{k.name}</s> : k.name}
+                  {k.revoked && <span className="font-jetbrains ml-2 text-[10px] uppercase tracking-widest text-rose-300/80">revoked</span>}
+                </td>
                 <td className="font-jetbrains px-3 py-2.5 text-[12px] text-cyan-200/90">{k.prefix}</td>
                 <td className="px-3 py-2.5">
                   <div className="flex flex-wrap gap-1">
@@ -112,7 +146,26 @@ export default function KeysLedger() {
                     className="font-jetbrains text-[11px] text-cyan-300/80 transition hover:text-cyan-200 disabled:cursor-not-allowed disabled:text-white/30">
                     {rotating === k.id ? "rotating…" : "rotate"}
                   </button>
-                  <button onClick={() => deleteKey(k.id)} className="font-jetbrains ml-3 text-[11px] text-white/45 transition hover:text-rose-300">revoke</button>
+                  {/* Revoke disappears once the key is revoked (it is already
+                      dead, and the backend is idempotent about it); rotate
+                      stays clickable so the backend's 409 — which states the
+                      reason — is the answer a user gets. */}
+                  {!k.revoked && (
+                    <button
+                      onClick={() => void kill(k.id, "revoke")}
+                      disabled={killing !== null}
+                      title="Stop this key authenticating, but keep it listed and auditable — the fix for a leak."
+                      className="font-jetbrains ml-3 text-[11px] text-white/45 transition hover:text-rose-300 disabled:cursor-not-allowed disabled:text-white/25">
+                      {killing === `${k.id}:revoke` ? "revoking…" : "revoke"}
+                    </button>
+                  )}
+                  <button
+                    onClick={() => confirmDestroy(k.id, k.name)}
+                    disabled={killing !== null}
+                    title="Delete the key AND its audit record. Permanent."
+                    className="font-jetbrains ml-3 text-[11px] text-rose-300/70 transition hover:text-rose-200 disabled:cursor-not-allowed disabled:text-white/25">
+                    {killing === `${k.id}:destroy` ? "destroying…" : "destroy"}
+                  </button>
                 </td>
               </tr>
             ))}

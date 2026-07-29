@@ -79,15 +79,23 @@ export function useKeys() {
     return body;
   }, [refresh]);
 
-  const deleteKey = useCallback(async (id: string) => {
-    // Optimistically hide the row, but keep a snapshot: if the DELETE doesn't
-    // actually revoke the key, restore it so the user is not told a still-live
-    // (possibly leaked) key is gone. 404 = already absent, treat as success.
+  /** Kill a key WITHOUT destroying its audit identity — the answer to a leak.
+   *
+   *  The key stops authenticating immediately but stays in the ledger with
+   *  `revoked: true`, so its scopes and last-used remain answerable and a later
+   *  rotate 409s. This is the default kill action; `destroyKey` is the one that
+   *  takes the audit trail with it.
+   *
+   *  Optimistic: flip the row to revoked in place (it must stay VISIBLE — that
+   *  is the whole point of revoke), with a snapshot to roll back to. A failure
+   *  restores the live row and says the key is still active, because it is. */
+  const revokeKey = useCallback(async (id: string) => {
     const snapshot = keys;
-    setKeys((ks) => ks.filter((k) => k.id !== id));
+    setKeys((ks) => ks.map((k) => (k.id === id ? { ...k, revoked: true } : k)));
     try {
-      const r = await fetch(`/api/keys/${encodeURIComponent(id)}`, { method: "DELETE" });
-      if (!r.ok && r.status !== 404) {
+      const r = await fetch(`/api/keys/${encodeURIComponent(id)}/revoke`, { method: "POST" });
+      if (!mounted.current) return;
+      if (!r.ok) {
         setKeys(snapshot);
         setError(`revoke failed (${r.status}) — the key is still active`);
         return;
@@ -95,10 +103,34 @@ export function useKeys() {
       setError(null);
       await refresh();
     } catch {
+      if (!mounted.current) return;
       setKeys(snapshot);
       setError("revoke failed — the key is still active");
     }
-  }, [keys, refresh]);
+  }, [keys, mounted, refresh]);
 
-  return { keys, loading, error, refresh, createKey, rotateKey, deleteKey };
+  /** DESTROY a key and its audit record. Optimistically hide the row, but keep
+   *  a snapshot: if the DELETE doesn't land, restore it rather than telling the
+   *  user a key that still exists is gone. 404 = already absent, so success. */
+  const destroyKey = useCallback(async (id: string) => {
+    const snapshot = keys;
+    setKeys((ks) => ks.filter((k) => k.id !== id));
+    try {
+      const r = await fetch(`/api/keys/${encodeURIComponent(id)}`, { method: "DELETE" });
+      if (!mounted.current) return;
+      if (!r.ok && r.status !== 404) {
+        setKeys(snapshot);
+        setError(`destroy failed (${r.status}) — the key still exists`);
+        return;
+      }
+      setError(null);
+      await refresh();
+    } catch {
+      if (!mounted.current) return;
+      setKeys(snapshot);
+      setError("destroy failed — the key still exists");
+    }
+  }, [keys, mounted, refresh]);
+
+  return { keys, loading, error, refresh, createKey, rotateKey, revokeKey, destroyKey };
 }
