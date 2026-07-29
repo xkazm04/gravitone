@@ -14,10 +14,57 @@ import { useState } from "react";
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { Button, Eyebrow } from "@/components/ui/Primitives";
 import SecretReveal from "./SecretReveal";
-import { SCOPES, relTime, useKeys, type ApiKeyWithSecret } from "./data";
+import { SCOPES, relTime, useKeys, type ApiKeyWithSecret, type Enforcement } from "./data";
+
+const Code = ({ children }: { children: string }) => (
+  <span className="font-jetbrains text-cyan-200/90">{children}</span>
+);
+
+/** What setting a root key COSTS, stated where the operator would act on it.
+ *  Both consequences are real and neither is obvious from this page. */
+function RootKeyConsequences() {
+  return (
+    <>
+      Setting it also takes <Code>/docs</Code>, <Code>/redoc</Code> and <Code>/openapi.json</Code> offline
+      (<Code>TTS_DOCS=on</Code> keeps them published), and puts <Code>/metrics</Code> — plus the engine
+      config and latency percentiles on <Code>/health</Code> — behind the <Code>tts</Code> scope.
+    </>
+  );
+}
+
+/** The posture strip. It reports only what the studio can prove; see
+ *  data.ts::Enforcement for why a served key list proves nothing.
+ *
+ *  A ledger full of tidy scoped keys looks like access control whether or not
+ *  the deployment checks any of them, so the ambiguous case is a WARNING, not
+ *  a silent omission — and the unreachable case says nothing at all about the
+ *  deployment rather than inventing a posture for a box that never answered. */
+function EnforcementNote({ state }: { state: Enforcement }) {
+  if (state === "unreachable") return null; // the error banner already says it
+  if (state === "enforced") {
+    return (
+      <p className="font-jetbrains mt-4 rounded-lg border border-cyan-400/25 bg-cyan-400/5 px-4 py-2 text-[11px] text-cyan-200/90">
+        Key enforcement is <strong className="font-semibold">ON</strong> — this backend answered 401, which only
+        a configured <Code>TTS_API_KEY</Code> does, so every request is checked and the keys below really do
+        gate access. It rejected this studio too: nothing on this page will work until{" "}
+        <Code>GRAVITONE_API_KEY</Code> in the studio&apos;s environment holds a key the backend accepts.{" "}
+        <RootKeyConsequences />
+      </p>
+    );
+  }
+  return (
+    <ErrorBanner severity="warning">
+      Key enforcement: <strong className="font-semibold">can&apos;t tell from here</strong>. This page reaches the
+      service through the studio&apos;s server-side proxy, which sends its own root key when it has one — so a key
+      list that loads looks identical whether the deployment checks credentials or not. If{" "}
+      <Code>TTS_API_KEY</Code> is unset on the box, the service serves <em>every</em> unauthenticated request and
+      the keys below enforce nothing. Verify it there, not here. <RootKeyConsequences />
+    </ErrorBanner>
+  );
+}
 
 export default function KeysLedger() {
-  const { keys, loading, error, createKey, rotateKey, revokeKey, destroyKey } = useKeys();
+  const { keys, loading, error, enforcement, createKey, rotateKey, revokeKey, destroyKey } = useKeys();
   const [name, setName] = useState("");
   const [scopes, setScopes] = useState<string[]>(["tts"]);
   const [busy, setBusy] = useState(false);
@@ -72,6 +119,10 @@ export default function KeysLedger() {
       </p>
 
       {(error || err) && <ErrorBanner>{error ?? err}</ErrorBanner>}
+
+      {/* Whether these keys enforce anything is not inferable from their
+          existence, so the page says which of the two it actually knows. */}
+      {!loading && <EnforcementNote state={enforcement} />}
 
       {/* create bar */}
       <div className="glass-panel mt-8 rounded-2xl p-4">

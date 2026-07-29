@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 
-import { apiJson, throwDetail } from "@/lib/apiFetch";
+import { throwDetail } from "@/lib/apiFetch";
 import { useMounted } from "@/lib/useMounted";
 
 export type ApiKey = {
@@ -35,18 +35,55 @@ export function relTime(iso?: string | null): string {
   return `${Math.floor(h / 24)}d ago`;
 }
 
+/** What the studio can HONESTLY say about whether this backend checks keys.
+ *
+ *  With `TTS_API_KEY` unset the service serves every unauthenticated request
+ *  (`service/auth.py::_authorize` returns immediately), so the keys managed on
+ *  this page enforce nothing at all. That is the single most misleading thing
+ *  this surface can hide, so it is derived rather than assumed — and the three
+ *  values are exactly what the studio can prove, no more:
+ *
+ *  - `enforced`  — the backend answered 401. Only a configured `TTS_API_KEY`
+ *                  can produce that (open mode never rejects anyone), so key
+ *                  enforcement is definitely ON.
+ *  - `unknown`   — the list came back. This proves NOTHING about the posture:
+ *                  the request went through the studio's server-side proxy,
+ *                  which attaches its own root key when it has one
+ *                  (`lib/backend.ts`), so a keyed backend and an open one look
+ *                  identical from the browser. The studio says "I can't tell"
+ *                  instead of guessing.
+ *  - `unreachable` — nothing answered; there is no deployment to describe.
+ *
+ *  Determining `unknown` apart from open-mode would need an UNAUTHENTICATED
+ *  probe of the backend, which only a server route could make (the browser
+ *  can't: CORS is default-closed) — see the follow-ups in the build report. */
+export type Enforcement = "enforced" | "unknown" | "unreachable";
+
 export function useKeys() {
   const [keys, setKeys] = useState<ApiKey[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [enforcement, setEnforcement] = useState<Enforcement>("unknown");
   const mounted = useMounted();
 
   const refresh = useCallback(async () => {
     try {
-      const list = await apiJson<ApiKey[]>("/api/keys", { cache: "no-store" },
-        "failed to load keys");
+      const r = await fetch("/api/keys", { cache: "no-store" });
+      if (!r.ok) {
+        if (mounted.current) {
+          // 401 is the ONE status that proves a root key is configured. Every
+          // other failure (503 unreachable, a 5xx, a proxy hiccup) says
+          // nothing about the posture, so it must not be read as one.
+          setEnforcement(r.status === 401 ? "enforced" : r.status === 503 ? "unreachable" : "unknown");
+        }
+        return await throwDetail(r, "failed to load keys");
+      }
+      const list = (await r.json()) as ApiKey[];
       if (!mounted.current) return;
       setKeys(list);
+      // A served list means the proxy's credential (or the absence of any
+      // check) was accepted — which of the two, this side cannot see.
+      setEnforcement("unknown");
       setError(null);
     } catch (e) {
       if (!mounted.current) return;
@@ -132,5 +169,5 @@ export function useKeys() {
     }
   }, [keys, mounted, refresh]);
 
-  return { keys, loading, error, refresh, createKey, rotateKey, revokeKey, destroyKey };
+  return { keys, loading, error, enforcement, refresh, createKey, rotateKey, revokeKey, destroyKey };
 }

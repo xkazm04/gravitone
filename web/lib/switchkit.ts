@@ -2,6 +2,12 @@
 // one-line migration snippets used on the landing page, the keys page and
 // the profile "your key" panel.
 //
+// The snippets below send the key as `xi-api-key`. Note that a Gravitone
+// deployment only CHECKS that header when `TTS_API_KEY` is set on the service
+// (service/auth.py); with it unset the same request succeeds with no key at
+// all. Nothing here should imply otherwise — the keys page carries the posture
+// notice (app/keys/_variants/data.ts::Enforcement).
+//
 // ElevenLabs numbers are public list prices (credits ≈ characters, and
 // ~1,000 characters ≈ 1 minute of audio on multilingual v2). Gravitone
 // numbers come from the measured benchmark study in gravitone/README.md:
