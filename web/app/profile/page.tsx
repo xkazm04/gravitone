@@ -21,7 +21,10 @@ export default function ProfilePage() {
   const [minting, setMinting] = useState(false);
   const [mintErr, setMintErr] = useState<string | null>(null);
   const [lang, setLang] = useState<SnippetLang>("curl");
-  const { copy, copied } = useCopyFeedback<"key" | "snippet">();
+  // `failed` is not optional: dropping it made both copy buttons no-op in
+  // silence when the clipboard refused (permission, insecure context), on the
+  // one screen whose entire job is handing the user a credential.
+  const { copy, copied, failed } = useCopyFeedback<"key" | "snippet">();
   // Cleared on unmount so a save that lands as the user navigates away doesn't
   // setState on a dead component.
   const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -132,7 +135,7 @@ export default function ProfilePage() {
                     <code className="font-jetbrains flex-1 truncate text-sm text-cyan-200">{storedKey.secret}</code>
                     <button onClick={() => void copyText("key", storedKey.secret)}
                       className="font-jetbrains shrink-0 rounded-lg border border-white/15 px-3 py-1.5 text-[12px] text-white/85 transition hover:bg-white/5">
-                      {copied === "key" ? "✓ copied" : "copy"}
+                      {failed === "key" ? "copy blocked — select it" : copied === "key" ? "✓ copied" : "copy"}
                     </button>
                   </div>
                   <p className="mt-3 text-sm text-white/65">
@@ -144,7 +147,7 @@ export default function ProfilePage() {
                   <div className="mt-3 flex items-center gap-3">
                     <button onClick={() => void copyText("snippet", migrationSnippet(lang, { apiKey: storedKey.secret }))}
                       className="font-jetbrains cursor-pointer rounded-lg border border-white/15 px-3 py-1.5 text-[11px] text-white/85 transition hover:bg-white/5">
-                      {copied === "snippet" ? "✓ copied" : "copy snippet"}
+                      {failed === "snippet" ? "copy blocked — select it" : copied === "snippet" ? "✓ copied" : "copy snippet"}
                     </button>
                     <Link href="/keys" className="font-jetbrains text-[11px] text-cyan-300/80 transition hover:text-cyan-200">
                       manage all keys →

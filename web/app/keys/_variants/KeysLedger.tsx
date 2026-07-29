@@ -66,7 +66,9 @@ export default function KeysLedger() {
       <p className="mt-2 max-w-2xl text-base text-white/70">
         Issue keys for other apps to call your Gravitone API. Send them as{" "}
         <span className="font-jetbrains text-cyan-300">xi-api-key</span> — the same header ElevenLabs
-        clients already send, so a new key plus a base-URL swap is a complete migration. Secrets are shown once.
+        clients already send, so a new key plus a base-URL swap is a complete migration. Secrets created here
+        are shown once — the only exception is the key minted at first sign-in, which this browser keeps so you
+        can re-copy it from your profile until you sign out.
       </p>
 
       {(error || err) && <ErrorBanner>{error ?? err}</ErrorBanner>}
