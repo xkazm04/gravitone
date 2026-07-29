@@ -241,6 +241,30 @@ export async function removeCustomEmotionReq(id: string, emotion: string): Promi
   invalidateRoster();
 }
 
+// ── collision messages ────────────────────────────────────────────────────────
+/**
+ * The Voice a slot-collision 409 names, resolved against the roster.
+ *
+ * The backend writes "'sarah' already has a 'baseline' voice (v_ab12) — delete
+ * or re-slot that voice first": it names the holder ON PURPOSE so the UI can
+ * point at it. Rendered as raw text, that id is something the user has to hunt
+ * for by hand, so callers use this to turn it into a link.
+ *
+ * Returns null when the message names nothing we can find — never a guess.
+ */
+export function collisionVoice(
+  message: string,
+  characters: Character[],
+): { voice: Voice; character: Character } | null {
+  for (const m of message.matchAll(/\(([^()\s]+)\)/g)) {
+    for (const character of characters) {
+      const voice = character.voices.find((v) => v.voice_id === m[1]);
+      if (voice) return { voice, character };
+    }
+  }
+  return null;
+}
+
 // ── roster hook ───────────────────────────────────────────────────────────────
 export function useCharacters() {
   const [characters, setCharacters] = useState<Character[]>([]);

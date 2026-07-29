@@ -10,7 +10,8 @@ import Link from "next/link";
 import { Eyebrow } from "@/components/ui/Primitives";
 import { EMOTION_IDS, emotionMeta } from "@/lib/emotions";
 import TagEditor from "./TagEditor";
-import { hueOf, relTime, useCharacters, useVoicePreview, patchCharacterReq, deleteCharacterReq, type Character } from "../_data/characters";
+import { hueOf, relTime, useCharacters, useVoicePreview, patchCharacterReq, deleteCharacterReq, collisionVoice, type Character } from "../_data/characters";
+import { ApiError, readDetail } from "@/lib/apiFetch";
 import { useAuth } from "@/lib/useAuth";
 import { useMounted } from "@/lib/useMounted";
 import { CONSENT_PROMPT, recordVoiceOwnership } from "@/lib/voiceVault";
@@ -99,6 +100,12 @@ export default function CharacterTable() {
   const [bulkTag, setBulkTag] = useState("");
   const [cloning, setCloning] = useState(false);
   const [cloneErr, setCloneErr] = useState<string | null>(null);
+  // A quick clone that 409'd on a taken id. The FILE is kept: the id is taken,
+  // the recording is fine, and discarding it made the user re-pick the file to
+  // answer a question we could have asked with it still in hand.
+  const [collision, setCollision] = useState<{ file: File; name: string; detail: string } | null>(null);
+  const [retryName, setRetryName] = useState("");
+  const [bulkNotice, setBulkNotice] = useState<string | null>(null);
   const [vaultWarn, setVaultWarn] = useState<string | null>(null);
   const [importing, setImporting] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -146,10 +153,17 @@ export default function CharacterTable() {
   async function applyBulkTag() {
     const t = bulkTag.trim().toLowerCase();
     if (!t) return;
-    const targets = [...selected]
+    const chosen = [...selected]
       .map((id) => characters.find((x) => x.character_id === id))
-      .filter((c): c is Character => !!c && !c.tags.includes(t));
+      .filter((c): c is Character => !!c);
+    // PATCH 409s a built-in ("cannot be renamed"), so tagging one was always a
+    // guaranteed failure dressed up as a bulk action. Skip them and SAY so.
+    const builtIns = chosen.filter((c) => c.category === "premade");
+    const targets = chosen.filter((c) => c.category === "cloned" && !c.tags.includes(t));
     setCloneErr(null);
+    setBulkNotice(builtIns.length
+      ? `${builtIns.length} built-in character${builtIns.length > 1 ? "s were" : " was"} skipped — built-ins cannot be retagged`
+      : null);
     // Bounded parallel (≤6 in flight) + one refresh at the end, instead of N
     // serial round-trips each triggering their own re-sync.
     const errs = await runPool(targets, 6, async (c) => { await patchCharacterReq(c.character_id, { tags: [...c.tags, t] }); });
@@ -165,12 +179,24 @@ export default function CharacterTable() {
     await refresh();
     if (errs.length) setCloneErr(`${errs.length} delete${errs.length > 1 ? "s" : ""} failed: ${errs[0].message}`);
   }
-  async function onFile(f: File) {
-    if (!window.confirm(CONSENT_PROMPT)) return; // Voice Vault attestation gate
+  /** Quick clone: one file → one Character named after it.
+   *
+   *  The name comes from the FILENAME, and the built-in ids are ordinary first
+   *  names (mary, jane, paul…), so dropping `mary.wav` is a guaranteed 409.
+   *  That used to be a generic banner with the file thrown away. Now the 409 is
+   *  caught on its own: the file is retained and the user picks another name.
+   *
+   *  `name` re-runs the clone with a different Character name; `attested` says
+   *  the consent gate was already answered for this same file. */
+  async function onFile(f: File, opts: { name?: string; attested?: boolean } = {}) {
+    if (cloning) return; // in-flight gate — a double-click must not clone twice
+    if (!opts.attested && !window.confirm(CONSENT_PROMPT)) return; // Voice Vault attestation gate
+    const name = (opts.name ?? f.name.replace(/\.[^.]+$/, "")).trim();
+    if (!name) return;
     setCloning(true); setCloneErr(null);
     try {
-      const name = f.name.replace(/\.[^.]+$/, "");
       const v = await createVoice(f, name, "baseline", [], f.name);
+      setCollision(null);
       if (user) {
         // Consume the {saved, failed} result — a dropped consent receipt is a
         // compliance-visible loss, not something to discover later.
@@ -183,7 +209,14 @@ export default function CharacterTable() {
           : null);
       }
     } catch (e) {
-      setCloneErr(e instanceof Error ? e.message : "clone failed");
+      // 409 = "that name is taken" (a built-in id, or a slot this Character
+      // already fills). Answerable, so ask instead of dead-ending.
+      if (e instanceof ApiError && e.status === 409) {
+        setCollision({ file: f, name, detail: e.message });
+        setRetryName("");
+      } else {
+        setCloneErr(e instanceof Error ? e.message : "clone failed");
+      }
     } finally { setCloning(false); }
   }
 
@@ -195,13 +228,17 @@ export default function CharacterTable() {
       fd.append("file", f, f.name);
       if (rename) fd.append("rename", rename);
       const r = await fetch("/api/characters/import", { method: "POST", body: fd });
-      const body = await r.json().catch(() => ({}));
       if (r.status === 409) {
-        const name = window.prompt("A character with this id already exists. Import under a new name:");
+        // The backend says WHICH id and why (a built-in collision reads
+        // differently from an existing clone). Asserting "a character with this
+        // id already exists" was false copy for the built-in case and threw the
+        // real answer away — ask with the backend's own words.
+        const detail = (await readDetail(r)) ?? "A character with this id already exists.";
+        const name = window.prompt(`${detail}\n\nImport under a different character name:`);
         if (name?.trim()) { setImporting(false); return onPack(f, name.trim()); }
-        throw new Error(body?.detail ?? "character already exists");
+        throw new Error(detail);
       }
-      if (!r.ok) throw new Error(body?.detail ?? `import failed (${r.status})`);
+      if (!r.ok) throw new Error((await readDetail(r)) ?? `import failed (${r.status})`);
       await refresh();
     } catch (e) {
       setCloneErr(e instanceof Error ? e.message : "import failed");
@@ -226,7 +263,47 @@ export default function CharacterTable() {
       </p>
 
       {(error || cloneErr) && <ErrorBanner>{error ?? cloneErr}</ErrorBanner>}
+      {bulkNotice && <ErrorBanner severity="warning">{bulkNotice}</ErrorBanner>}
       {vaultWarn && <ErrorBanner severity="warning">{vaultWarn}</ErrorBanner>}
+
+      {collision && (() => {
+        // If the 409 named a voice_id, that id is a place in the app — link it
+        // instead of printing a string the user has to hunt for.
+        const held = collisionVoice(collision.detail, characters);
+        return (
+          <div className="mt-4 rounded-lg border border-rose-400/25 bg-rose-400/5 px-4 py-3">
+            <p role="alert" className="font-jetbrains text-[11px] text-rose-200">
+              {collision.detail}
+              {held && (
+                <Link href={`/voices/${held.character.character_id}`}
+                  className="ml-2 underline decoration-rose-300/40 underline-offset-2 transition hover:text-rose-100">
+                  open {held.character.name} → {emotionMeta(held.voice.emotion).label}
+                </Link>
+              )}
+            </p>
+            <p className="font-jetbrains mt-1.5 text-[11px] text-white/60">
+              Nothing was cloned. “{collision.file.name}” is still here — give it another character name.
+            </p>
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <input
+                autoFocus value={retryName} onChange={(e) => setRetryName(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter" && retryName.trim()) void onFile(collision.file, { name: retryName, attested: true }); }}
+                placeholder={`${collision.name} 2`} aria-label="Character name"
+                className="font-jetbrains w-48 rounded border border-white/15 bg-transparent px-2 py-1 text-[12px] text-white placeholder:text-white/40 focus:border-cyan-400/40 focus:outline-none" />
+              <button
+                onClick={() => void onFile(collision.file, { name: retryName, attested: true })}
+                disabled={!retryName.trim() || cloning}
+                className="font-jetbrains rounded border border-cyan-400/30 px-2 py-1 text-[11px] text-cyan-200 transition hover:bg-cyan-400/10 disabled:opacity-40">
+                {cloning ? "cloning…" : "clone under this name"}
+              </button>
+              <button onClick={() => setCollision(null)} disabled={cloning}
+                className="font-jetbrains text-[11px] text-white/55 transition hover:text-white disabled:opacity-40">
+                discard the file
+              </button>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* toolbar */}
       <div className="mt-8 flex flex-wrap items-center gap-3">
@@ -249,7 +326,7 @@ export default function CharacterTable() {
           {importing ? "importing…" : "⇪ import pack"}
         </button>
         <input ref={fileRef} type="file" accept="audio/*,video/mp4" hidden
-          onChange={(e) => { const f = e.target.files?.[0]; if (f) void onFile(f); e.target.value = ""; }} />
+          onChange={(e) => { const f = e.target.files?.[0]; setCollision(null); if (f) void onFile(f); e.target.value = ""; }} />
         <button onClick={() => fileRef.current?.click()} disabled={cloning}
           className="font-jetbrains rounded-full border border-white/12 px-3 py-2 text-[12px] text-white/70 transition hover:text-white disabled:opacity-50">
           {cloning ? "cloning…" : "quick clone"}
@@ -316,6 +393,10 @@ export default function CharacterTable() {
             )}
             {rows.map((c) => {
               const baseline = c.voices.find((v) => v.emotion === "baseline") ?? c.voices[0];
+              // PATCH /v1/characters 409s a built-in, so rename and tag editing
+              // were offered, optimistically painted, refused and snapped back.
+              // Don't offer what the backend will refuse.
+              const editable = c.category === "cloned";
               return (
                 <tr key={c.character_id} className={`border-b border-white/5 transition hover:bg-white/[0.03] ${selected.has(c.character_id) ? "bg-cyan-400/[0.04]" : ""}`}>
                   <td className="px-3 py-2">
@@ -336,7 +417,7 @@ export default function CharacterTable() {
                   <td className="px-3 py-2">
                     <div className="flex items-center gap-2.5">
                       <span className="h-6 w-6 shrink-0 rounded-full" style={{ background: `radial-gradient(circle at 30% 30%, hsl(${hueOf(c.character_id)} 90% 70%), hsl(${hueOf(c.character_id)} 80% 45%))` }} />
-                      {renaming === c.character_id ? (
+                      {editable && renaming === c.character_id ? (
                         <input autoFocus defaultValue={c.name}
                           onBlur={(e) => {
                             // Escape unmounts the input, which fires this blur — bail out
@@ -346,8 +427,11 @@ export default function CharacterTable() {
                           }}
                           onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); if (e.key === "Escape") { cancelRename.current = true; setRenaming(null); } }}
                           className="w-40 rounded border border-cyan-400/40 bg-transparent px-1.5 py-0.5 text-sm text-white focus:outline-none" />
-                      ) : (
+                      ) : editable ? (
                         <button onDoubleClick={() => setRenaming(c.character_id)} title="Double-click to rename" className="truncate text-left text-sm font-medium text-white">{c.name}</button>
+                      ) : (
+                        <span title="Built-in characters ship with the service and cannot be renamed"
+                          className="truncate text-sm font-medium text-white">{c.name}</span>
                       )}
                     </div>
                   </td>
@@ -371,7 +455,22 @@ export default function CharacterTable() {
                       );
                     })()}
                   </td>
-                  <td className="px-3 py-2"><TagEditor compact max={3} tags={c.tags} onChange={(tags) => patchCharacter(c.character_id, { tags })} /></td>
+                  <td className="px-3 py-2">
+                    {editable ? (
+                      <TagEditor compact max={3} tags={c.tags} onChange={(tags) => patchCharacter(c.character_id, { tags })} />
+                    ) : (
+                      <span title="Built-in characters ship with the service — their tags cannot be edited"
+                        className="flex flex-wrap items-center gap-1.5">
+                        {c.tags.slice(0, 3).map((t) => (
+                          <span key={t} className="font-jetbrains rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-[11px] text-white/60">{t}</span>
+                        ))}
+                        {c.tags.length > 3 && (
+                          <span className="font-jetbrains rounded-full border border-white/10 px-2 py-0.5 text-[11px] text-white/60">+{c.tags.length - 3}</span>
+                        )}
+                        {c.tags.length === 0 && <span className="font-jetbrains text-[11px] text-white/35">—</span>}
+                      </span>
+                    )}
+                  </td>
                   <td className="font-jetbrains px-3 py-2 text-[12px] text-white/65">{relTime(c.created)}</td>
                   <td className="px-3 py-2 text-right">
                     <Link href={`/voices/${c.character_id}`} className="font-jetbrains text-[11px] text-cyan-300/80 transition hover:text-cyan-200">open →</Link>
