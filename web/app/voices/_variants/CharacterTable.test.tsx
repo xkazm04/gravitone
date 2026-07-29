@@ -3,10 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // The table reaches the data layer, whose hooks touch Firebase auth.
 vi.mock("@/lib/useAuth", () => ({ useAuth: () => ({ user: null }) }));
-vi.mock("@/lib/voiceVault", () => ({ recordVoiceOwnership: async () => ({ saved: 0, failed: 0 }) }));
-
-import CharacterTable from "./CharacterTable";
-import { invalidateRoster } from "../_data/characters";
+vi.mock("@/lib/voiceVault", () => ({
+  CONSENT_PROMPT: "I attest…",
   recordVoiceOwnership: async () => ({ saved: 0, failed: 0 }),
 }));
 
@@ -76,8 +74,10 @@ describe("CharacterTable — a failed roster read is never an empty roster", () 
     await act(async () => { retry.click(); });
     await waitFor(() => expect(screen.getByText("Sarah")).toBeInTheDocument());
     expect(screen.queryByText(/could not be loaded/i)).toBeNull();
+  });
+});
 
-// ── merged from the sibling builder that landed in this file in the same wave
+// ── the collision suites ─────────────────────────────────────────────────────
 
 const ROSTER = [
   {
