@@ -7,7 +7,8 @@ or `Authorization: Bearer <key>`:
     passes every scope check including key management. This is the key the
     local web studio and operators use.
   * MANAGED keys — issued via `/v1/keys` (service/keys.py), hashed at rest,
-    scoped to a subset of {tts, voices, clone}. Never valid for `admin`.
+    scoped to a subset of `keys.SCOPES` (that list is the only truth; it has
+    grown since — `performance` is grantable). Never valid for `admin`.
 
 Enforcement is ON whenever `TTS_API_KEY` is set. If it is empty the service
 stays fully open (the pre-auth local-dev behaviour), so bare checkouts and
