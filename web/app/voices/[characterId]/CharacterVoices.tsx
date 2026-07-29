@@ -6,6 +6,7 @@ import Link from "next/link";
 import { Eyebrow } from "@/components/ui/Primitives";
 import { EMOTION_IDS } from "@/lib/emotions";
 import { CONSENT_PROMPT } from "@/lib/voiceVault";
+import { useMounted } from "@/lib/useMounted";
 import { useCharacter } from "@/app/voices/_data/characters";
 import EmotionRack from "./_variants/EmotionRack";
 import GuidedRecorder from "./_variants/GuidedRecorder";
@@ -13,9 +14,18 @@ import ApiPanel from "./_variants/ApiPanel";
 
 // Rack won the voice-overview round — rendered directly, no switcher.
 export default function CharacterVoices({ characterId }: { characterId: string }) {
-  const { character, slots, coverage, total, loading, error, busySlot, vaultWarning,
-          addVoice, removeVoice, addCustomEmotion, removeCustomEmotion } = useCharacter(characterId);
+  const { character, slots, coverage, total, loading, error, notFound, busySlot, vaultWarning,
+          addVoice, removeVoice, addCustomEmotion, removeCustomEmotion, refresh } = useCharacter(characterId);
   const [recording, setRecording] = useState<string | null>(null);
+  const [retrying, setRetrying] = useState(false);
+  const mounted = useMounted();
+
+  // The unavailable state's retry. `loading` is already false by then, so the
+  // button owns its own pending state rather than leaving the click silent.
+  const retry = useCallback(async () => {
+    setRetrying(true);
+    try { await refresh(); } finally { if (mounted.current) setRetrying(false); }
+  }, [refresh, mounted]);
 
   // Deep link from playground fallbacks: /voices/{id}?record=angry opens the
   // guided recorder ONCE. It reads `character` (to validate custom slots) so it
@@ -48,13 +58,37 @@ export default function CharacterVoices({ characterId }: { characterId: string }
 
   if (loading) return <p className="py-20 text-sm text-white/60">Loading character…</p>;
 
-  if (!character) {
+  // Only a 404 is a missing character. A registry that is temporarily
+  // unreadable (503) used to render the SAME dead-end, which told the user
+  // their character was gone — the one thing we had not established.
+  if (!character && notFound) {
     return (
       <div className="py-20">
-        <p className="text-sm text-white/65">{error ?? `No character “${characterId}”.`}</p>
+        <p className="text-sm text-white/65">No character “{characterId}”.</p>
         <Link href="/voices" className="font-jetbrains mt-4 inline-block text-[12px] text-cyan-300/80 hover:text-cyan-200">
           ← back to characters
         </Link>
+      </div>
+    );
+  }
+
+  if (!character) {
+    return (
+      <div className="py-20">
+        <ErrorBanner className="">{error ?? "this character could not be loaded"}</ErrorBanner>
+        <p className="mt-3 text-sm text-white/65">
+          “{characterId}” could not be loaded — that is a failed read, not a missing character.
+          Its voices are untouched; retry once the backend recovers.
+        </p>
+        <div className="mt-4 flex items-center gap-4">
+          <button onClick={() => void retry()} disabled={retrying}
+            className="font-jetbrains rounded-full border border-white/15 px-4 py-1.5 text-[12px] text-white/80 transition hover:bg-white/5 disabled:opacity-50">
+            {retrying ? "retrying…" : "retry"}
+          </button>
+          <Link href="/voices" className="font-jetbrains text-[12px] text-cyan-300/80 hover:text-cyan-200">
+            ← back to characters
+          </Link>
+        </div>
       </div>
     );
   }

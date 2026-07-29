@@ -12,6 +12,7 @@ import { EMOTION_IDS, emotionMeta } from "@/lib/emotions";
 import TagEditor from "./TagEditor";
 import { hueOf, relTime, useCharacters, useVoicePreview, patchCharacterReq, deleteCharacterReq, type Character } from "../_data/characters";
 import { useAuth } from "@/lib/useAuth";
+import { useMounted } from "@/lib/useMounted";
 import { CONSENT_PROMPT, recordVoiceOwnership } from "@/lib/voiceVault";
 
 type SortKey = "name" | "category" | "lang" | "coverage" | "demand" | "created";
@@ -85,9 +86,10 @@ function CoverageBar({ c }: { c: Character }) {
 }
 
 export default function CharacterTable() {
-  const { characters, loading, error, createVoice, patchCharacter, deleteCharacter, refresh } = useCharacters();
+  const { characters, loading, error, readFailed, createVoice, patchCharacter, deleteCharacter, refresh } = useCharacters();
   const { preview, playingId, busyId, failedId } = useVoicePreview();
   const { user } = useAuth();
+  const mounted = useMounted();
 
   const [query, setQuery] = useState("");
   const [tagFilter, setTagFilter] = useState<string | null>(null);
@@ -121,6 +123,15 @@ export default function CharacterTable() {
       : Date.parse(c.created ?? "") || 0;
     return [...f].sort((a, b) => (val(a) > val(b) ? sort.dir : val(a) < val(b) ? -sort.dir : 0));
   }, [characters, query, tagFilter, sort]);
+
+  // The read failed AND left nothing on screen — the only case where an empty
+  // table body would be a lie rather than a fact.
+  const rosterUnavailable = !loading && readFailed && characters.length === 0;
+  const [retrying, setRetrying] = useState(false);
+  const retry = async () => {
+    setRetrying(true);
+    try { await refresh(); } finally { if (mounted.current) setRetrying(false); }
+  };
 
   const clonedSelected = [...selected].filter((id) => characters.find((c) => c.character_id === id)?.category === "cloned");
   const allShownSelected = rows.length > 0 && rows.every((r) => selected.has(r.character_id));
@@ -281,7 +292,28 @@ export default function CharacterTable() {
           </thead>
           <tbody>
             {loading && <tr><td colSpan={10} className="px-3 py-8 text-center text-sm text-white/60">Loading characters…</td></tr>}
-            {!loading && rows.length === 0 && <tr><td colSpan={10} className="px-3 py-8 text-center text-sm text-white/60">No characters match.</td></tr>}
+            {/* A failed read is NOT an empty roster. When the read failed and we
+                have nothing to show, the table says so (and offers the retry)
+                instead of printing "No characters match." under its own error
+                banner. A read that failed while a previous roster is still on
+                screen keeps showing it — the banner above carries the staleness. */}
+            {rosterUnavailable && (
+              <tr><td colSpan={10} className="px-3 py-8 text-center text-sm text-white/60">
+                The character roster could not be loaded — this is a failed read, not an empty roster.
+                Your characters are untouched.{" "}
+                <button onClick={() => void retry()} disabled={retrying}
+                  className="font-jetbrains ml-1 text-[12px] text-cyan-300/80 underline underline-offset-2 transition hover:text-cyan-200 disabled:opacity-50">
+                  {retrying ? "retrying…" : "retry"}
+                </button>
+              </td></tr>
+            )}
+            {!loading && !rosterUnavailable && rows.length === 0 && (
+              <tr><td colSpan={10} className="px-3 py-8 text-center text-sm text-white/60">
+                {characters.length === 0
+                  ? "No characters yet — clone a recording or import a pack to make one."
+                  : "No characters match."}
+              </td></tr>
+            )}
             {rows.map((c) => {
               const baseline = c.voices.find((v) => v.emotion === "baseline") ?? c.voices[0];
               return (

@@ -83,7 +83,9 @@ export function relTime(iso?: string | null): string {
 // ONE way to ask for the character list. The playground kept its own
 // `apiJson("/api/characters")` next to this module's, so the app had two
 // truths about which Characters exist (and the rail and the script <select>
-// could disagree). Both now call loadRoster().
+// could disagree). The create flow (voices/new) kept a THIRD, whose .catch set
+// [] and so rendered a failed read as "you have no characters to extend". All
+// three now call loadRoster() — which is what makes that claim true.
 //
 // Deliberately NOT a time-based cache. A previous fetch-reduction round in this
 // repo shipped a roster that stayed stale after a clone; the win here is
@@ -236,6 +238,12 @@ export function useCharacters() {
   const [characters, setCharacters] = useState<Character[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Did the last READ fail? `characters` staying [] after a failure is
+  // indistinguishable from a new install, and the roster rendered "No
+  // characters match." underneath its own error banner. `error` cannot answer
+  // this — a mutation sets it too, and a failed rename must not turn a
+  // genuinely empty roster into "unavailable". So the read reports separately.
+  const [readFailed, setReadFailed] = useState(false);
   const mounted = useMounted();
 
   const refresh = useCallback(async () => {
@@ -243,9 +251,11 @@ export function useCharacters() {
       const roster = await fetchRoster();
       if (!mounted.current) return;
       setCharacters(roster);
+      setReadFailed(false);
       setError(null);
     } catch (e) {
       if (!mounted.current) return;
+      setReadFailed(true);
       setError(e instanceof Error ? e.message : "failed to load characters");
     } finally {
       if (mounted.current) setLoading(false);
@@ -289,7 +299,7 @@ export function useCharacters() {
     }
   }, [refresh]);
 
-  return { characters, loading, error, refresh, createVoice, patchCharacter, deleteCharacter };
+  return { characters, loading, error, readFailed, refresh, createVoice, patchCharacter, deleteCharacter };
 }
 
 // ── detail hook ─────────────────────────────────────────────────────────────
@@ -299,6 +309,11 @@ export function useCharacter(characterId: string) {
   const [character, setCharacter] = useState<Character | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // ONLY a 404 means "no such character". Everything else — a 503 from a
+  // corrupt registry, a dead backend — used to fall through to the same
+  // dead-end, telling the user their character does not exist when the truth
+  // was that we could not find out.
+  const [notFound, setNotFound] = useState(false);
   const [busySlot, setBusySlot] = useState<string | null>(null);
   // Consent-receipt failures are a WARNING, not a clone failure: the voice
   // exists, its provenance record doesn't.
@@ -310,9 +325,11 @@ export function useCharacter(characterId: string) {
       const c = await fetchCharacter(characterId);
       if (!mounted.current) return;
       setCharacter(c);
+      setNotFound(c === null); // fetchCharacter maps ONLY 404 to null
       setError(null);
     } catch (e) {
       if (!mounted.current) return;
+      setNotFound(false); // a failed read is not an absent character
       setError(e instanceof Error ? e.message : "failed to load character");
     } finally {
       if (mounted.current) setLoading(false);
@@ -397,7 +414,7 @@ export function useCharacter(characterId: string) {
 
   const coverage = slots.filter((s) => s.voice).length;
 
-  return { character, slots, coverage, total: slots.length, loading, error, busySlot,
+  return { character, slots, coverage, total: slots.length, loading, error, notFound, busySlot,
            vaultWarning, addVoice, removeVoice, addCustomEmotion,
            removeCustomEmotion, refresh };
 }

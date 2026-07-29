@@ -11,6 +11,7 @@ import { EMOTION_IDS, emotionMeta } from "@/lib/emotions";
 import { useAuth } from "@/lib/useAuth";
 import { useMounted } from "@/lib/useMounted";
 import { characterSlug } from "@/lib/slugs";
+import { loadRoster } from "@/app/voices/_data/characters";
 import { recordVoiceOwnership } from "@/lib/voiceVault";
 import { CONSENT_STATEMENT } from "@/lib/consent";
 import WaveformLab from "./_loaders/WaveformLab";
@@ -70,6 +71,9 @@ export default function NewCharacterPage() {
   // sovereign = force local-only: the recording never leaves the machine.
   const [ingestMode, setIngestMode] = useState<"auto" | "sovereign">("auto");
   const [characters, setCharacters] = useState<Character[]>([]);
+  // An empty `characters` means "you have nothing to extend"; this means "we
+  // could not find out". The two must not render the same.
+  const [rosterFailed, setRosterFailed] = useState(false);
   // What the BACKEND says each mode does — including which mode `auto` resolves
   // to on this box. The panel below states sovereign's limits from this, never
   // from a copy of the constant kept over here.
@@ -97,19 +101,31 @@ export default function NewCharacterPage() {
   // Cloneable characters change rarely; fetch on mount — plus once more when a
   // commit completes, so "scan another" offers the just-created character by
   // name in the extend dropdown instead of a stale list.
+  //
+  // This goes through loadRoster (the shared data layer) like every other
+  // roster read. It used to be a third, private apiJson("/api/characters")
+  // whose .catch set [] — so a failed read was rendered as "you have no
+  // characters to extend", and the module comment claiming the duplicates were
+  // consolidated was false. A failure now SAYS so, next to the control it
+  // disables.
   const atUpload = phase === "upload";
   const atComplete = phase === "complete";
   useEffect(() => {
     if (!atUpload && !atComplete) return;
-    let alive = true;
-    void apiJson<(Character & { category: string })[]>(
-      "/api/characters", { cache: "no-store" }, "could not load characters")
-      .then((cs) => { if (alive) setCharacters(cs.filter((c) => c.category === "cloned")); })
-      // The extend dropdown is optional here — the create flow still works
-      // without it, so a failure degrades quietly rather than blocking upload.
-      .catch(() => { if (alive) setCharacters([]); });
-    return () => { alive = false; };
-  }, [atUpload, atComplete]);
+    const ctrl = new AbortController();
+    void loadRoster(ctrl.signal)
+      .then((cs) => {
+        if (!mounted.current) return;
+        setCharacters(cs.filter((c) => c.category === "cloned"));
+        setRosterFailed(false);
+      })
+      .catch(() => {
+        // An abort is this effect being replaced, not a failure.
+        if (ctrl.signal.aborted || !mounted.current) return;
+        setRosterFailed(true);
+      });
+    return () => ctrl.abort();
+  }, [atUpload, atComplete, mounted]);
 
   // Mode descriptions are backend constants — fetch once. A failure is SAID
   // (the panel can't invent the limits), never swallowed into silence.
@@ -595,8 +611,17 @@ export default function NewCharacterPage() {
             <div className="glass-panel mt-6 max-w-2xl rounded-2xl p-5">
               <div className="flex gap-2">
                 <button onClick={() => dispatch({ type: "SET_MODE", mode: "new" })} className={`font-jetbrains cursor-pointer rounded-full border px-3 py-1.5 text-[12px] ${mode === "new" ? "border-cyan-400/40 bg-cyan-400/10 text-cyan-200" : "border-white/12 text-white/60"}`}>New character</button>
-                <button onClick={() => dispatch({ type: "SET_MODE", mode: "extend" })} disabled={characters.length === 0} className={`font-jetbrains cursor-pointer rounded-full border px-3 py-1.5 text-[12px] disabled:opacity-40 ${mode === "extend" ? "border-cyan-400/40 bg-cyan-400/10 text-cyan-200" : "border-white/12 text-white/60"}`}>Extend existing</button>
+                <button onClick={() => dispatch({ type: "SET_MODE", mode: "extend" })} disabled={characters.length === 0}
+                  title={rosterFailed ? "Your existing characters could not be loaded" : undefined}
+                  className={`font-jetbrains cursor-pointer rounded-full border px-3 py-1.5 text-[12px] disabled:opacity-40 ${mode === "extend" ? "border-cyan-400/40 bg-cyan-400/10 text-cyan-200" : "border-white/12 text-white/60"}`}>Extend existing</button>
               </div>
+              {/* Not "you have no characters to extend" — we do not know that. */}
+              {rosterFailed && (
+                <ErrorBanner className="mt-3">
+                  Your existing characters could not be loaded, so “Extend existing” is unavailable —
+                  reload to retry. Creating a new character still works.
+                </ErrorBanner>
+              )}
               <div className="mt-4 flex flex-wrap items-center gap-3">
                 {mode === "new" ? (
                   <input value={charName} onChange={(e) => dispatch({ type: "SET_CHAR_NAME", name: e.target.value })} placeholder="Character name"
