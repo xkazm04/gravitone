@@ -6,13 +6,13 @@
 
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { Fragment, useState } from "react";
-import { useVoicePreview, relTime, pickAudio, type Slot } from "@/app/voices/_data/characters";
+import { useVoicePreview, relTime, pickAudio, deleteVoiceQuestion, type Slot } from "@/app/voices/_data/characters";
 import { checkEmotion } from "@/lib/slugs";
 import EmotionArt from "@/components/ui/EmotionArt";
 
 export default function EmotionRack({
   name, characterId, slots, coverage, total, busySlot, addVoice, removeVoice, onRecord,
-  addCustomEmotion, removeCustomEmotion,
+  addCustomEmotion, removeCustomEmotion, removingVoiceId = null,
 }: {
   name: string;
   // The address the API actually answers on. Previously derived from `name` by
@@ -24,8 +24,11 @@ export default function EmotionRack({
   onRecord: (emotion: string) => void; // open the guided capture session
   addCustomEmotion: (name: string) => Promise<void>;
   removeCustomEmotion: (emotion: string) => Promise<void>;
+  /** The voice whose DELETE is in flight — its remove button stops taking
+   *  clicks instead of firing a second request behind the first. */
+  removingVoiceId?: string | null;
 }) {
-  const { preview, playingId, busyId, failedId } = useVoicePreview();
+  const { preview, playingId, busyId, failedId, failedReason } = useVoicePreview();
   const [custom, setCustom] = useState("");
   const [minting, setMinting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -55,6 +58,17 @@ export default function EmotionRack({
     } catch (e) {
       setErr(e instanceof Error ? e.message : "could not add the slot");
     } finally { setMinting(false); }
+  }
+
+  /** Ask before destroying a cloned embedding.
+   *
+   *  Removing a Voice was the only single-click destruction on this page, next
+   *  to a consent gate and an import rename that both stop and ask. It names
+   *  the Character, the slot and the id, because "remove" on a dense rack of
+   *  rows is otherwise a click whose target the user infers from the cursor. */
+  function confirmRemove(voiceId: string, label: string, shadowed = false) {
+    if (!window.confirm(deleteVoiceQuestion(name, label, voiceId, shadowed))) return;
+    removeVoice(voiceId);
   }
 
   async function dropSlot(emotion: string) {
@@ -161,8 +175,13 @@ export default function EmotionRack({
                           </span>
                         )}
                         {previewFailed && (
-                          <span title="The preview could not be synthesized — try again."
-                            className="font-jetbrains rounded bg-rose-400/10 px-1.5 py-0.5 text-[11px] text-rose-300">preview failed</span>
+                          // The reason, not just the fact: an unreachable
+                          // backend, a 429 and a blocked autoplay are three
+                          // different things for the user to do next.
+                          <span title={failedReason ?? "The preview could not be synthesized — try again."}
+                            className="font-jetbrains rounded bg-rose-400/10 px-1.5 py-0.5 text-[11px] text-rose-300">
+                            {`preview failed${failedReason ? ` — ${failedReason}` : ""}`}
+                          </span>
                         )}
                       </span>
                     ) : s.demand > 0 ? (
@@ -183,9 +202,12 @@ export default function EmotionRack({
 
                   <td className="px-3 py-2 text-right">
                     {filled ? (
-                      <button onClick={() => removeVoice(s.voice!.voice_id)}
+                      <button onClick={() => confirmRemove(s.voice!.voice_id, s.label)}
+                        disabled={removingVoiceId === s.voice!.voice_id}
                         aria-label={`Remove the ${s.label} voice`}
-                        className="font-jetbrains text-[11px] text-white/55 transition hover:text-rose-300">remove</button>
+                        className="font-jetbrains text-[11px] text-white/55 transition hover:text-rose-300 disabled:opacity-40">
+                        {removingVoiceId === s.voice!.voice_id ? "removing…" : "remove"}
+                      </button>
                     ) : (
                       <>
                         <button onClick={() => onRecord(s.emotion)} disabled={isBusy}
@@ -250,8 +272,10 @@ export default function EmotionRack({
                             shadowed · never spoken
                           </span>
                           {failedId === v.voice_id && (
-                            <span title="The preview could not be synthesized — try again."
-                              className="font-jetbrains rounded bg-rose-400/10 px-1.5 py-0.5 text-[11px] text-rose-300">preview failed</span>
+                            <span title={failedReason ?? "The preview could not be synthesized — try again."}
+                              className="font-jetbrains rounded bg-rose-400/10 px-1.5 py-0.5 text-[11px] text-rose-300">
+                              {`preview failed${failedReason ? ` — ${failedReason}` : ""}`}
+                            </span>
                           )}
                         </span>
                       </td>
@@ -261,10 +285,13 @@ export default function EmotionRack({
                       <td className="font-jetbrains px-3 py-2 text-[12px] text-white/65">{relTime(v.created)}</td>
 
                       <td className="px-3 py-2 text-right">
-                        <button onClick={() => removeVoice(v.voice_id)}
+                        <button onClick={() => confirmRemove(v.voice_id, s.label, true)}
+                          disabled={removingVoiceId === v.voice_id}
                           aria-label={`Remove the shadowed ${s.label} voice`}
                           title="Delete this voice — the slot keeps the voice that speaks"
-                          className="font-jetbrains text-[11px] text-white/55 transition hover:text-rose-300">remove</button>
+                          className="font-jetbrains text-[11px] text-white/55 transition hover:text-rose-300 disabled:opacity-40">
+                          {removingVoiceId === v.voice_id ? "removing…" : "remove"}
+                        </button>
                       </td>
                     </tr>
                   );

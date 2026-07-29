@@ -170,6 +170,141 @@ describe("CharacterTable — a collision gets an answer, not a banner", () => {
   });
 });
 
+// ── the destruction suites ───────────────────────────────────────────────────
+
+/** Two CLONED characters, so a bulk delete has a count worth naming. */
+const CLONED_ROSTER = [
+  {
+    character_id: "sarah", name: "Sarah", category: "cloned", tags: [], lang: "en",
+    emotions: ["baseline", "angry"], coverage: 2, total: 8, created: null,
+    voices: [
+      { voice_id: "v_sarah_base", character_id: "sarah", emotion: "baseline",
+        name: "Sarah", category: "cloned", lang: "en" },
+      { voice_id: "v_sarah_angry", character_id: "sarah", emotion: "angry",
+        name: "Sarah", category: "cloned", lang: "en" },
+    ],
+  },
+  {
+    character_id: "milo", name: "Milo", category: "cloned", tags: [], lang: "en",
+    emotions: ["baseline"], coverage: 1, total: 8, created: null,
+    voices: [{ voice_id: "v_milo_base", character_id: "milo", emotion: "baseline",
+               name: "Milo", category: "cloned", lang: "en" }],
+  },
+];
+
+/** Roster reads answer `roster()`; DELETEs answer `onDelete()`. Both are
+ *  factories because a Response body can only be consumed once. */
+function stubDeletes(onDelete: () => Response, roster: () => Response = () => json(CLONED_ROSTER)) {
+  const f = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) =>
+    (init?.method === "DELETE" ? onDelete() : roster()));
+  vi.stubGlobal("fetch", f);
+  return f;
+}
+
+const deletesOf = (f: ReturnType<typeof vi.fn>) =>
+  f.mock.calls.filter(([, init]) => (init as RequestInit | undefined)?.method === "DELETE");
+
+describe("CharacterTable — a Character is never destroyed on one click", () => {
+  it("asks before deleting a row, naming the character and how many voices go with it", async () => {
+    const confirm = vi.fn((_message?: string) => false);
+    vi.stubGlobal("confirm", confirm);
+    const f = stubDeletes(() => new Response(null, { status: 204 }));
+    render(<CharacterTable />);
+    await screen.findByText("Sarah");
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete Sarah" }));
+    const asked = String(confirm.mock.calls[0][0]);
+    expect(asked).toContain("Sarah");
+    expect(asked).toMatch(/all 2 of its voices/);
+    expect(asked).toMatch(/cannot be undone/i);
+    // Declined means DECLINED: no request, and the row is still there.
+    expect(deletesOf(f)).toHaveLength(0);
+    expect(screen.getByText("Sarah")).toBeInTheDocument();
+  });
+
+  it("names the COUNT before a bulk delete, and sends nothing when declined", async () => {
+    // "Are you sure?" over a selection made minutes ago is not a question —
+    // the count is the only thing that makes it one.
+    const confirm = vi.fn((_message?: string) => false);
+    vi.stubGlobal("confirm", confirm);
+    const f = stubDeletes(() => new Response(null, { status: 204 }));
+    render(<CharacterTable />);
+    await screen.findByText("Sarah");
+
+    fireEvent.click(screen.getByLabelText("Select Sarah"));
+    fireEvent.click(screen.getByLabelText("Select Milo"));
+    fireEvent.click(screen.getByRole("button", { name: "delete 2 cloned" }));
+
+    const asked = String(confirm.mock.calls[0][0]);
+    expect(asked).toMatch(/Delete 2 characters and 3 voices\?/);
+    expect(asked).toContain("Sarah, Milo");
+    expect(deletesOf(f)).toHaveLength(0);
+  });
+
+  it("deletes exactly the confirmed selection once the user says yes", async () => {
+    vi.stubGlobal("confirm", vi.fn(() => true));
+    const f = stubDeletes(() => new Response(null, { status: 204 }));
+    render(<CharacterTable />);
+    await screen.findByText("Sarah");
+
+    fireEvent.click(screen.getByLabelText("Select Milo"));
+    await act(async () => { screen.getByRole("button", { name: "delete 1 cloned" }).click(); });
+    await waitFor(() => expect(deletesOf(f)).toHaveLength(1));
+    expect(String(deletesOf(f)[0][0])).toBe("/api/characters/milo");
+  });
+});
+
+describe("CharacterTable — a failed delete says what SURVIVED", () => {
+  it("restores the row from a snapshot even when the re-read fails too", async () => {
+    // The rollback used to be a second network call. When that call failed as
+    // well — the same outage that failed the DELETE — the row stayed gone and
+    // the user was looking at a character that still exists.
+    vi.stubGlobal("confirm", vi.fn(() => true));
+    let deleted = false;
+    const f = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === "DELETE") {
+        deleted = true;
+        return json({ detail: "internal error (request id ab12ef)" }, 500);
+      }
+      return deleted ? json({ detail: "the voice registry is unreadable" }, 503) : json(CLONED_ROSTER);
+    });
+    vi.stubGlobal("fetch", f);
+    render(<CharacterTable />);
+    await screen.findByText("Sarah");
+
+    await act(async () => { screen.getByRole("button", { name: "Delete Sarah" }).click(); });
+    expect(await screen.findByText(/still in your roster/)).toBeInTheDocument();
+    expect(screen.getByText("Sarah")).toBeInTheDocument();
+    expect(screen.getByText("Milo")).toBeInTheDocument();
+  });
+
+  it("names the surviving state, not just 'delete failed'", async () => {
+    vi.stubGlobal("confirm", vi.fn(() => true));
+    stubDeletes(() => json({ detail: "internal error (request id ab12ef)" }, 500));
+    render(<CharacterTable />);
+    await screen.findByText("Sarah");
+
+    await act(async () => { screen.getByRole("button", { name: "Delete Sarah" }).click(); });
+    // The backend's 500 here means a PARTIAL delete: the character row survives.
+    const banner = await screen.findByText(/internal error \(request id ab12ef\)/);
+    expect(banner).toHaveTextContent(/“Sarah” is still in your roster/);
+    expect(banner).toHaveTextContent(/some of its voices may already have been deleted/);
+  });
+
+  it("reports the survivors of a partly-failed bulk delete", async () => {
+    vi.stubGlobal("confirm", vi.fn(() => true));
+    stubDeletes(() => json({ detail: "internal error (request id cd34)" }, 500));
+    render(<CharacterTable />);
+    await screen.findByText("Sarah");
+
+    fireEvent.click(screen.getByLabelText("Select Sarah"));
+    fireEvent.click(screen.getByLabelText("Select Milo"));
+    await act(async () => { screen.getByRole("button", { name: "delete 2 cloned" }).click(); });
+
+    expect(await screen.findByText(/those characters are still in your roster/)).toBeInTheDocument();
+  });
+});
+
 describe("CharacterTable — what the backend will refuse is not offered", () => {
   it("does not offer rename or tag editing on a built-in", async () => {
     stubFetch([]);

@@ -1,5 +1,5 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // The rack pulls in the data layer, whose hooks reach Firebase auth — it
 // refuses to initialize without real keys. Rendering is what's under test.
@@ -81,6 +81,12 @@ describe("EmotionRack — the slug preview tells the truth", () => {
   });
 });
 
+// Removing a Voice now asks first (jsdom's own `confirm` is unimplemented and
+// answers falsy, which would read as "the user said no"), so the suites below
+// answer YES by default and override per test.
+beforeEach(() => { vi.stubGlobal("confirm", vi.fn(() => true)); });
+afterEach(() => { vi.unstubAllGlobals(); });
+
 function voice(id: string, emotion: string): Voice {
   return {
     voice_id: id, character_id: "sarah", emotion, name: "Sarah",
@@ -142,5 +148,60 @@ describe("EmotionRack — the shadowed voice gets a row of its own", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Remove the Angry voice" }));
     expect(removeVoice).toHaveBeenCalledWith("v_first");
+  });
+});
+
+describe("EmotionRack — a cloned embedding is never destroyed on one click", () => {
+  it("destroys nothing when the confirmation is declined", () => {
+    // The consent gate and the import rename both stop and ask on this surface;
+    // remove was the one action that just did it.
+    const confirm = vi.fn((_message?: string) => false);
+    vi.stubGlobal("confirm", confirm);
+    const removeVoice = renderSlots([slot("baseline", "Baseline", [voice("v_base", "baseline")])]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove the Baseline voice" }));
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(removeVoice).not.toHaveBeenCalled();
+  });
+
+  it("names the character, the slot, the id and the irreversibility", () => {
+    const confirm = vi.fn((_message?: string) => true);
+    vi.stubGlobal("confirm", confirm);
+    renderSlots([slot("angry", "Angry", [voice("v_first", "angry")])]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove the Angry voice" }));
+    const asked = String(confirm.mock.calls[0][0]);
+    expect(asked).toContain("Sarah");
+    expect(asked).toContain("Angry");
+    expect(asked).toContain("v_first");
+    expect(asked).toMatch(/cannot be undone/i);
+  });
+
+  it("promises the surviving voice when the SHADOWED one is the target", () => {
+    // Deleting the shadow must not read as "delete this slot": the voice that
+    // actually speaks is kept, and that is the whole reason to press it.
+    const confirm = vi.fn((_message?: string) => true);
+    vi.stubGlobal("confirm", confirm);
+    renderSlots([slot("angry", "Angry", [voice("v_first", "angry"), voice("v_second", "angry")])]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove the shadowed Angry voice" }));
+    const asked = String(confirm.mock.calls[0][0]);
+    expect(asked).toContain("v_second");
+    expect(asked).toMatch(/speaks this slot is kept/i);
+  });
+});
+
+describe("EmotionRack — a failed preview says WHY", () => {
+  it("carries the backend's own detail instead of a bare 'preview failed'", async () => {
+    // useVoicePreview used to swallow the cause entirely, so an unreachable
+    // backend, a 429 and a missing embedding all read the same.
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(
+      JSON.stringify({ detail: "no embedding for v_base — re-clone this voice" }),
+      { status: 500, headers: { "Content-Type": "application/json" } },
+    )));
+    renderSlots([slot("baseline", "Baseline", [voice("v_base", "baseline")])]);
+
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Play Baseline" })); });
+    expect(await screen.findByText(/preview failed — no embedding for v_base/)).toBeInTheDocument();
   });
 });

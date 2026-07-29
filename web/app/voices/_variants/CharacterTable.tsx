@@ -10,7 +10,7 @@ import Link from "next/link";
 import { Eyebrow } from "@/components/ui/Primitives";
 import { EMOTION_IDS, emotionMeta } from "@/lib/emotions";
 import TagEditor from "./TagEditor";
-import { hueOf, relTime, useCharacters, useVoicePreview, patchCharacterReq, deleteCharacterReq, collisionVoice, type Character } from "../_data/characters";
+import { hueOf, relTime, useCharacters, useVoicePreview, patchCharacterReq, deleteCharacterReq, collisionVoice, bulkDeleteQuestion, deleteCharacterQuestion, type Character } from "../_data/characters";
 import { ApiError, readDetail } from "@/lib/apiFetch";
 import { useAuth } from "@/lib/useAuth";
 import { useMounted } from "@/lib/useMounted";
@@ -87,8 +87,8 @@ function CoverageBar({ c }: { c: Character }) {
 }
 
 export default function CharacterTable() {
-  const { characters, loading, error, readFailed, createVoice, patchCharacter, deleteCharacter, refresh } = useCharacters();
-  const { preview, playingId, busyId, failedId } = useVoicePreview();
+  const { characters, loading, error, readFailed, deleting, createVoice, patchCharacter, deleteCharacter, refresh } = useCharacters();
+  const { preview, playingId, busyId, failedId, failedReason } = useVoicePreview();
   const { user } = useAuth();
   const mounted = useMounted();
 
@@ -108,6 +108,7 @@ export default function CharacterTable() {
   const [bulkNotice, setBulkNotice] = useState<string | null>(null);
   const [vaultWarn, setVaultWarn] = useState<string | null>(null);
   const [importing, setImporting] = useState(false);
+  const [bulkDeleting, setBulkDeleting] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const packRef = useRef<HTMLInputElement>(null);
   const cancelRename = useRef(false); // Escape sets this so the unmount's onBlur doesn't commit
@@ -171,13 +172,35 @@ export default function CharacterTable() {
     await refresh();
     if (errs.length) setCloneErr(`${errs.length} tag update${errs.length > 1 ? "s" : ""} failed: ${errs[0].message}`);
   }
+  /** Destroy every selected CLONED character at once.
+   *
+   *  The one action on this page that can destroy dozens of embeddings from a
+   *  single click, so it is the one that most needs to say how many — the
+   *  selection bar is the only place the count exists, and a bare "are you
+   *  sure?" over a selection made minutes ago is not a question. */
   async function bulkDelete() {
-    const ids = clonedSelected;
+    if (bulkDeleting) return; // in-flight gate
+    const targets = clonedSelected
+      .map((id) => characters.find((c) => c.character_id === id))
+      .filter((c): c is Character => !!c);
+    if (targets.length === 0) return;
+    if (!window.confirm(bulkDeleteQuestion(targets))) return;
+    setBulkDeleting(true);
     setCloneErr(null);
-    const errs = await runPool(ids, 6, (id) => deleteCharacterReq(id));
+    const errs = await runPool(targets, 6, (c) => deleteCharacterReq(c.character_id));
+    if (!mounted.current) return;
     setSelected(new Set());
     await refresh();
-    if (errs.length) setCloneErr(`${errs.length} delete${errs.length > 1 ? "s" : ""} failed: ${errs[0].message}`);
+    if (!mounted.current) return;
+    setBulkDeleting(false);
+    // The ones that failed are still in the roster the refresh just re-read —
+    // say that, rather than leaving "N deletes failed" to be read as "gone".
+    if (errs.length) {
+      setCloneErr(
+        `${errs.length} of ${targets.length} delete${targets.length > 1 ? "s" : ""} failed: `
+        + `${errs[0].message} — those characters are still in your roster.`,
+      );
+    }
   }
   /** Quick clone: one file → one Character named after it.
    *
@@ -341,9 +364,9 @@ export default function CharacterTable() {
             placeholder="add tag to all…"
             className="font-jetbrains rounded border border-white/15 bg-transparent px-2 py-1 text-[11px] text-white placeholder:text-white/55 focus:outline-none" />
           <button onClick={applyBulkTag} className="font-jetbrains rounded border border-white/15 px-2 py-1 text-[11px] text-white/80 hover:bg-white/5">apply tag</button>
-          <button onClick={bulkDelete} disabled={clonedSelected.length === 0}
+          <button onClick={bulkDelete} disabled={clonedSelected.length === 0 || bulkDeleting}
             className="font-jetbrains rounded border border-rose-400/30 px-2 py-1 text-[11px] text-rose-300 disabled:opacity-30 hover:bg-rose-400/10">
-            delete {clonedSelected.length} cloned
+            {bulkDeleting ? "deleting…" : `delete ${clonedSelected.length} cloned`}
           </button>
           <button onClick={() => setSelected(new Set())} className="font-jetbrains ml-auto text-[11px] text-white/60 hover:text-white">clear</button>
         </div>
@@ -407,7 +430,8 @@ export default function CharacterTable() {
                       const failed = !!baseline && failedId === baseline.voice_id;
                       return (
                         <button onClick={() => baseline && preview(baseline.voice_id, c.name)} disabled={!baseline || busyId === baseline?.voice_id}
-                          aria-label="Preview baseline" title={failed ? "Preview failed — try again" : "Preview baseline"}
+                          aria-label="Preview baseline"
+                          title={failed ? `Preview failed — ${failedReason ?? "try again"}` : "Preview baseline"}
                           className={`grid h-7 w-7 place-items-center rounded-full text-[11px] text-slate-950 transition hover:brightness-110 disabled:opacity-50 ${failed ? "bg-rose-300" : "bg-cyan-300"}`}>
                           {busyId === baseline?.voice_id ? "…" : failed ? "!" : playingId === baseline?.voice_id ? "⏸" : "▶"}
                         </button>
@@ -475,7 +499,16 @@ export default function CharacterTable() {
                   <td className="px-3 py-2 text-right">
                     <Link href={`/voices/${c.character_id}`} className="font-jetbrains text-[11px] text-cyan-300/80 transition hover:text-cyan-200">open →</Link>
                     {c.category === "cloned" && (
-                      <button onClick={() => deleteCharacter(c.character_id)} className="font-jetbrains ml-3 text-[11px] text-white/55 transition hover:text-rose-300">delete</button>
+                      // Deleting a Character destroys every embedding under it,
+                      // so it asks first — the same native gate the consent
+                      // attestation and the import rename already use.
+                      <button
+                        onClick={() => { if (window.confirm(deleteCharacterQuestion(c))) void deleteCharacter(c.character_id); }}
+                        disabled={deleting.has(c.character_id)}
+                        aria-label={`Delete ${c.name}`}
+                        className="font-jetbrains ml-3 text-[11px] text-white/55 transition hover:text-rose-300 disabled:opacity-40">
+                        {deleting.has(c.character_id) ? "deleting…" : "delete"}
+                      </button>
                     )}
                   </td>
                 </tr>

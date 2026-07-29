@@ -15,7 +15,8 @@ import ApiPanel from "./_variants/ApiPanel";
 // Rack won the voice-overview round — rendered directly, no switcher.
 export default function CharacterVoices({ characterId }: { characterId: string }) {
   const { character, slots, coverage, total, loading, error, notFound, busySlot, vaultWarning,
-          addVoice, removeVoice, addCustomEmotion, removeCustomEmotion, refresh } = useCharacter(characterId);
+          removingVoiceId, addVoice, removeVoice, addCustomEmotion, removeCustomEmotion,
+          refresh } = useCharacter(characterId);
   const [recording, setRecording] = useState<string | null>(null);
   const [retrying, setRetrying] = useState(false);
   const mounted = useMounted();
@@ -143,7 +144,7 @@ export default function CharacterVoices({ characterId }: { characterId: string }
           name={character.name} characterId={character.character_id}
           slots={slots} coverage={coverage} total={total}
           busySlot={busySlot} addVoice={addVoiceWithConsent} removeVoice={removeVoice}
-          onRecord={setRecording}
+          removingVoiceId={removingVoiceId} onRecord={setRecording}
           addCustomEmotion={addCustomEmotion} removeCustomEmotion={removeCustomEmotion}
         />
       </div>

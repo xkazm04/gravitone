@@ -8,7 +8,7 @@
 // their failures to callers; nothing is swallowed.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { apiJson, throwDetail } from "@/lib/apiFetch";
+import { ApiError, apiJson, throwDetail } from "@/lib/apiFetch";
 import { CONSENT_STATEMENT } from "@/lib/consent";
 import { useMounted } from "@/lib/useMounted";
 import { EMOTIONS, emotionMeta, isBaseEmotion } from "@/lib/emotions";
@@ -241,6 +241,94 @@ export async function removeCustomEmotionReq(id: string, emotion: string): Promi
   invalidateRoster();
 }
 
+// ── destruction: the question, and the honest answer when it fails ────────────
+//
+// Deleting a cloned Voice destroys an embedding the user may not be able to
+// make again — the original recording is the only way back — and deleting a
+// Character destroys every one of them at once. These were the ONLY actions on
+// this surface that happened on a single click, while the consent gate
+// (`voiceVault.CONSENT_PROMPT`) and the import rename already ask with a native
+// dialog. Same idiom, asked here too: these builders write the question, the
+// call site passes it to window.confirm.
+
+const NO_UNDO =
+  "This cannot be undone: the cloned embedding is deleted from the engine, and " +
+  "only the original recording can make it again.";
+
+/** The question before destroying ONE Voice (one emotion of one Character). */
+export function deleteVoiceQuestion(
+  characterName: string, label: string, voiceId: string, shadowed = false,
+): string {
+  return shadowed
+    ? `Delete the shadowed ${label} voice of ${characterName} (${voiceId})?\n\n` +
+      `The voice that actually speaks this slot is kept.\n\n${NO_UNDO}`
+    : `Delete the ${label} voice of ${characterName} (${voiceId})?\n\n` +
+      `${characterName} will have no ${label} voice until you record it again.\n\n${NO_UNDO}`;
+}
+
+/** The question before destroying a Character AND every Voice under it. */
+export function deleteCharacterQuestion(c: Character): string {
+  const n = c.voices.length;
+  return `Delete ${c.name} and ${n === 1 ? "its 1 voice" : `all ${n} of its voices`}?\n\n${NO_UNDO}`;
+}
+
+/** The question before a BULK delete. It names the count (and who) — "are you
+ *  sure?" over a selection the user can no longer see is not a question. */
+export function bulkDeleteQuestion(cs: Character[]): string {
+  const voices = cs.reduce((n, c) => n + c.voices.length, 0);
+  const names = cs.slice(0, 5).map((c) => c.name).join(", ")
+    + (cs.length > 5 ? `, +${cs.length - 5} more` : "");
+  return `Delete ${cs.length} character${cs.length === 1 ? "" : "s"} and `
+    + `${voices} voice${voices === 1 ? "" : "s"}?\n\n${names}\n\n${NO_UNDO}`;
+}
+
+function detailOf(e: unknown, fallback: string): string {
+  return e instanceof Error ? e.message : fallback;
+}
+
+function statusOf(e: unknown): number | null {
+  return e instanceof ApiError ? e.status : null;
+}
+
+/**
+ * What SURVIVED a failed voice delete, said out loud.
+ *
+ * The backend is more specific than "delete failed" ever was: when the
+ * embedding cannot be unlinked it keeps the registry row too, so the Voice is
+ * "unchanged rather than half-deleted" and answers a 500
+ * (`service/voices.py::delete_voice`). A 404 is the opposite state — the Voice
+ * is not there at all. Copy that names the WRONG surviving state is the same
+ * bug as no copy, so the two are never collapsed.
+ */
+export function deleteVoiceFailure(e: unknown, label: string): string {
+  const msg = detailOf(e, "delete failed");
+  if (statusOf(e) === 404) return `${msg} — the ${label} voice was already gone.`;
+  if (statusOf(e) === 500)
+    return `${msg} — the ${label} voice was NOT deleted: it is still there and still usable.`;
+  return `${msg} — the ${label} voice was not deleted; it is still there.`;
+}
+
+/** The same, for a Character. A 500 here means a PARTIAL delete: the voices
+ *  whose embeddings did unlink are gone, the rest kept their rows, and the
+ *  Character survives (`service/voices.py::delete_character` only drops the
+ *  character row when nothing failed). Saying "still in your roster" is true in
+ *  every failure case; claiming nothing happened would not be. */
+export function deleteCharacterFailure(e: unknown, name: string): string {
+  const msg = detailOf(e, "delete failed");
+  if (statusOf(e) === 404) return `${msg} — “${name}” was already gone from the registry.`;
+  if (statusOf(e) === 500)
+    return `${msg} — “${name}” is still in your roster; some of its voices may already have been deleted.`;
+  return `${msg} — “${name}” was not deleted and is still in your roster.`;
+}
+
+/** A failed rename/retag leaves the Character exactly as it was: `mutate_meta`
+ *  either saves the whole edit or none of it. */
+export function patchCharacterFailure(e: unknown, name: string): string {
+  const msg = detailOf(e, "update failed");
+  if (statusOf(e) === 404) return `${msg} — “${name}” is no longer in the registry.`;
+  return `${msg} — “${name}” is unchanged.`;
+}
+
 // ── collision messages ────────────────────────────────────────────────────────
 /**
  * The Voice a slot-collision 409 names, resolved against the roster.
@@ -306,32 +394,58 @@ export function useCharacters() {
     [refresh],
   );
 
+  // Both optimistic mutations below roll back from a SNAPSHOT taken before the
+  // paint, never from a second `refresh()`: that second request can fail too,
+  // and when it did the wrong row stayed on screen under a second error. This
+  // is the shape `app/keys/_variants/data.ts::revokeKey` establishes.
   const patchCharacter = useCallback(async (id: string, patch: { name?: string; tags?: string[] }) => {
+    const snapshot = characters;
+    const name = characters.find((c) => c.character_id === id)?.name ?? id;
     setCharacters((cs) => cs.map((c) => (c.character_id === id ? { ...c, ...patch } : c))); // optimistic
     try {
       const updated = await patchCharacterReq(id, patch);
+      if (!mounted.current) return;
       // Re-sync from the server so normalized values (lowercased tags, trimmed
       // name) replace the optimistic guess.
       setCharacters((cs) => cs.map((c) => (c.character_id === id ? updated : c)));
       setError(null);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "update failed");
-      await refresh(); // roll the optimistic edit back to server truth
+      if (!mounted.current) return;
+      setCharacters(snapshot); // the edit did not land — put back what was there
+      setError(patchCharacterFailure(e, name));
     }
-  }, [refresh]);
+  }, [characters, mounted]);
+
+  // Ids with a DELETE in flight. A ref because the gate has to hold within the
+  // same tick (a double-click is two clicks before any re-render), mirrored
+  // into state so the row can disable its own button.
+  const deletingRef = useRef<Set<string>>(new Set());
+  const [deleting, setDeleting] = useState<Set<string>>(new Set());
 
   const deleteCharacter = useCallback(async (id: string) => {
+    if (deletingRef.current.has(id)) return; // in-flight gate
+    deletingRef.current.add(id);
+    setDeleting(new Set(deletingRef.current));
+    const snapshot = characters;
+    const name = characters.find((c) => c.character_id === id)?.name ?? id;
     setCharacters((cs) => cs.filter((c) => c.character_id !== id)); // optimistic
     try {
       await deleteCharacterReq(id);
-      setError(null);
+      if (mounted.current) setError(null);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "delete failed");
-      await refresh(); // restore the row we optimistically removed
+      if (!mounted.current) return;
+      // A 404 means it was not in the registry to begin with — the row really
+      // is gone, so restoring it would be the lie. Every other failure leaves
+      // the Character standing, so the row comes back with it.
+      if (!(e instanceof ApiError && e.status === 404)) setCharacters(snapshot);
+      setError(deleteCharacterFailure(e, name));
+    } finally {
+      deletingRef.current.delete(id);
+      if (mounted.current) setDeleting(new Set(deletingRef.current));
     }
-  }, [refresh]);
+  }, [characters, mounted]);
 
-  return { characters, loading, error, readFailed, refresh, createVoice, patchCharacter, deleteCharacter };
+  return { characters, loading, error, readFailed, deleting, refresh, createVoice, patchCharacter, deleteCharacter };
 }
 
 // ── slot assembly ───────────────────────────────────────────────────────────
@@ -451,29 +565,53 @@ export function useCharacter(characterId: string) {
     [character, refresh, user],
   );
 
+  // The voice id with a DELETE in flight (ref for the same-tick double-click
+  // gate, state so the rack can disable the button that fired it).
+  const removingRef = useRef<string | null>(null);
+  const [removingVoiceId, setRemovingVoiceId] = useState<string | null>(null);
+
   const removeVoice = useCallback(
     async (voiceId: string) => {
+      if (removingRef.current) return; // in-flight gate
+      removingRef.current = voiceId;
+      setRemovingVoiceId(voiceId);
+      // Name the slot in the failure message from the roster we already have —
+      // "delete failed" over a rack of eight rows does not say which one.
+      const found = character?.voices.find((v) => v.voice_id === voiceId);
+      const label = found ? emotionMeta(found.emotion).label : voiceId;
       setError(null);
       try {
         await deleteVoiceReq(voiceId);
         await refresh();
       } catch (e) {
-        setError(e instanceof Error ? e.message : "delete failed");
+        if (!mounted.current) return;
+        setError(deleteVoiceFailure(e, label));
+        // A 404 says the Voice is not there; the rack is the stale one, so it
+        // has to re-read. Every other failure left the Voice intact, and the
+        // rack is already showing exactly that — re-reading would only risk a
+        // second failure on top of the first.
+        if (e instanceof ApiError && e.status === 404) await refresh();
+      } finally {
+        removingRef.current = null;
+        if (mounted.current) setRemovingVoiceId(null);
       }
     },
-    [refresh],
+    [character, mounted, refresh],
   );
 
   const coverage = slots.filter((s) => s.voice).length;
 
   return { character, slots, coverage, total: slots.length, loading, error, notFound, busySlot,
-           vaultWarning, addVoice, removeVoice, addCustomEmotion,
+           vaultWarning, removingVoiceId, addVoice, removeVoice, addCustomEmotion,
            removeCustomEmotion, refresh };
 }
 
 // ── preview hook ────────────────────────────────────────────────────────────
 /** Synthesize a short line with one Voice and play it. One preview at a time.
- *  A failed preview surfaces briefly as `failedId` (no longer swallowed). */
+ *  A failed preview surfaces briefly as `failedId` — WITH the reason it failed
+ *  (`failedReason`). The bare `catch {}` here used to throw the backend's own
+ *  detail away, so "the voice registry is unreadable", a 429 backpressure
+ *  reply and a browser that blocked autoplay all read as "preview failed". */
 export function useVoicePreview() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const urlRef = useRef<string | null>(null); // current preview blob URL, so it can be revoked
@@ -482,6 +620,7 @@ export function useVoicePreview() {
   const [playingId, setPlayingId] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [failedId, setFailedId] = useState<string | null>(null);
+  const [failedReason, setFailedReason] = useState<string | null>(null);
 
   const revokeUrl = useCallback(() => {
     if (urlRef.current) { URL.revokeObjectURL(urlRef.current); urlRef.current = null; }
@@ -498,6 +637,7 @@ export function useVoicePreview() {
       if (playingId === voiceId) return stop();
       stop();
       setFailedId(null);
+      setFailedReason(null);
       if (failTimer.current) clearTimeout(failTimer.current);
       setBusyId(voiceId);
       try {
@@ -506,7 +646,9 @@ export function useVoicePreview() {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ text, voiceId }),
         });
-        if (!r.ok) throw new Error("preview failed");
+        // The backend's `detail` is written to be shown; route it through the
+        // one conversion (503 → "Gravitone backend unreachable", &c.).
+        if (!r.ok) await throwDetail(r, `preview failed (${r.status})`);
         const url = URL.createObjectURL(await r.blob());
         // The unmount cleanup already ran if we got here after teardown, so it
         // will never see this URL — revoke it now or it leaks for the tab's
@@ -521,12 +663,15 @@ export function useVoicePreview() {
         await a.play();
         if (!mounted.current) { revokeUrl(); return; }
         setPlayingId(voiceId);
-      } catch {
+      } catch (e) {
         if (!mounted.current) return;
         setPlayingId(null);
-        // Surface a brief "preview failed" pip; auto-clear so it stays quiet.
+        // Surface a brief "preview failed" pip WITH its cause; auto-clear so it
+        // stays quiet. `a.play()` rejects with a DOMException whose message is
+        // the browser's own explanation (autoplay policy) — also worth saying.
         setFailedId(voiceId);
-        failTimer.current = setTimeout(() => setFailedId(null), 2600);
+        setFailedReason(e instanceof Error ? e.message : "preview failed");
+        failTimer.current = setTimeout(() => { setFailedId(null); setFailedReason(null); }, 2600);
       } finally {
         setBusyId(null);
       }
@@ -541,7 +686,7 @@ export function useVoicePreview() {
     if (urlRef.current) URL.revokeObjectURL(urlRef.current);
   }, []);
 
-  return { preview, stop, playingId, busyId, failedId };
+  return { preview, stop, playingId, busyId, failedId, failedReason };
 }
 
 /** Open a file picker for one emotion slot and hand the file back. */
