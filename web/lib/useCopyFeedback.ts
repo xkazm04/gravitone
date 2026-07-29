@@ -15,6 +15,17 @@ import { useCallback, useEffect, useRef, useState } from "react";
  * insecure context), and reporting "copied" anyway is the failure mode this
  * codebase's honesty rule exists to prevent.
  */
+/** The target a caller means when it copies ONE thing and doesn't name it.
+ *
+ *  MUST be non-empty. It was `""`, which is FALSY — so every keyless call site
+ *  (`{failed ? "blocked" : copied ? "✓ copied" : "copy"}`: SecretReveal,
+ *  MigrationKit, SwitchKit, ApiPanel, TakeCode, UserMenu, BenchmarksView) sat
+ *  on the idle label forever. The clipboard worked; the feedback never fired,
+ *  including the "copy blocked" branch that exists so a refused clipboard is
+ *  never silent. The hook's own test only asserted `not.toBeNull()`, which ""
+ *  satisfies — implementation pinned, behaviour missed. */
+const SOLE_TARGET = "copied";
+
 export function useCopyFeedback<K extends string = string>(resetMs = 1500) {
   const [copied, setCopied] = useState<K | null>(null);
   const [failed, setFailed] = useState<K | null>(null);
@@ -24,7 +35,7 @@ export function useCopyFeedback<K extends string = string>(resetMs = 1500) {
     if (timer.current) { clearTimeout(timer.current); timer.current = null; }
   }, []);
 
-  const copy = useCallback(async (text: string, key: K = "" as K) => {
+  const copy = useCallback(async (text: string, key: K = SOLE_TARGET as K) => {
     clear();
     try {
       await navigator.clipboard.writeText(text);

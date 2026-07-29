@@ -162,7 +162,11 @@ export default function KeysLedger() {
           </thead>
           <tbody>
             {loading && <tr><td colSpan={6} className="px-3 py-8 text-center text-sm text-white/60">Loading keys…</td></tr>}
-            {!loading && keys.length === 0 && <tr><td colSpan={6} className="px-3 py-8 text-center text-sm text-white/60">No keys yet — create one above.</td></tr>}
+            {/* "No keys yet" is a CLAIM about the account, and a load that
+                failed cannot make it — an empty table under a red banner used
+                to say the user has no keys when the truth is nobody knows. */}
+            {!loading && keys.length === 0 && !error && <tr><td colSpan={6} className="px-3 py-8 text-center text-sm text-white/60">No keys yet — create one above.</td></tr>}
+            {!loading && keys.length === 0 && error && <tr><td colSpan={6} className="px-3 py-8 text-center text-sm text-rose-200/80">Key list unavailable — this table is empty because the request failed, not because you have no keys.</td></tr>}
             {keys.map((k) => (
               // Revoked keys STAY listed — keeping them auditable is what
               // revoke is for. Dimmed + struck through + labelled, matching
@@ -182,7 +186,11 @@ export default function KeysLedger() {
                 <td className="font-jetbrains px-3 py-2.5 text-[12px] text-white/60">{relTime(k.last_used)}</td>
                 <td className="px-3 py-2.5 text-right">
                   <button
-                    disabled={rotating === k.id}
+                    // Disabled while ANY row is rotating, not just this one:
+                    // the handler's `if (rotating) return` made every other
+                    // row's rotate button a silent no-op — a click that looks
+                    // live and does nothing is the failure this repo bans.
+                    disabled={rotating !== null}
                     onClick={async () => {
                       // In-flight guard: a double-click used to fire two
                       // rotations, minting two secrets where the second
