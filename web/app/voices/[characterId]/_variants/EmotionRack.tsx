@@ -5,7 +5,7 @@
 // practical; every slot is visible at once with no scrolling or spatial hunting.
 
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
-import { useState } from "react";
+import { Fragment, useState } from "react";
 import { useVoicePreview, relTime, pickAudio, type Slot } from "@/app/voices/_data/characters";
 import { checkEmotion } from "@/lib/slugs";
 import EmotionArt from "@/components/ui/EmotionArt";
@@ -30,6 +30,10 @@ export default function EmotionRack({
   const [minting, setMinting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const missing = total - coverage;
+  // Voices sharing a slot with the one that speaks. The registry tolerates them
+  // so they can be deleted; coverage counts DISTINCT emotions, so without this
+  // line nothing on the page would even hint they exist.
+  const shadowed = slots.reduce((n, s) => n + Math.max(0, s.voices.length - 1), 0);
 
   // The WHOLE of normalize_emotion (lib/slugs), not just its substitution half:
   // what the panel prints below is now the same verdict the service will reach,
@@ -65,6 +69,14 @@ export default function EmotionRack({
         <span>emotion rack</span>
         <span>
           {coverage}/{total} recorded{missing > 0 && <span className="ml-2 text-amber-300/70">· {missing} fall back to baseline</span>}
+          {shadowed > 0 && (
+            <span
+              className="ml-2 text-amber-300/70"
+              title="Two voices occupy one slot. Only the first speaks; remove one to resolve it."
+            >
+              · {shadowed} shadowed
+            </span>
+          )}
         </span>
       </div>
 
@@ -89,9 +101,14 @@ export default function EmotionRack({
               const isPlaying = filled && playingId === s.voice!.voice_id;
               const isBusy = busySlot === s.emotion || (filled && busyId === s.voice!.voice_id);
               const previewFailed = filled && failedId === s.voice!.voice_id;
+              // Extra voices registered on the same emotion. They never speak,
+              // but they are real rows in the registry — each gets its own line
+              // (and its own remove button) or it cannot be deleted at all.
+              const shadows = s.voices.slice(1);
 
               return (
-                <tr key={s.emotion} className={`border-b border-white/5 transition hover:bg-white/[0.03] ${!filled ? "opacity-70" : ""}`}>
+                <Fragment key={s.emotion}>
+                <tr className={`border-b border-white/5 transition hover:bg-white/[0.03] ${!filled ? "opacity-70" : ""}`}>
                   <td className="px-2 py-2">
                     <button
                       onClick={() => (filled ? preview(s.voice!.voice_id, `${name} ${s.emotion}`) : onRecord(s.emotion))}
@@ -136,6 +153,13 @@ export default function EmotionRack({
                     {filled ? (
                       <span className="flex items-center gap-2">
                         <span className="font-jetbrains rounded bg-cyan-400/10 px-1.5 py-0.5 text-[11px] text-cyan-300">recorded</span>
+                        {shadows.length > 0 && (
+                          <span
+                            title="Two voices occupy this slot — this is the one the engine speaks with"
+                            className="font-jetbrains rounded bg-emerald-400/10 px-1.5 py-0.5 text-[11px] text-emerald-300">
+                            speaks this slot
+                          </span>
+                        )}
                         {previewFailed && (
                           <span title="The preview could not be synthesized — try again."
                             className="font-jetbrains rounded bg-rose-400/10 px-1.5 py-0.5 text-[11px] text-rose-300">preview failed</span>
@@ -160,6 +184,7 @@ export default function EmotionRack({
                   <td className="px-3 py-2 text-right">
                     {filled ? (
                       <button onClick={() => removeVoice(s.voice!.voice_id)}
+                        aria-label={`Remove the ${s.label} voice`}
                         className="font-jetbrains text-[11px] text-white/55 transition hover:text-rose-300">remove</button>
                     ) : (
                       <>
@@ -182,6 +207,69 @@ export default function EmotionRack({
                     )}
                   </td>
                 </tr>
+
+                {shadows.map((v) => {
+                  const vBusy = busyId === v.voice_id;
+                  return (
+                    <tr key={v.voice_id} className="border-b border-white/5 bg-amber-400/[0.03] transition hover:bg-white/[0.03]">
+                      <td className="px-2 py-2">
+                        <button
+                          onClick={() => preview(v.voice_id, `${name} ${s.emotion}`)}
+                          disabled={vBusy}
+                          aria-label={`Play the shadowed ${s.label} voice`}
+                          className="grid h-7 w-7 place-items-center rounded-full border border-amber-300/40 text-[11px] text-amber-200 transition hover:bg-amber-400/10 disabled:opacity-50"
+                        >
+                          {vBusy ? "…" : playingId === v.voice_id ? "⏸" : "▶"}
+                        </button>
+                      </td>
+
+                      <td className="px-3 py-2">
+                        <div className="flex items-center gap-2.5 pl-4">
+                          <span className="font-jetbrains text-[12px] text-white/40">↳</span>
+                          <span className="grid h-7 w-7 shrink-0 place-items-center overflow-hidden rounded-lg border border-white/8 bg-black/40">
+                            <EmotionArt emotion={s.emotion} size={26} dim />
+                          </span>
+                          <span className="text-sm text-white/70">{s.label}</span>
+                          {v.consent ? (
+                            <span title="Consent receipt on file for this voice"
+                              aria-label="consent receipt on file"
+                              className="text-[13px] leading-none text-emerald-300/90">🛡</span>
+                          ) : (
+                            <span title="No receipt (pre-consent voice)"
+                              aria-label="no consent receipt"
+                              className="text-[13px] leading-none text-white/25">🛡</span>
+                          )}
+                        </div>
+                      </td>
+
+                      <td className="px-3 py-2">
+                        <span className="flex items-center gap-2">
+                          <span
+                            title={`This slot already had a voice when this one was registered, so ${s.label} is spoken by ${s.voice!.voice_id}. Remove one of them to resolve the duplicate.`}
+                            className="font-jetbrains rounded bg-amber-400/10 px-1.5 py-0.5 text-[11px] text-amber-300">
+                            shadowed · never spoken
+                          </span>
+                          {failedId === v.voice_id && (
+                            <span title="The preview could not be synthesized — try again."
+                              className="font-jetbrains rounded bg-rose-400/10 px-1.5 py-0.5 text-[11px] text-rose-300">preview failed</span>
+                          )}
+                        </span>
+                      </td>
+
+                      <td className="font-jetbrains px-3 py-2 text-[12px] text-white/60">{v.sample_seconds ?? "?"}s</td>
+                      <td className="font-jetbrains px-3 py-2 text-[12px] text-white/60">{v.voice_id}</td>
+                      <td className="font-jetbrains px-3 py-2 text-[12px] text-white/65">{relTime(v.created)}</td>
+
+                      <td className="px-3 py-2 text-right">
+                        <button onClick={() => removeVoice(v.voice_id)}
+                          aria-label={`Remove the shadowed ${s.label} voice`}
+                          title="Delete this voice — the slot keeps the voice that speaks"
+                          className="font-jetbrains text-[11px] text-white/55 transition hover:text-rose-300">remove</button>
+                      </td>
+                    </tr>
+                  );
+                })}
+                </Fragment>
               );
             })}
           </tbody>

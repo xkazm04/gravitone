@@ -57,7 +57,15 @@ export type Slot = {
   label: string;
   hue: number;
   custom: boolean; // beyond the base scale — art is a generated sigil
-  voice: Voice | null; // null = empty slot (falls back to baseline)
+  /** The Voice that actually SPEAKS this slot, or null for an empty slot.
+   *  This is the backend's own answer, not a rule re-derived here: the service
+   *  sorts `character.voices` into scale order and `_by_emotion` serves the
+   *  first match, so the first match in that same list is the speaking voice. */
+  voice: Voice | null;
+  /** EVERY Voice registered for this emotion, speaker first. Normally 0 or 1;
+   *  the registry tolerates duplicates (see `_by_emotion`) precisely so the
+   *  extra ones stay visible — and therefore deletable. */
+  voices: Voice[];
   demand: number; // unmet requests for this emotion (fallback telemetry)
 };
 
@@ -302,6 +310,39 @@ export function useCharacters() {
   return { characters, loading, error, readFailed, refresh, createVoice, patchCharacter, deleteCharacter };
 }
 
+// ── slot assembly ───────────────────────────────────────────────────────────
+/**
+ * A Character's emotion scale, as slots.
+ *
+ * The scale is the Character's own palette (base scale + its custom slots),
+ * falling back to the base eight while the character is still loading.
+ *
+ * A slot carries EVERY Voice registered for its emotion, not just the first.
+ * The registry deliberately tolerates two voices on one emotion — "a Voice that
+ * is invisible is also undeletable" — and this used to take `.find()`, so the
+ * shadowed voice had no row, no id and no remove button: the API kept the
+ * duplicate fixable and the UI was the reason it wasn't. `voice` (the one that
+ * speaks) is simply the FIRST of them, which is the backend's answer rather
+ * than a rule re-derived here: the service pre-sorts `voices` into scale order
+ * and `_by_emotion` serves the first match from that same list.
+ */
+export function buildSlots(character: Character | null): Slot[] {
+  const scale = character?.scale?.length ? character.scale : EMOTIONS.map((e) => e.id);
+  return scale.map((id) => {
+    const m = emotionMeta(id);
+    const voices = character?.voices.filter((v) => v.emotion === id) ?? [];
+    return {
+      emotion: id,
+      label: m.label,
+      hue: m.hue,
+      custom: !isBaseEmotion(id),
+      voice: voices[0] ?? null,
+      voices,
+      demand: character?.demand?.[id] ?? 0,
+    };
+  });
+}
+
 // ── detail hook ─────────────────────────────────────────────────────────────
 /** One Character's emotion scale: which slots are filled, and how to fill them. */
 export function useCharacter(characterId: string) {
@@ -338,20 +379,7 @@ export function useCharacter(characterId: string) {
 
   useEffect(() => { void refresh(); }, [refresh]);
 
-  // The Character's own palette: the base scale plus any custom slots it
-  // declared ("sarcastic", "battle_cry"). Falls back to the base eight while
-  // the character is still loading.
-  const slots: Slot[] = (character?.scale?.length ? character.scale : EMOTIONS.map((e) => e.id)).map((id) => {
-    const m = emotionMeta(id);
-    return {
-      emotion: id,
-      label: m.label,
-      hue: m.hue,
-      custom: !isBaseEmotion(id),
-      voice: character?.voices.find((v) => v.emotion === id) ?? null,
-      demand: character?.demand?.[id] ?? 0,
-    };
-  });
+  const slots = buildSlots(character);
 
   /** Mint a new custom emotion slot on this Character. */
   const addCustomEmotion = useCallback(async (name: string) => {

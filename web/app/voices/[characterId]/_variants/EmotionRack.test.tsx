@@ -1,14 +1,21 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-// The data layer this component imports reaches Firebase auth through useAuth.
+// The rack pulls in the data layer, whose hooks reach Firebase auth — it
+// refuses to initialize without real keys. Rendering is what's under test.
 vi.mock("@/lib/useAuth", () => ({ useAuth: () => ({ user: null }) }));
 vi.mock("@/lib/voiceVault", () => ({ recordVoiceOwnership: async () => ({ saved: 0, failed: 0 }) }));
 
 import EmotionRack from "./EmotionRack";
 import { EMOTION_RULE } from "@/lib/slugs";
+import type { Slot, Voice } from "@/app/voices/_data/characters";
 
-function renderRack(addCustomEmotion = vi.fn(async () => {})) {
+// Two harnesses, because the two behaviours under test want opposite fixtures:
+// the slug panel needs a character whose NAME slugs non-trivially and no slots
+// at all, while the shadowed-voice rows need slots and do not care about the
+// name. Merged from two builders that landed in this file in the same wave.
+
+function renderSlugPanel(addCustomEmotion = vi.fn(async () => {})) {
   render(
     <EmotionRack
       name="Mary O'Brien"
@@ -31,13 +38,13 @@ describe("EmotionRack — the slug preview tells the truth", () => {
   it("prints the address the API actually answers on, not one derived from the name", () => {
     // "Mary O'Brien" used to render as `mary-o'brien:sarcastic`: copy-pasteable
     // and 404ing, because only whitespace was substituted.
-    renderRack();
+    renderSlugPanel();
     expect(screen.getByText(/mary-o-brien:sarcastic/)).toBeInTheDocument();
     expect(screen.queryByText(/mary-o'brien/)).toBeNull();
   });
 
   it("previews the canonical slug for a name the service will accept", () => {
-    const { input } = renderRack();
+    const { input } = renderSlugPanel();
     fireEvent.change(input, { target: { value: "battle cry" } });
     expect(screen.getByText(/mary-o-brien:battle_cry/)).toBeInTheDocument();
   });
@@ -45,7 +52,7 @@ describe("EmotionRack — the slug preview tells the truth", () => {
   it("refuses an invalid name at the input, with the reason, before any round trip", () => {
     // The contradiction this fixes: the panel said "[battle_cry] is addressable
     // immediately" two lines under an input the server would 400.
-    const { addCustomEmotion, input } = renderRack();
+    const { addCustomEmotion, input } = renderSlugPanel();
     fireEvent.change(input, { target: { value: "battle_cry!" } });
 
     expect(screen.getByText(new RegExp(EMOTION_RULE.slice(0, 40)))).toBeInTheDocument();
@@ -58,7 +65,7 @@ describe("EmotionRack — the slug preview tells the truth", () => {
   });
 
   it("refuses the lengths and shapes maxLength={24} never covered", () => {
-    const { addCustomEmotion, input } = renderRack();
+    const { addCustomEmotion, input } = renderSlugPanel();
     for (const bad of ["a", "1st", "_x"]) {
       fireEvent.change(input, { target: { value: bad } });
       fireEvent.keyDown(input, { key: "Enter" });
@@ -67,9 +74,73 @@ describe("EmotionRack — the slug preview tells the truth", () => {
   });
 
   it("submits the canonical slug, so what was previewed is what is minted", async () => {
-    const { addCustomEmotion, input } = renderRack();
+    const { addCustomEmotion, input } = renderSlugPanel();
     fireEvent.change(input, { target: { value: "  Battle-Cry " } });
     await act(async () => { fireEvent.keyDown(input, { key: "Enter" }); });
     expect(addCustomEmotion).toHaveBeenCalledWith("battle_cry");
+  });
+});
+
+function voice(id: string, emotion: string): Voice {
+  return {
+    voice_id: id, character_id: "sarah", emotion, name: "Sarah",
+    category: "cloned", lang: "en", created: null, sample_seconds: 4,
+  };
+}
+
+function slot(emotion: string, label: string, voices: Voice[]): Slot {
+  return { emotion, label, hue: 200, custom: false, voice: voices[0] ?? null, voices, demand: 0 };
+}
+
+function renderSlots(slots: Slot[], removeVoice = vi.fn()) {
+  const coverage = slots.filter((s) => s.voice).length;
+  render(
+    <EmotionRack
+      // `characterId` became a required prop in the same wave (the slug panel
+      // now takes the server's id instead of deriving one from the name).
+      name="Sarah" characterId="sarah" slots={slots} coverage={coverage}
+      total={slots.length} busySlot={null}
+      addVoice={vi.fn()} removeVoice={removeVoice} onRecord={vi.fn()}
+      addCustomEmotion={vi.fn()} removeCustomEmotion={vi.fn()}
+    />,
+  );
+  return removeVoice;
+}
+
+describe("EmotionRack — the shadowed voice gets a row of its own", () => {
+  it("leaves an ordinary one-voice slot with exactly one row and one remove", () => {
+    renderSlots([slot("baseline", "Baseline", [voice("v_base", "baseline")])]);
+
+    expect(screen.getAllByRole("button", { name: "Remove the Baseline voice" })).toHaveLength(1);
+    expect(screen.queryByText(/shadowed/)).not.toBeInTheDocument();
+    expect(screen.getByText("v_base")).toBeInTheDocument();
+  });
+
+  it("shows BOTH voices of a doubled slot and marks which one speaks", () => {
+    renderSlots([
+      slot("baseline", "Baseline", [voice("v_base", "baseline")]),
+      slot("angry", "Angry", [voice("v_first", "angry"), voice("v_second", "angry")]),
+    ]);
+
+    // Before this, the second voice had no row, no id and no remove button.
+    expect(screen.getByText("v_first")).toBeInTheDocument();
+    expect(screen.getByText("v_second")).toBeInTheDocument();
+    expect(screen.getByText("speaks this slot")).toBeInTheDocument();
+    expect(screen.getByText(/shadowed · never spoken/)).toBeInTheDocument();
+    // …and the header says the duplicate exists at all (coverage counts
+    // distinct emotions, so the numbers alone would hide it).
+    expect(screen.getByText(/1 shadowed/)).toBeInTheDocument();
+  });
+
+  it("removes each voice of a doubled slot individually", () => {
+    const removeVoice = renderSlots([
+      slot("angry", "Angry", [voice("v_first", "angry"), voice("v_second", "angry")]),
+    ]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove the shadowed Angry voice" }));
+    expect(removeVoice).toHaveBeenCalledWith("v_second");
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove the Angry voice" }));
+    expect(removeVoice).toHaveBeenCalledWith("v_first");
   });
 });
