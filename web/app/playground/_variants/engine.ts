@@ -83,9 +83,14 @@ export async function uploadTake(t: Take): Promise<string> {
   // The filename carries the take's real extension — an mp3 posted as
   // "take.wav" would be a second lie on top of the one the backend rejects.
   fd.append("file", blob, `take.${formatMeta(t.format).ext}`);
+  // Remix lineage: /t/[id]'s "open in the rack" leaves the source take id in
+  // sessionStorage, so the take rendered from it publishes as that take's CHILD.
+  let parentId = "";
+  try { parentId = sessionStorage.getItem("gravitone.remix.parent") ?? ""; } catch { /* no storage - publish unlinked */ }
   fd.append("meta", JSON.stringify({
     character_id: t.characterId, character_name: t.characterName,
     text: t.text, seconds: t.seconds, rtf: t.rtf, segments: t.segments,
+    ...(parentId ? { parent_id: parentId, derived_from: { kind: "remix" } } : {}),
   }));
   // Through the apiFetch contract so the backend's sanitized `detail` (request
   // id included) reaches the caller's banner instead of a generic sentence.

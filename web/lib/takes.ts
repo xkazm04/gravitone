@@ -17,7 +17,52 @@ export type SharedTake = {
   rtf: number;
   segments: { text: string; requested: string; used: string; fallback: boolean; seconds: number }[];
   created: string;
+  // Lineage. Optional on the type because every take published before
+  // re-performable takes existed has neither key on disk — a child take is a
+  // fork of another share (open in the rack, change a tag, re-render).
+  parent_id?: string | null;
+  derived_from?: Record<string, unknown> | null;
 };
+
+/** How a lineage member is reported — the compact shape, never the whole take.
+ *  `missing` is the honest answer for an ancestor the bounded store has since
+ *  evicted: "the parent is gone" is not "there was no parent". */
+export type LineageMember = {
+  id: string;
+  character_id?: string;
+  character_name?: string;
+  seconds?: number;
+  created?: string;
+  derived_from?: Record<string, unknown>;
+  missing?: boolean;
+};
+
+export type TakeLineage = {
+  id: string;
+  take?: LineageMember; // the subject itself, with its own derived_from block
+  ancestors: LineageMember[]; // nearest parent first
+  children: LineageMember[];
+  children_total: number;
+  depth_capped: boolean;
+};
+
+/** The chain a take belongs to, or null when it cannot be read.
+ *
+ *  Provenance is decoration on a share page: a take whose lineage call fails
+ *  still renders in full, exactly as it did before lineage existed. Callers
+ *  therefore treat null as "no lineage to show", never as an error to raise.
+ */
+export async function loadLineage(id: string): Promise<TakeLineage | null> {
+  try {
+    const r = await backendFetch(`/v1/takes/${encodeURIComponent(id)}/lineage`, {
+      cache: "no-store",
+      signal: AbortSignal.timeout(READ_TIMEOUT_MS),
+    });
+    return r.ok ? ((await r.json()) as TakeLineage) : null;
+  } catch {
+    return null;
+  }
+}
 
 /** Fetch one published take server-side.
  *

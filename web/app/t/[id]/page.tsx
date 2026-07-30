@@ -5,7 +5,9 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { Wordmark } from "@/components/ui/Primitives";
-import { loadTake } from "@/lib/takes";
+import { loadLineage, loadTake } from "@/lib/takes";
+import Lineage from "./Lineage";
+import OpenInRack from "./OpenInRack";
 import TakeCard from "./TakeCard";
 
 export async function generateMetadata({ params }: { params: Promise<{ id: string }> }): Promise<Metadata> {
@@ -26,7 +28,10 @@ export async function generateMetadata({ params }: { params: Promise<{ id: strin
 
 export default async function TakePage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  const take = await loadTake(id);
+  // Two independent reads. The lineage is provenance — it must never be able to
+  // cost the page its take, so it is awaited beside the take and degrades to
+  // null (no lineage shown) on its own.
+  const [take, lineage] = await Promise.all([loadTake(id), loadLineage(id)]);
   if (!take) notFound();
 
   return (
@@ -45,6 +50,9 @@ export default async function TakePage({ params }: { params: Promise<{ id: strin
         <div className="pt-8">
           <TakeCard take={take} />
         </div>
+
+        {lineage && <Lineage lineage={lineage} />}
+        <OpenInRack take={take} />
 
         {/* try-it-yourself CTA — every share is a landing page */}
         <div className="glass-panel mt-6 rounded-2xl p-5 text-center">

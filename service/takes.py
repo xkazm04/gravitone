@@ -15,6 +15,13 @@ answer "what should the studio default to" (see preferred()).
 
 Bounded store: oldest takes/reviews are evicted past their caps — shares are
 a marketing surface, not an archive.
+
+LINEAGE: a take may be DERIVED from another (open a share back in the rack,
+change one [emotion] tag, re-render). The child records `parent_id` +
+`derived_from`, so /t/{id} can show provenance, `GET /v1/takes/{id}/lineage`
+can walk the chain, and `direction.py` can count what the human changed.
+Eviction is lineage-aware: dropping a mid-chain link would leave a child
+pointing at a parent that no longer exists, so the store evicts LEAF-FIRST.
 """
 from __future__ import annotations
 
@@ -28,6 +35,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+from service import direction
 from service.config import SETTINGS
 
 router = APIRouter(prefix="/v1/takes", tags=["takes"])
@@ -40,13 +48,128 @@ MAX_REVIEWS = 200
 MAX_AUDIO_BYTES = 25 * 1024 * 1024  # ~4 min of 24 kHz wav
 MAX_TEXT = 8000
 MAX_SEGMENTS = 200
+MAX_LINEAGE_DEPTH = 20     # ancestors walked before the answer says so
+MAX_LINEAGE_CHILDREN = 50  # children listed per take
+MAX_DERIVED_KEYS = 10      # fields kept from a client's derived_from block
+
+
+def _valid_id(take_id: str) -> bool:
+    """Ids are minted here (10 hex chars); anything else is a caller's string
+    and must not become a path segment."""
+    return bool(take_id) and take_id.isalnum() and len(take_id) <= 32
+
+
+def _read_meta(take_id: str) -> dict | None:
+    if not _valid_id(take_id):
+        return None
+    return _read_meta_path(TAKES_DIR / f"{take_id}.json")
+
+
+def _read_meta_path(path: Path) -> dict | None:
+    try:
+        data = json.loads(path.read_text("utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _parent_of(meta: dict | None) -> str:
+    pid = str((meta or {}).get("parent_id") or "")
+    return pid if _valid_id(pid) else ""
+
+
+def _drop(path: Path) -> None:
+    path.with_suffix(".wav").unlink(missing_ok=True)
+    path.unlink(missing_ok=True)
 
 
 def _evict_oldest() -> None:
-    metas = sorted(TAKES_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime)
-    for p in metas[: max(0, len(metas) - MAX_TAKES + 1)]:
-        p.with_suffix(".wav").unlink(missing_ok=True)
-        p.unlink(missing_ok=True)
+    """Make room for one new take without orphaning a lineage.
+
+    Oldest-first is still the rule, with one addition: a take whose CHILD is
+    still in the store is skipped, because deleting a mid-chain link leaves the
+    child pointing at a parent that no longer exists — `/lineage` would report a
+    hole in the middle of a chain it should be able to walk. Removing leaves
+    first strips a chain from its tip inward, so whatever survives is always a
+    complete chain back to its root.
+
+    Last resort: if a pass frees nothing (only reachable if the store was
+    hand-edited into a parent cycle), the oldest remaining take goes anyway —
+    a wedged writer would be worse than a broken link.
+    """
+    try:
+        entries = [(p.stem, p.stat().st_mtime, p) for p in TAKES_DIR.glob("*.json")]
+    except OSError:
+        return
+    need = len(entries) - MAX_TAKES + 1
+    if need <= 0:
+        return  # the common path never reads a single metadata file
+
+    entries.sort(key=lambda e: e[1])
+    ids = {tid for tid, _, _ in entries}
+    parents = {tid: _parent_of(_read_meta_path(p)) for tid, _, p in entries}
+    kids: dict[str, int] = {}
+    for tid, pid in parents.items():
+        if pid in ids:
+            kids[pid] = kids.get(pid, 0) + 1
+
+    removed: set[str] = set()
+    while need > 0:
+        freed = 0
+        for tid, _, path in entries:
+            if need == 0:
+                break
+            if tid in removed or kids.get(tid, 0) > 0:
+                continue
+            _drop(path)
+            removed.add(tid)
+            need -= 1
+            freed += 1
+            pid = parents.get(tid, "")
+            if pid in kids:
+                kids[pid] -= 1
+        if freed == 0:
+            for tid, _, path in entries:
+                if tid not in removed:
+                    _drop(path)
+                    removed.add(tid)
+                    need -= 1
+                    break
+            else:
+                return
+            if need <= 0:
+                return
+
+
+def _clean_derived_from(raw: object) -> dict:
+    """Keep a caller's provenance block, bounded. It is display + telemetry
+    metadata, never trusted input: strings are truncated, structures other than
+    scalars and short string lists are dropped."""
+    if not isinstance(raw, dict):
+        return {}
+    out: dict = {}
+    for key, value in list(raw.items())[:MAX_DERIVED_KEYS]:
+        name = str(key)[:32]
+        if isinstance(value, bool) or isinstance(value, (int, float)):
+            out[name] = value
+        elif isinstance(value, str):
+            out[name] = value[:200]
+        elif isinstance(value, list):
+            out[name] = [str(v)[:64] for v in value[:20]]
+    return out
+
+
+def _summary(meta: dict) -> dict:
+    """The compact shape lineage answers in — never the whole take."""
+    return {
+        "id": str(meta.get("id", ""))[:32],
+        "character_id": str(meta.get("character_id", ""))[:100],
+        "character_name": str(meta.get("character_name", ""))[:100],
+        "seconds": float(meta.get("seconds", 0) or 0),
+        "created": str(meta.get("created", ""))[:32],
+        "derived_from": meta.get("derived_from") or {},
+        "missing": False,
+    }
 
 
 # NOT async: writes up to 25 MB and globs/stats the whole takes dir to evict.
@@ -72,6 +195,15 @@ def create_take(
     if audio[:4] != b"RIFF":
         raise HTTPException(400, "audio must be a wav file")
 
+    # Lineage is OPTIONAL and additive: a client that knows nothing about it
+    # posts exactly what it posted before. An unknown parent (evicted between
+    # the fork and the render) is kept rather than rejected — losing a rendered
+    # take over a missing ancestor would be the worse failure, and every
+    # lineage reader already tolerates a member that is gone.
+    parent_id = str(m.get("parent_id") or "").strip()
+    if parent_id and not _valid_id(parent_id):
+        raise HTTPException(400, "parent_id must be an alphanumeric take id")
+
     take_id = uuid.uuid4().hex[:10]
     record = {
         "id": take_id,
@@ -91,12 +223,21 @@ def create_take(
             for s in segments
         ],
         "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "parent_id": parent_id or None,
+        "derived_from": _clean_derived_from(m.get("derived_from")) or None,
     }
 
     TAKES_DIR.mkdir(parents=True, exist_ok=True)
     _evict_oldest()
     (TAKES_DIR / f"{take_id}.wav").write_bytes(audio)
     (TAKES_DIR / f"{take_id}.json").write_text(json.dumps(record), "utf-8")
+
+    # The diff between parent and child is a human direction decision. Counted
+    # after the take is safely on disk, and never able to fail it.
+    if parent_id:
+        parent_meta = _read_meta(parent_id)
+        if parent_meta is not None:
+            direction.record_delta(parent_meta, record)
     return {"take_id": take_id}
 
 
@@ -106,6 +247,55 @@ def get_take(take_id: str) -> dict:
     if not take_id.isalnum() or not p.is_file():
         raise HTTPException(404, "take not found (shares are evicted oldest-first)")
     return json.loads(p.read_text("utf-8"))
+
+
+@router.get("/{take_id}/lineage")
+def get_lineage(take_id: str) -> dict:
+    """The chain this take belongs to: ancestors (nearest first) and children.
+
+    Bounded on both axes — a walk stops at MAX_LINEAGE_DEPTH and says so
+    (`depth_capped`), and children are capped with the true total alongside.
+    An ancestor that has been evicted is REPORTED (`missing: true`) rather than
+    silently ending the chain, because "the parent is gone" and "there was no
+    parent" are different sentences on a provenance line.
+    """
+    meta = _read_meta(take_id)
+    if meta is None:
+        raise HTTPException(404, "take not found (shares are evicted oldest-first)")
+
+    ancestors: list[dict] = []
+    seen = {take_id}
+    depth_capped = False
+    cursor = _parent_of(meta)
+    while cursor:
+        if cursor in seen:  # a hand-edited store could describe a cycle
+            break
+        seen.add(cursor)
+        if len(ancestors) >= MAX_LINEAGE_DEPTH:
+            depth_capped = True
+            break
+        parent_meta = _read_meta(cursor)
+        if parent_meta is None:
+            ancestors.append({"id": cursor, "missing": True})
+            break
+        ancestors.append(_summary(parent_meta))
+        cursor = _parent_of(parent_meta)
+
+    children: list[dict] = []
+    if TAKES_DIR.is_dir():
+        for path in TAKES_DIR.glob("*.json"):
+            child = _read_meta_path(path)
+            if child is not None and _parent_of(child) == take_id:
+                children.append(_summary(child))
+    children.sort(key=lambda c: c["created"])
+    return {
+        "id": take_id,
+        "take": _summary(meta),
+        "ancestors": ancestors,
+        "children": children[:MAX_LINEAGE_CHILDREN],
+        "children_total": len(children),
+        "depth_capped": depth_capped,
+    }
 
 
 @router.get("/{take_id}/audio")
@@ -126,6 +316,13 @@ class PickReq(BaseModel):
     take_id: str
     reviewer: str = Field("", max_length=80)
     note: str = Field("", max_length=500)
+
+
+class ReviseReq(BaseModel):
+    """A reviewer asking for a change instead of ending the conversation."""
+    note: str = Field(..., min_length=1, max_length=500)
+    reviewer: str = Field("", max_length=80)
+    direction: str = Field("", max_length=200)  # e.g. "line 3: baseline -> angry"
 
 
 def _review_path(review_id: str) -> Path:
@@ -159,13 +356,45 @@ def create_review(req: ReviewReq) -> dict:
         "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "pick": None,  # {take_id, reviewer, note, picked_at}
     }
+    _evict_reviews()
+    _review_path(review_id).write_text(json.dumps(record), "utf-8")
+    return {"review_id": review_id}
+
+
+def _evict_reviews() -> None:
     REVIEWS_DIR.mkdir(parents=True, exist_ok=True)
     metas = sorted(REVIEWS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime)
     for old in metas[: max(0, len(metas) - MAX_REVIEWS + 1)]:
         old.unlink(missing_ok=True)
         old.with_suffix(".pick").unlink(missing_ok=True)  # drop its decision sentinel
-    _review_path(review_id).write_text(json.dumps(record), "utf-8")
-    return {"review_id": review_id}
+
+
+def _revisions_of(review_id: str) -> list[dict]:
+    """Later rounds seeded from this one. Derived by scanning the (capped)
+    review store rather than by writing a pointer back into a DECIDED review —
+    a recorded decision is never rewritten, which is what makes 'first pick is
+    final' a property of the file and not just of the handler."""
+    out: list[dict] = []
+    if not REVIEWS_DIR.is_dir():
+        return out
+    for path in REVIEWS_DIR.glob("*.json"):
+        try:
+            other = json.loads(path.read_text("utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(other, dict):
+            continue
+        src = other.get("derived_from") or {}
+        if isinstance(src, dict) and src.get("review_id") == review_id:
+            out.append({
+                "id": other.get("id", ""),
+                "title": other.get("title", ""),
+                "round": int(other.get("round", 1) or 1),
+                "created": other.get("created", ""),
+                "decided": bool(other.get("pick")),
+            })
+    out.sort(key=lambda r: r["created"])
+    return out
 
 
 @reviews_router.get("/preferred")
@@ -202,7 +431,53 @@ def get_review(review_id: str) -> dict:
         p = TAKES_DIR / f"{tid}.json"
         if p.is_file():  # a take may have been evicted from the bounded store
             takes.append(json.loads(p.read_text("utf-8")))
-    return {**review, "takes": takes}
+    return {**review, "takes": takes, "revisions": _revisions_of(review_id)}
+
+
+@reviews_router.post("/{review_id}/revise", status_code=201)
+def revise_review(review_id: str, req: ReviseReq) -> dict:
+    """Ask for a change: a NEW review round, seeded from the picked take.
+
+    The shipped invariant is "first pick is final — a new round is a new link".
+    Revision keeps it exactly: the decided review is not touched, and the note
+    plus the requested direction open a fresh round whose only starting take is
+    the one the client already approved. What used to be an email round trip
+    ("close, but make line 3 angrier") is now a link, and the requested change
+    rides in `derived_from` where the studio — and direction.py, once the
+    re-render is published as a child take — can read it.
+    """
+    review = _load_review(review_id)
+    pick = review.get("pick")
+    if not pick:
+        raise HTTPException(409, "pick a take first — a revision revises a decision")
+
+    seed = str(pick.get("take_id", ""))
+    if not _valid_id(seed):
+        raise HTTPException(409, "this review's decision names no take to revise")
+
+    round_no = int(review.get("round", 1) or 1) + 1
+    base_title = str(review.get("title_base") or review.get("title") or "Pick a take")
+    new_id = uuid.uuid4().hex[:10]
+    record = {
+        "id": new_id,
+        "title": f"{base_title[:120]} - round {round_no}",
+        "title_base": base_title[:120],
+        "round": round_no,
+        "script": review.get("script", ""),
+        "take_ids": [seed],
+        "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "pick": None,
+        "derived_from": {
+            "review_id": review_id,
+            "take_id": seed,
+            "note": req.note.strip()[:500],
+            "direction": req.direction.strip()[:200],
+            "reviewer": req.reviewer.strip()[:80],
+        },
+    }
+    _evict_reviews()
+    _review_path(new_id).write_text(json.dumps(record), "utf-8")
+    return {"review_id": new_id, "round": round_no}
 
 
 @reviews_router.post("/{review_id}/pick")
