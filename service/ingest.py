@@ -61,6 +61,7 @@ from typing import Callable, NamedTuple
 
 import numpy as np
 
+from service import voiceprint
 from service.config import SETTINGS
 from service.emotions import BASELINE, EMOTION_SCALE
 from service.errors import UserFacing
@@ -1071,6 +1072,287 @@ def baseline_note(plan: BaselinePlan, seconds: float, min_stem: float) -> str | 
             f"{what}. Record more neutral speech.")
 
 
+# ── measured fidelity: the pipeline hears its own audio ───────────────────────
+# Until now this pipeline was BLIND. It cut a recording into segments, trusted a
+# classifier's emotion labels and a diarizer's (or, in sovereign mode, an
+# assumption's) speaker attribution, spliced the result, cloned it, and verified
+# exactly one thing: that the embedding file parsed. Whether the stems were even
+# the same person — let alone whether the clone resembled them — was unmeasured,
+# and therefore unmentioned.
+#
+# `service/voiceprint.py` closes that. Every segment gets a speaker embedding,
+# the speaker's own centre of mass is the reference, and a segment sitting far
+# from it is a diarization error or a bystander voice. That is REPORTED always
+# and acted on rarely, for a reason worth writing down: the numbers below are NOT
+# calibrated against a fixture set (that is a later step in the proposal), so the
+# statistical rule does the deciding and the absolute constants only guard the
+# one case a rule cannot see — a segment that is not this person at all.
+#
+#   * OUTLIER_MAD_K — flag at K median-absolute-deviations below the median
+#     similarity. Self-calibrating per recording: there is no fixed "good"
+#     similarity to be wrong about, only "unlike the rest of this speaker".
+#   * FOREIGN_SIMILARITY — an absolute floor, and the ONLY thing that removes
+#     audio. Deliberately far below anything a real speaker's own clip reaches.
+#   * MAX_DROP_FRACTION — a recording is never mostly-foreign; if the rule says
+#     it is, the rule is wrong, so the surplus is flagged rather than dropped.
+# Nothing here can empty a stem: the last audio for an emotion is always kept
+# (flagged), and a drop set that would leave no usable segments at all is
+# abandoned wholesale. Every one of those outcomes is named in the payload.
+FIDELITY_VERSION = 1
+OUTLIER_MAD_K = 3.0
+OUTLIER_MIN_SEGMENTS = 4      # below this, "unlike the rest" has no rest to mean
+FOREIGN_SIMILARITY = 0.25
+MAX_DROP_FRACTION = 0.34
+# One fixed line, so a clone's identity number is comparable with the next
+# clone's. Phonetically broad, short enough that synthesizing it costs seconds.
+CALIBRATION_TEXT = ("The quick brown fox jumps over the lazy dog, and she "
+                    "reads the whole page out loud before breakfast.")
+CALIBRATION_TIMEOUT_S = 120.0
+
+_IDENTITY_CAVEAT = ("speaker identity (embedding cosine similarity), "
+                    "not perceptual quality")
+
+
+class SegmentFidelity(NamedTuple):
+    """What embedding the segments taught us. `payload` is JSON-safe and rides
+    in the job's partial/result; `dropped` is the set of segment indices whose
+    audio must not reach a stem; `centre` is the speaker's centroid (None when
+    nothing could be measured)."""
+    payload: dict
+    dropped: set
+    centre: object | None
+
+
+def _unmeasured(reason: str) -> dict:
+    """A fidelity payload for "we did not measure this, and here is why".
+
+    Never an empty dict and never zeros: absent has to be distinguishable from
+    measured-badly, on the wire and in the UI.
+    """
+    return {"version": FIDELITY_VERSION, "available": False, "reason": reason,
+            "reference_similarity": None, "segments_measured": 0,
+            "segments_failed": [], "per_segment_outliers": [],
+            "dropped": 0, "flagged": 0, "stems": {},
+            "measures": _IDENTITY_CAVEAT}
+
+
+def measure_segments(labels: list[dict], *,
+                     embed: Callable[[Path], object] | None = None) -> SegmentFidelity:
+    """Embed every usable segment and judge it against the speaker's centroid.
+
+    Pure measurement plus a decision about which indices to exclude — no I/O
+    beyond reading the segment wavs, so it is testable with synthetic embeddings.
+    `embed` defaults to `voiceprint.embed`; when the embedder is unavailable this
+    returns a payload that SAYS so and drops nothing.
+    """
+    if embed is None:
+        reason = voiceprint.unavailable_reason()
+        if reason:
+            return SegmentFidelity(_unmeasured(reason), set(), None)
+        embed = voiceprint.embed
+
+    vectors: dict[int, object] = {}
+    failed: list[dict] = []
+    for lab in labels:
+        try:
+            vectors[lab["i"]] = embed(Path(lab["wav"]))
+        except Exception as exc:  # noqa: BLE001 - one unmeasurable clip is not a failure
+            failed.append({"i": lab["i"], "error": f"{type(exc).__name__}: {exc}"[:160]})
+
+    if len(vectors) < 2:
+        pay = _unmeasured(
+            f"only {len(vectors)} of {len(labels)} segment(s) could be embedded, "
+            "which is too few to locate this speaker")
+        pay["segments_failed"] = failed
+        return SegmentFidelity(pay, set(), None)
+
+    try:
+        centre = voiceprint.centroid(list(vectors.values()))
+        sims = {i: voiceprint.similarity(v, centre) for i, v in vectors.items()}
+    except Exception as exc:  # noqa: BLE001 - measurement must never fail a scan
+        pay = _unmeasured(f"the speaker centroid could not be computed ({exc})")
+        pay["segments_failed"] = failed
+        return SegmentFidelity(pay, set(), None)
+
+    ordered = sorted(sims.values())
+    median = float(np.median(ordered))
+    mad = float(np.median([abs(s - median) for s in ordered]))
+    by_index = {lab["i"]: lab for lab in labels}
+
+    # Candidates: statistically unlike the rest of this speaker, or below the
+    # absolute floor regardless of how spread out the recording is.
+    cut = median - OUTLIER_MAD_K * mad
+    candidates = []
+    for i, sim in sims.items():
+        stat = (len(sims) >= OUTLIER_MIN_SEGMENTS and mad > 0.0 and sim < cut)
+        if stat or sim < FOREIGN_SIMILARITY:
+            candidates.append(i)
+    candidates.sort(key=lambda i: sims[i])       # least like the speaker first
+
+    drop_budget = int(len(sims) * MAX_DROP_FRACTION)
+    per_emotion: dict[str, int] = {}
+    for lab in labels:
+        per_emotion[lab["emotion"]] = per_emotion.get(lab["emotion"], 0) + 1
+
+    dropped: set = set()
+    outliers: list[dict] = []
+    for i in candidates:
+        lab = by_index.get(i, {})
+        emo = lab.get("emotion", BASELINE)
+        sim = round(sims[i], 3)
+        why: str | None = None
+        action = "flagged"
+        if sims[i] < FOREIGN_SIMILARITY:
+            if len(dropped) >= drop_budget:
+                why = ("kept: more segments look foreign than a recording of one "
+                       "person plausibly can, so the measurement is not trusted")
+            elif per_emotion.get(emo, 0) - _dropped_for(dropped, by_index, emo) <= 1:
+                why = f"kept: the only remaining audio labelled '{emo}'"
+            else:
+                action = "dropped"
+                why = ("removed from the stems: this does not sound like the same "
+                       "speaker (another voice, or a mis-attributed span)")
+                dropped.add(i)
+        else:
+            why = ("unlike the rest of this speaker's audio — reported only, still "
+                   "used in the stems")
+        outliers.append({"i": i, "emotion": emo, "similarity": sim,
+                         "action": action, "why": why})
+
+    if dropped and len(dropped) >= len(sims):     # belt: never strip everything
+        for o in outliers:
+            if o["action"] == "dropped":
+                o["action"] = "flagged"
+                o["why"] = ("kept: dropping these would leave no usable audio at "
+                            "all")
+        dropped = set()
+
+    payload = {
+        "version": FIDELITY_VERSION, "available": True, "reason": None,
+        # Contract name (cloning-ingest.md M1 step 1). What it actually is: the
+        # MEDIAN similarity of this recording's segments to the speaker's own
+        # centroid — how much this audio agrees with itself about who is talking.
+        "reference_similarity": round(median, 3),
+        "cohesion_mad": round(mad, 3),
+        "segments_measured": len(sims),
+        "segments_failed": failed,
+        "per_segment_outliers": outliers,
+        "dropped": len(dropped),
+        "flagged": sum(1 for o in outliers if o["action"] == "flagged"),
+        "stems": {},
+        "measures": _IDENTITY_CAVEAT,
+    }
+    return SegmentFidelity(payload, dropped, centre)
+
+
+def _dropped_for(dropped: set, by_index: dict, emotion: str) -> int:
+    return sum(1 for i in dropped if by_index.get(i, {}).get("emotion") == emotion)
+
+
+def score_stems(payload: dict, centre: object | None, stem_paths: dict[str, Path],
+                *, embed: Callable[[Path], object] | None = None) -> None:
+    """Fill `payload["stems"][emotion] = {"identity": …}` — how much each spliced
+    stem sounds like the speaker it was cut from. Mutates `payload`; failures are
+    named per stem instead of removing the key (a missing number and an
+    unmeasurable one are different facts)."""
+    if centre is None or not payload.get("available"):
+        return
+    fn = embed or voiceprint.embed
+    for emo, path in stem_paths.items():
+        try:
+            payload["stems"][emo] = {
+                "identity": round(voiceprint.similarity(fn(Path(path)), centre), 3)}
+        except Exception as exc:  # noqa: BLE001
+            payload["stems"][emo] = {
+                "identity": None,
+                "reason": f"{type(exc).__name__}: {exc}"[:160]}
+
+
+# ── closing the loop: score the CLONE, not just its inputs ────────────────────
+def _engine_synthesize(voice_id: str, text: str) -> bytes:
+    """Synthesize one line through an already-running engine, if there is one.
+
+    Deliberately NOT an import of `service.app`: ingest is imported BY the app
+    (via ingest_api), so importing it back would be a cycle, and a CLI ingest run
+    has no engine at all. Looking the module up in `sys.modules` asks exactly the
+    right question — "is a loaded engine already in this process?" — and answers
+    "no" cheaply everywhere else. A caller with its own synthesizer passes
+    `synthesize=` to `commit` instead.
+    """
+    app = sys.modules.get("service.app")
+    engine = getattr(app, "ENGINE", None) if app is not None else None
+    if engine is None or not getattr(engine, "ready", lambda: False)():
+        raise RuntimeError("no synthesis engine is running in this process")
+    job = engine.submit(voice_id, text)
+    return job.future.result(timeout=CALIBRATION_TIMEOUT_S).wav_bytes
+
+
+def calibrate_clone(voice_id: str, reference_wav: Path, work_dir: Path,
+                    synthesize: Callable[[str, str], bytes] | None = None,
+                    *, embed: Callable[[Path], object] | None = None
+                    ) -> tuple[float | None, str | None]:
+    """Score a freshly exported clone against the audio it was cloned from.
+
+    Synthesizes ONE fixed calibration line through the new embedding and compares
+    its speaker embedding with the reference stem's: the first time this pipeline
+    ever hears its own output. Returns `(identity, reason)` — exactly one of the
+    two is None, so a caller can always say either the number or why there isn't
+    one. Never raises: a clone is not failed over a measurement (and see
+    voiceprint.py on why synthetic speech makes this advisory evidence).
+    """
+    if embed is None:
+        reason = voiceprint.unavailable_reason()
+        if reason:
+            return None, reason
+        embed = voiceprint.embed
+    try:
+        wav = (synthesize or _engine_synthesize)(voice_id, CALIBRATION_TEXT)
+    except Exception as exc:  # noqa: BLE001
+        return None, f"calibration line was not synthesized: {exc}"[:200]
+    try:
+        out = work_dir / f"calib_{voice_id}.wav"
+        out.write_bytes(wav)
+        return round(voiceprint.similarity(embed(out), embed(Path(reference_wav))), 3), None
+    except Exception as exc:  # noqa: BLE001
+        return None, f"calibration line was not scored: {type(exc).__name__}: {exc}"[:200]
+
+
+def _stamp_fidelity(entry: dict, reference_wav: Path, identity: float) -> None:
+    """Put a measured identity on a registry row, in the C1 fidelity shape.
+
+    `service/voices.py` OWNS that schema (batch-1 design C1): `measure_fidelity`
+    computes the signal-only half — speech seconds, clip ratio, noise floor,
+    flags — from the audio and merges an identity the caller supplies. It is
+    reached through the loaded module rather than imported, so a rename there
+    degrades this to "identity only" instead of breaking ingest's import; the
+    identity is never lost either way. What this will NOT write is a row of
+    Nones, because `fidelity: null` has to keep meaning "not measured".
+    """
+    module = sys.modules.get("service.voices")
+    builder = next((fn for fn in (getattr(module, "measure_fidelity", None),
+                                  getattr(module, "build_fidelity", None))
+                    if callable(fn)), None)
+    if builder is not None:
+        try:
+            try:
+                obj = builder(Path(reference_wav), identity=identity)
+            except TypeError:      # the seam exists but not (yet) that keyword
+                obj = builder(Path(reference_wav))
+                if isinstance(obj, dict):
+                    obj["identity"] = identity
+            if isinstance(obj, dict) and obj:
+                entry["fidelity"] = obj
+                return
+        except Exception as exc:  # noqa: BLE001 - advisory, never fail a clone
+            _log(f"commit: voices fidelity measurement failed, storing identity "
+                 f"only: {exc}")
+    entry["fidelity"] = {
+        "version": FIDELITY_VERSION,
+        "measured_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "identity": identity, "speech_seconds": None, "clip_ratio": None,
+        "noise_floor_db": None, "flags": [], "measures": _IDENTITY_CAVEAT}
+
+
 # ── LABEL + STEM for a chosen speaker ─────────────────────────────────────────
 def label_and_stem(work_dir: Path, target: str, min_stem: float = MIN_STEM_SECONDS, limit: int = 40,
                    progress: Callable[[str, str], None] | None = None,
@@ -1194,6 +1476,23 @@ def label_and_stem(work_dir: Path, target: str, min_stem: float = MIN_STEM_SECON
             f"{state['classify_errors']} could not be classified. "
             "If this keeps happening the emotion classifier may be unavailable; "
             "try again in a few minutes.")
+    # MEASURE the segments before anything is spliced: a bystander voice or a
+    # mis-attributed span is cheap to exclude here and impossible to remove once
+    # it is inside a stem. Wrapped whole — a scan is never failed over a
+    # measurement, it is only ever made less informative (and says so).
+    _check(should_cancel)
+    try:
+        fidelity, dropped, centre = measure_segments(usable)
+    except Exception as exc:  # noqa: BLE001
+        fidelity, dropped, centre = _unmeasured(
+            f"speaker measurement failed: {type(exc).__name__}: {exc}"[:200]), set(), None
+    if dropped:
+        _log(f"label: {len(dropped)} segment(s) removed from the stems — they do "
+             "not sound like the target speaker")
+        usable = [l for l in usable if l["i"] not in dropped]
+    if partial:
+        partial({"fidelity": fidelity})
+
     by_emotion: dict[str, list[dict]] = {}
     for lab in usable:
         by_emotion.setdefault(lab["emotion"], []).append(lab)
@@ -1219,13 +1518,36 @@ def label_and_stem(work_dir: Path, target: str, min_stem: float = MIN_STEM_SECON
                       "cues": [l["cue"] for l in labs[:3]], "note": None})
     order = {e: i for i, e in enumerate(EMOTION_SCALE)}
     stems.sort(key=lambda s: order.get(s["emotion"], 99))
+
+    # The stems exist now, so each one can be scored as a whole — the number the
+    # review screen shows per stem. Splicing can lower it (level matching, the
+    # borrowed baseline top-up), which is exactly why it is measured AFTER.
+    try:
+        score_stems(fidelity, centre,
+                    {s["emotion"]: work_dir / f"stem_{s['emotion']}.wav" for s in stems})
+    except Exception as exc:  # noqa: BLE001
+        _log(f"stem: fidelity scoring skipped: {exc}")
+    _outlier_by_index = {o["i"]: o["action"]
+                         for o in fidelity.get("per_segment_outliers", [])}
+    for s in stems:
+        scored = fidelity.get("stems", {}).get(s["emotion"]) or {}
+        # Absent = absent: a stem that could not be scored carries no key at all,
+        # so the UI has nothing to render rather than a zero to misread.
+        if scored.get("identity") is not None:
+            s["identity"] = scored["identity"]
     prog("stem", "done")
 
     return {"target": target, "utterances": len(tsegs), "min_stem": min_stem, "stems": stems,
-            "spend": ledger.snapshot(),
+            "fidelity": fidelity, "spend": ledger.snapshot(),
+            # `outlier` rides here (not only in fidelity.per_segment_outliers) so
+            # the review list can mark a segment where the user is already
+            # looking: "dropped" = its audio is not in any stem, "flagged" = it
+            # is, and it looked unlike the rest. Absent = nothing measured about
+            # it, which must render as nothing at all.
             "segments": [{"emotion": l["emotion"], "confidence": l["confidence"], "cue": l["cue"],
                           "dur": l["dur"], "text": l["text"], "model": l["model"],
                           "failure": l.get("failure"),
+                          "outlier": _outlier_by_index.get(l["i"]),
                           "escalation": l.get("escalation")} for l in labelled]}
 
 
@@ -1272,7 +1594,8 @@ def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: st
            progress: Callable[[int, str | None], None] | None = None,
            should_cancel: Callable[[], bool] | None = None,
            on_voice: Callable[[dict], None] | None = None,
-           allow_short: bool = False) -> list[dict]:
+           allow_short: bool = False,
+           synthesize: Callable[[str, str], bytes] | None = None) -> list[dict]:
     """Clone each accepted stem into a Voice.
 
     Cloning runs in ONE child process (`python -m service.export_stems`) that
@@ -1290,6 +1613,16 @@ def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: st
     learn from it what an EXCEPTION left behind — registration happens per stem
     via `mutate_meta`, so a raise mid-batch leaves live Voices the return value
     never mentions. This callback is that caller's ledger.
+
+    CLOSING THE LOOP: when speaker measurement is available, each exported clone
+    is heard back — one fixed calibration line synthesized through the new
+    embedding, scored against the stem it was cloned from — and the resulting
+    identity is stamped on the Voice's registry row (design C1). `synthesize` is
+    that seam: `(voice_id, text) -> wav bytes`. Left None it asks whether a loaded
+    engine happens to be in this process and, if not, reports a named skip; the
+    identity is then absent, never zero. NOTHING here can fail a clone: the whole
+    measurement is advisory, and the reason for every skip travels back to the
+    caller on the per-voice dict.
 
     Eligibility: a stem shorter than MIN_STEM_SECONDS clones poorly, so it is
     SKIPPED (never cloned) and reported — the whole commit does not fail. Pass
@@ -1353,6 +1686,13 @@ def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: st
         "stems": [{"emotion": p["emotion"], "src": p["src"], "dst": p["dst"]} for p in plan],
     }), "utf-8")
 
+    # Asked ONCE, before the model is loaded: if identity cannot be measured
+    # there is no point synthesizing a calibration line to measure it with, so an
+    # un-equipped box pays nothing for this feature and still gets told why.
+    fidelity_reason = voiceprint.unavailable_reason()
+    if fidelity_reason:
+        _log(f"commit: clone identity will not be measured — {fidelity_reason}")
+
     by_emotion = {p["emotion"]: p for p in plan}
     proc = subprocess.Popen(
         [sys.executable, "-m", "service.export_stems", str(spec_path)],
@@ -1399,10 +1739,22 @@ def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: st
         if not evt.get("ok") or not Path(p["dst"]).is_file():
             _terminate()
             raise RuntimeError(f"clone {emo} failed: {evt.get('error') or 'export error'}")
+        # The embedding is written and loadable-back; hear it before registering
+        # it, so the row lands carrying its own measured fact.
+        identity, identity_reason = None, fidelity_reason
+        if fidelity_reason is None:
+            identity, identity_reason = calibrate_clone(
+                p["voice_id"], Path(p["src"]), work_dir, synthesize)
+            _log(f"commit: '{emo}' identity "
+                 + (f"{identity:.3f}" if identity is not None
+                    else f"not measured — {identity_reason}"))
+
         entry = {
             "name": name, "character_id": cid, "emotion": emo,
             "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "sample_seconds": p["seconds"], "lang": "EN", "source": "ingest"}
+        if identity is not None:
+            _stamp_fidelity(entry, Path(p["src"]), identity)
         if consent is not None:
             entry["consent"] = {
                 "consented_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -1434,6 +1786,12 @@ def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: st
                     progress(done, plan[done]["emotion"])
             continue
         made = {"voice_id": p["voice_id"], "emotion": emo, "seconds": p["seconds"]}
+        if identity is not None:
+            made["identity"] = identity
+        elif identity_reason:
+            # Named, not silent: the studio can say "identity was not measured
+            # because …" instead of showing an empty slot the user must guess at.
+            made["identity_reason"] = identity_reason
         created.append(made)
         if on_voice:
             on_voice(made)
