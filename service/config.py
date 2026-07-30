@@ -155,6 +155,13 @@ class Settings:
     ingest_escalation_budget: int = _int("INGEST_ESCALATION_BUDGET", 12)
     # Fallback built-in voice if a requested voice_id isn't found.
     default_voice: str = _str("TTS_DEFAULT_VOICE", "alba")
+    # --- Piper voices (service/piper.py) -----------------------------------
+    # A SECOND synthesis engine, for the languages Pocket TTS does not speak
+    # (it does English and French; the transcriber understands dozens). Nothing
+    # is required: an empty directory means no Piper voices and every caller
+    # falls through to the Pocket TTS pool exactly as before.
+    #   python -m piper.download_voices --download-dir piper_voices cs_CZ-jirka-medium
+    piper_voices_dir: str = _str("PIPER_VOICES_DIR", str(REPO_ROOT / "piper_voices"))
 
     # --- Generation defaults ----------------------------------------------
     # Passed to TTSModel.generate_audio(max_tokens=...) for EVERY job. No HTTP
@@ -205,8 +212,140 @@ class Settings:
     # N single-worker replicas, so plan for cache_bytes × replicas of RSS.
     cache_bytes: int = _int("TTS_CACHE_BYTES", 128 * 1024 * 1024)
 
+    # --- Speech to text (local, faster-whisper) ----------------------------
+    # The transcriber behind /v1/speech-to-text and the ConvAI session's ears.
+    # Local by construction: CTranslate2 int8 on CPU, weights cached on disk,
+    # nothing leaves the machine. This is the half of the product the ingest
+    # pipeline had to buy from ElevenLabs Scribe (service/ingest.py, CLOUD
+    # mode); sovereign mode simply had no transcript at all.
+    #
+    # Size is the accuracy/latency dial, and the default is deliberate: "small"
+    # is the smallest model that reliably keeps domain nouns intact ("React",
+    # "PostgreSQL"), which is the whole point of transcribing an interview.
+    # "base" is ~2x faster and noticeably worse at exactly those words; "tiny"
+    # is for smoke tests. Weights download on FIRST use (~460 MB for small).
+    stt_model: str = _str("STT_MODEL", "small")
+    # int8 is the CPU-sane default (CTranslate2 quantizes on load). "float32"
+    # is the reference path; "int8_float32" trades some memory for accuracy.
+    stt_compute_type: str = _str("STT_COMPUTE_TYPE", "int8")
+    stt_device: str = _str("STT_DEVICE", "cpu")
+    # Beam width. 1 (greedy) is ~2x faster than the library default of 5 and is
+    # the right trade for conversational turns, where latency IS the product.
+    # Raise it for offline batch transcription of a recording.
+    stt_beam_size: int = _int("STT_BEAM_SIZE", 1)
+    # Threads CTranslate2 may use. Shares a box with the TTS worker pool, so it
+    # is pinned for the same reason ffmpeg_threads is: an unpinned transcriber
+    # oversubscribes exactly the cores the launcher gave to inference.
+    stt_threads: int = _int("STT_THREADS", 4)
+    # Where model weights are cached. Empty = the HuggingFace default
+    # (~/.cache/huggingface), shared with the TTS weights.
+    stt_download_root: str = _str("STT_DOWNLOAD_ROOT", "")
+    # Longest clip /v1/speech-to-text will accept. Whisper is ~5-10x realtime on
+    # CPU, so an unbounded upload is an unbounded request. 15 min matches
+    # ingest_max_clip_seconds — the same recording, the same ceiling.
+    stt_max_clip_seconds: float = float(_str("STT_MAX_CLIP_SECONDS", "900"))
+
+    # --- Speaker diarization (service/diarize.py) --------------------------
+    # Who spoke when. sherpa-onnx + pyannote-segmentation-3.0 (MIT) + WeSpeaker
+    # CAM++ (Apache-2.0), all from unauthenticated GitHub releases — chosen over
+    # pyannote.audio precisely because its pretrained pipelines need a
+    # HuggingFace account and token, which this service cannot require.
+    #   python -m service.diarize --download        (~34 MB, once)
+    diarize_models_dir: str = _str("DIARIZE_MODELS_DIR",
+                                   str(REPO_ROOT / "diarization_models"))
+    diarize_threads: int = _int("DIARIZE_THREADS", 1)
+    # Cosine distance at which two voices are called different people — the only
+    # knob that genuinely moves the answer (sherpa-onnx's num_clusters does not
+    # produce the count you ask for; see service/diarize.py). 0.6 is measured,
+    # not guessed: in a 0.4-0.8 sweep it was the only value that got BOTH of
+    # sherpa-onnx's labelled human fixtures exactly right.
+    diarize_threshold: float = float(_str("DIARIZE_THRESHOLD", "0.6"))
+    diarize_min_speech_s: float = float(_str("DIARIZE_MIN_SPEECH_S", "0.3"))
+    diarize_min_silence_s: float = float(_str("DIARIZE_MIN_SILENCE_S", "0.5"))
+
+    # --- Conversational agent (ConvAI) -------------------------------------
+    # The ElevenLabs-Agents-shaped WebSocket surface: ears (stt) + brain (an
+    # LLM) + mouth (the TTS pool) in one duplex session. See service/convai.py.
+    convai_enabled: bool = _bool("CONVAI_ENABLED", True)
+    # Which brain answers. Defaults to "scripted" ON PURPOSE: it needs no LLM,
+    # no network and no extra install, and a canned interviewer is what an
+    # automated test actually wants — deterministic turns make transcript and
+    # latency assertions mean something. Point it at a real model
+    # (CONVAI_LLM=openai-compat + a local Ollama / LM Studio) for realism.
+    # `GET /v1/convai/agents` reports which one is live, so nobody has to guess.
+    #   "scripted"      — fixed turns, no model (the default; see above)
+    #   "claude-cli"     — the `claude` CLI headless, on the machine's own
+    #                      subscription. No key, no server, no download; costs
+    #                      ~4-6 s per turn instead of ~1.6 s.
+    #   "openai-compat" — any local /chat/completions server
+    convai_llm: str = _str("CONVAI_LLM", "scripted")
+    # The Claude CLI brain (service/dialog.ClaudeCliBackend).
+    claude_cli_command: str = _str("CLAUDE_CLI_COMMAND", "claude")
+    # "haiku" is the fastest tier and a screening question does not need more.
+    # Empty string uses whatever the CLI is configured to default to.
+    claude_cli_model: str = _str("CLAUDE_CLI_MODEL", "haiku")
+    # Per-turn ceiling. Generous next to a ~5 s turn because a cold CLI start on
+    # a loaded box is slow, and a killed turn costs the whole conversation.
+    claude_cli_timeout_s: float = float(_str("CLAUDE_CLI_TIMEOUT_S", "60"))
+    # Any OpenAI-compatible /chat/completions server. Ollama's default port.
+    convai_llm_base_url: str = _str("CONVAI_LLM_BASE_URL", "http://127.0.0.1:11434/v1")
+    convai_llm_model: str = _str("CONVAI_LLM_MODEL", "llama3.2")
+    convai_llm_api_key: str = _str("CONVAI_LLM_API_KEY", "")
+    # Ceiling on ONE reply. A conversational turn that takes longer than this
+    # has already failed the conversation, whatever it eventually says.
+    convai_llm_timeout_s: float = float(_str("CONVAI_LLM_TIMEOUT_S", "45"))
+    # Per-reply token budget. Interview turns are short; an unbounded reply is a
+    # minute of synthesis the caller has to sit through.
+    convai_llm_max_tokens: int = _int("CONVAI_LLM_MAX_TOKENS", 220)
+    # Agent definitions (JSON, one per file). Alongside voices/, takes/, ... so
+    # a deployment mounts ONE data volume. BUILTIN_AGENTS ships a working
+    # interviewer, so an empty directory is a valid installation.
+    convai_agents_dir: str = _str("CONVAI_AGENTS_DIR", str(REPO_ROOT / "agents"))
+    # Base URL clients should dial back on, for deployments where the address
+    # the browser uses is NOT the address this process sees (a reverse proxy, a
+    # container port map). Empty = derive it from the mint request, which is
+    # right for every direct-connection case including localhost.
+    #   CONVAI_PUBLIC_URL="https://tts.example.com"  -> wss://tts.example.com/...
+    convai_public_url: str = _str("CONVAI_PUBLIC_URL", "")
+    # How long a minted signed URL stays valid. It is a connect ticket, not a
+    # session credential: the client dials immediately, so a short life bounds
+    # the damage from a leaked URL (the WS cannot carry an auth header, which is
+    # exactly why this ticket exists — see convai.mint_ticket).
+    convai_ticket_ttl_s: int = _int("CONVAI_TICKET_TTL_S", 120)
+    # Concurrent conversations this replica will hold. Each one owns a
+    # transcriber and competes for the TTS pool, so the honest cap is small;
+    # over it the WS is closed at once rather than queued (a conversation that
+    # waits is a conversation that failed).
+    convai_max_sessions: int = _int("CONVAI_MAX_SESSIONS", 4)
+    # Whole-conversation ceiling (seconds). A wedged or abandoned socket costs a
+    # session slot forever without it. 30 min is longer than any interview.
+    convai_session_max_s: float = float(_str("CONVAI_SESSION_MAX_S", "1800"))
+    # Silence (no user speech, no agent turn) that ends a conversation.
+    convai_idle_timeout_s: float = float(_str("CONVAI_IDLE_TIMEOUT_S", "300"))
+    # Sample rate for BOTH directions of the audio stream, announced in
+    # conversation_initiation_metadata as pcm_{rate}. 16 kHz is what ElevenLabs
+    # agents use, what Whisper wants natively, and what the browser SDK expects;
+    # the TTS pool's 24 kHz output is resampled down on the way out.
+    convai_audio_rate: int = _int("CONVAI_AUDIO_RATE", 16000)
+    # Server->client ping cadence and how many unanswered pings end the session.
+    # Same shape as the ElevenLabs ping/pong: it is the only liveness signal on
+    # a socket where silence is also a legitimate state.
+    convai_ping_interval_s: float = float(_str("CONVAI_PING_INTERVAL_S", "20"))
+    convai_ping_max_missed: int = _int("CONVAI_PING_MAX_MISSED", 3)
+    # Write each conversation's audio and transcript to disk (service/recording.py).
+    # OFF by default and deliberately so: this service's claim is that audio does
+    # not leave the machine, and recording every caller unasked is a DIFFERENT
+    # promise that belongs to an operator, not to a default. Turn it on for test
+    # runs, where the recording is the deliverable.
+    convai_record: bool = _bool("CONVAI_RECORD", False)
+    convai_recordings_dir: str = _str("CONVAI_RECORDINGS_DIR",
+                                      str(REPO_ROOT / "recordings"))
+
     # --- Server ------------------------------------------------------------
     host: str = _str("TTS_HOST", "127.0.0.1")
+    # Level for this service's OWN logs (the `gravitone` logger tree), applied
+    # by app.main. Separate from uvicorn's request log, which it does not touch.
+    log_level: str = _str("TTS_LOG_LEVEL", "info")
     port: int = _int("TTS_PORT", 8080)
     # Optional shared secret; if set, requests must send it as `xi-api-key`
     # (ElevenLabs-compatible header). Empty = open (local dev).

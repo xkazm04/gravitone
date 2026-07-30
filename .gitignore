@@ -17,3 +17,6 @@ takes/
 reviews/
 .worktrees/
 ingest_jobs/
+recordings/
+piper_voices/
+diarization_models/

@@ -50,6 +50,27 @@ study**:
 4. **Load-test harness** (`service/loadtest.py`) — ramps concurrency, reports
    latency percentiles / throughput / server RTF / CPU / RAM, and the
    recommended safe cap. Emits `loadtest_result.json`.
+5. **Local speech-to-text** (`service/stt.py`) — `POST /v1/speech-to-text`,
+   shaped like ElevenLabs Scribe, backed by faster-whisper (CTranslate2 int8 on
+   CPU). Per-request keyword bias, which the hosted browser SDK cannot do at
+   all. Optional **speaker diarization** (`service/diarize.py`, sherpa-onnx —
+   chosen over pyannote.audio because its pretrained pipelines need a
+   HuggingFace account, which a service that claims to run offline cannot
+   demand).
+6. **Conversational agents** (`service/convai.py`) — the **ElevenLabs Agents
+   WebSocket, served locally**: `GET /v1/convai/conversation/get-signed-url`
+   then a duplex socket that hears the caller (`service/vad.py` finds the turn
+   boundaries, `stt.py` transcribes), answers (`service/dialog.py`), and speaks
+   through the same worker pool. Barge-in, ping/pong and per-session prompt
+   overrides included. An app already written against ElevenLabs Agents
+   repoints by changing **one base URL** — the browser SDK needs no changes.
+
+**A conversation costs nothing per minute.** Hosted conversational AI bills by
+the minute (~$0.09–0.15/min at the time of writing), which is what makes
+*automated* spoken testing — run the same interview a hundred times, measure
+word error rate and turn latency — a line item instead of a habit. The whole
+loop here is local: 3-second turn latency budget on this class of hardware,
+$0.00 per minute, and no audio leaves the machine.
 
 **Canonical audio cleanup.** Pocket TTS reproduces the *acoustic quality* of the
 reference clip, so every clone path conditions audio through **one** shared
@@ -178,10 +199,179 @@ curl -X POST "localhost:8080/v1/text-to-speech/myvoice" \
   -H "Content-Type: application/json" \
   -d '{"text":"This is my cloned voice."}' --output cloned.wav
 
-# 4. Find this machine's concurrency cap (or just run: bash benchmark_arm.sh)
+# 4. Transcribe a recording (first call downloads the model, ~460 MB)
+curl -X POST localhost:8080/v1/speech-to-text \
+  -F file=@out.wav -F keywords="Arm Graviton"
+
+# 5. List the conversational agents and mint a conversation URL
+curl -s localhost:8080/v1/convai/agents
+curl -s "localhost:8080/v1/convai/conversation/get-signed-url?agent_id=local-interviewer"
+
+# 6. Find this machine's concurrency cap (or just run: bash benchmark_arm.sh)
 python -m service.loadtest \
   --voice alba --levels 1,2,3,4,6,8 --requests 8
 ```
+
+### Holding a conversation
+
+The socket in step 5 speaks the ElevenLabs Agents protocol: send
+`conversation_initiation_client_data`, then a continuous stream of
+`{"user_audio_chunk": "<base64 PCM16 mono 16 kHz>"}` paced in real time, and
+read back `user_transcript`, `agent_response`, `audio` and `interruption`.
+
+Who answers is `CONVAI_LLM`, and the choice is a latency-for-realism trade with
+measured numbers:
+
+| `CONVAI_LLM` | Turn latency | What it is |
+|---|---|---|
+| **`scripted`** (default) | **1.3–1.7 s** | Fixed turns, no model, nothing to install. Deterministic — which is what a word-error-rate or latency assertion needs. |
+| `claude-cli` | **11–15 s** | The `claude` CLI headless on the machine's own subscription. Real adaptive conversation, no API key, no server, no download. |
+| `openai-compat` | depends | Any local OpenAI-compatible server (LM Studio, llama.cpp, vLLM). |
+
+`scripted` is not a placeholder — a test that asserts WER or turn latency needs
+the interviewer to say the same thing every run. Reach for `claude-cli` when the
+test is about behaviour: it answers what the candidate actually said ("That's
+solid experience with Python and PostgreSQL — what's been your most recent
+role?"), at roughly ten times the turn cost. Most of that is the CLI's own
+start-up and thinking, and it gets worse under load because it competes with
+synthesis for the same cores.
+
+`GET /v1/convai/agents` reports which brain is live, because a scripted agent
+and a model-driven one sound identical from the outside.
+
+**The CLI brain runs disarmed.** A default `claude -p` session has Bash, Write
+and a scheduler available, which should not be one hallucination away from an
+unattended interview. `--disallowed-tools` removes them (verified — unlike
+`--allowed-tools`, which only decides what is *pre-approved* and leaves
+everything callable), `--system-prompt` replaces Claude Code's identity with the
+agent's brief, and if a tool call appears anyway the turn is killed and fails
+loudly. The denylist lowers the odds; the abort is the guarantee, because it
+does not depend on knowing the tool's name.
+
+An agent is a JSON file in `agents/` — prompt, voice, language, opening line,
+keyword bias, and an optional script. A file whose id matches a built-in
+replaces it, which is how you re-voice or re-prompt the shipped interviewer
+without forking the source.
+
+### Speaking a language Pocket TTS doesn't
+
+Pocket TTS speaks English and French. The transcriber understands dozens, so a
+Czech caller was *heard* correctly and answered in English phonetics — a
+conversation that worked and was unusable. `service/piper.py` is a **second**
+synthesis engine (Piper, ONNX, CPU, MIT) for exactly that gap, and it is a
+fallback rather than a replacement: Pocket TTS keeps voice cloning and emotion
+voices, which Piper has no answer to.
+
+```bash
+python -m piper.download_voices --download-dir piper_voices cs_CZ-jirka-medium
+curl -s "localhost:8080/v1/convai/conversation/get-signed-url?agent_id=local-interviewer-cs"
+```
+
+The shipped `local-interviewer-cs` agent names **no voice** — `"language": "cs"`
+is enough, because a language Pocket TTS cannot speak resolves to a Piper voice
+automatically. With no Czech voice installed that agent reports itself
+`"speakable": false` with the download command, instead of reading Czech words
+with English phonemes. A full Czech conversation measured **1.2 s** per turn.
+
+Keyword bias is what makes technical speech survive. Czech Whisper heard
+"backendové služby v Pythonu a PostgreSQL" as *"bekendové služby v Pithanu a
+pozdějc Esquale"*; with the agent's `keywords` list it became *"backendové
+služby v Pythonu a pozdějc SQL"* — two of the three terms recovered. "PostgreSQL"
+in Czech speech remains stubborn, and that is the honest state of it.
+
+### Who spoke when
+
+```bash
+python -m service.diarize --download        # ~34 MB, no account needed
+curl -X POST localhost:8080/v1/speech-to-text \
+  -F file=@interview.wav -F diarize=true
+```
+
+Words come back tagged `speaker_0` / `speaker_1` (renumbered in order of first
+appearance — the clusterer's own ids are arbitrary and sparse), plus the speaker
+turns and a `speaker_count_is_a_hypothesis` flag that is always true. Read the
+limits above before believing a count.
+
+### Recordings — playing a test back
+
+`CONVAI_RECORD=1` makes every conversation leave `recordings/<id>/`:
+
+```
+user.wav          what the caller's microphone sent
+agent.wav         what the agent said back
+transcript.json   every turn, with audio_s / transcribe_s / answer_s per turn
+meta.json         agent, voice, brain, transcriber, how it ended
+```
+
+**The two WAVs share one timeline** — open them on two tracks and you are
+listening to the call as it happened. That takes work rather than luck: the
+agent's audio is transmitted much faster than it plays, so its track is padded
+to the moment the caller actually heard each reply begin. `transcript.json`
+carries the numbers a word-error-rate or latency report is computed from, and
+`GET /v1/convai/conversations` lists what has been recorded.
+
+Recording is **off by default**. This service's claim is that audio does not
+leave the machine; writing every caller's voice to disk unasked is a different
+promise, and it belongs to an operator rather than to a default. For test runs,
+where the recording is the deliverable, turn it on.
+
+### Pointing an existing app at it
+
+An app already written against ElevenLabs Agents needs one environment change.
+Verified against [kp](https://github.com/xkazm04/kp)'s AI interviewer, whose
+browser client is `@elevenlabs/react` and which needed **no client change at
+all** — the SDK connects to whatever signed URL the server hands it:
+
+```bash
+ELEVENLABS_BASE_URL=http://127.0.0.1:8080   # instead of api.elevenlabs.io
+ELEVENLABS_AGENT_ID=local-interviewer
+ELEVENLABS_API_KEY=local                    # a local service may ignore it
+```
+
+Its own spoken-interview harness then ran 11 scenarios (including barge-in,
+monologue, hostile and prompt-injection probes) end to end against this
+service — every session completing, no turns dropped, **corpus WER 0–12%** and
+**p95 turn latency 1.2–1.8 s**, at zero cost per minute.
+
+### Limits worth knowing before you rely on it
+
+- **Diarization is good on people, bad on robots.** Measured against
+  sherpa-onnx's labelled human fixtures it got both exactly right (2→2, 4→4 at
+  the default threshold). Pointed at this service's own synthesized voices it
+  reported two speakers as three — independently generated TTS moves the speaker
+  embedding more than one real person's voice does. There is deliberately **no
+  "number of speakers" parameter**: the underlying `num_clusters` does not
+  honour it (asking for 4 gave 3, asking for 2 gave 1), so `speaker_threshold`
+  is the only honest knob and counts skew high. Treat the count as a hypothesis
+  a human may correct.
+- **The scripted brain cannot adapt.** It says the same lines every run, which
+  is exactly why latency and word-error tests use it — and means it will not
+  follow a speaker into another language or answer a question they asked. Use
+  `CONVAI_LLM=claude-cli` when the test is about behaviour.
+- **A level-based turn detector hears doors.** `service/vad.py` finds speech by
+  loudness, not by phonetics, and the transcriber is the backstop: a false onset
+  produces no words and is dropped rather than becoming an empty turn. A gate
+  that opens mid-utterance also costs one utterance while it calibrates.
+
+**Measured on the x86-64 dev box** (1 worker, `small` transcriber, scripted
+brain) as a closed loop: the service synthesizes a candidate's line, streams it
+back into its own ear at real-time pace, and answers.
+
+| Server-side, end of speech → first audio | |
+|---|---|
+| Turn latency, steady state | **1.6 s** |
+| Of which: transcribing ~4.6 s of speech | 1.3–1.6 s (~3x realtime) |
+| Of which: synthesizing the first sentence | ~0.3 s |
+| First turn of a conversation | 2.0 s |
+
+Transcription dominates, so `STT_MODEL=base` is the dial to turn if 1.6 s is
+too slow and the vocabulary is ordinary. The first turn is slightly dearer
+because the transcriber loads while the agent speaks its opening line; without
+that overlap it costs ~1.8 s more, which is why the session starts the load at
+connect rather than at the first thing it hears. Replies are synthesized
+sentence by sentence as the model writes them, so a **long** reply costs no
+more before its first word is heard — a language-model brain adds only its own
+time-to-first-sentence.
 
 ### Scaling on Arm — the replica launcher
 

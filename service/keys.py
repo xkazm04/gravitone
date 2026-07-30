@@ -65,8 +65,10 @@ _LAST_USED_DEBOUNCE_S = 60.0
 _LAST_USED: dict[str, str] = {}        # kid -> current iso timestamp (in-memory)
 _LAST_PERSIST: dict[str, float] = {}   # kid -> monotonic time of last file write
 # tts=synthesize, voices=manage, clone=upload,
-# performance=multi-character scripts (/v1/performance — the premium tier)
-SCOPES = ["tts", "voices", "clone", "performance"]
+# performance=multi-character scripts (/v1/performance — the premium tier),
+# stt=transcribe (/v1/speech-to-text), convai=hold a spoken conversation
+# (/v1/convai/... — it both listens and speaks, so it is neither of the two).
+SCOPES = ["tts", "voices", "clone", "performance", "stt", "convai"]
 
 
 class ApiKey(BaseModel):

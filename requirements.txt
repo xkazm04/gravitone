@@ -1,6 +1,20 @@
 # torch is pulled in by pocket-tts. On aarch64 Linux, pip installs the
 # manylinux ARM wheel with oneDNN + Arm Compute Library kernels.
 pocket-tts>=2.1.0
+# Local speech-to-text (service/stt.py) and therefore the ears of the
+# conversational agent. CTranslate2 int8 on CPU — no GPU, no API key, and the
+# same "runs on the box you already have" claim the TTS side makes. Weights are
+# fetched on first use, not at install time.
+faster-whisper>=1.1
+# Speaker diarization (service/diarize.py). Chosen over pyannote.audio because
+# its pretrained pipelines require a HuggingFace account + token, which a service
+# that claims to run offline on your own box cannot demand. sherpa-onnx links its
+# own ONNX runtime, so this adds no torch dependency. Models are fetched by
+# `python -m service.diarize --download` (~34 MB), not at install time.
+sherpa-onnx>=1.13
+# Piper voices (service/piper.py) — the second synthesis engine, for the
+# languages Pocket TTS does not speak. Voice files are downloaded separately.
+piper-tts>=1.3
 fastapi>=0.100
 uvicorn[standard]>=0.20
 scipy>=1.10

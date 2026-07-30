@@ -2,7 +2,11 @@
 
 Endpoints (compatible with common ElevenLabs client code):
   POST /v1/text-to-speech/{voice_id}          -> audio bytes (wav|mp3)
+  POST /v1/speech-to-text                     -> transcript (service/stt.py)
   GET  /v1/voices                             -> list available voices
+  WS   /v1/convai/conversation                -> a spoken conversation, shaped
+                                                 like ElevenLabs Agents
+                                                 (service/convai.py)
   GET  /health                                -> readiness (config/metrics for
                                                  observability-scope callers)
   GET  /metrics                               -> raw counters for the load test
@@ -62,6 +66,9 @@ from service.ingest_api import (
 )
 from service.packs import router as packs_router
 from service.takes import router as takes_router, reviews_router
+from service import convai
+from service.convai import router as convai_router, ws_router as convai_ws_router
+from service.stt import router as stt_router
 
 ENGINE: TtsEngine | None = None
 
@@ -1217,6 +1224,23 @@ app.include_router(packs_router, dependencies=[Depends(require_scope("voices"))]
 app.include_router(takes_router, dependencies=[Depends(require_scope("tts"))])
 # Review sets (client approval links) — same surface, same scope.
 app.include_router(reviews_router, dependencies=[Depends(require_scope("tts"))])
+# Local transcription (service/stt.py) — its own scope: hearing a recording is
+# a different capability from speaking one, and a drop-in TTS client has no
+# business transcribing.
+app.include_router(stt_router, dependencies=[Depends(require_scope("stt"))])
+# Conversational agents (service/convai.py). TWO routers on purpose: the HTTP
+# half mints the signed URL and is scope-checked like everything else, while the
+# socket half authenticates on the ticket in that URL. A browser cannot put an
+# xi-api-key header on a WebSocket handshake, so applying an auth dependency to
+# the socket would lock out the exact client this surface exists for.
+app.include_router(convai_router, dependencies=[Depends(require_scope("convai"))])
+app.include_router(convai_ws_router)
+# The conversation session speaks through the same worker pool as every other
+# route, but it cannot import this module to reach it (that is the import cycle
+# — app imports the router). So the pool is handed over instead; the lambda
+# defers the read until a session actually synthesizes, by which time the
+# lifespan has built it.
+convai.set_engine_provider(lambda: ENGINE)
 
 
 class SpeakRequest(BaseModel):
@@ -1535,6 +1559,23 @@ async def metrics():
 
 def main():
     import uvicorn
+    # uvicorn configures its OWN loggers and leaves the root logger at WARNING,
+    # so everything this service says about itself at INFO — "engine ready",
+    # each conversation's turns and latencies, the ingest phases — was written
+    # and then discarded. Set the level on the `gravitone` tree here (and only
+    # here, in the server entrypoint) so importing the app as a library or under
+    # test still inherits the caller's logging policy.
+    gravitone = logging.getLogger("gravitone")
+    gravitone.setLevel(SETTINGS.log_level.upper())
+    if not gravitone.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s: %(message)s"))
+        gravitone.addHandler(handler)
+        # Our own handler AND propagation to a root handler prints every line
+        # twice. Stopping here is safe precisely because we only reach this
+        # branch when nothing else has claimed this logger — an operator who
+        # configures `gravitone` themselves keeps their setup untouched.
+        gravitone.propagate = False
     uvicorn.run(app, host=SETTINGS.host, port=SETTINGS.port, log_level="info")
 
 
