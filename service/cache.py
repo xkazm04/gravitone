@@ -28,13 +28,32 @@ being a CDN.
 Threading: every entry point is called from the FastAPI event loop and does no
 blocking work, so the state needs no lock — but it is NOT safe to call from a
 worker thread.
+
+**Two shapes of entry, one mechanism.** ``CachedAudio`` is a WAV for the HTTP
+synthesis routes; ``CachedPcm`` is raw PCM at a wire rate, for the conversation
+socket's pre-rendered turn openers (service/convai.py). They are stored in
+separate cache instances and never mix in one keyspace — this object only ever
+needs an entry to report its ``nbytes``, so the byte budget, the LRU order and
+the single-flight are shared code rather than copied code.
 """
 from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Hashable
+from typing import Awaitable, Callable, Generic, Hashable, Protocol, TypeVar
+
+
+class Cacheable(Protocol):
+    """The only thing this cache needs to know about what it is holding."""
+
+    @property
+    def nbytes(self) -> int: ...
+
+
+# Whatever a given cache instance holds, it hands back the same type: a cache of
+# openers never returns a WAV to a caller that asked for PCM.
+E = TypeVar("E", bound=Cacheable)
 
 
 @dataclass(frozen=True)
@@ -51,7 +70,27 @@ class CachedAudio:
         return len(self.wav_bytes)
 
 
-class _Flight:
+@dataclass(frozen=True)
+class CachedPcm:
+    """Raw PCM16 mono at a conversation's wire rate, ready to put on the socket.
+
+    Stored rather than a WAV because the conversation path never wants a
+    container: the bytes here are handed straight to ``_send_audio``, so a hit
+    costs a base64 encode and nothing else.
+    """
+    pcm: bytes
+    sample_rate: int
+
+    @property
+    def nbytes(self) -> int:
+        return len(self.pcm)
+
+    @property
+    def audio_seconds(self) -> float:
+        return round(len(self.pcm) / 2 / max(1, self.sample_rate), 3)
+
+
+class _Flight(Generic[E]):
     """The in-flight state one leader shares with its followers.
 
     Exactly one of ``value`` / ``error`` is set before ``event`` fires, unless
@@ -64,16 +103,16 @@ class _Flight:
 
     def __init__(self) -> None:
         self.event = asyncio.Event()
-        self.value: CachedAudio | None = None
+        self.value: E | None = None
         self.error: BaseException | None = None
 
 
-class SynthCache:
+class SynthCache(Generic[E]):
     def __init__(self, max_bytes: int) -> None:
         self._max_bytes = max(0, int(max_bytes))
-        self._entries: "OrderedDict[Hashable, CachedAudio]" = OrderedDict()
+        self._entries: "OrderedDict[Hashable, E]" = OrderedDict()
         self._bytes = 0
-        self._inflight: dict[Hashable, _Flight] = {}
+        self._inflight: dict[Hashable, "_Flight[E]"] = {}
         self.hits = 0
         self.misses = 0
         self.evictions = 0
@@ -126,14 +165,14 @@ class SynthCache:
         }
 
     # -- storage ----------------------------------------------------------
-    def get(self, key: Hashable) -> CachedAudio | None:
+    def get(self, key: Hashable) -> E | None:
         entry = self._entries.get(key)
         if entry is None:
             return None
         self._entries.move_to_end(key)  # most-recently-used
         return entry
 
-    def put(self, key: Hashable, value: CachedAudio) -> None:
+    def put(self, key: Hashable, value: E) -> None:
         if not self.enabled or value.nbytes > self._max_bytes:
             # An entry larger than the whole budget would evict everything and
             # then itself; never admit it.
@@ -154,8 +193,8 @@ class SynthCache:
     # -- single-flight ----------------------------------------------------
     async def get_or_synthesize(
         self, key: Hashable,
-        produce: Callable[[], Awaitable[CachedAudio]],
-    ) -> tuple[CachedAudio, bool]:
+        produce: Callable[[], Awaitable[E]],
+    ) -> tuple[E, bool]:
         """Return ``(audio, was_cached)``, synthesizing at most once per key.
 
         ``was_cached`` is True both for a stored hit and for a request that

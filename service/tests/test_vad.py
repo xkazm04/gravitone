@@ -142,5 +142,131 @@ class SpeechGateTests(unittest.TestCase):
         self.assertLess(ends[0].utterance.ended_at_s, ends[1].utterance.started_at_s)
 
 
+class UtteranceInProgressTests(unittest.TestCase):
+    """The read-only view a speculative turn transcribes from.
+
+    Every assertion here is also an assertion that LOOKING is free: the views
+    report the buffer the gate was already keeping, and a caller that polls them
+    on every chunk must get the same turn boundaries as one that never does.
+    """
+
+    def test_nothing_is_in_progress_before_a_turn_starts(self) -> None:
+        gate = SpeechGate(RATE)
+        gate.feed(silence(400))
+        self.assertEqual(gate.partial_pcm(), b"")
+        self.assertEqual(gate.voiced_ms, 0)
+        self.assertFalse(gate.in_hangover)
+
+    def test_the_utterance_so_far_grows_while_it_is_being_spoken(self) -> None:
+        gate = SpeechGate(RATE)
+        gate.feed(silence(300) + tone(400))
+        first = gate.partial_pcm()
+        self.assertTrue(first)
+        self.assertEqual(len(first), int(gate.voiced_ms * RATE / 1000) * 2)
+        gate.feed(tone(400))
+        self.assertGreater(len(gate.partial_pcm()), len(first))
+        self.assertTrue(gate.partial_pcm().startswith(first))  # nothing rewritten
+
+    def test_hangover_is_speaking_but_quiet(self) -> None:
+        """The window a speculation is allowed to think in."""
+        gate = SpeechGate(RATE)
+        gate.feed(silence(300) + tone(600))
+        self.assertTrue(gate.speaking)
+        self.assertFalse(gate.in_hangover)
+        gate.feed(silence(100))          # quiet, but not yet long enough to end
+        self.assertTrue(gate.speaking)
+        self.assertTrue(gate.in_hangover)
+        gate.feed(silence(1000))         # the turn ends
+        self.assertFalse(gate.speaking)
+        self.assertFalse(gate.in_hangover)
+
+    def test_the_completed_utterance_is_what_was_being_watched(self) -> None:
+        gate = SpeechGate(RATE)
+        gate.feed(silence(300) + tone(700))
+        watched = gate.partial_pcm()
+        utt = gate.feed(silence(1000))[-1].utterance
+        # The final utterance is the same audio with the trailing silence (the
+        # end SIGNAL) trimmed — so a partial decode really did see the words.
+        self.assertTrue(watched.startswith(utt.pcm[:len(watched)]))
+        self.assertEqual(gate.partial_pcm(), b"")
+
+    def test_polling_the_views_does_not_move_a_boundary(self) -> None:
+        audio = silence(300) + tone(700) + silence(1000)
+        quiet = SpeechGate(RATE).feed(audio)[-1].utterance
+        polled = SpeechGate(RATE)
+        events = []
+        for i in range(0, len(audio), 640):
+            events.extend(polled.feed(audio[i:i + 640]))
+            polled.partial_pcm(), polled.voiced_ms, polled.in_hangover
+        self.assertEqual(events[-1].utterance.pcm, quiet.pcm)
+
+
+class EchoReferenceTests(unittest.TestCase):
+    """Not mistaking our own output, heard back through an open mic, for a turn.
+
+    A "quiet" tone here stands in for the echo: loud enough to clear the gate's
+    threshold (which is what makes this a real problem) but well below the level
+    we declared sending, which is what marks it as a leak rather than a person.
+    """
+
+    ECHO_LEVEL_DB = -24.0   # what we sent, roughly tone(amp=3000)
+
+    def _ready(self) -> SpeechGate:
+        gate = SpeechGate(RATE)
+        gate.feed(silence(400))          # let the floor settle first
+        return gate
+
+    def test_without_a_reference_our_own_echo_takes_the_floor(self) -> None:
+        """The problem, asserted first: this is what happens today."""
+        gate = self._ready()
+        self.assertEqual(kinds(gate.feed(tone(600, amp=400) + silence(1000))),
+                         [SPEECH_START, SPEECH_END])
+
+    def test_a_declared_window_suppresses_an_echo_level_onset(self) -> None:
+        gate = self._ready()
+        gate.expect_echo(self.ECHO_LEVEL_DB, 1.0)
+        self.assertTrue(gate.echo_active)
+        self.assertEqual(kinds(gate.feed(tone(600, amp=400) + silence(1000))), [])
+        self.assertGreater(gate.suppressed_onsets, 0)
+
+    def test_a_caller_clearly_louder_than_the_leak_still_barges_in(self) -> None:
+        """Suppression is a level test, not deafness. Losing a real interruption
+        is worse than hearing an echo, so the benefit of the doubt goes to the
+        person."""
+        gate = self._ready()
+        gate.expect_echo(self.ECHO_LEVEL_DB, 1.0)
+        self.assertEqual(kinds(gate.feed(tone(600, amp=3000) + silence(1000))),
+                         [SPEECH_START, SPEECH_END])
+
+    def test_a_caller_who_already_has_the_floor_is_never_re_judged(self) -> None:
+        gate = self._ready()
+        gate.feed(tone(500))                       # they are speaking
+        self.assertTrue(gate.speaking)
+        gate.expect_echo(self.ECHO_LEVEL_DB, 1.0)  # and now we speak too
+        events = gate.feed(tone(400) + silence(1000))
+        self.assertEqual(kinds(events), [SPEECH_END])
+        self.assertEqual(events[0].utterance.reason, "silence")
+
+    def test_the_window_is_spent_by_the_audio_that_follows_it(self) -> None:
+        gate = self._ready()
+        gate.expect_echo(self.ECHO_LEVEL_DB, 0.2)  # 200 ms + the lag allowance
+        gate.feed(silence(1000))
+        self.assertFalse(gate.echo_active)
+        # ...and the gate is its normal self again afterwards.
+        self.assertEqual(kinds(gate.feed(tone(600, amp=400) + silence(1000))),
+                         [SPEECH_START, SPEECH_END])
+
+    def test_overlapping_windows_are_judged_by_their_loudest_part(self) -> None:
+        gate = self._ready()
+        gate.expect_echo(-60.0, 1.0)                # a near-silent chunk
+        gate.expect_echo(self.ECHO_LEVEL_DB, 1.0)   # then a loud one
+        self.assertEqual(kinds(gate.feed(tone(600, amp=400) + silence(1000))), [])
+
+    def test_declaring_nothing_opens_no_window(self) -> None:
+        gate = self._ready()
+        gate.expect_echo(self.ECHO_LEVEL_DB, 0.0, lag_ms=0)
+        self.assertFalse(gate.echo_active)
+
+
 if __name__ == "__main__":
     unittest.main()

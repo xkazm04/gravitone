@@ -30,6 +30,22 @@ Three numbers do the real work, and all three are contracts with the client:
   utterance handed to the transcriber is missing its first consonant, which is
   a word error the transcriber cannot recover from because the sound is gone.
 
+Two things this gate exposes for speculative turn-taking (service/convai.py),
+both inert unless somebody asks:
+
+* **The utterance in progress.** ``partial_pcm()`` / ``voiced_ms`` /
+  ``in_hangover`` are read-only views of the buffer this gate is already
+  keeping, so a caller can transcribe the utterance-so-far while it is still
+  being spoken instead of waiting for SPEECH_END. Reading them changes nothing.
+* **An echo reference.** ``expect_echo()`` says "we just put N seconds of audio
+  at this level on the wire". While that window is open an ONSET needs a frame
+  clearly louder than our own output could plausibly leak back as (level minus
+  ``attenuation_db``); quieter loud frames are presumed to be us hearing
+  ourselves. It suppresses only onsets — a caller who already has the floor is
+  never re-judged — and it is the honest local answer to having no acoustic echo
+  canceller: it cannot cancel the echo, it can only decline to mistake it for a
+  new turn. Nothing calls it unless the session was configured to.
+
 One consequence of tracking the floor rather than measuring it is worth stating
 plainly, because it is a real cost and not a hypothetical: a gate whose FIRST
 frame is already speech takes that level as the background and hears nothing
@@ -71,6 +87,15 @@ _FLOOR_CREEP_DB = 0.02
 
 SPEECH_START = "speech_start"
 SPEECH_END = "speech_end"
+
+# How much quieter than the audio we SENT its echo is assumed to arrive. A
+# speaker-to-microphone path in a room loses well more than this, so 12 dB is
+# the conservative end: it presumes less attenuation than reality, which means
+# it suppresses less than it could rather than deafening the gate.
+_ECHO_ATTENUATION_DB = 12.0
+# Allowance for the client's playback lag — audio is SENT long before it is
+# heard, so the window stays open past the audio's own duration.
+_ECHO_LAG_MS = 250
 
 
 @dataclass(frozen=True)
@@ -133,12 +158,45 @@ class SpeechGate:
         self._peak_db = _DB_FLOOR
         self._frames_seen = 0                 # every frame ever, = the clock
         self._utterance_start_frame = 0
+        # Echo reference (see expect_echo). Zero frames = no window open, which
+        # is the state a gate stays in forever unless a caller opts in.
+        self._echo_frames = 0
+        self._echo_gate_db = _DB_FLOOR
+        self.suppressed_onsets = 0            # frames declined as our own output
 
     # -- state a caller can ask about ---------------------------------------
     @property
     def speaking(self) -> bool:
         """True between SPEECH_START and its SPEECH_END."""
         return self._speaking
+
+    @property
+    def in_hangover(self) -> bool:
+        """Speaking, but the last frame(s) were quiet — the turn may be ending.
+
+        This is the window a speculative turn is allowed to think in: the caller
+        has stopped making noise but has not yet been declared finished.
+        """
+        return self._speaking and self._quiet_run > 0
+
+    @property
+    def voiced_ms(self) -> int:
+        """How much speech the utterance in progress holds, in milliseconds."""
+        return len(self._voiced) * FRAME_MS
+
+    def partial_pcm(self) -> bytes:
+        """The utterance SO FAR — pre-roll included, nothing trimmed.
+
+        A copy of what this gate already holds; calling it does not advance,
+        consume or otherwise disturb the state machine. Empty when no utterance
+        is in progress.
+        """
+        return b"".join(self._voiced)
+
+    @property
+    def echo_active(self) -> bool:
+        """Whether an echo reference window is currently open."""
+        return self._echo_frames > 0
 
     @property
     def floor_db(self) -> float | None:
@@ -177,10 +235,23 @@ class SpeechGate:
         loud = db >= self.threshold_db  # threshold reads the PREVIOUS floor
         self._track_floor(db, loud)
         self._frames_seen += 1
+        # This frame is judged against the window that was open when it arrived,
+        # THEN the window is spent. It is spent in GATE time (one frame per frame
+        # heard) rather than wall time, so a client that stalls its microphone
+        # cannot let the window lapse while its speaker is still playing.
+        echoing = self._echo_frames > 0
+        if echoing:
+            self._echo_frames -= 1
 
         if not self._speaking:
-            return self._maybe_start(frame, db, loud)
-        return self._continue(frame, db, loud)
+            events = self._maybe_start(frame, db, loud, echoing)
+        else:
+            # A caller who already has the floor is never re-judged: the echo
+            # reference suppresses ONSETS, and nothing else.
+            events = self._continue(frame, db, loud)
+        if self._echo_frames == 0:
+            self._echo_gate_db = _DB_FLOOR
+        return events
 
     def _track_floor(self, db: float, loud: bool) -> None:
         if self._floor_db is None:
@@ -190,7 +261,15 @@ class SpeechGate:
         elif not loud:
             self._floor_db = min(self._floor_db + _FLOOR_CREEP_DB, db)
 
-    def _maybe_start(self, frame: bytes, db: float, loud: bool) -> list[GateEvent]:
+    def _maybe_start(self, frame: bytes, db: float, loud: bool,
+                     echoing: bool = False) -> list[GateEvent]:
+        if loud and echoing and db < self._echo_gate_db:
+            # Loud, but no louder than our own output plausibly leaks back as.
+            # Presumed to be us; it does not start a turn and it does not
+            # advance the onset run. Counted, because a suppression that cannot
+            # be measured cannot be tuned.
+            self.suppressed_onsets += 1
+            loud = False
         if not loud:
             self._loud_run = 0
             self._preroll.append(frame)
@@ -249,6 +328,33 @@ class SpeechGate:
             started_at_s=round(started, 3), ended_at_s=round(started + seconds, 3),
             peak_db=round(peak, 1), reason=reason,
         ))]
+
+    def expect_echo(self, level_db: float, seconds: float, *,
+                    lag_ms: int = _ECHO_LAG_MS,
+                    attenuation_db: float = _ECHO_ATTENUATION_DB) -> None:
+        """Declare audio WE just sent, so its echo cannot start a turn.
+
+        ``level_db`` is the RMS level of the PCM handed to the client and
+        ``seconds`` how long it plays. For that long (plus ``lag_ms`` for the
+        client's playback delay) an onset needs a frame louder than
+        ``level_db - attenuation_db``; anything at or below that is consistent
+        with our own output leaking into the caller's microphone and is not
+        treated as a new turn.
+
+        Windows EXTEND rather than replace, and the level is the loudest of the
+        overlapping ones — back-to-back chunks of one reply are one echo window,
+        judged by its loudest part.
+
+        This is not echo cancellation and does not pretend to be: the caller's
+        real speech over ours is still heard the moment it is clearly louder
+        than the leak, and a caller who already has the floor is untouched.
+        """
+        window = max(0.0, seconds) + max(0, lag_ms) / 1000.0
+        frames = int(window * 1000.0 / FRAME_MS)
+        if frames <= 0:
+            return
+        self._echo_frames = max(self._echo_frames, frames)
+        self._echo_gate_db = max(self._echo_gate_db, level_db - attenuation_db)
 
     def flush(self) -> list[GateEvent]:
         """End an utterance still in progress — the socket closed mid-sentence.

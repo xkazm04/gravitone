@@ -341,6 +341,62 @@ class Settings:
     convai_recordings_dir: str = _str("CONVAI_RECORDINGS_DIR",
                                       str(REPO_ROOT / "recordings"))
 
+    # --- Zero-gap turn-taking (speculative hearing and thinking) -----------
+    # Four independent speculations, ALL off by default, because every one of
+    # them spends the same pinned CPU the TTS pool needs: they make a turn feel
+    # faster and can make a small replica's throughput worse, so a deployment
+    # opts in per replica. With all four off the conversation behaves exactly as
+    # it did before they existed (asserted in test_zero_gap).
+    #
+    # 1. Transcribe the utterance WHILE it is being spoken, so the final decode
+    #    starts warm and an interim user_transcript can be emitted. Partial text
+    #    is noisier than final text and is never written to history or to the
+    #    recorded transcript (service/stt.transcribe_partial explains why).
+    convai_partial_decode: bool = _bool("CONVAI_PARTIAL_DECODE", False)
+    # How often, at most, a partial decode may run for one utterance. 600 ms is
+    # the proposal's number: often enough that the newest partial is close to
+    # what was said, rare enough that the decodes do not become the load.
+    convai_partial_interval_ms: int = _int("CONVAI_PARTIAL_INTERVAL_MS", 600)
+    # Speech that must have accumulated before the first partial. Below this
+    # Whisper is mostly guessing at a fragment, and the guess costs a decode.
+    convai_partial_min_ms: int = _int("CONVAI_PARTIAL_MIN_MS", 700)
+    # 2. Start the BRAIN on a partial transcript once two consecutive partials
+    #    agree on a prefix and the gate is in hangover. Needs (1). A speculation
+    #    is never sent: if the caller resumes, or the final transcript does not
+    #    continue the prefix it was built on, it is cancelled and discarded
+    #    unheard. The win is the brain's latency (~4-6 s for the Claude CLI).
+    convai_speculate: bool = _bool("CONVAI_SPECULATE", False)
+    # Shortest agreed prefix worth thinking about. A three-word prefix is not
+    # yet a question, and speculating on it mostly buys a discarded reply.
+    convai_speculate_min_chars: int = _int("CONVAI_SPECULATE_MIN_CHARS", 16)
+    # 3. Pre-rendered turn openers ("Mm-hm.", "Got it,") from the opener cache,
+    #    on the wire in milliseconds while sentence one renders behind them. An
+    #    opener is a backchannel, NOT content: it is not a turn, not history and
+    #    not in the transcript, and it plays only once a turn end is confirmed
+    #    (words actually heard). Per agent, because an interviewer wants this and
+    #    a legal read-back does not.
+    convai_openers: bool = _bool("CONVAI_OPENERS", False)
+    # Which agents get them: comma-separated agent ids, empty = every agent on
+    # this replica once the switch above is on.
+    convai_opener_agents: str = _str("CONVAI_OPENER_AGENTS", "")
+    # The phrases themselves, pipe-separated, used in rotation. Keep them
+    # content-free: an opener that answers anything is a speculation that has
+    # already been spoken, which is the one failure worse than latency.
+    convai_opener_phrases: str = _str("CONVAI_OPENER_PHRASES", "Mm-hm.|Got it,")
+    # Byte budget for the opener cache (service/cache.py), per replica. A handful
+    # of one-second clips per voice; 2 MB is already generous.
+    convai_opener_cache_bytes: int = _int("CONVAI_OPENER_CACHE_BYTES", 2 * 1024 * 1024)
+    # 4. Self-echo reference: tell the gate about the audio we just sent so its
+    #    echo in an open microphone cannot be mistaken for the caller taking the
+    #    floor (see SpeechGate.expect_echo). This is the precondition for a more
+    #    aggressive onset, not that change itself. Only useful without headphones.
+    convai_echo_suppression: bool = _bool("CONVAI_ECHO_SUPPRESSION", False)
+    # How much quieter than what we sent its echo is assumed to arrive. Lower =
+    # more suppression and more risk of ignoring a real barge-in.
+    convai_echo_attenuation_db: float = float(_str("CONVAI_ECHO_ATTENUATION_DB", "12"))
+    # Allowance for the client's playback lag: audio is sent long before it plays.
+    convai_echo_lag_ms: int = _int("CONVAI_ECHO_LAG_MS", 250)
+
     # --- Server ------------------------------------------------------------
     host: str = _str("TTS_HOST", "127.0.0.1")
     # Level for this service's OWN logs (the `gravitone` logger tree), applied

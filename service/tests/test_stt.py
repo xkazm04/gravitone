@@ -207,6 +207,124 @@ class TranscribeTests(_FakeWhisperCase):
         self.assertEqual(stt.transcribe_pcm(b"\x00\x00" * 16000).text, "")
 
 
+class PartialDecodeTests(_FakeWhisperCase):
+    """Partials are subordinate to every real decode, and say so by returning None.
+
+    The policy is the feature: a partial that runs when it should not have is
+    CPU stolen from the turn the caller is actually waiting for, so every way of
+    declining is asserted here — and each one is counted, because a speculation
+    nobody can measure cannot be tuned or switched off with evidence.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._orig_partials = stt.partial_stats()
+        self._orig_finals = stt._FINALS_WAITING
+        for key in stt._PARTIALS:
+            stt._PARTIALS[key] = 0
+
+    def tearDown(self) -> None:
+        stt._PARTIALS.update(self._orig_partials)
+        stt._FINALS_WAITING = self._orig_finals
+        super().tearDown()
+
+    def _pcm(self, samples: int = 16000) -> bytes:
+        return b"\x00\x00" * samples
+
+    def test_a_partial_is_greedy_and_carries_no_word_timing(self) -> None:
+        """It exists to be cheap: a beam search and word timestamps are both
+        things only the final decode can justify."""
+        stt.load_model()
+        result = stt.transcribe_partial(self._pcm())
+        self.assertIsNotNone(result)
+        call = _FakeModel.calls[-1]
+        self.assertEqual(call["beam_size"], 1)
+        self.assertFalse(call["word_timestamps"])
+        # And it keeps the anti-hallucination guards a final decode has: partial
+        # text is noisy enough already.
+        self.assertTrue(call["vad_filter"])
+        self.assertFalse(call["condition_on_previous_text"])
+        self.assertEqual(stt.partial_stats()["run"], 1)
+
+    def test_bias_and_language_reach_a_partial_too(self) -> None:
+        stt.load_model()
+        stt.transcribe_partial(self._pcm(), language="cs", hotwords="React")
+        call = _FakeModel.calls[-1]
+        self.assertEqual((call["language"], call["hotwords"]), ("cs", "React"))
+
+    def test_a_cold_model_is_not_loaded_for_a_guess(self) -> None:
+        """A ~2 s model load inside the audio path would make the very turn this
+        is supposed to accelerate arrive late."""
+        self.assertIsNone(stt.transcribe_partial(self._pcm()))
+        self.assertEqual(_FakeModel.built, [])
+        self.assertEqual(stt.partial_stats()["dropped_cold"], 1)
+
+    def test_a_waiting_final_wins_outright(self) -> None:
+        stt.load_model()
+        _FakeModel.calls.clear()
+        stt._FINALS_WAITING = 1
+        try:
+            self.assertIsNone(stt.transcribe_partial(self._pcm()))
+        finally:
+            stt._FINALS_WAITING = 0
+        self.assertEqual(_FakeModel.calls, [])
+        self.assertEqual(stt.partial_stats()["dropped_for_final"], 1)
+
+    def test_a_held_run_lock_is_never_waited_on(self) -> None:
+        stt.load_model()
+        _FakeModel.calls.clear()
+        self.assertTrue(stt._RUN_LOCK.acquire(blocking=False))
+        try:
+            self.assertIsNone(stt.transcribe_partial(self._pcm()))
+        finally:
+            stt._RUN_LOCK.release()
+        self.assertEqual(_FakeModel.calls, [])
+        self.assertEqual(stt.partial_stats()["dropped_busy"], 1)
+
+    def test_a_partial_releases_the_lock_it_took(self) -> None:
+        stt.load_model()
+        stt.transcribe_partial(self._pcm())
+        self.assertTrue(stt._RUN_LOCK.acquire(blocking=False))
+        stt._RUN_LOCK.release()
+
+    def test_an_empty_clip_is_not_a_decode(self) -> None:
+        stt.load_model()
+        _FakeModel.calls.clear()
+        self.assertIsNone(stt.transcribe_partial(b""))
+        self.assertEqual(_FakeModel.calls, [])
+
+    def test_off_rate_audio_is_resampled_for_a_partial_as_well(self) -> None:
+        stt.load_model()
+        self.assertIsNotNone(stt.transcribe_partial(self._pcm(8000), rate=8000))
+
+    def test_a_final_conversational_decode_declares_itself_waiting(self) -> None:
+        """The signal a partial reads. Only true WHILE a final is in flight."""
+        seen: list[bool] = []
+        original = _FakeModel.transcribe
+
+        def _watching(self, audio, **kwargs):
+            seen.append(stt.final_is_waiting())
+            return original(self, audio, **kwargs)
+
+        _FakeModel.transcribe = _watching
+        try:
+            stt.transcribe_pcm(self._pcm())
+        finally:
+            _FakeModel.transcribe = original
+        self.assertEqual(seen, [True])
+        self.assertFalse(stt.final_is_waiting())
+
+    def test_the_stats_are_a_copy_and_not_the_live_dict(self) -> None:
+        snapshot = stt.partial_stats()
+        snapshot["run"] = 999
+        self.assertEqual(stt.partial_stats()["run"], 0)
+
+    def test_the_ear_reports_its_partial_activity(self) -> None:
+        stt.load_model()
+        stt.transcribe_partial(self._pcm())
+        self.assertEqual(stt.info()["partials"]["run"], 1)
+
+
 class HttpSurfaceTests(_FakeWhisperCase):
     def setUp(self) -> None:
         super().setUp()
