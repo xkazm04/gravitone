@@ -2,7 +2,14 @@
 
 import { apiJson, readDetail, throwDetail } from "@/lib/apiFetch";
 import { DEFAULT_OUTPUT_FORMAT, formatMeta, type OutputFormat } from "@/lib/audioFormats";
-import { stripTags, waveHeights, type Expression, type PerfLine, type Segment, type Take } from "./shared";
+import {
+  crossfadeConcat, encodeWav, fromDecodedAudio, peaksFromPcm, peaksFromSamples, pcmDuration,
+  slicePcm, type Pcm,
+} from "@/lib/wavEncode";
+import {
+  scaleSegmentSeconds, segmentRegions, stripTags, waveHeights,
+  type Expression, type PerfLine, type Segment, type Take,
+} from "./shared";
 
 // One module-level AudioContext shared across every peak computation. Browsers
 // cap the number of live AudioContexts (~6), so minting a fresh one per take
@@ -26,20 +33,21 @@ function peakContext(): AudioContext {
 export async function computePeaks(blob: Blob, n = 56): Promise<{ peaks: number[]; duration: number }> {
   const ctx = peakContext();
   const buf = await ctx.decodeAudioData(await blob.arrayBuffer());
-  const data = buf.getChannelData(0);
-  const chunk = Math.max(1, Math.floor(data.length / n));
-  const peaks: number[] = [];
-  for (let i = 0; i < n; i++) {
-    let peak = 0;
-    const start = i * chunk;
-    for (let j = start; j < start + chunk && j < data.length; j++) {
-      const v = Math.abs(data[j]);
-      if (v > peak) peak = v;
-    }
-    peaks.push(peak);
-  }
-  const max = Math.max(...peaks, 0.001);
-  return { peaks: peaks.map((p) => Math.max(0.06, p / max)), duration: buf.duration };
+  // The reduction itself lives in lib/wavEncode so a SPLICED take's bars are
+  // computed by exactly the same arithmetic as a rendered one's.
+  return { peaks: peaksFromSamples(buf.getChannelData(0), n), duration: buf.duration };
+}
+
+/**
+ * Decode any take/fragment blob into samples on the shared AudioContext.
+ *
+ * This is where "mp3 takes are decoded and re-mastered as WAV" happens: the
+ * decoder does not care what container it was handed, and everything downstream
+ * of here is Float32 at the context's rate.
+ */
+export async function decodePcm(blob: Blob): Promise<Pcm> {
+  const ctx = peakContext();
+  return fromDecodedAudio(await ctx.decodeAudioData(await blob.arrayBuffer()));
 }
 
 /**
@@ -369,4 +377,111 @@ export async function perform(lines: PerfLine[], expr: Expression,
   }
 
   return browserFallback(stripTags(lines.map((l) => l.text).join(" ")), reason, detail);
+}
+
+// ── the splice kernel ───────────────────────────────────────────────────────
+
+export type SpliceInput = {
+  /** The take being punched. Must carry its audio blob (every gravitone take
+   *  does, restored ones included). */
+  base: Take;
+  /** Which segment of `base.segments` the fragment replaces. */
+  regionIndex: number;
+  /** The re-rendered region, in whatever format it was rendered as. */
+  fragment: Blob;
+  /** The fragment's own per-segment report (X-Segments). May be empty. */
+  fragmentSegments: Segment[];
+};
+
+export type SpliceResult = {
+  /** The new master. ALWAYS wav: a spliced mp3 would mean re-encoding a lossy
+   *  file every time a word is fixed, and the studio's lossless format is what
+   *  the share/review paths accept. */
+  blob: Blob;
+  /** Decoded duration of the result — the truth, not a sum of reports. */
+  seconds: number;
+  peaks: number[];
+  segments: Segment[];
+  /** Where the patched region now sits, so the caller can play just the edit. */
+  start: number;
+  end: number;
+};
+
+/**
+ * Replace one segment's audio with a re-rendered fragment.
+ *
+ * Boundaries come from `segmentRegions`, which snaps them to segment edges —
+ * exactly where the engine already cut — and the seams get a short crossfade
+ * (lib/wavEncode) so a splice does not click.
+ *
+ * Returns null on ANY failure, the same degrade as refinePeaks: a browser that
+ * cannot decode the take, a fragment that will not decode, a context that was
+ * never granted. The caller keeps the original take and offers a full
+ * re-render, which is always the escape hatch. Losing the user's take to fix
+ * one word would be the worst possible trade.
+ */
+export async function spliceRegion(input: SpliceInput): Promise<SpliceResult | null> {
+  const { base, regionIndex, fragment, fragmentSegments } = input;
+  if (!base.blob || regionIndex < 0 || regionIndex >= base.segments.length) return null;
+  try {
+    const [basePcm, fragPcm] = await Promise.all([decodePcm(base.blob), decodePcm(fragment)]);
+    const duration = pcmDuration(basePcm);
+    const regions = segmentRegions(base.segments, duration);
+    const region = regions[regionIndex];
+    if (!region) return null;
+
+    const head = slicePcm(basePcm, 0, region.start);
+    const tail = slicePcm(basePcm, region.end, duration);
+    const out = crossfadeConcat([head, fragPcm, tail]);
+    const fragSeconds = pcmDuration(fragPcm);
+
+    // The replaced segment's Character and source line survive the patch — a
+    // punched performance take must stay attributable line by line.
+    const carrier = base.segments[regionIndex];
+    const replacement: Segment[] = (fragmentSegments.length > 0
+      ? scaleSegmentSeconds(fragmentSegments, fragSeconds)
+      : [{ ...carrier, seconds: Math.round(fragSeconds * 100) / 100 }]
+    ).map((s) => ({ ...s, characterId: s.characterId ?? carrier.characterId, line: s.line ?? carrier.line }));
+    const segments = [...base.segments];
+    segments.splice(regionIndex, 1, ...replacement);
+
+    return {
+      blob: encodeWav(out),
+      seconds: Math.round(pcmDuration(out) * 10) / 10,
+      peaks: peaksFromPcm(out),
+      segments,
+      start: pcmDuration(head),
+      end: pcmDuration(head) + fragSeconds,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// ── word timestamps (the studio's own ears) ─────────────────────────────────
+
+export type WordStamp = { text: string; start: number; end: number };
+
+/**
+ * Word timings for a take, through the local ASR (`/api/stt` → the service's
+ * `/v1/speech-to-text`). Used to narrow a punch-in from a whole segment to the
+ * smallest re-renderable span.
+ *
+ * The route answers 503 with the install hint when faster-whisper weights are
+ * absent, which is a legitimate state on a fresh box — the caller reports it and
+ * keeps offering segment-level punch-in.
+ */
+export async function transcribeWords(blob: Blob, format?: OutputFormat,
+                                      signal?: AbortSignal): Promise<{ text: string; words: WordStamp[] }> {
+  const fd = new FormData();
+  fd.append("file", blob, `take.${formatMeta(format).ext}`);
+  fd.append("timestamps_granularity", "word");
+  const j = await apiJson<{ text?: string; words?: Array<{ text?: string; start?: number; end?: number }> }>(
+    "/api/stt", { method: "POST", body: fd, signal }, "could not transcribe this take");
+  return {
+    text: j.text ?? "",
+    words: (j.words ?? [])
+      .filter((w) => typeof w.start === "number" && typeof w.end === "number" && !!w.text)
+      .map((w) => ({ text: String(w.text), start: w.start as number, end: w.end as number })),
+  };
 }

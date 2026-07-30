@@ -71,7 +71,127 @@ export type Take = {
   // queueSeconds) this take carries — see TAKE_TIMING_VERSION. Absent on every
   // take written before the marker existed.
   timingVersion?: number;
+  // Punch-in provenance: this take is a SPLICE of an earlier one. Absent for
+  // every take that was rendered in one call (and for every take stored before
+  // the editor existed) — see TakeEdits.
+  edits?: TakeEdits;
 };
+
+// ── punch-in provenance (D5) ────────────────────────────────────────────────
+/**
+ * How a spliced take was made.
+ *
+ * `source` is the id of the ORIGINAL take (the base render), and `regions` is
+ * every patch applied since, in order — so one take carries its whole
+ * reproduction recipe: the base `/v1/performance` (or `/v1/speak`) call plus one
+ * `/v1/speak` call per patched region. A chain of ids would have been smaller
+ * and would have left the code export unable to print the recipe once the
+ * intermediate takes aged out of the log.
+ *
+ * `v` is why older stored takes restore cleanly: takes are durable
+ * (lib/takeStore, IndexedDB), so the console reads records written by builds
+ * that had no editor at all. `readEdits` treats an absent OR unrecognised
+ * version as "no edit history", which is exactly what such a record has — and
+ * never as a reason to refuse the take.
+ */
+export const TAKE_EDITS_VERSION = 1;
+
+/** One punched region: which segment index, the text that was re-rendered, and
+ *  the per-region overrides it was rendered with. */
+export type EditRegion = {
+  i: number;
+  text: string;
+  emotion?: string;
+  characterId?: string;
+};
+
+export type TakeEdits = {
+  v: 1;
+  /** Take id of the base render this chain started from. */
+  source: string;
+  regions: EditRegion[];
+};
+
+/** Read a take's edit history defensively. Returns null for a take with none,
+ *  for a record written before the field existed, and for a version this build
+ *  does not understand — all three mean "there is no history to show", and none
+ *  of them is a reason to lose the take. */
+export function readEdits(t: { edits?: unknown } | null | undefined): TakeEdits | null {
+  const e = t?.edits as Partial<TakeEdits> | undefined;
+  if (!e || e.v !== TAKE_EDITS_VERSION || typeof e.source !== "string") return null;
+  const regions = Array.isArray(e.regions) ? e.regions : [];
+  const clean = regions.filter(
+    (r): r is EditRegion =>
+      !!r && typeof r === "object" && Number.isInteger((r as EditRegion).i) && typeof (r as EditRegion).text === "string",
+  );
+  return { v: TAKE_EDITS_VERSION, source: e.source, regions: clean };
+}
+
+/** The edit history a spliced take inherits from `base` plus one new region.
+ *  The chain's `source` stays the ORIGINAL render, so a take punched five times
+ *  still names the call that made it. */
+export function appendEdit(base: Take, region: EditRegion): TakeEdits {
+  const prior = readEdits(base);
+  return {
+    v: TAKE_EDITS_VERSION,
+    source: prior?.source ?? base.id,
+    regions: [...(prior?.regions ?? []), region],
+  };
+}
+
+// ── timeline math ───────────────────────────────────────────────────────────
+/** One clickable region of a take: a segment, placed in time. */
+export type Region = {
+  index: number;
+  start: number;
+  end: number;
+  segment: Segment;
+};
+
+/**
+ * Place a take's segments on its timeline.
+ *
+ * The offsets come from the cumulative `segment.seconds` the backend reported,
+ * SCALED so the last region ends exactly at the take's real (decoded) duration.
+ * The report and the samples disagree by a few milliseconds per segment — the
+ * engine trims and concatenates — and without the scale that error accumulates
+ * until a click near the end of a 40-line performance seeks past the audio.
+ *
+ * A report with no usable seconds (all zero, or absent) still gets regions: the
+ * duration is divided equally, which is a labelled guess at WHERE each segment
+ * is, not a claim about how long it took to say.
+ */
+export function segmentRegions(segments: Segment[], duration: number): Region[] {
+  if (segments.length === 0 || !(duration > 0)) return [];
+  const secs = segments.map((s) => (Number.isFinite(s.seconds) && s.seconds > 0 ? s.seconds : 0));
+  const sum = secs.reduce((a, b) => a + b, 0);
+  const even = duration / segments.length;
+  let at = 0;
+  return segments.map((segment, index) => {
+    const len = sum > 0 ? (secs[index] / sum) * duration : even;
+    const start = at;
+    at = index === segments.length - 1 ? duration : Math.min(duration, at + len);
+    return { index, start, end: at, segment };
+  });
+}
+
+/** Re-scale a fragment's reported segment seconds onto its decoded duration —
+ *  the same "samples are the truth" rule as segmentRegions, applied to the
+ *  segments a spliced take carries so the NEXT timeline is built from honest
+ *  numbers. */
+export function scaleSegmentSeconds(segments: Segment[], duration: number): Segment[] {
+  const sum = segments.reduce((n, s) => n + (s.seconds > 0 ? s.seconds : 0), 0);
+  if (segments.length === 0) return [];
+  if (!(duration > 0)) return segments;
+  if (sum <= 0) {
+    const even = Math.round((duration / segments.length) * 100) / 100;
+    return segments.map((s) => ({ ...s, seconds: even }));
+  }
+  return segments.map((s) => ({
+    ...s,
+    seconds: Math.round(((s.seconds > 0 ? s.seconds : 0) / sum) * duration * 100) / 100,
+  }));
+}
 
 /**
  * Version of a take's TIMING numbers.

@@ -21,8 +21,9 @@ import { EASE } from "@/components/ui/tokens";
 import { EMOTION_IDS, emotionMeta, wrapWithTag } from "@/lib/emotions";
 import EmotionArt from "@/components/ui/EmotionArt";
 import {
-  composerLimit, DEFAULT_EXPRESSION, DEFAULT_TEXT, isTimingBasis, MAX_SCRIPT_LINES, MAX_TEXT_CHARS,
-  stripTags, TAKE_TIMING_VERSION, type Expression, type PerfLine, type ScriptLine, type Take,
+  appendEdit, composerLimit, DEFAULT_EXPRESSION, DEFAULT_TEXT, isTimingBasis, MAX_SCRIPT_LINES,
+  MAX_TEXT_CHARS, readEdits, stripTags, TAKE_TIMING_VERSION,
+  type Expression, type PerfLine, type ScriptLine, type Take,
 } from "./shared";
 // Composer durability — the same IndexedDB mechanism the take log uses.
 import { loadComposer, reconcileCharacters, saveComposer, type ComposerState } from "@/lib/composerStore";
@@ -36,6 +37,11 @@ import { putTake, getRecentTakes, deleteTake } from "@/lib/takeStore";
 import { useAudioPlayer } from "./useAudioPlayer";
 import EmotionPicker from "./EmotionPicker";
 import TakeCode from "./TakeCode";
+import LiveStage from "../_live/LiveStage";
+// Punch-in: the take log's editing drill-down. Deliberately a separate module —
+// the take card stays exactly what it was until the user asks for the timeline.
+import PunchIn, { type CommitPayload } from "./PunchIn";
+import { dropVariants } from "./variantStore";
 
 function Bars({ peaks, progress = 0, active = false, className = "" }: { peaks: number[]; progress?: number; active?: boolean; className?: string }) {
   return (
@@ -184,6 +190,8 @@ export default function PlaygroundConsole() {
   // Composer mode: Solo = one Character throughout (current flow); Script = a
   // multi-character performance rendered as one take via /v1/performance.
   const [mode, setMode] = useState<"solo" | "script">("solo");
+  const [liveOn, setLiveOn] = useState(false);
+  const [liveActive, setLiveActive] = useState(false);
   // What the next take is rendered as. It sits beside Generate rather than in
   // the expression panel because it is a decision about the FILE you keep, not
   // about how the voice sounds.
@@ -220,6 +228,9 @@ export default function PlaygroundConsole() {
   const [takes, setTakes] = useState<Take[]>([]);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [codeFor, setCodeFor] = useState<string | null>(null); // take id with the code panel open
+  // take id whose punch-in drill-down is open. Editing is opt-in per take: the
+  // default card must stay as uncluttered as it was before there was an editor.
+  const [punchFor, setPunchFor] = useState<string | null>(null);
   // take id → shared state: publishing / share id / failed
   const [shares, setShares] = useState<Record<string, string | "pending" | "error">>({});
   // Clipboard truth for both copy affordances (per-take share link, keyed by
@@ -273,7 +284,7 @@ export default function PlaygroundConsole() {
   const runRef = useRef<AbortController | null>(null);
   const mounted = useMounted();
 
-  const { playingId, paused, progress, toggle, stop } = useAudioPlayer();
+  const { playingId, paused, progress, toggle, stop, seekTo } = useAudioPlayer();
 
   // Engine state BEFORE the user commits to a render. The page most affected by
   // a loading or draining engine used to discover that state only by failing a
@@ -837,8 +848,60 @@ export default function PlaygroundConsole() {
     });
     setReviewSel((s) => { const n = new Set(s); n.delete(id); return n; });
     setCodeFor((c) => (c === id ? null : c));
+    setPunchFor((p) => (p === id ? null : p));
     setShares((s) => { const { [id]: _, ...rest } = s; return rest; });
     void deleteTake(id);
+    // A deleted take's audition lanes are orphaned audio — the one thing the
+    // variant store must never accumulate.
+    void dropVariants(id);
+  }
+
+  /**
+   * Commit a punched region: the spliced master becomes a NEW take.
+   *
+   * The original is untouched and stays in the log — an editor that overwrites
+   * the thing you were comparing against is not an editor. The new take inherits
+   * the base's identity (Character, script, text) and carries `edits`, so its
+   * code export prints the base call plus every patch call (see TakeCode).
+   */
+  function commitPunch(base: Take, p: CommitPayload) {
+    seq.current += 1;
+    const take: Take = {
+      ...base,
+      id: `take-${Date.now()}-${seq.current}`,
+      url: URL.createObjectURL(p.blob),
+      blob: p.blob,
+      peaks: p.peaks,
+      seconds: p.seconds,
+      kb: Math.round(p.blob.size / 1024),
+      // A splice has no whole-call realtime factor to report: part of this audio
+      // was rendered minutes ago. Reporting the patch render's rtf as the take's
+      // would let a one-segment render calibrate the estimate for a whole take,
+      // so the timing fields carry ONLY what was measured (the patch), rtf stays
+      // 0 and no timingVersion is stamped — isTimingBasis therefore skips it.
+      rtf: 0,
+      synthSeconds: p.synthSeconds,
+      queueSeconds: p.queueSeconds,
+      timingVersion: undefined,
+      segments: p.segments,
+      // The master is always wav (engine.spliceRegion), whatever the base was.
+      format: DEFAULT_OUTPUT_FORMAT,
+      createdAt: Date.now(),
+      edits: appendEdit(base, p.region),
+      // Whatever made the BASE fall back is not a property of this splice.
+      fallbackReason: undefined,
+      fallbackDetail: undefined,
+    };
+    addTake(take);
+    // addTake's generic announcement is true but says nothing about the edit,
+    // which is the whole event here.
+    setAnnouncement(
+      `Punched take ready — segment ${p.region.i + 1} replaced, ${take.seconds} seconds total. ` +
+      `The original take is still in the log.`,
+    );
+    // Keep the editor open on the RESULT: the loop this feature exists for is
+    // fix, listen, fix the next one.
+    setPunchFor(take.id);
   }
 
   /** Start a cancellable run, replacing any previous controller.
@@ -1145,6 +1208,11 @@ export default function PlaygroundConsole() {
                   {m}
                 </button>
               ))}
+              <button onClick={() => setLiveOn((v) => !v)} aria-pressed={liveOn}
+                title="Talk to this Character in real time — every turn becomes a take"
+                className={`rounded-full border px-2.5 py-0.5 transition ${liveOn ? "border-cyan-400/30 bg-cyan-400/10 text-cyan-200" : "border-transparent text-white/50 hover:text-white/80"}`}>
+                live
+              </button>
             </div>
             {/* The counter states the REAL ceiling, and turns as the text
                 approaches it — the limit used to be discovered by a rejected
@@ -1273,7 +1341,7 @@ export default function PlaygroundConsole() {
                   cancel
                 </button>
               )}
-              <Button onClick={generate} disabled={busy || !canGenerate}
+              <Button onClick={generate} disabled={busy || liveActive || !canGenerate}
                 title={blocked ?? (canGenerate ? "Render this take" : "Write something to render")}>
                 {busy ? "Rendering…" : "Generate ▶"}
               </Button>
@@ -1301,6 +1369,12 @@ export default function PlaygroundConsole() {
           </p>
         </div>
       </div>
+
+      {liveOn && (
+        <LiveStage characters={characters} charId={charId} generateBusy={busy} onTake={addTake}
+          onScript={(lines) => { setScript(lines); setMode("script"); }} scriptLines={script}
+          onActiveChange={setLiveActive} />
+      )}
 
       {/* takes log */}
       <div className="mt-8">
@@ -1359,6 +1433,9 @@ export default function PlaygroundConsole() {
 
           {takes.map((t) => {
             const isCurrent = playingId === t.id;
+            // Punch-in provenance. Absent on every take that was rendered in one
+            // call, and on every record stored before the editor existed.
+            const edits = readEdits(t);
             return (
               <motion.div key={t.id} layout initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }}
                 transition={{ duration: 0.4, ease: EASE }} className="glass-panel mb-2 rounded-xl px-5 py-4">
@@ -1423,6 +1500,23 @@ export default function PlaygroundConsole() {
                   >
                     ↺ reuse
                   </button>
+                  {/* The editor's entry point. Collapsed by default — the card
+                      is a log row until the user asks to edit it. */}
+                  <button
+                    onClick={() => setPunchFor((p) => (p === t.id ? null : t.id))}
+                    disabled={t.mode === "browser" || !t.blob}
+                    title={t.mode === "browser" || !t.blob
+                      ? "Browser-speech fallback take — there is no audio to edit"
+                      : "Show the segment timeline: hear a region, retake just that region"}
+                    aria-expanded={punchFor === t.id}
+                    className={`font-jetbrains shrink-0 rounded-lg border px-3 py-1.5 text-[11px] transition ${
+                      punchFor === t.id
+                        ? "border-cyan-400/40 bg-cyan-400/10 text-cyan-200"
+                        : "border-white/15 text-white/80 hover:bg-white/5 disabled:cursor-not-allowed disabled:border-white/10 disabled:text-white/50"
+                    }`}
+                  >
+                    ⌗ timeline
+                  </button>
                   <button
                     onClick={() => setCodeFor((c) => (c === t.id ? null : t.id))}
                     disabled={t.mode === "browser"}
@@ -1455,6 +1549,22 @@ export default function PlaygroundConsole() {
                 </div>
 
                 {codeFor === t.id && t.mode === "gravitone" && <TakeCode take={t} />}
+
+                {/* Punch-in drill-down: the segment timeline plus the retake
+                    lanes for whichever region is selected. */}
+                {punchFor === t.id && (
+                  <PunchIn
+                    take={t}
+                    characters={characters}
+                    charName={charName}
+                    playing={isCurrent}
+                    progress={isCurrent ? progress : 0}
+                    onSeek={(seconds) => { void seekTo(t, seconds); }}
+                    onCommit={(p) => commitPunch(t, p)}
+                    onStorageError={setStorageErr}
+                    engineBusy={busy}
+                  />
+                )}
 
                 {/* segment ribbon — what actually ran */}
                 {t.segments.length > 0 && (
@@ -1490,6 +1600,20 @@ export default function PlaygroundConsole() {
                       );
                     })}
                   </div>
+                )}
+
+                {/* This take is an EDIT of another one. Said out loud, because
+                    its one-line preview below is the base take's transcript —
+                    the exact text the base call still reproduces — while its
+                    audio has these regions replaced (the timeline shows them). */}
+                {edits && edits.regions.length > 0 && (
+                  <p className="font-jetbrains mt-3 inline-flex flex-wrap items-center gap-1.5 rounded-lg border border-cyan-400/20 bg-cyan-400/5 px-2.5 py-1 text-[11px] text-cyan-200/85">
+                    <span aria-hidden>✎</span>
+                    punched · segment{edits.regions.length === 1 ? "" : "s"}{" "}
+                    {edits.regions.map((r) => r.i + 1).join(", ")} re-rendered and spliced
+                    <span className="text-white/40">·</span>
+                    <span className="text-white/55">base {edits.source}</span>
+                  </p>
                 )}
 
                 {t.ignoredSettings.length > 0 && (

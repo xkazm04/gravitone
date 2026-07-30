@@ -16,6 +16,10 @@ export function useAudioPlayer() {
   const elapsedRef = useRef(0);
   const lastTickRef = useRef(0);
   const currentRef = useRef<Take | null>(null);
+  // A seek requested before the element knows its duration. Setting currentTime
+  // on an <audio> whose metadata has not loaded is silently dropped, which is
+  // how "click a segment to hear it" became "play from the start".
+  const pendingSeekRef = useRef<number | null>(null);
 
   const [playingId, setPlayingId] = useState<string | null>(null);
   const [paused, setPaused] = useState(false);
@@ -26,6 +30,16 @@ export function useAudioPlayer() {
       const a = new Audio();
       a.addEventListener("timeupdate", () => {
         if (a.duration) setProgress(a.currentTime / a.duration);
+      });
+      a.addEventListener("loadedmetadata", () => {
+        const at = pendingSeekRef.current;
+        pendingSeekRef.current = null;
+        if (at === null) return;
+        try {
+          a.currentTime = at;
+        } catch {
+          /* an unseekable source plays from the start — nothing is lost */
+        }
       });
       a.addEventListener("ended", () => {
         setPlayingId(null);
@@ -142,6 +156,45 @@ export function useAudioPlayer() {
     setPaused(false);
   }, []);
 
+  /**
+   * Play a take FROM a given offset — the seam the segment timeline clicks
+   * through.
+   *
+   * Browser-fallback takes have no audio to seek (SpeechSynthesis has no
+   * transport at all), so this returns false for them rather than pretending:
+   * the caller keeps the region selectable for editing and simply does not move
+   * a playhead that does not exist.
+   */
+  const seekTo = useCallback(
+    async (take: Take, seconds: number): Promise<boolean> => {
+      if (take.mode !== "gravitone" || !take.url) return false;
+      const a = getAudio();
+      const at = Math.max(0, seconds);
+      const switching = currentRef.current?.id !== take.id;
+      if (switching) {
+        stop();
+        currentRef.current = take;
+        pendingSeekRef.current = at;
+        a.src = take.url;
+      } else {
+        try { a.currentTime = at; } catch { pendingSeekRef.current = at; }
+      }
+      setPlayingId(take.id);
+      setPaused(false);
+      setProgress(take.seconds > 0 ? Math.min(1, at / take.seconds) : 0);
+      try {
+        await a.play();
+      } catch {
+        // autoplay refused / source unplayable — never leave a fake playing row
+        setPlayingId(null);
+        setProgress(0);
+        return false;
+      }
+      return true;
+    },
+    [stop],
+  );
+
   /** One control for the row button: play → pause → resume. */
   const toggle = useCallback(
     (take: Take) => {
@@ -157,5 +210,5 @@ export function useAudioPlayer() {
 
   useEffect(() => () => stop(), [stop]);
 
-  return { playingId, paused, progress, toggle, stop };
+  return { playingId, paused, progress, toggle, stop, seekTo };
 }
