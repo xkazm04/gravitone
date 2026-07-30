@@ -13,6 +13,7 @@ import { motion } from "framer-motion";
 import { HERO_DEMO, SAMPLE_TEXT } from "@/lib/content";
 import { useAuth } from "@/lib/useAuth";
 import { CONSENT_STATEMENT } from "@/lib/consent";
+import { getEngine } from "@/lib/engineSeam";
 import Equalizer from "@/components/ui/Equalizer";
 import TakePlayer from "@/components/ui/TakePlayer";
 import { useAudioBus, useSignalWorking } from "@/components/ui/AudioBus";
@@ -81,17 +82,18 @@ export default function HeroMicDemo() {
       createdCid = voice.character_id ?? null;
 
       setPhase("rendering");
-      const tr = await fetch("/api/tts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: SAMPLE_TEXT, voiceId: voice.voice_id }),
+      // Through the engine seam (lib/engineSeam) rather than a hand-rolled
+      // fetch: the hero is the loudest claim the product makes about WHERE
+      // audio is made, so it must ask the same object the studio asks. Today
+      // that object is always the server engine; when a local one exists this
+      // line is where "your voice never left the tab" becomes literally true.
+      const audio = await getEngine().synthesize({
+        kind: "voice", text: SAMPLE_TEXT, voiceId: voice.voice_id,
         signal: controller.signal,
       });
-      if (!tr.ok) throw new Error("synthesis failed");
-      const wav = await tr.arrayBuffer();
       setAudioUrl((old) => {
         if (old) URL.revokeObjectURL(old);
-        return URL.createObjectURL(new Blob([wav], { type: "audio/wav" }));
+        return audio.url;
       });
       setPhase("ready");
     } catch (e) {
