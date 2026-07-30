@@ -17,6 +17,7 @@ from service.tests import fake_engine  # installs shims — must precede app imp
 import service.app as appmod
 import service.direction as direction
 import service.takes as takes
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 WAV = b"RIFF" + b"\x00" * 40  # enough to pass the RIFF sniff
@@ -235,6 +236,146 @@ class DirectionWiringTests(_TakesBase):
         direction.DIRECTION_PATH.write_text("{corrupt", "utf-8")
         child = self._take_with("angry", parent_id=parent)  # 201 or the test fails
         self.assertEqual(self.client.get(f"/v1/takes/{child}").status_code, 200)
+
+
+class ReperformTests(_TakesBase):
+    """Public re-perform: publisher consent, the named refusals, the budget,
+    and the child's lineage. The renderer is a stub — what is under test is the
+    policy around the render, not the synthesis (which /v1/speak owns)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.rendered: list[tuple[str, str]] = []
+        self._orig_provider = takes._SPEAK_PROVIDER
+        takes.set_speak_provider(self._render)
+        takes.REPERFORM_BUDGET.limiter.reset()
+
+    def tearDown(self) -> None:
+        takes.set_speak_provider(self._orig_provider)
+        takes.REPERFORM_BUDGET.limiter.reset()
+        super().tearDown()
+
+    async def _render(self, character_id: str, text: str) -> dict:
+        self.rendered.append((character_id, text))
+        return {"audio": WAV, "seconds": 1.5, "rtf": 0.4,
+                "segments": [{"text": text, "requested": "angry", "used": "angry"}]}
+
+    def _open_take(self, **meta) -> str:
+        return self._create_take(
+            allow_reperform=True,
+            segments=[{"text": "Hello there.", "requested": "baseline",
+                       "used": "baseline"}], **meta)
+
+    def test_an_opted_in_take_mints_a_child_with_lineage(self) -> None:
+        parent = self._open_take()
+        r = self.client.post(f"/v1/takes/{parent}/reperform",
+                             json={"text": "[angry]Hello there."})
+        self.assertEqual(r.status_code, 201, r.text)
+        child_id = r.json()["take_id"]
+        self.assertEqual(r.json()["parent_id"], parent)
+        self.assertEqual(self.rendered, [("sarah", "[angry]Hello there.")])
+
+        child = self.client.get(f"/v1/takes/{child_id}").json()
+        self.assertEqual(child["parent_id"], parent)
+        self.assertEqual(child["derived_from"], {"kind": "public-reperform"})
+        self.assertEqual(child["character_id"], "sarah")
+        self.assertEqual(child["seconds"], 1.5)
+        # A fork is a leaf: consent was for ONE fork, not for a public chain.
+        self.assertFalse(child["allow_reperform"])
+        lineage = self.client.get(f"/v1/takes/{parent}/lineage").json()
+        self.assertEqual([c["id"] for c in lineage["children"]], [child_id])
+
+    def test_the_fork_is_counted_as_a_direction_decision(self) -> None:
+        parent = self._open_take()
+        self.client.post(f"/v1/takes/{parent}/reperform", json={"text": "Hi."})
+        stored = json.loads(direction.DIRECTION_PATH.read_text("utf-8"))
+        self.assertEqual(stored["characters"]["sarah"]["deltas"],
+                         {"baseline>angry": 1})
+
+    def test_a_take_published_without_the_opt_in_refuses_by_name(self) -> None:
+        take_id = self._create_take()  # allow_reperform absent = OFF
+        r = self.client.post(f"/v1/takes/{take_id}/reperform", json={"text": "Hi."})
+        self.assertEqual(r.status_code, 403)
+        self.assertIn("not-published-for-reperform", r.json()["detail"])
+        self.assertEqual(self.rendered, [])
+
+    def test_an_unknown_take_is_404(self) -> None:
+        r = self.client.post("/v1/takes/deadbeef99/reperform", json={"text": "Hi."})
+        self.assertEqual(r.status_code, 404)
+
+    def test_over_long_text_is_refused_by_name_before_any_render(self) -> None:
+        parent = self._open_take()
+        r = self.client.post(f"/v1/takes/{parent}/reperform",
+                             json={"text": "x" * (takes.MAX_REPERFORM_TEXT + 1)})
+        self.assertEqual(r.status_code, 413)
+        self.assertIn("too-long", r.json()["detail"])
+        self.assertEqual(self.rendered, [])
+
+    def test_a_deployment_with_no_renderer_says_engine_absent(self) -> None:
+        parent = self._open_take()
+        takes.set_speak_provider(None)
+        r = self.client.post(f"/v1/takes/{parent}/reperform", json={"text": "Hi."})
+        self.assertEqual(r.status_code, 503)
+        self.assertIn("engine-absent", r.json()["detail"])
+
+    def test_a_refusal_from_the_render_path_reaches_the_caller_intact(self) -> None:
+        parent = self._open_take()
+
+        async def busy(character_id: str, text: str) -> dict:
+            raise HTTPException(429, "all workers are busy")
+
+        takes.set_speak_provider(busy)
+        r = self.client.post(f"/v1/takes/{parent}/reperform", json={"text": "Hi."})
+        self.assertEqual(r.status_code, 429)
+        self.assertIn("busy", r.json()["detail"])
+
+    def test_a_renderer_that_blows_up_is_a_named_502_not_a_crash(self) -> None:
+        parent = self._open_take()
+
+        async def boom(character_id: str, text: str) -> dict:
+            raise RuntimeError("model gone")
+
+        takes.set_speak_provider(boom)
+        r = self.client.post(f"/v1/takes/{parent}/reperform", json={"text": "Hi."})
+        self.assertEqual(r.status_code, 502)
+        self.assertIn("render-failed", r.json()["detail"])
+
+    def test_a_renderer_that_returns_no_wav_does_not_publish_a_take(self) -> None:
+        parent = self._open_take()
+
+        async def empty(character_id: str, text: str) -> dict:
+            return {"audio": b"", "segments": []}
+
+        takes.set_speak_provider(empty)
+        r = self.client.post(f"/v1/takes/{parent}/reperform", json={"text": "Hi."})
+        self.assertEqual(r.status_code, 502)
+        self.assertEqual(self.client.get(f"/v1/takes/{parent}/lineage")
+                         .json()["children"], [])
+
+    def test_the_per_ip_budget_refuses_with_retry_after(self) -> None:
+        # The test package disarms app-wired budgets globally; this test IS the
+        # budget's proof on the reperform surface, so re-arm it for its duration.
+        bypass = os.environ.pop("GRAVITONE_RATELIMIT_TEST_BYPASS", None)
+        if bypass is not None:
+            self.addCleanup(os.environ.__setitem__,
+                            "GRAVITONE_RATELIMIT_TEST_BYPASS", bypass)
+        parent = self._open_take()
+        limiter = takes.REPERFORM_BUDGET.limiter
+        codes = [self.client.post(f"/v1/takes/{parent}/reperform",
+                                  json={"text": "Hi."}).status_code
+                 for _ in range(limiter.limit + 2)]
+        self.assertEqual(codes[0], 201)
+        self.assertIn(429, codes)
+        r = self.client.post(f"/v1/takes/{parent}/reperform", json={"text": "Hi."})
+        self.assertEqual(r.status_code, 429)
+        self.assertIn("rate-limited", r.json()["detail"])
+        self.assertTrue(int(r.headers["Retry-After"]) >= 1)
+
+    def test_the_publish_flag_is_off_unless_the_publisher_asked(self) -> None:
+        self.assertFalse(self.client.get(f"/v1/takes/{self._create_take()}")
+                         .json()["allow_reperform"])
+        self.assertTrue(self.client.get(f"/v1/takes/{self._open_take()}")
+                        .json()["allow_reperform"])
 
 
 class ReviewsErrorTests(_TakesBase):

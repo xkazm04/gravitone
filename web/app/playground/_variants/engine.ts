@@ -75,8 +75,14 @@ export async function refinePeaks(blob: Blob): Promise<{ peaks: number[]; durati
  * The single upload path shared by "↗ share" and the client-review flow — both
  * turn the take's audio blob into the same multipart POST to /api/takes.
  * Throws for browser-fallback takes (no audio blob to publish).
+ *
+ * `allowReperform` is the publisher's consent for PUBLIC re-perform (a visitor
+ * editing the text and re-rendering it in this Character's voice on /t/{id}).
+ * It defaults to false and is only ever sent as an explicit true, so every
+ * existing caller publishes exactly the take it published before.
  */
-export async function uploadTake(t: Take): Promise<string> {
+export async function uploadTake(t: Take,
+                                 opts: { allowReperform?: boolean } = {}): Promise<string> {
   // The take carries its own audio blob (synthesis hands it over, and session
   // restore reads it back out of IndexedDB). Re-fetching t.url — an object URL
   // pointing at a blob we already hold — was a copy of the whole WAV for
@@ -95,6 +101,7 @@ export async function uploadTake(t: Take): Promise<string> {
     character_id: t.characterId, character_name: t.characterName,
     text: t.text, seconds: t.seconds, rtf: t.rtf, segments: t.segments,
     ...(parentId ? { parent_id: parentId, derived_from: { kind: "remix" } } : {}),
+    ...(opts.allowReperform ? { allow_reperform: true } : {}),
   }));
   // Through the apiFetch contract so the backend's sanitized `detail` (request
   // id included) reaches the caller's banner instead of a generic sentence.

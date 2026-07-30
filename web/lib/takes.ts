@@ -22,6 +22,12 @@ export type SharedTake = {
   // fork of another share (open in the rack, change a tag, re-render).
   parent_id?: string | null;
   derived_from?: Record<string, unknown> | null;
+  // Publish-time consent for PUBLIC re-perform: may a visitor edit this text
+  // and spend the box's CPU rendering it in this Character's voice? Optional
+  // and falsy by default — a take published before the toggle existed, or by a
+  // publisher who left it off, is not forkable. Forking puts new words in
+  // someone's voice, so the absent answer is "no".
+  allow_reperform?: boolean;
 };
 
 /** How a lineage member is reported — the compact shape, never the whole take.

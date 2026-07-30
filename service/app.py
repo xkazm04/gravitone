@@ -69,7 +69,10 @@ from service.ingest_api import (
 )
 from service.packs import router as packs_router
 from service.direction import router as direction_router
+from service.narrate import router as narrate_router
 from service.takes import router as takes_router, reviews_router
+from service import takes as takes_plane
+from service.ratelimit import per_ip_budget
 from service import convai
 from service.appliance import router as appliance_router
 from service.convai import router as convai_router, ws_router as convai_ws_router
@@ -1192,7 +1195,16 @@ async def _store_artifact(digest: str, body: bytes, fmt: _AudioFormat,
         audio_seconds=audio.audio_seconds, sample_rate=fmt.sample_rate))
 
 
-@app.post("/v1/text-to-speech/{voice_id}", dependencies=[Depends(require_scope("tts"))])
+# Hero-demo hardening: the unauthenticated relay path (/api/tts -> here,
+# /api/voices -> the clone route) gets a per-IP budget. Tighten once
+# TTS_TRUST_PROXY is on and the studio is not one address for every visitor.
+DEMO_TTS_BUDGET = per_ip_budget("demo-tts", limit=60, window_s=60, burst=6)
+DEMO_CLONE_BUDGET = per_ip_budget("demo-clone", limit=20, window_s=600,
+                                  burst=4, methods=("POST",))
+
+
+@app.post("/v1/text-to-speech/{voice_id}",
+          dependencies=[Depends(require_scope("tts")), Depends(DEMO_TTS_BUDGET)])
 async def text_to_speech(
     voice_id: str,
     req: TTSRequest,
@@ -1876,8 +1888,38 @@ async def build_plan(req: BuildRequest):
         "lines": lines,
         "fresh": sum(1 for l in lines if l["state"] == "fresh"),
         "would_render": sum(1 for l in lines if l["state"] == "would_render"),
+        # The id this manifest WOULD build to. Reported by the dry run because
+        # it is a function of the inputs: a plan that reports the same build_id
+        # as the lockfile in your repo is the cheapest possible "nothing moved".
+        "build_id": buildstore.build_id(lines),
         "identity_version": buildstore.IDENTITY_VERSION,
     }
+
+
+@app.post("/v1/build/lock", dependencies=[Depends(require_scope("tts"))])
+async def build_lock(req: BuildRequest):
+    """Emit ``gravitone.lock`` for a manifest. No synthesis, no bytes, no clock.
+
+    The document a team COMMITS. Its schema is documented on
+    ``buildstore.lockfile`` and versioned by ``schema_version``; it holds only
+    values derived from the inputs (digest, resolved voice, engine version,
+    format) so its diff is exactly the set of lines whose audio would change —
+    nothing about when it was generated, on which host, or by whom.
+
+    A manifest with two lines sharing an id is refused by name: the file is
+    keyed by id, so locking it would silently drop one of them.
+    """
+    dupes = buildstore.duplicate_line_ids([{"id": ln.id} for ln in req.lines])
+    if dupes:
+        raise HTTPException(status_code=422,
+                            detail=buildstore.DUPLICATE_LINE_ID + ", ".join(dupes))
+    engine_version = _engine_version()
+    lines = []
+    for i, line in enumerate(req.lines):
+        resolved, fmt_str, digest, _emotion = await _line_identity(line, i)
+        lines.append({"id": line.id, "digest": digest, "voice": resolved,
+                      "format": fmt_str, "engine_version": engine_version})
+    return buildstore.lockfile(lines)
 
 
 @app.post("/v1/build", dependencies=[Depends(require_scope("tts"))])
@@ -1902,9 +1944,13 @@ async def build(req: BuildRequest):
     """
     assert ENGINE is not None
     results = []
+    lock_lines = []
+    engine_version = _engine_version()
     rendered_now: set[str] = set()
     for i, line in enumerate(req.lines):
         resolved, fmt_str, digest, _emotion = await _line_identity(line, i)
+        lock_lines.append({"id": line.id, "digest": digest, "voice": resolved,
+                           "format": fmt_str, "engine_version": engine_version})
         if digest in rendered_now or await _offload(BUILD_STORE.has, digest):
             results.append({"id": line.id, "digest": digest, "format": fmt_str,
                             "state": "fresh"})
@@ -1925,18 +1971,122 @@ async def build(req: BuildRequest):
             "state": "rendered", "bytes": len(body),
             "audio_seconds": rendered.audio.audio_seconds,
         })
+    build_ident = await _record_build(lock_lines)
     return {
         "lines": results,
         "fresh": sum(1 for l in results if l["state"] == "fresh"),
         "rendered": sum(1 for l in results if l["state"] == "rendered"),
+        # The name of this build: fetch every artifact at once from
+        # GET /v1/build/{build_id}.zip, or line by line from /v1/audio/{digest}.
+        "build_id": build_ident,
         "identity_version": buildstore.IDENTITY_VERSION,
     }
+
+
+async def _record_build(lock_lines: list[dict]) -> str:
+    """Persist the skeleton of a finished build and return its id.
+
+    The record owns no audio — it names digests the artifact store already
+    holds, which is why it is capped by count and why an evicted artifact makes
+    the zip a named 410 instead of making this record a lie. A record that
+    cannot be written is logged, never raised: every digest is already in the
+    response and ``/v1/audio/{digest}`` still serves each one individually.
+    """
+    build_ident = buildstore.build_id(lock_lines)
+    record = {
+        "schema_version": buildstore.BUILD_RECORD_SCHEMA_VERSION,
+        "build_id": build_ident,
+        "identity_version": buildstore.IDENTITY_VERSION,
+        "lines": [{"id": ln["id"], "digest": ln["digest"], "format": ln["format"]}
+                  for ln in lock_lines],
+    }
+    try:
+        # A manifest MAY repeat a line id (two lines can legitimately be the
+        # same audio); a lockfile may not. When it does, the zip ships without
+        # the lock member rather than with a lock that dropped a line.
+        record["lock"] = buildstore.lockfile(lock_lines)
+    except ValueError:
+        pass
+    await _offload(BUILD_STORE.put_record, record)
+    return build_ident
+
+
+@app.get("/v1/build/{build_id}.zip", dependencies=[Depends(require_scope("tts"))])
+async def get_build_zip(build_id: str):
+    """Every artifact of one build, streamed as a zip, plus its lockfile.
+
+    The convenience half of the build plane: CI already knows each digest and
+    can fetch them one at a time, but a human who just built a 300-line script
+    wants one file. Nothing is re-rendered here — this route reads the store and
+    only the store, so a zip is exactly as expensive as the bytes it moves.
+
+    Bounded and honest about its edges, all named:
+      * unknown build id -> 404 ``BUILD_NOT_FOUND``;
+      * known build whose audio was evicted by the LRU budget -> 410
+        ``BUILD_PRUNED``, listing the digests, checked BEFORE a byte is sent so
+        a caller never has to tell a truncated download from a complete one;
+      * a build larger than ``GRAVITONE_BUILD_ZIP_MAX_BYTES`` -> 413 naming the
+        budget and pointing at the per-digest route.
+
+    Members are stored (not deflated) with a fixed timestamp, so the archive of
+    an unchanged build is byte-identical every time it is fetched.
+    """
+    try:
+        bare = buildstore.parse_build_id(build_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    record = await _offload(BUILD_STORE.get_record, bare)
+    if record is None:
+        raise HTTPException(status_code=404, detail=buildstore.BUILD_NOT_FOUND)
+
+    lines = [ln for ln in (record.get("lines") or []) if ln.get("digest")]
+    missing, total = [], 0
+    for line in lines:
+        size = await _offload(BUILD_STORE.size_of, line["digest"])
+        if not size:
+            missing.append(line["digest"])
+        total += size
+    if missing:
+        raise HTTPException(status_code=410,
+                            detail=buildstore.BUILD_PRUNED + ", ".join(missing))
+    budget = buildstore.zip_max_bytes()
+    if total > budget:
+        raise HTTPException(
+            status_code=413,
+            detail=f"{buildstore.ZIP_TOO_LARGE}{total}/{budget}")
+
+    names = buildstore.zip_member_names(lines)
+    lock = record.get("lock")
+
+    def _members():
+        if lock:
+            yield "gravitone.lock", buildstore.lockfile_bytes(lock)
+        for name, line in zip(names, lines):
+            entry = BUILD_STORE.get(line["digest"])
+            if entry is None:
+                # Evicted between the pre-flight check and this read. A zip that
+                # simply omits the member would be a VALID archive missing a
+                # file — a silent lie — so the transfer fails instead.
+                logger.warning("build %s lost %s mid-stream", bare, line["digest"])
+                raise RuntimeError(buildstore.BUILD_PRUNED + str(line["digest"]))
+            yield name, entry.data
+
+    return StreamingResponse(
+        buildstore.stream_zip(_members()),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="gravitone-{bare[:12]}.zip"',
+            "Cache-Control": "public, max-age=31536000, immutable",
+        },
+    )
 
 
 # Voice + Character management lives in service/voices.py. Read endpoints
 # (list voices/characters/emotions) accept a tts-scoped key so ElevenLabs
 # drop-in clients work; mutations need the "voices" scope.
-app.include_router(voices_router, dependencies=[Depends(require_read_write("tts", "voices"))])
+app.include_router(voices_router, dependencies=[
+    Depends(require_read_write("tts", "voices")), Depends(DEMO_CLONE_BUDGET)])
 # API key management (issue / rotate / revoke) — root TTS_API_KEY only.
 app.include_router(keys_router, dependencies=[Depends(require_scope("admin"))])
 # Character ingestion (scan a recording → review → commit) — "clone" scope.
@@ -1951,6 +2101,10 @@ app.include_router(takes_router, dependencies=[Depends(require_scope("tts"))])
 app.include_router(reviews_router, dependencies=[Depends(require_scope("tts"))])
 # Direction corpus (what re-performances change) - same surface, same scope.
 app.include_router(direction_router, dependencies=[Depends(require_scope("tts"))])
+# Audible Docs: a URL / markdown / HTML body -> a segmented, emotion-tagged
+# narration PLAN. It synthesizes nothing; every block is rendered lazily through
+# the ordinary TTS routes, so it carries the same tts scope they do.
+app.include_router(narrate_router, dependencies=[Depends(require_scope("tts"))])
 # Local transcription (service/stt.py) — its own scope: hearing a recording is
 # a different capability from speaking one, and a drop-in TTS client has no
 # business transcribing.
@@ -2095,6 +2249,25 @@ async def speak(
             **_ignored_headers(req.voice_settings),
         },
     )
+
+
+async def _speak_for_take(character_id: str, text: str) -> dict:
+    """Public re-perform renders through the SAME machinery /v1/speak uses.
+    Handed over instead of imported: takes.py cannot import this module (it is
+    the router this module imports) — same seam as convai.set_engine_provider."""
+    resp = await speak(SpeakRequest(character_id=character_id, text=text),
+                       output_format="wav_24000")
+    if getattr(resp, "status_code", 200) != 200:  # backpressure JSON, not audio
+        raise HTTPException(resp.status_code,
+                            "the render queue is full - try again shortly")
+    report = json.loads(base64.b64decode(resp.headers.get("X-Segments", "")) or b"[]")
+    rtf = resp.headers.get("X-Realtime-Factor", "")
+    return {"audio": resp.body, "segments": report,
+            "seconds": float(resp.headers.get("X-Audio-Seconds", 0) or 0),
+            "rtf": float(rtf) if rtf.replace(".", "", 1).isdigit() else 0.0}
+
+
+takes_plane.set_speak_provider(_speak_for_take)
 
 
 class PerformanceLine(BaseModel):

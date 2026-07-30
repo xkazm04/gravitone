@@ -22,21 +22,32 @@ change one [emotion] tag, re-render). The child records `parent_id` +
 can walk the chain, and `direction.py` can count what the human changed.
 Eviction is lineage-aware: dropping a mid-chain link would leave a child
 pointing at a parent that no longer exists, so the store evicts LEAF-FIRST.
+
+PUBLIC RE-PERFORM: a visitor to /t/{id} may edit the text and render a CHILD
+take — but only if the publisher opted in (`allow_reperform`, default OFF).
+That flag is the whole consent model: forking puts NEW WORDS in someone's
+voice, so it is a decision the publisher makes at publish time, never a
+default the product makes for them. The render costs this box real CPU, so it
+is bounded by the shared per-IP limiter (service/ratelimit.py) and by a text
+cap far below the studio's own, and the child is minted WITHOUT the flag — a
+fork is a leaf, not the start of an unbounded public chain.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from service import direction
 from service.config import SETTINGS
+from service.ratelimit import per_ip_budget
 
 router = APIRouter(prefix="/v1/takes", tags=["takes"])
 reviews_router = APIRouter(prefix="/v1/reviews", tags=["reviews"])
@@ -51,6 +62,16 @@ MAX_SEGMENTS = 200
 MAX_LINEAGE_DEPTH = 20     # ancestors walked before the answer says so
 MAX_LINEAGE_CHILDREN = 50  # children listed per take
 MAX_DERIVED_KEYS = 10      # fields kept from a client's derived_from block
+# A public fork is one edited line or two, not a script: a visitor spending
+# this box's CPU gets a fraction of MAX_TEXT. Refused by NAME, not by a
+# pydantic 422, because the panel shows the sentence to a human.
+MAX_REPERFORM_TEXT = 1000
+
+# The public-compute budget. Deliberately small and slow: a fork is seconds of
+# CPU on a box that is also serving the studio, and the honest ceiling for an
+# anonymous visitor is "a few tries, then come back later". Named "reperform"
+# so /metrics-shaped introspection and the tests can find it.
+REPERFORM_BUDGET = per_ip_budget("reperform", limit=5, window_s=300, burst=2)
 
 
 def _valid_id(take_id: str) -> bool:
@@ -204,14 +225,38 @@ def create_take(
     if parent_id and not _valid_id(parent_id):
         raise HTTPException(400, "parent_id must be an alphanumeric take id")
 
-    take_id = uuid.uuid4().hex[:10]
-    record = {
-        "id": take_id,
-        "character_id": str(m.get("character_id", ""))[:100],
-        "character_name": str(m.get("character_name", "Character"))[:100],
+    record = _build_record(
+        character_id=str(m.get("character_id", ""))[:100],
+        character_name=str(m.get("character_name", "Character"))[:100],
+        text=text,
+        seconds=float(m.get("seconds", 0) or 0),
+        rtf=float(m.get("rtf", 0) or 0),
+        segments=segments,
+        parent_id=parent_id,
+        derived_from=_clean_derived_from(m.get("derived_from")),
+        # Publish-time opt-in for public re-perform. Absent = OFF: every take
+        # published before this existed is not forkable, which is the only
+        # reading of an unanswered consent question.
+        allow_reperform=bool(m.get("allow_reperform", False)),
+    )
+    _write_take(record, audio)
+    return {"take_id": record["id"]}
+
+
+def _build_record(*, character_id: str, character_name: str, text: str,
+                  seconds: float, rtf: float, segments: list,
+                  parent_id: str = "", derived_from: dict | None = None,
+                  allow_reperform: bool = False) -> dict:
+    """The on-disk shape of one take. Shared by the upload route and the
+    server-side re-perform render, so a forked take is the same record a
+    published one is — same caps, same fields, same reader."""
+    return {
+        "id": uuid.uuid4().hex[:10],
+        "character_id": character_id,
+        "character_name": character_name,
         "text": text,
-        "seconds": float(m.get("seconds", 0) or 0),
-        "rtf": float(m.get("rtf", 0) or 0),
+        "seconds": seconds,
+        "rtf": rtf,
         "segments": [
             {
                 "text": str(s.get("text", ""))[:300],
@@ -220,25 +265,31 @@ def create_take(
                 "fallback": bool(s.get("fallback", False)),
                 "seconds": float(s.get("seconds", 0) or 0),
             }
-            for s in segments
+            for s in segments if isinstance(s, dict)
         ],
         "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "parent_id": parent_id or None,
-        "derived_from": _clean_derived_from(m.get("derived_from")) or None,
+        "derived_from": derived_from or None,
+        "allow_reperform": allow_reperform,
     }
 
+
+def _write_take(record: dict, audio: bytes) -> None:
+    """Evict, write the pair, and count the direction delta. Blocking by
+    construction (up to 25 MB plus a glob of the store) — callers on the event
+    loop must hand it to a thread."""
     TAKES_DIR.mkdir(parents=True, exist_ok=True)
     _evict_oldest()
-    (TAKES_DIR / f"{take_id}.wav").write_bytes(audio)
-    (TAKES_DIR / f"{take_id}.json").write_text(json.dumps(record), "utf-8")
+    (TAKES_DIR / f"{record['id']}.wav").write_bytes(audio)
+    (TAKES_DIR / f"{record['id']}.json").write_text(json.dumps(record), "utf-8")
 
     # The diff between parent and child is a human direction decision. Counted
     # after the take is safely on disk, and never able to fail it.
+    parent_id = record.get("parent_id") or ""
     if parent_id:
         parent_meta = _read_meta(parent_id)
         if parent_meta is not None:
             direction.record_delta(parent_meta, record)
-    return {"take_id": take_id}
 
 
 @router.get("/{take_id}")
@@ -304,6 +355,108 @@ def get_take_audio(take_id: str) -> FileResponse:
     if not take_id.isalnum() or not p.is_file():
         raise HTTPException(404, "take audio not found")
     return FileResponse(str(p), media_type="audio/wav")
+
+
+# ── public re-perform (a share is a fork point) ───────────────────────────────
+# The renderer, handed over rather than imported. `service/app.py` owns the
+# synthesis machinery (/v1/speak resolves a Character's per-emotion voices,
+# admits against the worker pool and reports what it substituted) and it
+# imports THIS module for its router — so importing it back would be the cycle.
+# Same seam, and same reason, as `convai.set_engine_provider`.
+#
+# Contract: `await provider(character_id, text) -> {audio: bytes (wav),
+# segments: [...], seconds: float, rtf: float}`, raising HTTPException for a
+# refusal the caller should see (unknown Character, backpressure). None = this
+# process has no renderer wired, which is a NAMED refusal, not a 500.
+_SPEAK_PROVIDER = None
+
+
+def set_speak_provider(provider) -> None:
+    global _SPEAK_PROVIDER
+    _SPEAK_PROVIDER = provider
+
+
+class ReperformReq(BaseModel):
+    """One edit, one render. The text is the parent's, as the visitor changed
+    it — emotion metatags and all."""
+    text: str = Field(..., min_length=1)
+
+
+@router.post("/{take_id}/reperform", status_code=201,
+             dependencies=[Depends(REPERFORM_BUDGET)])
+async def reperform(take_id: str, req: ReperformReq) -> dict:
+    """Fork a published take: render the edited text in the same Character's
+    voice and mint a CHILD take with lineage.
+
+    Every refusal is named, because this runs for an anonymous visitor who
+    cannot read a log: `not-published-for-reperform` (the publisher did not opt
+    in), `too-long`, `engine-absent`, plus the limiter's `rate-limited` (429 +
+    Retry-After) and whatever the render path itself says (a 429 for
+    backpressure, a 404 for a Character deleted since the take was published).
+
+    The child is NOT itself forkable: consent was given for one fork of one
+    published take, and inheriting the flag would turn one opt-in into an
+    unbounded public render chain.
+    """
+    parent = _read_meta(take_id)
+    if parent is None:
+        raise HTTPException(404, "take not found (shares are evicted oldest-first)")
+    if not bool(parent.get("allow_reperform")):
+        raise HTTPException(
+            403, "not-published-for-reperform: whoever published this take did "
+                 "not open it for public re-performance")
+
+    text = req.text.strip()
+    if not text:
+        raise HTTPException(400, "empty: there is nothing to perform")
+    if len(text) > MAX_REPERFORM_TEXT:
+        raise HTTPException(
+            413, f"too-long: a public re-perform is capped at "
+                 f"{MAX_REPERFORM_TEXT} characters ({len(text)} sent)")
+
+    character_id = str(parent.get("character_id") or "")
+    if not character_id:
+        raise HTTPException(
+            409, "character-absent: this take does not name a Character to "
+                 "perform with")
+
+    provider = _SPEAK_PROVIDER
+    if provider is None:
+        raise HTTPException(
+            503, "engine-absent: this deployment has no renderer wired for "
+                 "public re-performance")
+
+    try:
+        rendered = await provider(character_id, text)
+    except HTTPException:
+        raise  # already a named refusal from the render path (404 / 429 / 503)
+    except Exception as exc:  # noqa: BLE001 - a render failure is not a crash report
+        raise HTTPException(502, f"render-failed: {type(exc).__name__}") from exc
+
+    audio = rendered.get("audio") or b""
+    if not isinstance(audio, (bytes, bytearray)) or audio[:4] != b"RIFF":
+        raise HTTPException(502, "render-failed: the renderer returned no wav")
+    audio = bytes(audio)
+    if len(audio) > MAX_AUDIO_BYTES:
+        raise HTTPException(
+            413, f"too-long: the render is over {MAX_AUDIO_BYTES // 2**20} MB")
+
+    record = _build_record(
+        character_id=character_id,
+        character_name=str(parent.get("character_name", "Character"))[:100],
+        text=text[:MAX_TEXT],
+        seconds=float(rendered.get("seconds", 0) or 0),
+        rtf=float(rendered.get("rtf", 0) or 0),
+        segments=list(rendered.get("segments") or [])[:MAX_SEGMENTS],
+        parent_id=take_id,
+        derived_from={"kind": "public-reperform"},
+        allow_reperform=False,
+    )
+    # Off the event loop: writing the wav and globbing the store to evict are
+    # both blocking, and this handler is async because the render is.
+    await asyncio.to_thread(_write_take, record, audio)
+    return {"take_id": record["id"], "parent_id": take_id,
+            "seconds": record["seconds"]}
 
 
 # ── review sets (client approval loop) ────────────────────────────────────────

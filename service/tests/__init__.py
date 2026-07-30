@@ -23,6 +23,10 @@ import os
 import tempfile
 
 os.environ["TTS_API_KEY"] = ""
+# Disarm the app-wired demo per-IP budgets: every suite shares ONE fake client
+# address, so a heavy suite would 429 itself on infrastructure it is not
+# testing. test_ratelimit proves the limiter on its own instances.
+os.environ["GRAVITONE_RATELIMIT_TEST_BYPASS"] = "1"
 os.environ.setdefault(
     "GRAVITONE_BUILD_STORE_DIR",
     os.path.join(tempfile.gettempdir(), "gravitone-build-store-tests"))

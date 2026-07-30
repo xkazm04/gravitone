@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import unittest
 
-from service.tests import fake_engine  # installs shims — must precede app import
+from service.tests import fake_engine
+from service import ratelimit  # installs shims — must precede app import
 
 import service.app as appmod
 import service.engine as enginemod
@@ -24,6 +25,8 @@ import numpy as np
 
 class _Base(unittest.TestCase):
     def setUp(self) -> None:
+
+        ratelimit.reset_all()  # demo per-IP budgets are process-global; a heavy suite must not 429 itself
         self._orig = appmod.ENGINE
         appmod.SYNTH_CACHE.clear()  # process-wide singleton — isolate cases
         appmod.ENGINE = fake_engine.FakeEngine(workers=2, delay=0.01)
@@ -242,6 +245,8 @@ class PremiumRouteFormatTests(_Base):
     _EMAP = {"baseline": "v_base", "happy": "v_happy", "sad": "v_sad"}
 
     def setUp(self) -> None:
+
+        ratelimit.reset_all()  # demo per-IP budgets are process-global; a heavy suite must not 429 itself
         super().setUp()
         self._orig_emap = appmod.emotion_map
         appmod.emotion_map = lambda cid: dict(self._EMAP)
