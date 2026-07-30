@@ -18,14 +18,52 @@ export type Speaker = { id: string; utterances: number; seconds: number; sample_
 // the recording had too little neutral speech. It must be SHOWN, never dropped:
 // the whole point is that an emotionally blended baseline is never presented as
 // a clean one (service/ingest.py::plan_baseline).
-export type Stem = { emotion: string; seconds: number; segments: number; eligible: boolean; cues: string[]; note?: string | null };
+// One candidate splice of an emotion's segments, computed by the backend from
+// the labels the scan already produced (service/ingest_api.py::build_recipes).
+// `label`/`how` are the backend's own words for what makes this take different —
+// the UI never invents a description of audio it did not measure. `default` marks
+// the splice the ledger row is already reporting, which is what commits when
+// nobody auditions anything.
+export type Recipe = {
+  id: string; label: string; how: string;
+  seconds: number; segments: number; default?: boolean;
+};
+// `recipes` is optional and absent whenever there is no real choice (a single
+// segment, or every candidate splice identical). Absent = the drill-down simply
+// does not exist for that row — never an empty "no alternatives" affordance.
+export type Stem = { emotion: string; seconds: number; segments: number; eligible: boolean; cues: string[]; note?: string | null; recipes?: Recipe[] };
 // `min_stem` is the seconds-of-audio floor a stem must clear to be cloneable
 // (service/ingest.py::MIN_STEM_SECONDS, echoed back per job) and `mode` is the
 // pipeline that produced this ledger. Both are served on every result and both
 // were dropped on the floor: the review screen spoke of "the clone threshold"
 // without ever naming it, and reported a speaker COUNT in a mode that cannot
 // count speakers.
-export type Result = { duration: number; speakers: string[]; target: string; utterances: number; stems: Stem[]; min_stem: number; mode?: "cloud" | "sovereign" };
+// One labelled span of the recording — the ATOM a stem is spliced from, and
+// until the Casting Board the only thing on this screen the user could not see.
+// `i` is the segment's own index (the id `/api/ingest/{job}/segment/{i}` serves),
+// `ok` is whether it has audio at all, and `outlier` is the pipeline's own
+// verdict: "dropped" = its audio is in no stem, "flagged" = it is, and it looked
+// unlike the rest. Absent must render as nothing, never as a zero.
+export type Segment = {
+  i: number; emotion: string; confidence: number; cue: string; dur: number;
+  text: string; model?: string; ok?: boolean;
+  failure?: string | null; outlier?: string | null; escalation?: string | null;
+};
+export type Result = { duration: number; speakers: string[]; target: string; utterances: number; stems: Stem[]; min_stem: number; mode?: "cloud" | "sovereign"; segments?: Segment[] };
+// What POST /api/ingest/{job}/stems answers with: every stem re-measured from
+// the file it just wrote. `assigned` is what this stem is now spliced from,
+// `proposed` what the pipeline chose, `takes` whether alternative recipes still
+// exist for it (an edit withdraws them, because they described a selection the
+// user has just replaced).
+export type CastStem = {
+  emotion: string; seconds: number; segments: number; eligible: boolean;
+  note?: string | null; assigned: number[]; proposed: number[];
+  edited: boolean; takes: boolean;
+};
+export type CastResult = {
+  min_stem: number; reset: boolean; edited: string[]; changed: string[];
+  stems: CastStem[];
+};
 export type Character = { character_id: string; name: string };
 export type Created = { voice_id: string; emotion: string };
 
@@ -42,6 +80,20 @@ export type Job = {
   note?: string | null;
   limits?: string[] | null;
   detection?: Detection | null;
+  // What the backend DID with the recipe choices at commit, plus why candidate
+  // takes are absent when they are. `skipped` is the honesty half: a pick that
+  // could not be applied is stated, never quietly downgraded to the default.
+  recipes?: RecipeOutcome | null;
+  // The Casting Board's server-side state: what each stem is currently spliced
+  // from, and which emotions the user has re-cast. Served on every poll so a
+  // reload never shows a ledger whose numbers disagree with the audio.
+  casting?: { assignments: Record<string, number[]>; edited: string[] } | null;
+};
+
+export type RecipeOutcome = {
+  applied: Record<string, string>;
+  skipped: { emotion: string; recipe: string; why: string }[];
+  unavailable?: string | null;
 };
 
 /** GET /api/ingest/modes — the backend's own description of each ingest mode. */
@@ -97,6 +149,19 @@ export type State = {
   committedCid: string | null;
   pendingCommit: { character: string; cid: string } | null;
   created: Created[];
+  // Audition Room: {emotion -> recipe id} the user's EAR chose. Empty is the
+  // normal case — auditioning is an opt-in drill-down, and an emotion missing
+  // from here commits the default splice the ledger already showed.
+  auditions: Record<string, string>;
+  // Casting Board: {emotion -> segment indices} this stem is spliced from.
+  // Empty is the normal case and means "whatever the pipeline proposed" — the
+  // board fills it in from the server's answer the first time anything is
+  // re-cast, so an empty map and a map that happens to equal the proposal stay
+  // distinguishable.
+  assignments: Record<string, number[]>;
+  // Emotions whose stem is no longer the pipeline's own splice. Drives the
+  // "edited" marks; "reset to proposed" is offered whether or not it is empty.
+  dirty: string[];
 };
 
 export const initialState: State = {
@@ -112,6 +177,9 @@ export const initialState: State = {
   committedCid: null,
   pendingCommit: null,
   created: [],
+  auditions: {},
+  assignments: {},
+  dirty: [],
 };
 
 export type Action =
@@ -126,6 +194,16 @@ export type Action =
   // message — the page states the recoverable truth separately (amber).
   | { type: "COMMIT_FAILED"; error: string | null }
   | { type: "TOGGLE_EMOTION"; emotion: string }
+  // The winner of an audition. `recipeId: null` returns the emotion to the
+  // default splice — a vote must be undoable, or the drill-down becomes a trap.
+  | { type: "CHOOSE_RECIPE"; emotion: string; recipeId: string | null }
+  // Casting Board. CAST_SEGMENTS is the OPTIMISTIC half — the checkbox has to
+  // answer the click, and the re-splice behind it is debounced. CAST_SYNCED is
+  // the server's answer, and it is the only thing that ever moves the seconds,
+  // the eligible badge or the note: those are measurements of a file, and the
+  // browser is not allowed to guess them.
+  | { type: "CAST_SEGMENTS"; assignments: Record<string, number[]> }
+  | { type: "CAST_SYNCED"; cast: CastResult }
   | { type: "SET_MODE"; mode: "new" | "extend" }
   | { type: "SET_CHAR_NAME"; name: string }
   | { type: "SET_EXTEND_CID"; cid: string }
@@ -140,7 +218,8 @@ export function reducer(state: State, action: Action): State {
       // No fabricated step labels: job stays null until the first poll brings
       // the server's own steps (~1.5s). The loader shows a neutral placeholder.
       return { ...state, jobId: action.jobId, job: null, result: null,
-        selected: new Set(), error: null, phase: "processing" };
+        selected: new Set(), auditions: {}, assignments: {}, dirty: [],
+        error: null, phase: "processing" };
 
     case "JOB_POLLED": {
       const job = action.job;
@@ -157,6 +236,12 @@ export function reducer(state: State, action: Action): State {
         if (backTo === "upload") {
           return { ...state, phase: "upload", error,
             job: null, jobId: null, result: null, selected: new Set(),
+            // The recipes were candidates OF that discarded recording; keeping
+            // them would send a dead emotion→recipe map with the next commit.
+            auditions: {},
+            // Same for a segment selection: those indices addressed segments in
+            // a workdir the server has already torn down.
+            assignments: {}, dirty: [],
             pendingCommit: null };
         }
         return { ...state, job, phase: "review", error };
@@ -167,6 +252,15 @@ export function reducer(state: State, action: Action): State {
       if (job.status === "done" && job.result) {
         next.result = job.result;
         next.selected = new Set(job.result.stems.filter((s) => s.eligible).map((s) => s.emotion));
+        // A fresh ledger is a fresh set of candidates; a recipe id chosen for a
+        // previous scan means nothing here, and neither does a segment index.
+        next.auditions = {};
+        // What each stem is spliced FROM, as the backend published it with the
+        // ledger. Derived server-side on purpose: a borrowed baseline is not
+        // "the neutral segments", so a map built here from the labels would
+        // describe a stem the pipeline never built.
+        next.assignments = job.casting?.assignments ?? {};
+        next.dirty = job.casting?.edited ?? [];
       }
       if (job.status === "committed") {
         next.created = job.committed ?? [];
@@ -201,6 +295,46 @@ export function reducer(state: State, action: Action): State {
       return { ...state, selected };
     }
 
+    case "CAST_SEGMENTS":
+      return { ...state, assignments: { ...state.assignments, ...action.assignments } };
+
+    case "CAST_SYNCED": {
+      if (!state.result) return state;
+      const by = new Map(action.cast.stems.map((s) => [s.emotion, s]));
+      const stems = state.result.stems.map((st) => {
+        const c = by.get(st.emotion);
+        if (!c) return st;
+        const next: Stem = { ...st, seconds: c.seconds, segments: c.segments,
+          eligible: c.eligible, note: c.note ?? null };
+        // The alternative takes were readings of the splice the pipeline
+        // proposed. Once a row is re-cast the backend withdraws them, and an
+        // offer it would refuse at commit must leave the screen with it.
+        if (!c.takes) delete next.recipes;
+        return next;
+      });
+      const assignments = { ...state.assignments };
+      const auditions = { ...state.auditions };
+      const selected = new Set(state.selected);
+      for (const c of action.cast.stems) {
+        assignments[c.emotion] = c.assigned;
+        if (!c.takes) delete auditions[c.emotion];
+        // A stem the user cast below the clone minimum is descoped rather than
+        // left ticked for a commit the backend will refuse. Crossing the line
+        // the other way is NOT auto-ticked: keeping is the user's click, and
+        // silently re-adding a row they descoped would undo their decision.
+        if (!c.eligible) selected.delete(c.emotion);
+      }
+      return { ...state, result: { ...state.result, stems },
+        assignments, auditions, selected, dirty: action.cast.edited };
+    }
+
+    case "CHOOSE_RECIPE": {
+      const auditions = { ...state.auditions };
+      if (action.recipeId === null) delete auditions[action.emotion];
+      else auditions[action.emotion] = action.recipeId;
+      return { ...state, auditions };
+    }
+
     case "SET_MODE":
       return { ...state, mode: action.mode };
     case "SET_CHAR_NAME":
@@ -221,12 +355,16 @@ export function reducer(state: State, action: Action): State {
         return {
           ...initialState,
           selected: new Set(),
+          auditions: {},
+          assignments: {},
+          dirty: [],
           mode: "extend",
           extendCid: state.committedCid ?? state.extendCid,
           committedCid: state.committedCid,
         };
       }
-      return { ...initialState, selected: new Set() };
+      return { ...initialState, selected: new Set(), auditions: {},
+        assignments: {}, dirty: [] };
     }
 
     default:

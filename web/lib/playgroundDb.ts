@@ -11,9 +11,14 @@
 const DB_NAME = "gravitone-playground";
 export const TAKES_STORE = "takes";
 export const COMPOSER_STORE = "composer";
-// v1 was takes-only; v2 adds the composer store. The upgrade is additive, so an
-// existing session's takes survive it.
-const DB_VERSION = 2;
+// Punch-in variants: the A/B lanes for one region of one take, each holding its
+// own rendered audio. Kept out of the takes store because they are NOT takes —
+// they are candidates, they are capped and pruned aggressively (see
+// _variants/variantStore), and only the one the user commits becomes a take.
+export const VARIANTS_STORE = "variants";
+// v1 was takes-only; v2 adds the composer store; v3 adds punch-in variants.
+// Every upgrade is additive, so an existing session's takes survive all of them.
+const DB_VERSION = 3;
 
 export function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -29,6 +34,9 @@ export function openDb(): Promise<IDBDatabase> {
       }
       if (!db.objectStoreNames.contains(COMPOSER_STORE)) {
         db.createObjectStore(COMPOSER_STORE, { keyPath: "id" });
+      }
+      if (!db.objectStoreNames.contains(VARIANTS_STORE)) {
+        db.createObjectStore(VARIANTS_STORE, { keyPath: "id" });
       }
     };
     req.onsuccess = () => resolve(req.result);

@@ -71,7 +71,127 @@ export type Take = {
   // queueSeconds) this take carries — see TAKE_TIMING_VERSION. Absent on every
   // take written before the marker existed.
   timingVersion?: number;
+  // Punch-in provenance: this take is a SPLICE of an earlier one. Absent for
+  // every take that was rendered in one call (and for every take stored before
+  // the editor existed) — see TakeEdits.
+  edits?: TakeEdits;
 };
+
+// ── punch-in provenance (D5) ────────────────────────────────────────────────
+/**
+ * How a spliced take was made.
+ *
+ * `source` is the id of the ORIGINAL take (the base render), and `regions` is
+ * every patch applied since, in order — so one take carries its whole
+ * reproduction recipe: the base `/v1/performance` (or `/v1/speak`) call plus one
+ * `/v1/speak` call per patched region. A chain of ids would have been smaller
+ * and would have left the code export unable to print the recipe once the
+ * intermediate takes aged out of the log.
+ *
+ * `v` is why older stored takes restore cleanly: takes are durable
+ * (lib/takeStore, IndexedDB), so the console reads records written by builds
+ * that had no editor at all. `readEdits` treats an absent OR unrecognised
+ * version as "no edit history", which is exactly what such a record has — and
+ * never as a reason to refuse the take.
+ */
+export const TAKE_EDITS_VERSION = 1;
+
+/** One punched region: which segment index, the text that was re-rendered, and
+ *  the per-region overrides it was rendered with. */
+export type EditRegion = {
+  i: number;
+  text: string;
+  emotion?: string;
+  characterId?: string;
+};
+
+export type TakeEdits = {
+  v: 1;
+  /** Take id of the base render this chain started from. */
+  source: string;
+  regions: EditRegion[];
+};
+
+/** Read a take's edit history defensively. Returns null for a take with none,
+ *  for a record written before the field existed, and for a version this build
+ *  does not understand — all three mean "there is no history to show", and none
+ *  of them is a reason to lose the take. */
+export function readEdits(t: { edits?: unknown } | null | undefined): TakeEdits | null {
+  const e = t?.edits as Partial<TakeEdits> | undefined;
+  if (!e || e.v !== TAKE_EDITS_VERSION || typeof e.source !== "string") return null;
+  const regions = Array.isArray(e.regions) ? e.regions : [];
+  const clean = regions.filter(
+    (r): r is EditRegion =>
+      !!r && typeof r === "object" && Number.isInteger((r as EditRegion).i) && typeof (r as EditRegion).text === "string",
+  );
+  return { v: TAKE_EDITS_VERSION, source: e.source, regions: clean };
+}
+
+/** The edit history a spliced take inherits from `base` plus one new region.
+ *  The chain's `source` stays the ORIGINAL render, so a take punched five times
+ *  still names the call that made it. */
+export function appendEdit(base: Take, region: EditRegion): TakeEdits {
+  const prior = readEdits(base);
+  return {
+    v: TAKE_EDITS_VERSION,
+    source: prior?.source ?? base.id,
+    regions: [...(prior?.regions ?? []), region],
+  };
+}
+
+// ── timeline math ───────────────────────────────────────────────────────────
+/** One clickable region of a take: a segment, placed in time. */
+export type Region = {
+  index: number;
+  start: number;
+  end: number;
+  segment: Segment;
+};
+
+/**
+ * Place a take's segments on its timeline.
+ *
+ * The offsets come from the cumulative `segment.seconds` the backend reported,
+ * SCALED so the last region ends exactly at the take's real (decoded) duration.
+ * The report and the samples disagree by a few milliseconds per segment — the
+ * engine trims and concatenates — and without the scale that error accumulates
+ * until a click near the end of a 40-line performance seeks past the audio.
+ *
+ * A report with no usable seconds (all zero, or absent) still gets regions: the
+ * duration is divided equally, which is a labelled guess at WHERE each segment
+ * is, not a claim about how long it took to say.
+ */
+export function segmentRegions(segments: Segment[], duration: number): Region[] {
+  if (segments.length === 0 || !(duration > 0)) return [];
+  const secs = segments.map((s) => (Number.isFinite(s.seconds) && s.seconds > 0 ? s.seconds : 0));
+  const sum = secs.reduce((a, b) => a + b, 0);
+  const even = duration / segments.length;
+  let at = 0;
+  return segments.map((segment, index) => {
+    const len = sum > 0 ? (secs[index] / sum) * duration : even;
+    const start = at;
+    at = index === segments.length - 1 ? duration : Math.min(duration, at + len);
+    return { index, start, end: at, segment };
+  });
+}
+
+/** Re-scale a fragment's reported segment seconds onto its decoded duration —
+ *  the same "samples are the truth" rule as segmentRegions, applied to the
+ *  segments a spliced take carries so the NEXT timeline is built from honest
+ *  numbers. */
+export function scaleSegmentSeconds(segments: Segment[], duration: number): Segment[] {
+  const sum = segments.reduce((n, s) => n + (s.seconds > 0 ? s.seconds : 0), 0);
+  if (segments.length === 0) return [];
+  if (!(duration > 0)) return segments;
+  if (sum <= 0) {
+    const even = Math.round((duration / segments.length) * 100) / 100;
+    return segments.map((s) => ({ ...s, seconds: even }));
+  }
+  return segments.map((s) => ({
+    ...s,
+    seconds: Math.round(((s.seconds > 0 ? s.seconds : 0) / sum) * duration * 100) / 100,
+  }));
+}
 
 /**
  * Version of a take's TIMING numbers.
@@ -123,6 +243,222 @@ export function waveHeights(seed: number, n = 48): number[] {
 /** Remove metatags — used for the browser-speech fallback and char counts. */
 export function stripTags(text: string): string {
   return text.replace(/\[\/?[a-zA-Z_]*\]/g, "").replace(/\s+/g, " ").trim();
+}
+
+// ── the score: emotion regions over character offsets ───────────────────────
+//
+// The engine addresses emotion with an INLINE grammar (service/emotions.py):
+//
+//     Hello there. [excited]This is amazing![/excited] And now, back to normal.
+//
+// which is a fine wire format and a terrible editing model — you cannot drag a
+// substring, and every offset in it is off by the length of the tags around it.
+// So the UI models a take as PLAIN TEXT plus a list of regions expressed over
+// offsets INTO THAT PLAIN TEXT, and `toTags`/`parseTags` bridge the two.
+//
+// The string remains the API contract: nothing new is sent, nothing new is
+// stored, and a take composed by typing tags by hand and a take directed on the
+// score are the same request. These functions are pure so the round-trip is
+// testable in both directions, which is the only thing standing between a
+// visual editor and a corrupted prompt.
+//
+// `baseline` is the ABSENCE of a region, not a region whose value is
+// "baseline" — that is what the grammar means by a closing tag, and keeping the
+// two spellings from both existing is what makes the round-trip stable.
+
+/** The scale's neutral. Mirrors service/emotions.py::BASELINE. */
+export const SCORE_BASELINE = "baseline";
+
+/**
+ * The tag grammar, character for character as the service compiles it
+ * (`_TAG_RE = re.compile(r"\[(/?)([a-zA-Z_]*)\]")`). Built fresh per call —
+ * a shared /g regex carries `lastIndex` between calls.
+ */
+function tagRe(): RegExp {
+  return /\[(\/?)([a-zA-Z_]*)\]/g;
+}
+
+/**
+ * Which emotion names the grammar can actually carry.
+ *
+ * NOTE the asymmetry, because it is a real one: `normalize_emotion` accepts
+ * DIGITS in a custom emotion (`[a-z][a-z0-9_]{1,23}`) but the tag regex does
+ * not, so an emotion named `mode2` is a legal slot that no inline tag can
+ * address. A region for it therefore cannot be serialised — `regionProblem`
+ * says so out loud rather than letting `toTags` drop it silently.
+ */
+const TAGGABLE = /^[a-zA-Z_]+$/;
+
+/** One directed span of the text: characters [start, end) spoken as `value`. */
+export type ScoreRegion = {
+  start: number;
+  end: number;
+  kind: "emotion";
+  value: string;
+};
+
+/** Build a region without repeating the discriminant at every call site. */
+export function scoreRegion(start: number, end: number, value: string): ScoreRegion {
+  return { start, end, kind: "emotion", value };
+}
+
+/**
+ * Why this region cannot be placed on this text — or null when it can.
+ *
+ * The editor calls this BEFORE adding a region so a refusal is a sentence the
+ * user reads, not a region that quietly fails to serialise. `others` is the
+ * regions already on the text (overlaps are refused: the grammar has no nesting
+ * — `[/x]` returns to baseline, not to the enclosing tag — so two overlapping
+ * regions cannot both survive a round-trip).
+ */
+export function regionProblem(
+  text: string,
+  region: ScoreRegion,
+  others: ScoreRegion[] = [],
+): string | null {
+  if (!Number.isInteger(region.start) || !Number.isInteger(region.end)) {
+    return "That region has no whole-character bounds.";
+  }
+  if (region.start < 0 || region.end > text.length) {
+    return "That region falls outside the text.";
+  }
+  if (region.end <= region.start) {
+    return "Select at least one character to direct — an empty region says nothing.";
+  }
+  if (region.value === SCORE_BASELINE) {
+    return "Baseline is the absence of direction — delete the region instead of tagging it baseline.";
+  }
+  if (!TAGGABLE.test(region.value)) {
+    return `"${region.value}" cannot be written as an inline tag (letters and underscores only), so it cannot be sent to the engine.`;
+  }
+  const clash = others.find((o) => o !== region && o.start < region.end && region.start < o.end);
+  if (clash) {
+    return `That overlaps the ${clash.value} region — the tag grammar has no nesting, so regions cannot overlap.`;
+  }
+  return null;
+}
+
+/**
+ * The regions that can actually be written, in order.
+ *
+ * Defensive rather than trusting: clamps to the text, drops empty/unwritable
+ * ones and drops any region overlapping one already kept. `toTags` runs this so
+ * a bad region can never corrupt the string that goes to the engine; the editor
+ * runs `regionProblem` first so it never produces one.
+ */
+export function normalizeRegions(text: string, regions: ScoreRegion[]): ScoreRegion[] {
+  const kept: ScoreRegion[] = [];
+  const sorted = regions
+    .filter((r) => !!r && Number.isInteger(r.start) && Number.isInteger(r.end))
+    .map((r) => scoreRegion(Math.max(0, r.start), Math.min(text.length, r.end), r.value))
+    .filter((r) => r.end > r.start && r.value !== SCORE_BASELINE && TAGGABLE.test(r.value))
+    .sort((a, b) => a.start - b.start || a.end - b.end);
+  for (const r of sorted) {
+    const last = kept[kept.length - 1];
+    if (last && r.start < last.end) continue; // overlap: first one wins
+    kept.push(r);
+  }
+  return kept;
+}
+
+/** Serialise plain text + regions into the inline `[tag]` string the engine
+ *  takes. Regions that cannot be written are dropped (see normalizeRegions). */
+export function toTags(text: string, regions: ScoreRegion[]): string {
+  let out = "";
+  let at = 0;
+  for (const r of normalizeRegions(text, regions)) {
+    out += `${text.slice(at, r.start)}[${r.value}]${text.slice(r.start, r.end)}[/${r.value}]`;
+    at = r.end;
+  }
+  return out + text.slice(at);
+}
+
+/**
+ * Read an inline `[tag]` string back into plain text + regions.
+ *
+ * Follows the service's grammar exactly, including its two sharp edges:
+ *   * `[/anything]` and `[]` both return to BASELINE — the grammar does not
+ *     nest, so `[a]x[b]y[/b]z[/a]` ends with `z` at baseline, not at `a`.
+ *   * an unclosed tag runs to the next tag or to the end of the text.
+ * Baseline runs produce no region, and a run with no characters in it (`[a][b]`,
+ * `[a][/a]`) produces none either — both are exactly what the engine renders.
+ */
+export function parseTags(tagged: string): { text: string; regions: ScoreRegion[] } {
+  let text = "";
+  let pos = 0;
+  let current = SCORE_BASELINE;
+  let openAt = 0;
+  const regions: ScoreRegion[] = [];
+  const close = (at: number) => {
+    if (current !== SCORE_BASELINE && at > openAt) regions.push(scoreRegion(openAt, at, current));
+  };
+  for (const m of tagged.matchAll(tagRe())) {
+    text += tagged.slice(pos, m.index);
+    pos = m.index + m[0].length;
+    close(text.length);
+    const closing = m[1] === "/";
+    const name = m[2].toLowerCase();
+    current = closing || !name ? SCORE_BASELINE : name;
+    openAt = text.length;
+  }
+  text += tagged.slice(pos);
+  close(text.length);
+  return { text, regions };
+}
+
+/** What an edit did to the score: the regions that survived (shifted onto the
+ *  new text) and the ones that were CLEARED because the words underneath them
+ *  changed. Never a silent drift onto different words. */
+export type ScoreShift = { regions: ScoreRegion[]; cleared: ScoreRegion[] };
+
+/**
+ * Carry regions across a text edit.
+ *
+ * Offsets are the fragile part of this model — the risk M2 names — so the rule
+ * is stated once, here, and tested as a matrix:
+ *
+ *   * edit entirely BEFORE a region  → the region shifts by the length delta
+ *   * edit entirely AFTER a region   → the region is untouched
+ *   * pure INSERTION strictly inside → the region grows to include it. Nothing
+ *     the region covered has changed, so this is the one interior edit that
+ *     cannot land the direction on different words (typing a word into a
+ *     whispered clause keeps it whispered — clearing there would be hostile).
+ *   * anything else that touches the span (any deletion or replacement that
+ *     overlaps it, an edit that swallows it whole) → the region is CLEARED and
+ *     returned in `cleared` so the caller can NAME it in a notice.
+ *
+ * The edit is recovered as a single replaced run (common prefix + common
+ * suffix), which is what a textarea edit is. It is deliberately conservative:
+ * two far-apart changes arriving as one change read as one big replaced span
+ * and clear everything between them, which is honest — it never guesses.
+ */
+export function transformRegions(regions: ScoreRegion[], before: string, after: string): ScoreShift {
+  if (before === after) return { regions: [...regions], cleared: [] };
+
+  let p = 0;
+  const min = Math.min(before.length, after.length);
+  while (p < min && before[p] === after[p]) p += 1;
+  let s = 0;
+  while (s < min - p && before[before.length - 1 - s] === after[after.length - 1 - s]) s += 1;
+
+  const removedEnd = before.length - s;
+  const removedLen = removedEnd - p;
+  const delta = after.length - before.length;
+
+  const kept: ScoreRegion[] = [];
+  const cleared: ScoreRegion[] = [];
+  for (const r of regions) {
+    if (r.end <= p) {
+      kept.push(r);
+    } else if (r.start >= removedEnd) {
+      kept.push(scoreRegion(r.start + delta, r.end + delta, r.value));
+    } else if (removedLen === 0 && r.start < p && p < r.end) {
+      kept.push(scoreRegion(r.start, r.end + delta, r.value));
+    } else {
+      cleared.push(r);
+    }
+  }
+  return { regions: normalizeRegions(after, kept), cleared };
 }
 
 // ── the limits the SERVER actually enforces ─────────────────────────────────

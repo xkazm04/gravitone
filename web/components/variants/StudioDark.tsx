@@ -7,6 +7,8 @@ import { useAuth } from "@/lib/useAuth";
 import UserMenu from "@/components/ui/UserMenu";
 import MobileNav from "@/components/ui/MobileNav";
 import Equalizer, { usePauseOffscreen } from "@/components/ui/Equalizer";
+import { EYEBROW_CLASS } from "@/components/ui/Primitives";
+import { makeRise } from "@/components/ui/tokens";
 import SwitchKit from "./SwitchKit";
 import HeroMicDemo from "./HeroMicDemo";
 
@@ -16,17 +18,16 @@ const APP_ROUTES = [
   { label: "API keys", href: "/keys" },
 ];
 
-const ease = [0.22, 1, 0.36, 1] as const;
-const rise = {
-  hidden: { opacity: 0, y: 24 },
-  show: (i = 0) => ({ opacity: 1, y: 0, transition: { duration: 0.7, ease, delay: i * 0.08 } }),
-};
+// The landing rises further and slower than a dense module panel — but the
+// curve comes from the design system, not a local copy of it (this file used to
+// re-declare `ease` and `rise`, and they had drifted from tokens.ts).
+const rise = makeRise({ y: 24, duration: 0.7, stagger: 0.08 });
 
 export default function StudioDark() {
   const { user } = useAuth();
   const aurora = usePauseOffscreen<HTMLDivElement>();
   return (
-    <div className="font-hanken relative min-h-screen overflow-hidden bg-[#080a10] text-slate-200 grain">
+    <div className="font-hanken relative min-h-screen overflow-hidden bg-[var(--gt-ink)] text-slate-200 grain">
       {/* atmosphere — aurora drift pauses once scrolled past */}
       <div ref={aurora.ref} className={`pointer-events-none absolute inset-0 aurora ${aurora.paused ? "anim-paused" : ""}`} />
       <div className="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-cyan-400/40 to-transparent" />
@@ -59,7 +60,7 @@ export default function StudioDark() {
           <div>
             <motion.span
               variants={rise} initial="hidden" animate="show"
-              className="font-jetbrains inline-flex items-center gap-2 rounded-full border border-cyan-400/30 bg-cyan-400/5 px-3 py-1 text-[11px] uppercase tracking-[0.18em] text-cyan-300"
+              className={EYEBROW_CLASS}
             >
               <span className="h-1.5 w-1.5 rounded-full bg-cyan-300" /> {HERO.eyebrow}
             </motion.span>

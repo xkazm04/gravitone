@@ -1,0 +1,37 @@
+{
+  "schema": "gravitone-gym-suite/1",
+  "name": "basic",
+  "pace": 0.0,
+  "thresholds": {
+    "wer_drift_max": 0.0
+  },
+  "cases": [
+    {
+      "name": "two-turns",
+      "recording": "recordings/two-turns",
+      "agent_id": "local-interviewer",
+      "override": {"first_message": ""},
+      "expect": {
+        "min_turns": 2,
+        "max_interruptions": 0,
+        "max_sentences_per_agent_turn": 2,
+        "max_drift_vs_source": 0.0,
+        "first_agent_turn_contains": ["day to day"],
+        "no_turn_contains": ["[lang:", "[emotion:", "[end_call]"]
+      }
+    },
+    {
+      "name": "disclosure",
+      "recording": "recordings/two-turns",
+      "agent_id": "local-interviewer",
+      "thresholds": {
+        "interruption_delta_max": 2
+      },
+      "expect": {
+        "min_turns": 2,
+        "max_sentences_per_agent_turn": 3,
+        "first_agent_turn_contains": ["AI", "transcribed"]
+      }
+    }
+  ]
+}

@@ -20,7 +20,7 @@ from service.tests import fake_engine  # installs shims — must precede app imp
 
 import service.app as appmod
 from service.app import TTSRequest
-from service.cache import CachedAudio, SynthCache
+from service.cache import CachedAudio, CachedPcm, SynthCache
 from fastapi.testclient import TestClient
 
 _EMAP = {"baseline": "v_base", "happy": "v_happy"}
@@ -383,6 +383,57 @@ class SynthCacheUnitTests(unittest.TestCase):
         self.assertFalse(cached)          # it did the work itself
         self.assertEqual(len(calls), 2)   # slow leader + the new leader
         self.assertEqual(cache.stats()["in_flight"], 0)
+
+
+class CachedPcmTests(unittest.TestCase):
+    """The conversation-shaped entry: PCM at a wire rate, no container.
+
+    Openers (service/convai.py) are cached as PCM because the socket never wants
+    a WAV — a hit has to cost a base64 encode and nothing more. It shares the
+    budget, LRU and single-flight code with the HTTP entries by reporting the one
+    thing the store needs, its size.
+    """
+
+    @staticmethod
+    def _pcm(samples: int) -> CachedPcm:
+        return CachedPcm(pcm=b"\x00\x00" * samples, sample_rate=16000)
+
+    def test_size_is_the_pcm_and_duration_is_derived_from_the_rate(self) -> None:
+        entry = self._pcm(8000)
+        self.assertEqual(entry.nbytes, 16000)
+        self.assertEqual(entry.audio_seconds, 0.5)
+
+    def test_an_empty_clip_reports_no_duration_rather_than_dividing_by_zero(self) -> None:
+        self.assertEqual(CachedPcm(pcm=b"", sample_rate=0).audio_seconds, 0.0)
+
+    def test_the_byte_budget_evicts_pcm_the_same_way(self) -> None:
+        cache = SynthCache(1000)
+        cache.put("mm-hm", self._pcm(300))    # 600 bytes
+        cache.put("got-it", self._pcm(300))   # 1200 bytes total -> evict the LRU
+        self.assertIsNone(cache.get("mm-hm"))
+        self.assertIsNotNone(cache.get("got-it"))
+        self.assertEqual(cache.stats()["evictions"], 1)
+
+    def test_one_render_serves_every_concurrent_asker(self) -> None:
+        """Two sessions hitting the same voice's opener at once render it once."""
+        cache: SynthCache = SynthCache(64 * 1024)
+        renders = []
+
+        async def _render():
+            renders.append(1)
+            await asyncio.sleep(0.01)
+            return CachedPcmTests._pcm(100)
+
+        async def _drive():
+            return await asyncio.gather(*[
+                cache.get_or_synthesize(("alba", "Mm-hm."), _render)
+                for _ in range(4)])
+
+        results = asyncio.run(_drive())
+        self.assertEqual(len(renders), 1)
+        self.assertEqual({entry.nbytes for entry, _ in results}, {200})
+        self.assertEqual(sorted(cached for _, cached in results),
+                         [False, True, True, True])
 
 
 if __name__ == "__main__":

@@ -8,11 +8,22 @@ import { forwardExposedHeaders } from "@/lib/serviceHeaders";
 
 const BASE = process.env.GRAVITONE_URL ?? "http://127.0.0.1:8080";
 
-export function backendFetch(path: string, init: RequestInit = {}): Promise<Response> {
-  const headers = new Headers(init.headers);
+/** `bare: true` sends the request with NO credential attached — not the root
+ *  key, not anything. It exists for exactly one caller: the proving route
+ *  (`app/api/keys/probe`), whose whole measurement is what this deployment does
+ *  with a request that carries no key (or carries only the key under test). The
+ *  root-key injection below is why the keys page could never state a posture,
+ *  so the opt-out is spelled out at the call site rather than inferred from an
+ *  absent header. Every existing call site is unchanged: no flag, same
+ *  behaviour, byte for byte. */
+export type BackendInit = RequestInit & { bare?: boolean };
+
+export function backendFetch(path: string, init: BackendInit = {}): Promise<Response> {
+  const { bare, ...rest } = init;
+  const headers = new Headers(rest.headers);
   const key = process.env.GRAVITONE_API_KEY;
-  if (key && !headers.has("xi-api-key")) headers.set("xi-api-key", key);
-  return fetch(`${BASE}${path}`, { ...init, headers });
+  if (!bare && key && !headers.has("xi-api-key")) headers.set("xi-api-key", key);
+  return fetch(`${BASE}${path}`, { ...rest, headers });
 }
 
 // The synthesis relays (/api/speak, /api/performance, /api/tts) are the app's

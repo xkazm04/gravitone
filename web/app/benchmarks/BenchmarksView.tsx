@@ -21,6 +21,7 @@ import {
   planEnvBlock,
 } from "@/lib/benchmarks";
 import { ELEVENLABS_TIERS, fmtUsd } from "@/lib/switchkit";
+import LocalEnginePanel from "./LocalEnginePanel";
 
 const ease = [0.22, 1, 0.36, 1] as const;
 const rise = {
@@ -237,6 +238,17 @@ deploy/aws-oneclick.sh up      # → base URL + xi-api-key (see deploy/README.md
               Community rows welcome — every submitted result JSON grows the sizing corpus behind the planner above.
             </p>
           </div>
+        </motion.section>
+
+        {/* where the audio is made — the page's last honest number is not a
+            price but a location. */}
+        <motion.section variants={rise} initial="hidden" whileInView="show" viewport={{ once: true, margin: "-60px" }} className="mt-14">
+          <h2 className="font-instrument text-2xl text-white">Where the synthesis runs</h2>
+          <p className="mt-2 max-w-2xl text-sm text-slate-300/80">
+            Every number above is a server cost, because every byte of audio here is made on a server.
+            A CPU-sized model is small enough to ask a harder question: could the browser do it instead?
+          </p>
+          <LocalEnginePanel />
         </motion.section>
 
         <footer className="mt-16 flex flex-col items-center justify-between gap-4 border-t border-white/5 pt-8 text-sm text-white/60 sm:flex-row">

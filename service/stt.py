@@ -29,6 +29,15 @@ safe to drive concurrently from several threads, and on a box whose core budget
 is already pinned to the TTS workers, parallel decodes would trade latency for
 latency anyway. The lock is the honest ceiling; scale by replica, exactly as
 ``config.Settings.workers`` argues for synthesis.
+
+**Partial decodes never delay a real one.** ``transcribe_partial`` exists so a
+conversation can hear the utterance-so-far while it is still being spoken
+(service/convai.py, CONVAI_PARTIAL_DECODE). It shares the one run lock with
+every other decode, so it is strictly subordinate to it: it takes the lock only
+if it is free, it declines outright while a FINAL decode is waiting for it, and
+it never loads the model — a partial is worth nothing if paying for it makes the
+turn that matters slower. Dropping a partial costs nothing; delaying the final
+costs the caller.
 """
 from __future__ import annotations
 
@@ -63,6 +72,12 @@ _MODEL: Any = None
 _MODEL_KEY: tuple | None = None      # the settings the loaded model was built from
 _LOAD_LOCK = threading.Lock()        # guards loading
 _RUN_LOCK = threading.Lock()         # guards transcription (see module docstring)
+# How many FINAL conversational decodes are queued for _RUN_LOCK right now. Only
+# the partial path reads it, and only to get out of the way.
+_FINALS_WAITING = 0
+_WAITING_LOCK = threading.Lock()
+# Partial-decode accounting, for the latency reporting a conversation publishes.
+_PARTIALS = {"run": 0, "dropped_busy": 0, "dropped_for_final": 0, "dropped_cold": 0}
 
 _INSTALL_HINT = (
     "local speech-to-text needs faster-whisper, which is not installed in this "
@@ -77,6 +92,10 @@ class Word:
     start: float
     end: float
     speaker_id: str = "speaker_0"
+    # faster-whisper's per-word probability, when the backend rates words at
+    # all. None = unrated — verify.py's confidence floor treats that honestly
+    # (confidence_source: "unrated") instead of scoring against a guess.
+    confidence: float | None = None
 
 
 @dataclass
@@ -175,7 +194,8 @@ def describe_model() -> dict:
 def info() -> dict:
     """What this replica's ear is and whether it is up, for /health-style
     reporting — where the live state is exactly the point."""
-    return dict(describe_model(), loaded=_MODEL is not None)
+    return dict(describe_model(), loaded=_MODEL is not None,
+                partials=partial_stats())
 
 
 def pcm16_to_float32(pcm: bytes) -> np.ndarray:
@@ -203,29 +223,41 @@ def transcribe(audio: "np.ndarray | io.BytesIO | str", *,
     model = load_model()
     t0 = time.perf_counter()
     with _RUN_LOCK:
-        segments, detected = model.transcribe(
-            audio,
-            language=language or None,
-            beam_size=beam_size if beam_size is not None else SETTINGS.stt_beam_size,
-            word_timestamps=word_timestamps,
-            hotwords=hotwords or None,
-            # Whisper's known failure mode on silence is to hallucinate a
-            # sentence (a caption, a "thank you"). Both filters below make it
-            # return nothing instead, which is what an empty room actually said.
-            vad_filter=True,
-            condition_on_previous_text=False,
-        )
-        # `segments` is a generator — the work happens HERE, inside the lock.
-        collected = list(segments)
-    elapsed = time.perf_counter() - t0
+        collected, detected = _decode(model, audio, language=language,
+                                      hotwords=hotwords,
+                                      word_timestamps=word_timestamps,
+                                      beam_size=beam_size)
+    return _assemble(collected, detected, time.perf_counter() - t0)
 
+
+def _decode(model, audio, *, language: str | None, hotwords: str | None,
+            word_timestamps: bool, beam_size: int | None):
+    """The model call itself. Caller MUST hold ``_RUN_LOCK``."""
+    segments, detected = model.transcribe(
+        audio,
+        language=language or None,
+        beam_size=beam_size if beam_size is not None else SETTINGS.stt_beam_size,
+        word_timestamps=word_timestamps,
+        hotwords=hotwords or None,
+        # Whisper's known failure mode on silence is to hallucinate a
+        # sentence (a caption, a "thank you"). Both filters below make it
+        # return nothing instead, which is what an empty room actually said.
+        vad_filter=True,
+        condition_on_previous_text=False,
+    )
+    # `segments` is a generator — the work happens HERE, inside the lock.
+    return list(segments), detected
+
+
+def _assemble(collected, detected, elapsed: float) -> Transcript:
     words: list[Word] = []
     parts: list[str] = []
     for seg in collected:
         parts.append(seg.text)
         for w in (getattr(seg, "words", None) or []):
             words.append(Word(text=w.word.strip(), start=round(w.start, 3),
-                              end=round(w.end, 3)))
+                              end=round(w.end, 3),
+                              confidence=getattr(w, "probability", None)))
     duration = float(getattr(detected, "duration", 0.0) or 0.0)
     return Transcript(
         text=" ".join(p.strip() for p in parts).strip(),
@@ -244,11 +276,84 @@ def transcribe_pcm(pcm: bytes, *, rate: int = TARGET_RATE,
     No word timestamps and no re-encode: the caller already has the samples,
     and a turn is waiting on this.
     """
-    if rate != TARGET_RATE:
-        from service.engine import resample_pcm16
-        samples = resample_pcm16(np.frombuffer(pcm, dtype="<i2"), rate, TARGET_RATE)
-        pcm = samples.tobytes()
-    return transcribe(pcm16_to_float32(pcm), language=language, hotwords=hotwords)
+    audio = pcm16_to_float32(_at_target_rate(pcm, rate))
+    global _FINALS_WAITING
+    with _WAITING_LOCK:
+        _FINALS_WAITING += 1
+    try:
+        return transcribe(audio, language=language, hotwords=hotwords)
+    finally:
+        with _WAITING_LOCK:
+            _FINALS_WAITING -= 1
+
+
+def _at_target_rate(pcm: bytes, rate: int) -> bytes:
+    if rate == TARGET_RATE:
+        return pcm
+    from service.engine import resample_pcm16
+    return resample_pcm16(np.frombuffer(pcm, dtype="<i2"), rate,
+                          TARGET_RATE).tobytes()
+
+
+def final_is_waiting() -> bool:
+    """Whether a final conversational decode is queued behind the run lock.
+
+    The one thing a speculative decode has to know: it is never allowed to be
+    the reason a turn the caller is actually waiting for starts late.
+    """
+    return _FINALS_WAITING > 0
+
+
+def partial_stats() -> dict:
+    """Partial decodes run and, by reason, declined. Copied, not shared."""
+    return dict(_PARTIALS)
+
+
+def transcribe_partial(pcm: bytes, *, rate: int = TARGET_RATE,
+                       language: str | None = None,
+                       hotwords: str | None = None) -> Transcript | None:
+    """Transcribe an utterance still in progress, or return None having done nothing.
+
+    Speculative by construction, and subordinate to every real decode (see the
+    module docstring). ``None`` means "not this time" and is the expected answer
+    on a busy box — it is never an error, and there is nothing to retry:
+
+      * the model is not loaded yet (a partial must not pay a ~2 s load),
+      * a final decode is waiting for the run lock,
+      * the run lock is held by someone else,
+      * the clip is empty.
+
+    The text that comes back is NOISIER than a final transcript
+    (``condition_on_previous_text=False`` plus Whisper's silence behaviour on a
+    clip that stops mid-word), which is why the caller must treat it as a hint
+    and never as a record. It is greedy (``beam_size=1``) and carries no word
+    timestamps: it exists to be cheap.
+    """
+    if not pcm:
+        return None
+    if _MODEL is None:
+        _PARTIALS["dropped_cold"] += 1
+        return None
+    if final_is_waiting():
+        _PARTIALS["dropped_for_final"] += 1
+        return None
+    if not _RUN_LOCK.acquire(blocking=False):
+        _PARTIALS["dropped_busy"] += 1
+        return None
+    t0 = time.perf_counter()
+    try:
+        model = _MODEL
+        if model is None:  # unloaded between the check and the lock
+            _PARTIALS["dropped_cold"] += 1
+            return None
+        collected, detected = _decode(
+            model, pcm16_to_float32(_at_target_rate(pcm, rate)),
+            language=language, hotwords=hotwords, word_timestamps=False,
+            beam_size=1)
+    finally:
+        _RUN_LOCK.release()
+    _PARTIALS["run"] += 1
+    return _assemble(collected, detected, time.perf_counter() - t0)
 
 
 # ---------------------------------------------------------------------------

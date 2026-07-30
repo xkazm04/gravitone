@@ -4,6 +4,18 @@
 #     from REPLICAS, never from in-process workers.
 #   * Each replica gets torchThreads CPUs; replicas × torchThreads ≈ node vCPU.
 #   * queue depth (the pre-429 signal) is the autoscaling metric.
+#
+# THESE DEFAULTS ARE ONE BOX'S NUMBERS (a c8g.2xlarge). Do not copy them onto
+# different silicon — compile the values for YOUR hardware instead:
+#
+#   bash benchmark_arm.sh && python -m service.certify        # measure
+#   python -m service.plan certification.json --emit helm-values
+#   helm install gravitone deploy/helm/gravitone -f gravitone-values.yaml
+#
+# The generated overlay sets only the measured keys (replicaCount, tts.*,
+# resources, autoscaling) and carries the certificate sha + hardware
+# fingerprint it came from in its header. Everything else stays this file's
+# business. See deploy/README.md, "Measure -> plan -> deploy".
 
 image:
   repository: gravitone   # build from the repo Dockerfile and push to your registry
@@ -52,6 +64,18 @@ autoscaling:
   #   cpu  — standard HPA on CPU utilization (works everywhere)
   #   keda — scale on the engine's live queue depth via KEDA's metrics-api
   #          scaler polling /metrics (requires KEDA installed in the cluster)
+  #
+  # KEDA CAVEAT — this is where the choice is made, so this is where it is
+  # stated. The scaler reads `metrics.queued` from ONE /metrics response. In a
+  # k8s Deployment each pod is its own process behind a Service, so that is a
+  # real per-pod queue and keda mode is sound. It is NOT sound when several
+  # replicas share a port: `python -m service.replicas` on Linux uses
+  # SO_REUSEPORT, and its aggregated /metrics is explicitly a
+  # `single_replica_sample` with `totals: null` — scaling on it would size the
+  # fleet from one arbitrary replica's queue. `python -m service.plan` applies
+  # exactly this rule: autoscaling.mode=cpu for SO_REUSEPORT topologies, keda
+  # only for sequential-port ones, and it writes its reasoning into
+  # autoscaling.why in deployment-plan.json.
   mode: "off"
   minReplicas: 2
   maxReplicas: 12

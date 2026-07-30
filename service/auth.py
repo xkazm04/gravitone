@@ -21,7 +21,7 @@ import secrets
 from fastapi import Header, HTTPException, Request
 
 from service.config import SETTINGS
-from service.keys import validate_key
+from service.keys import key_recognized, validate_key
 
 
 def _extract_secret(xi_api_key: str | None, authorization: str | None) -> str | None:
@@ -41,6 +41,14 @@ def _authorize(secret: str | None, scope: str) -> None:
         return  # root key — unlimited
     if scope != "admin" and validate_key(secret, scope):
         return  # managed key with the required scope
+    if scope != "admin" and key_recognized(secret):
+        # A real, active key that simply lacks this scope. 403-not-401 is the
+        # distinction the key-proving sweep measures: "wrong scope" must not be
+        # indistinguishable from "no key at all".
+        raise HTTPException(
+            status_code=403,
+            detail=f"key does not hold scope '{scope}'",
+        )
     raise HTTPException(
         status_code=401,
         detail=f"invalid or missing API key (scope '{scope}' required); "

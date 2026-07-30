@@ -17,6 +17,7 @@ import { isStoredSecret } from "@/lib/mintKey";
 import { useClientReady } from "@/lib/useMounted";
 import { useCopyFeedback } from "@/lib/useCopyFeedback";
 import MigrationKit from "./MigrationKit";
+import ProvingSweep from "./ProvingSweep";
 import type { ApiKeyWithSecret } from "./data";
 
 export default function SecretReveal({ keyData, onClose }: { keyData: ApiKeyWithSecret | null; onClose: () => void }) {
@@ -110,8 +111,13 @@ export default function SecretReveal({ keyData, onClose }: { keyData: ApiKeyWith
               ))}
             </div>
 
+            {/* The key-in-hand moment is also the ONLY moment this key can be
+                proved: the sweep needs the raw secret, and after this dialog
+                closes it is gone. Proof first, then the switch kit. */}
+            <ProvingSweep keyId={keyData.id} secret={keyData.secret} scopes={keyData.scopes} />
+
             {/* the key-in-hand moment IS the switching moment */}
-            <MigrationKit apiKey={keyData.secret} />
+            <MigrationKit apiKey={keyData.secret} keyId={keyData.id} />
 
             <div className="mt-6 flex justify-end">
               <Button onClick={onClose} className="cursor-pointer">I&apos;ve saved it</Button>

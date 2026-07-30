@@ -4,8 +4,22 @@
   GET  /v1/ingest/{job}                     → { status, step, steps[], partial, speakers, result }
   GET  /v1/ingest/{job}/speaker-preview/{id}→ per-speaker sample wav
   POST /v1/ingest/{job}/speaker             { speaker_id }  [start label+stem for that speaker]
-  GET  /v1/ingest/{job}/preview/{emotion}   → stem wav
-  POST /v1/ingest/{job}/commit              { character, emotions[], character_id? } → voices
+  GET  /v1/ingest/{job}/preview/{emotion}   → stem wav (the SPEAKER's own audio)
+  GET  /v1/ingest/{job}/segment/{i}         → ONE labelled segment's wav
+  POST /v1/ingest/{job}/stems               { assignments, reset? } → re-spliced stems
+  POST /v1/ingest/{job}/audition            { emotion, text, recipe? } → wav (a CLONE)
+  POST /v1/ingest/{job}/commit              { character, emotions[], character_id?,
+                                              recipes?, corpus? } → voices
+  POST /v1/ingest/rederive                  { character_id, emotions? } → { job_id }
+  GET  /v1/characters/{id}/corpus           → what audio of this person is kept
+  DELETE /v1/characters/{id}/corpus/{sha}   → remove every segment from one clip
+
+The corpus (`service/ingest.py`, "THE VOICE CORPUS"): OPT-IN per job (`corpus:
+true` on the scan or the commit, default OFF), captured only after a commit that
+really created Voices, and only when that commit carried an ownership
+attestation. `rederive` rebuilds a character's stems from everything the corpus
+holds and re-exports through the same one-load child a commit uses — it is a
+JOB, not a blocking call, for exactly the reason commit is one.
 
 Status flow: running → awaiting_speaker → running → done. `partial` streams live
 intermediate data (word count, speakers, per-emotion tally) for a data-rich loader.
@@ -26,10 +40,37 @@ stem and both paths otherwise leave a partial Character behind. Phase failures
 reach the client through `errors.sanitize_detail`, never as raw tool output.
 
 Admission: `Settings.ingest_max_jobs` bounds how many jobs may be working at
-once; the phase-starting routes answer 429 above it.
+once; the phase-starting routes answer 429 above it. Auditions are admitted
+SEPARATELY (`_audition_slot`): they hold no job slot, because an audition is a
+read-only experiment on a finished scan and queueing one behind two long scans
+would make "hear it first" unavailable exactly when someone is deciding.
+
+Auditions (the Audition Room): `/preview/{emotion}` serves the SOURCE stem — the
+speaker's own spliced audio — and always has. `/audition` serves a CLONE of a
+candidate stem speaking a chosen line: a throwaway voice, exported and spoken in
+one child process, never registered in the roster, deleted before the response is
+written. Candidate stems come from `recipes`: 2-3 deterministic splices per
+emotion computed from the segment labels the scan already produced, so a user can
+compare "all of it" against "the longest takes" against "the cleanest signal"
+before anything irreversible happens. `commit` re-splices to the chosen recipe.
+
+The Casting Board (`/segment/{i}` + `/stems`): a stem used to be an opaque
+aggregate — one number on screen for a splice of segments nobody could hear or
+change. `/segment/{i}` serves one labelled segment's own wav (the sibling of
+`speaker-preview`), and `/stems` re-runs `concat_wavs` over a caller-supplied
+`{emotion: [segment indices]}` map, rewriting `stem_{emotion}.wav` IN THE
+WORKDIR and reporting the new seconds/eligibility. It writes nothing to the
+roster, it cannot reach a filename (emotions are normalized, indices are ints
+validated against this scan's own segments), and `reset` restores the splice
+the pipeline proposed. Editing an emotion WITHDRAWS its candidate recipes —
+they were alternative readings of the proposed selection and "everything" no
+longer means what they were built from — so an audition of an edited emotion
+hears exactly the stem now on disk. Cross-recording pooling is NOT here: the
+corpus (below) is the seam that would carry it.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -38,21 +79,30 @@ import subprocess
 import threading
 import time
 import uuid
+import wave
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
-from service import errors, ingest, voices
+from service import errors, export_stems, ingest, voices
 from service.config import SETTINGS
 from service.emotions import normalize_emotion
 from service.errors import job_expired
 
 logger = logging.getLogger("gravitone")
 
-router = APIRouter(prefix="/v1/ingest", tags=["ingest"])
+# ONE router, NO prefix — deliberately. This module owns two path families:
+# `/v1/ingest/...` (the scan → review → commit flow) and
+# `/v1/characters/{id}/corpus...` (what audio of a person the box kept, and the
+# deletion surface for it). They are the same capability and the same "clone"
+# scope, so they ride the same router `service/app.py` already mounts; a second
+# router would need a second mount and would let the corpus surface ship
+# unwired. Every path below is therefore written out in full.
+router = APIRouter(tags=["ingest"])
+INGEST = "/v1/ingest"
 
 # Same step KEYS in both modes (the web loader keys off them); only the
 # labels differ. Sovereign = local-only ffmpeg pipeline, no network I/O.
@@ -69,7 +119,17 @@ STEPS_BY_MODE = {
         {"key": "label", "label": "Group segments (local)"},
         {"key": "stem", "label": "Build voice stem"},
     ],
+    # Re-derivation has no recording to analyze: it selects from stored audio
+    # and clones. Same step-key shape so the studio's loader needs no new case.
+    "rederive": [
+        {"key": "stem", "label": "Rebuild stems from the corpus"},
+        {"key": "clone", "label": "Re-export voices"},
+    ],
 }
+# Modes a caller may ASK for on /scan. "rederive" is a mode this service enters
+# by its own route, never by upload — kept off this tuple so the scan surface
+# cannot be talked into it.
+SCAN_MODES = ("auto", "cloud", "sovereign")
 
 # ── durable job store ─────────────────────────────────────────────────────────
 JOBS: dict[str, dict] = {}
@@ -95,6 +155,264 @@ MAX_ACTIVE_JOBS = SETTINGS.ingest_max_jobs
 # holds a slot is a whole scan or commit (minutes), so any precise-looking
 # number would be a guess dressed as an ETA. See `_admit`.
 ADMISSION_RETRY_AFTER_S = 5
+
+# ── auditions ─────────────────────────────────────────────────────────────────
+# How many auditions may be synthesizing at once, ACROSS jobs. Deliberately its
+# own budget rather than a job slot: an audition neither transcribes nor
+# registers anything, it is a finished scan being sampled, and the whole feature
+# is worthless if it is unavailable while somebody else's scan runs. It is still
+# bounded, because each one is a real CPU model load in a child process.
+MAX_ACTIVE_AUDITIONS = 2
+AUDITION_RETRY_AFTER_S = 8
+# One cold model load (~15s) plus one line of CPU synthesis. Generous, and a
+# timeout is REPORTED as a timeout (export_stems.audition names it).
+AUDITION_TIMEOUT_S = 240.0
+# The line a candidate speaks when the caller does not choose one. Short, plainly
+# declarative, and emotionally uncommitted, so the recipe is what differs between
+# two takes rather than the reading.
+DEFAULT_AUDITION_TEXT = "This is how I sound when I say something I mean."
+MAX_AUDITION_TEXT = 240
+_audition_lock = threading.Lock()
+_active_auditions = 0
+
+
+@contextlib.contextmanager
+def _audition_slot() -> Iterator[None]:
+    """Cheap admission for one audition. 429 (named, with Retry-After) when the
+    audition budget is full — never counted against, and never blocked by,
+    `MAX_ACTIVE_JOBS`. Released in a `finally`, so a failed synthesis cannot
+    strand the budget the way a leaked counter would."""
+    global _active_auditions
+    with _audition_lock:
+        if _active_auditions >= MAX_ACTIVE_AUDITIONS:
+            raise HTTPException(
+                429, f"{_active_auditions} audition(s) are already being "
+                     "synthesized on the CPU engine — try again in a moment",
+                headers={"Retry-After": str(AUDITION_RETRY_AFTER_S)})
+        _active_auditions += 1
+    try:
+        yield
+    finally:
+        with _audition_lock:
+            _active_auditions -= 1
+
+
+# ── recipes ───────────────────────────────────────────────────────────────────
+# A recipe is one DETERMINISTIC way to splice an emotion's segments into a stem.
+# The scan already knows each segment's emotion, confidence, duration and levels;
+# collapsing all of that into a single stem threw away every alternative reading
+# of the same recording. These are those alternatives, named:
+#
+#   full       every usable segment, recording order — what the ledger shows and
+#              what commit has always cloned. Always present, always the default.
+#   longest    the longest takes only — sustained phonation teaches a voice more
+#              than a pile of two-word fragments.
+#   confident  only the segments the classifier was most sure about — a stem with
+#              no mislabelled audio in it, at the cost of length.
+#   tightest   the best speech-to-noise-floor segments (`ingest.measure_levels`,
+#              the same measurement the sovereign path takes) — drops the noisy
+#              spans rather than the short ones.
+#
+# Determinism is a contract, not an accident: every ordering breaks ties on the
+# segment index, so the same job produces the same recipes on every rebuild, and
+# a test can assert the exact index sets.
+RECIPE_FULL = "full"
+RECIPE_ORDER = (RECIPE_FULL, "longest", "confident", "tightest")
+RECIPE_LABELS = {
+    RECIPE_FULL: ("everything", "every usable segment, in recording order"),
+    "longest": ("longest takes", "the longest segments only — more sustained speech"),
+    "confident": ("surest labels", "only the segments the classifier was most sure about"),
+    "tightest": ("cleanest signal", "the segments with the most speech above the noise floor"),
+}
+# 3 = the default plus two alternatives. Beyond that an A/B becomes a menu, and
+# the proposal's own risk note is decision fatigue on the critical path.
+MAX_RECIPES_PER_EMOTION = 3
+# How much audio a subset recipe aims for before it stops adding segments. The
+# floor is the backend's own clone minimum, so no alternative is offered that is
+# knowably too short to commit; above that a little headroom beats a bare pass.
+RECIPE_TARGET_SECONDS = 8.0
+# ...but never so much of what is available that every "subset" is the whole set.
+# A target at or above the emotion's total length makes each ordering select
+# everything, the variants collapse into `full`, and the drill-down silently
+# disappears on exactly the recordings it was built for (a 6s stem). The share is
+# therefore relative to what this emotion actually has.
+RECIPE_TARGET_SHARE = 0.7
+
+
+def _wav_seconds(path: Path) -> float:
+    try:
+        with wave.open(str(path), "rb") as w:
+            return round(w.getnframes() / w.getframerate(), 2)
+    except (OSError, wave.Error):
+        return 0.0
+
+
+def segment_rows(work_dir: Path, result: dict) -> tuple[list[dict], str | None]:
+    """The scan's per-segment labels re-joined to their extracted wavs.
+
+    `label_and_stem` reports segments in index order but publishes neither the
+    index nor the wav path, so the join is positional — and a positional join
+    that is wrong would silently splice the wrong audio into a recipe. It is
+    therefore VERIFIED: each row's labelled duration must match the wav on disk
+    (they are the same span, extracted by `to_wav`). A mismatch abandons recipes
+    entirely with a named reason rather than offering candidates built from
+    misattributed audio.
+
+    Returns (rows, reason-recipes-are-unavailable).
+    """
+    segs = result.get("segments")
+    if not isinstance(segs, list) or not segs:
+        return [], "no per-segment labels on this scan"
+    rows: list[dict] = []
+    for i, s in enumerate(segs):
+        wav = work_dir / f"seg_{i:03d}.wav"
+        if not wav.is_file():
+            # A segment that failed extraction has no audio and feeds no stem —
+            # exactly as the pipeline's own `usable` filter treats it.
+            if not s.get("failure"):
+                return [], "segment audio is missing for this scan"
+            continue
+        seconds = _wav_seconds(wav)
+        declared = float(s.get("dur") or 0.0)
+        if declared and abs(seconds - declared) > 0.35:
+            return [], "segment audio could not be matched to its labels"
+        if s.get("failure"):
+            continue
+        if s.get("outlier") == "dropped":
+            # The pipeline measured this segment as not the target speaker and
+            # removed it from every stem (ingest.label_and_stem). A recipe that
+            # re-introduced it would quietly undo that decision — and "the user
+            # picked it" is not consent to clone a bystander. "flagged" segments
+            # ARE in the stems, so they stay candidates.
+            continue
+        rows.append({"i": i, "wav": str(wav), "emotion": s.get("emotion"),
+                     "confidence": float(s.get("confidence") or 0.0),
+                     "seconds": seconds})
+    if not rows:
+        return [], "no usable segments on this scan"
+    return rows, None
+
+
+def _prefix_to_target(cands: list[dict], order: list[dict], target: float) -> list[dict]:
+    """Take segments in `order` until `target` seconds are covered, then return
+    them in RECORDING order. The selection is by merit; the splice is always
+    chronological, because `concat_wavs` level-matches and crossfades a sequence
+    and re-ordering utterances is the one thing that makes a stem sound assembled."""
+    picked: list[dict] = []
+    have = 0.0
+    for row in order:
+        if have >= target:
+            break
+        picked.append(row)
+        have += row["seconds"]
+    return sorted(picked, key=lambda r: r["i"])
+
+
+def _variants(cands: list[dict], target: float) -> list[tuple[str, list[dict]]]:
+    """Every candidate splice for one emotion, in offer order. A variant that
+    would be identical to one already offered is not offered — an A/B between two
+    identical takes is a fake choice, and this flow's whole problem was fake
+    information about audio."""
+    out: list[tuple[str, list[dict]]] = [(RECIPE_FULL, cands)]
+    if len(cands) >= 2:
+        out.append(("longest", _prefix_to_target(
+            cands, sorted(cands, key=lambda r: (-r["seconds"], r["i"])), target)))
+        confs = {r["confidence"] for r in cands}
+        if len(confs) > 1:
+            # All-equal confidence (sovereign mode labels everything 1.0) would
+            # make "surest labels" a lie dressed as a measurement.
+            out.append(("confident", _prefix_to_target(
+                cands, sorted(cands, key=lambda r: (-r["confidence"], r["i"])), target)))
+        snr: list[tuple[float, dict]] = []
+        for r in cands:
+            lv = ingest.measure_levels(Path(r["wav"]))
+            if lv.measured:
+                snr.append((lv.speech_db - lv.floor_db, r))
+        if len(snr) == len(cands) and len(cands) >= 3:
+            out.append(("tightest", _prefix_to_target(
+                cands, [r for _, r in sorted(snr, key=lambda t: (-t[0], t[1]["i"]))], target)))
+
+    seen: set[tuple[int, ...]] = set()
+    deduped: list[tuple[str, list[dict]]] = []
+    for kind, rows in out:
+        key = tuple(r["i"] for r in rows)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append((kind, rows))
+    return deduped[:MAX_RECIPES_PER_EMOTION]
+
+
+def build_recipes(work_dir: Path, result: dict) -> tuple[dict[str, dict[str, list[int]]], str | None]:
+    """Compute + splice the candidate stems for a finished scan, IN PLACE.
+
+    Grows every `result["stems"][*]` entry with `recipes: [{id, label, how,
+    seconds, segments, default}]` and writes one `stem_{emotion}__{id}.wav` per
+    non-default recipe (the default recipe IS `stem_{emotion}.wav`, already on
+    disk and already measured — it is never re-spliced, so the number the ledger
+    showed stays the number the ledger shows).
+
+    Returns (plan, reason) where `plan` is `{emotion: {recipe_id: [segment
+    indices]}}` — kept on the job and NEVER published: a client names a recipe by
+    id, so no caller can ever hand this service a segment selection of its own.
+    `reason` names a degraded outcome for the payload; recipes are advisory and
+    their absence must never fail a scan.
+    """
+    stems = result.get("stems")
+    if not isinstance(stems, list) or not stems:
+        return {}, "this scan produced no stems"
+    rows, reason = segment_rows(work_dir, result)
+    if reason:
+        return {}, reason
+
+    min_stem = float(result.get("min_stem") or ingest.MIN_STEM_SECONDS)
+    by_emotion: dict[str, list[dict]] = {}
+    for r in rows:
+        by_emotion.setdefault(r["emotion"], []).append(r)
+
+    plan: dict[str, dict[str, list[int]]] = {}
+    for stem in stems:
+        emo = stem.get("emotion")
+        if emo == ingest.BASELINE:
+            # The baseline stem is not "the neutral segments": plan_baseline may
+            # have topped it up from other emotions to clear the minimum, and it
+            # reports that. Recipes must start from the SAME material the shipped
+            # stem started from, or "everything" would mean something different
+            # here than it does one row above.
+            cands = list(ingest.plan_baseline(by_emotion, min_stem).labs)
+            for c in cands:
+                c.setdefault("seconds", _wav_seconds(Path(c["wav"])))
+        else:
+            cands = sorted(by_emotion.get(emo, []), key=lambda r: r["i"])
+        if len(cands) < 2:
+            continue   # one segment has exactly one splice; absent = invisible
+        total = sum(c["seconds"] for c in cands)
+        target = max(min_stem, min(RECIPE_TARGET_SECONDS, total * RECIPE_TARGET_SHARE))
+
+        offers: list[dict] = []
+        for kind, sel in _variants(cands, target):
+            label, how = RECIPE_LABELS[kind]
+            if kind == RECIPE_FULL:
+                seconds, segments = stem.get("seconds"), stem.get("segments")
+            else:
+                dst = work_dir / f"stem_{emo}__{kind}.wav"
+                try:
+                    sp = ingest.concat_wavs([Path(r["wav"]) for r in sel], dst)
+                except Exception as exc:  # noqa: BLE001 - one recipe, never the scan
+                    logger.warning("recipe %s/%s could not be spliced: %s", emo, kind, exc)
+                    continue
+                seconds, segments = sp.seconds, sp.segments
+            offers.append({"id": kind, "label": label, "how": how,
+                           "seconds": seconds, "segments": segments,
+                           "default": kind == RECIPE_FULL})
+            plan.setdefault(emo, {})[kind] = [r["i"] for r in sel]
+        if len(offers) > 1:
+            # A lone "everything" is not a choice worth rendering.
+            stem["recipes"] = offers
+        else:
+            plan.pop(emo, None)
+    return plan, None
+
 
 # One external-spend ledger per job, shared by its analyze and label phases so
 # the retry/escalation budgets are per JOB (the point of them) and the reported
@@ -326,6 +644,18 @@ def _gc_once() -> None:
             JOBS.pop(jid, None)
             _SPEND.pop(jid, None)
         live = {v["work_dir"] for v in JOBS.values()}
+    # Scratch audition artefacts inside a LIVE job's workdir. `export_stems
+    # .audition` removes its own scratch dir in a `finally`, so anything left
+    # here outlived a crash — log it rather than tidy up in silence.
+    for wd in live:
+        try:
+            leaked = export_stems.gc_scratch(wd)
+        except Exception as exc:  # noqa: BLE001 - the sweep must never break GC
+            logger.warning("audition scratch sweep failed for %s: %s", wd, exc)
+            continue
+        if leaked:
+            logger.warning("swept %d leaked audition scratch artefact(s) in %s: %s",
+                           len(leaked), wd, leaked)
     # orphan workdirs with no live job (e.g. left by a crash) age out too
     if WORK_ROOT.is_dir():
         for d in WORK_ROOT.iterdir():
@@ -432,9 +762,35 @@ def _label(job_id: str, target: str) -> None:
             partial=lambda d: _partial(job, d),
             mode=job["mode"],
             should_cancel=_canceller(job), spend=_spend_for(job_id))
+        # Candidate stems for the Audition Room. Advisory by construction: a
+        # failure here costs the user the drill-down, never the scan, and the
+        # reason is published rather than swallowed (`recipes.unavailable`).
+        plan: dict[str, dict[str, list[int]]] = {}
+        why: str | None = None
+        try:
+            plan, why = build_recipes(Path(job["work_dir"]), res)
+        except Exception as exc:  # noqa: BLE001 - never fail a scan over recipes
+            logger.warning("ingest job %s: recipes skipped: %s", job_id, exc)
+            why = "candidate stems could not be built for this scan"
+        # What each stem is spliced FROM, published with the ledger. The studio
+        # needs it before anything is re-cast (a row expands into its segments
+        # read-only first), and it must be the pipeline's own answer: the
+        # baseline's segments are not "the neutral ones" — plan_baseline may have
+        # topped it up — so a client deriving this from the labels would draw a
+        # stem the backend never built.
+        casting: dict | None = None
+        try:
+            _rows, proposed, why_cast = _board(Path(job["work_dir"]), res)
+            casting = {"assignments": proposed, "edited": [], "unavailable": why_cast}
+        except Exception as exc:  # noqa: BLE001 - never fail a scan over the board
+            logger.warning("ingest job %s: casting board unavailable: %s", job_id, exc)
+            casting = {"assignments": {}, "edited": [],
+                       "unavailable": "the segments of this scan could not be listed"}
         _update(job, result={"duration": job.get("duration", 0),
                              "speakers": [s["id"] for s in job.get("speakers", [])],
                              "mode": job["mode"], **res},
+                recipe_plan=plan, casting=casting,
+                recipes={"applied": {}, "skipped": [], "unavailable": why},
                 status="done")
     except ingest.Cancelled:
         logger.info("ingest job %s: labelling abandoned (cancelled)", job_id)
@@ -476,11 +832,93 @@ def _rollback(job_id: str, created: list[dict], why: str) -> None:
             job_id, why, ids, exc)
 
 
+def _apply_recipes(job: dict, emotions: list[str], chosen: dict[str, str]) -> None:
+    """Re-splice each chosen emotion's stem to the recipe the user auditioned.
+
+    `ingest.commit` clones `stem_{emotion}.wav`, so committing a choice means
+    making that file BE the chosen splice — the recipe wavs were written next to
+    it at scan time, so this is a copy, not a re-render, and the audition the user
+    heard is byte-identical to what gets cloned.
+
+    Every outcome is named on the job (`recipes.applied` / `recipes.skipped`): a
+    chosen recipe whose audio has since been swept, or which was never offered
+    for that emotion, must not silently clone the default and let the user
+    believe their pick shipped.
+    """
+    wd = Path(job["work_dir"])
+    plan = job.get("recipe_plan") or {}
+    applied: dict[str, str] = {}
+    skipped: list[dict] = []
+    for emo in emotions:
+        rid = chosen.get(emo)
+        if not rid or rid == RECIPE_FULL:
+            continue
+        if rid not in (plan.get(emo) or {}):
+            skipped.append({"emotion": emo, "recipe": rid,
+                            "why": "that recipe was not offered for this emotion"})
+            continue
+        src = wd / f"stem_{emo}__{rid}.wav"
+        dst = wd / f"stem_{emo}.wav"
+        try:
+            shutil.copyfile(src, dst)
+        except OSError as exc:
+            logger.warning("ingest job %s: recipe %s/%s not applied: %s",
+                           job.get("id"), emo, rid, exc)
+            skipped.append({"emotion": emo, "recipe": rid,
+                            "why": "the recipe audio is no longer available"})
+            continue
+        applied[emo] = rid
+    with _LOCK:
+        if job.get("cancel"):
+            return
+        cur = job.get("recipes") or {}
+        job["recipes"] = {"applied": applied, "skipped": skipped,
+                          "unavailable": cur.get("unavailable")}
+        _persist(job)
+
+
+def _capture_corpus(job: dict, character_id: str, statement: str,
+                    created: list[dict]) -> None:
+    """Copy this job's durable facts into the character's corpus, after a commit
+    that really created Voices.
+
+    Runs LAST and reports on the job (`corpus`), never raises and never changes
+    the commit's outcome: the clone is already done and registered, so a corpus
+    that could not be written is a named degradation, not a failed clone. The
+    workdir is untouched — GC still owns it — because the corpus is a COPY.
+    """
+    outcome: dict
+    if not created:
+        outcome = {"requested": True, "captured": False,
+                   "reason": "this commit created no voices, so there is "
+                             "nothing whose source audio would be kept"}
+    else:
+        res = ingest.capture_corpus(
+            Path(job["work_dir"]), character_id, job.get("result") or {},
+            clip_sha256=job.get("clip_sha256"), consent=statement,
+            mode=job.get("mode") or "cloud", levels=job.get("detection"),
+            committed=created)
+        outcome = {"requested": True, **res}
+    with _LOCK:
+        if job.get("cancel"):
+            return
+        job["corpus"] = outcome
+        _persist(job)
+
+
 def _do_commit(job_id: str, character: str, emotions: list[str], character_id: str | None,
-               statement: str) -> None:
+               statement: str, recipes: dict[str, str] | None = None,
+               corpus: bool = False) -> None:
     job = _get_job(job_id)
     if job is None:  # cancelled between Thread.start() and here
         return
+    if recipes:
+        # BEFORE the clone: the stems must be what the user chose by the time the
+        # exporter reads them.
+        try:
+            _apply_recipes(job, emotions, recipes)
+        except Exception as exc:  # noqa: BLE001 - a commit must not die over this
+            logger.warning("ingest job %s: recipe application failed: %s", job_id, exc)
     total = len(emotions)
     cancelled = _canceller(job)
 
@@ -515,15 +953,97 @@ def _do_commit(job_id: str, character: str, emotions: list[str], character_id: s
         _rollback(job_id, registered, "failed")
     elif was_cancelled:
         _rollback(job_id, created, "cancelled")
+    elif corpus:
+        # ONLY on the clean path: a rolled-back commit's voices no longer exist,
+        # and keeping the audio that made them would be retention with nothing
+        # to justify it.
+        cid = character_id or voices._slug(character)
+        try:
+            _capture_corpus(job, cid, statement, created)
+        except Exception as exc:  # noqa: BLE001 - never turn a clone into an error
+            logger.warning("ingest job %s: corpus capture failed: %s", job_id, exc)
+
+
+def _do_rederive(job_id: str, character_id: str, emotions: list[str] | None) -> None:
+    """Rebuild + re-export one character's voices from its corpus, as a phase.
+
+    Same shape as `_do_commit`, for the same reasons: it loads the TTS model in
+    a child process (minutes on a CPU box), it registers Voices one at a time,
+    and a caller must be able to cancel it and poll it.
+
+    It does NOT roll back, and that is the deliberate difference from a commit.
+    A commit's rollback removes voices the user never had; a re-derivation
+    REPLACES voices they already had, and the embedding it replaced is gone by
+    the time the row is swapped. Removing the rebuilt voice would therefore
+    leave the character with no voice for that emotion at all — strictly worse
+    than the rebuilt one it just made. So an abandoned rebuild keeps every
+    emotion it finished, and says which ones those were.
+    """
+    job = _get_job(job_id)
+    if job is None:
+        return
+    registered: list[dict] = []
+    started = {"clone": False}
+
+    def _progress(done: int, current: str | None) -> None:
+        if not started["clone"]:
+            started["clone"] = True
+            _mk_step(job, "stem", "done")
+            _mk_step(job, "clone", "active")
+        with _LOCK:
+            if job.get("cancel"):
+                return
+            job["partial"] = {**(job.get("partial") or {}),
+                              "emotions_done": done, "current": current}
+            _persist(job)
+
+    failure: BaseException | None = None
+    res: dict = {}
+    try:
+        _mk_step(job, "stem", "active")
+        res = ingest.rederive(
+            character_id, Path(job["work_dir"]), emotions,
+            progress=_progress, should_cancel=_canceller(job),
+            on_voice=registered.append)
+    except ingest.Cancelled:
+        logger.info("ingest job %s: rederive abandoned (cancelled)", job_id)
+    except Exception as exc:  # noqa: BLE001
+        failure = exc
+
+    with _LOCK:
+        was_cancelled = bool(job.get("cancel"))
+        if not was_cancelled and failure is None:
+            _mk_step(job, "clone", "done")
+            job["committed"] = res.get("created") or []
+            job["result"] = {"mode": "rederive", **res}
+            job["partial"] = {"emotions_done": len(res.get("created") or []),
+                              "emotions_total": len(res.get("stems") or []),
+                              "current": None}
+            job["status"] = "committed"
+            _persist(job)
+
+    if failure is not None or was_cancelled:
+        done = [v.get("voice_id") for v in registered if isinstance(v, dict)]
+        logger.warning(
+            "ingest job %s: rederive %s after rebuilding %d voice(s) — they are "
+            "KEPT (see _do_rederive): %s", job_id,
+            "failed" if failure is not None else "was cancelled", len(done), done)
+    if failure is not None:
+        _fail(job, "voice re-derivation", failure)
 
 
 # ── endpoints ─────────────────────────────────────────────────────────────────
-@router.post("/scan")
-def start_scan(file: UploadFile = File(...), mode: str = Form("auto")) -> dict:
+@router.post(f"{INGEST}/scan")
+def start_scan(file: UploadFile = File(...), mode: str = Form("auto"),
+               corpus: bool = Form(False)) -> dict:
     # NOT async: the prologue writes up to 50 MB, runs ffprobe and hashes the
     # clip before handing off to the phase thread — all of that belongs on the
     # threadpool, not the event loop (every other route in this file is `def`).
-    if mode not in ("auto", "cloud", "sovereign"):
+    #
+    # `corpus` (default FALSE) is the whole opt-in: it asks this box to KEEP the
+    # audio and labels this job produces once the clone succeeds. It changes
+    # nothing about the scan itself, and the commit can still override it.
+    if mode not in SCAN_MODES:
         raise HTTPException(400, "mode must be auto, cloud or sovereign")
     _admit()  # before the 50 MB read: a rejected upload should cost nothing
     data = file.file.read()  # sync read — we're on the threadpool
@@ -551,7 +1071,21 @@ def start_scan(file: UploadFile = File(...), mode: str = Form("auto")) -> dict:
         "note": None, "limits": None, "detection": None,
         "work_dir": str(work_dir), "created": time.time(),
         "clip_sha256": hashlib.sha256(data).hexdigest(), "cancel": False,
-        "committed": None}
+        "committed": None,
+        # Audition Room state: `recipes` is public (choices + named outcomes),
+        # `recipe_plan` is the server-side index map behind them.
+        "recipes": None, "recipe_plan": {},
+        # Casting Board state. None until the user re-casts something: absent
+        # means "the stems are exactly what the pipeline proposed", which is a
+        # different fact from an assignment map that happens to match it.
+        "casting": None,
+        # Corpus state. `requested` is what the caller asked for at upload time
+        # (the commit may still change its mind); everything else is filled in
+        # after a successful commit and always NAMES the outcome, including
+        # "not requested" — a silent absence would be indistinguishable from a
+        # capture that failed.
+        "corpus": {"requested": bool(corpus), "captured": False,
+                   "reason": None if corpus else "corpus capture was not requested"}}
     with _LOCK:
         JOBS[job_id] = job
         _persist(job)
@@ -561,13 +1095,27 @@ def start_scan(file: UploadFile = File(...), mode: str = Form("auto")) -> dict:
 
 _PUBLIC_KEYS = ("id", "status", "step", "steps", "partial", "speakers",
                 "duration", "result", "error", "mode", "committed",
+                # What happened to the user's recipe choices at commit, plus the
+                # reason candidate stems are absent when they are. `recipe_plan`
+                # (the segment indices behind each recipe) is deliberately NOT
+                # here: a client names a recipe, it never selects audio.
+                "recipes",
+                # The Casting Board's state: which segments each stem is
+                # currently spliced from and which emotions the user has
+                # re-cast. Published (unlike `recipe_plan`) because it IS the
+                # caller's own selection echoed back — a reload, or a second
+                # tab, must not show a ledger whose numbers no longer match the
+                # audio on disk.
+                "casting",
+                # Whether this job's audio was kept, and — always — why not.
+                "corpus",
                 # What analyze learned about THIS recording. A key the job dict
                 # holds but this tuple omits is computed and then thrown away —
                 # that is exactly what happened to these three.
                 "note", "limits", "detection")
 
 
-@router.get("/modes")
+@router.get(f"{INGEST}/modes")
 def modes() -> dict:
     """What each ingest mode does to a recording, from the backend's own
     constants — and which one `auto` resolves to right now.
@@ -584,7 +1132,7 @@ def modes() -> dict:
     }
 
 
-@router.get("/{job_id}")
+@router.get(INGEST + "/{job_id}")
 def get_job(job_id: str):
     with _LOCK:
         job = JOBS.get(job_id)
@@ -593,7 +1141,7 @@ def get_job(job_id: str):
         return {k: job.get(k) for k in _PUBLIC_KEYS}
 
 
-@router.get("/{job_id}/speaker-preview/{sid}")
+@router.get(INGEST + "/{job_id}/speaker-preview/{sid}")
 def speaker_preview(job_id: str, sid: str):
     job = _get_job(job_id)
     if not job:
@@ -608,7 +1156,7 @@ class SpeakerReq(BaseModel):
     speaker_id: str
 
 
-@router.post("/{job_id}/speaker")
+@router.post(INGEST + "/{job_id}/speaker")
 def choose_speaker(job_id: str, req: SpeakerReq) -> dict:
     _admit()  # labelling is the biggest fan-out in the pipeline
     with _LOCK:
@@ -624,7 +1172,84 @@ def choose_speaker(job_id: str, req: SpeakerReq) -> dict:
     return {"status": "running"}
 
 
-@router.get("/{job_id}/preview/{emotion}")
+class AuditionReq(BaseModel):
+    emotion: str
+    text: str = ""
+    recipe: str | None = None
+
+
+@router.post(INGEST + "/{job_id}/audition")
+def audition(job_id: str, req: AuditionReq):
+    """Hear a candidate stem AS A VOICE, before anything is committed.
+
+    The one thing this flow could never do: `/preview/{emotion}` plays the
+    speaker's own spliced audio, so the question the product exists to answer
+    ("does the clone sound like me?") was only answerable after an irreversible
+    commit had written real Voices into the roster. This synthesizes `text` with a
+    throwaway clone of the chosen candidate stem and returns the wav.
+
+    What makes it safe to call freely:
+      * it holds an AUDITION slot, not a job slot (`_audition_slot`), so it
+        neither blocks nor is blocked by scans and commits;
+      * the scratch voice lives and dies inside this job's workdir under the
+        `_audition_` prefix — never `VOICES_DIR`, never `meta.json`, never a
+        slot-holder check (`export_stems.audition`);
+      * there is no length gate: a stem too short to COMMIT can still be heard,
+        which is the point.
+
+    Meta comes back on `X-Audition-*` headers (emotion, recipe, seconds, source
+    seconds) so the studio can label what is playing without a second round trip.
+    """
+    try:
+        emotion = normalize_emotion(req.emotion)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    recipe = req.recipe or RECIPE_FULL
+    if recipe not in RECIPE_ORDER:
+        raise HTTPException(400, "unknown recipe")
+    text = (req.text or "").strip() or DEFAULT_AUDITION_TEXT
+    if len(text) > MAX_AUDITION_TEXT:
+        raise HTTPException(
+            400, f"audition line too long — keep it under {MAX_AUDITION_TEXT} characters")
+
+    job = _get_job(job_id)
+    if not job:
+        return job_expired()
+    if job.get("status") != "done":
+        raise HTTPException(409, "auditions need a finished scan")
+    wd = Path(job["work_dir"])
+    if recipe == RECIPE_FULL:
+        src = wd / f"stem_{emotion}.wav"
+    else:
+        if recipe not in ((job.get("recipe_plan") or {}).get(emotion) or {}):
+            raise HTTPException(404, "that recipe was not offered for this emotion")
+        src = wd / f"stem_{emotion}__{recipe}.wav"
+    if not src.is_file():
+        raise HTTPException(404, "no audio for that emotion")
+
+    with _audition_slot():
+        res = export_stems.audition(
+            src=src, text=text,
+            language=SETTINGS.language, quantize=SETTINGS.quantize,
+            scratch_dir=wd / f"{export_stems.AUDITION_PREFIX}{uuid.uuid4().hex[:8]}",
+            timeout=AUDITION_TIMEOUT_S)
+    if not res.get("ok") or not res.get("audio"):
+        # Named, sanitized: the child's error can carry paths and torch noise.
+        raise errors.sanitized_500("audition", res.get("error") or "audition failed")
+    return Response(
+        content=res["audio"], media_type="audio/wav",
+        headers={
+            "X-Audition-Emotion": emotion,
+            "X-Audition-Recipe": recipe,
+            "X-Audition-Seconds": str(res.get("seconds") or ""),
+            "X-Audition-Source-Seconds": str(_wav_seconds(src)),
+            # A candidate is regenerated on demand and never the same twice —
+            # nothing about it is cacheable.
+            "Cache-Control": "no-store",
+        })
+
+
+@router.get(INGEST + "/{job_id}/preview/{emotion}")
 def preview(job_id: str, emotion: str):
     job = _get_job(job_id)
     if not job:
@@ -635,6 +1260,310 @@ def preview(job_id: str, emotion: str):
     return FileResponse(str(stem), media_type="audio/wav")
 
 
+# ── the casting board ─────────────────────────────────────────────────────────
+# Serializes re-splices. Two /stems calls for the same job would otherwise write
+# the same stem file from two threads (the studio debounces, but a debounce is a
+# UI convenience, not a concurrency argument). Global rather than per-job: a
+# splice is milliseconds of local wav work, so one lock costs nothing and there
+# is no per-job lock lifecycle to leak.
+_STEM_LOCK = threading.Lock()
+# A hand-curated stem is a handful of takes, not a programme. The cap is a
+# boundary check on a client-supplied list, in the same spirit as MAX_UPLOAD_BYTES.
+MAX_ASSIGNED_SEGMENTS = 200
+
+
+def _segment_refusal(index: int, result: dict) -> str:
+    """WHY a segment index cannot feed a stem, in the pipeline's own terms.
+
+    "bad index" is four different facts, and a user staring at a greyed row
+    deserves the one that applies to it: out of range, extraction failed,
+    classification failed, or measured as not the target speaker.
+    """
+    segs = result.get("segments") or []
+    if not isinstance(index, int) or index < 0 or index >= len(segs):
+        return f"segment {index} is not part of this scan"
+    s = segs[index] if isinstance(segs[index], dict) else {}
+    failure = s.get("failure")
+    if failure == "extract":
+        return (f"segment {index} has no audio - that span of the recording "
+                "could not be decoded")
+    if failure:
+        return f"segment {index} has no audio - it could not be prepared ({failure})"
+    if s.get("outlier") == "dropped":
+        return (f"segment {index} was measured as not the target speaker, so it "
+                "is not available to any stem")
+    return f"segment {index} has no audio on this scan"
+
+
+def _board(work_dir: Path, result: dict) -> tuple[list[dict], dict[str, list[int]], str | None]:
+    """(usable segment rows, the splice the PIPELINE proposed, reason-unavailable).
+
+    The proposed map is re-derived from the same inputs `label_and_stem` used
+    rather than remembered, so "reset to proposed" restores what the ledger
+    actually reported instead of a second, drifting record of it — including the
+    baseline's borrow ORDER, which is not recording order (plan_baseline appends
+    the topped-up segments after the genuinely-neutral ones, and splicing them
+    back in index order would produce a different stem than the one on screen).
+    """
+    stems = result.get("stems")
+    if not isinstance(stems, list) or not stems:
+        return [], {}, "this scan produced no stems"
+    rows, reason = segment_rows(work_dir, result)
+    if reason:
+        return [], {}, reason
+    min_stem = float(result.get("min_stem") or ingest.MIN_STEM_SECONDS)
+    by_emotion: dict[str, list[dict]] = {}
+    for r in rows:
+        by_emotion.setdefault(r["emotion"], []).append(r)
+    proposed: dict[str, list[int]] = {}
+    for stem in stems:
+        emo = stem.get("emotion")
+        if not emo:
+            continue
+        if emo == ingest.BASELINE:
+            proposed[emo] = [l["i"] for l in ingest.plan_baseline(by_emotion, min_stem).labs]
+        else:
+            proposed[emo] = [r["i"] for r in sorted(by_emotion.get(emo, []),
+                                                    key=lambda r: r["i"])]
+    return rows, proposed, None
+
+
+def _mixed_note(emotion: str, indices: list[int], label_of: dict[int, str]) -> str | None:
+    """The sentence a HAND-ASSEMBLED stem needs: which of its segments are
+    labelled as something else. None when the selection is all one emotion.
+
+    This replaces the pipeline's own note for an edited emotion rather than
+    living beside it: `plan_baseline`'s note describes a borrow the user has just
+    overruled, and leaving it on screen would state a fact about a stem that no
+    longer exists.
+    """
+    foreign: dict[str, int] = {}
+    for i in indices:
+        lab = label_of.get(i)
+        if lab and lab != emotion:
+            foreign[lab] = foreign.get(lab, 0) + 1
+    if not foreign:
+        return None
+    what = ", ".join(f"{n} x {e}" for e, n in sorted(foreign.items()))
+    return (f"you assembled this stem: {what} segment(s) in it are labelled as "
+            f"another emotion, so this voice is not purely {emotion}.")
+
+
+def _withdraw_recipes(job: dict, work_dir: Path, stem: dict, emotion: str) -> bool:
+    """Drop an edited emotion's candidate takes, and their wavs.
+
+    A recipe is an alternative reading of the PROPOSED selection ("the longest of
+    these segments"). Once the user has chosen the segments themselves, every
+    alternative describes a set that is no longer on screen — and `full`, the
+    default, would name a splice that is not the one in `stem_{emotion}.wav`.
+    Withdrawing them means an audition of this emotion hears exactly the stem the
+    board just built, and a stale client choice is refused by name at commit
+    ("that recipe was not offered for this emotion") instead of quietly cloning
+    something else.
+    """
+    had = bool(stem.pop("recipes", None))
+    plan = job.get("recipe_plan") or {}
+    for rid in list((plan.get(emotion) or {})):
+        if rid == RECIPE_FULL:
+            continue
+        with contextlib.suppress(OSError):
+            (work_dir / f"stem_{emotion}__{rid}.wav").unlink(missing_ok=True)
+    had = bool(plan.pop(emotion, None)) or had
+    job["recipe_plan"] = plan
+    return had
+
+
+class StemsReq(BaseModel):
+    # {emotion: [segment indices]} — the emotions being re-cast. Emotions NOT
+    # named keep whatever selection they already have, so a move is one request
+    # naming both sides and everything else is left alone.
+    assignments: dict[str, list[int]] | None = None
+    # Restore the splice the pipeline proposed. An empty body means the same
+    # thing: there is no other sensible reading of "re-splice nothing".
+    reset: bool = False
+
+
+@router.post(INGEST + "/{job_id}/stems")
+def restem(job_id: str, req: StemsReq):
+    """Re-splice this job's stems from a caller-chosen segment selection.
+
+    The stem was the one part of this flow the user had no authority over: a
+    mislabelled laugh, a cough, or 0.4s under the clone minimum was a dead end
+    shown as a grey badge. This rewrites `stem_{emotion}.wav` from the segments
+    the user picked and answers with the measured seconds and the eligibility
+    that follows from them - so a short stem can be WATCHED crossing the line
+    rather than re-uploaded and hoped about.
+
+    What it deliberately does not do: touch the roster, touch the corpus, admit
+    against the job budget (this is local wav arithmetic, not a model load), or
+    accept anything that reaches a filename. Refusals are named, one per fact.
+    """
+    job = _get_job(job_id)
+    if not job:
+        return job_expired()
+    status = job.get("status")
+    if status in ("committing", "committed"):
+        raise HTTPException(
+            409, "this scan has already been committed - its stems can no longer "
+                 "be re-spliced")
+    if status != "done":
+        raise HTTPException(409, "re-splicing needs a finished scan")
+
+    wd = Path(job["work_dir"])
+    result = job.get("result") or {}
+    rows, proposed, why = _board(wd, result)
+    if why:
+        raise HTTPException(409, f"these stems cannot be re-spliced - {why}")
+    wav_of = {r["i"]: Path(r["wav"]) for r in rows}
+    label_of = {r["i"]: r["emotion"] for r in rows}
+    min_stem = float(result.get("min_stem") or ingest.MIN_STEM_SECONDS)
+    stem_of = {s.get("emotion"): s for s in result.get("stems") or []}
+
+    reset = bool(req.reset) or not req.assignments
+    current: dict[str, list[int]] = dict((job.get("casting") or {}).get("assignments")
+                                         or proposed)
+    # An emotion the job remembers but this scan no longer proposes cannot be
+    # spliced from here; proposed is the authority on what stems exist.
+    current = {e: list(v) for e, v in current.items() if e in proposed}
+    for emo in proposed:
+        current.setdefault(emo, list(proposed[emo]))
+
+    if reset:
+        effective = {e: list(v) for e, v in proposed.items()}
+    else:
+        effective = {e: list(v) for e, v in current.items()}
+        for raw_emo, idxs in (req.assignments or {}).items():
+            try:
+                emo = normalize_emotion(raw_emo)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc))
+            if emo not in proposed:
+                raise HTTPException(
+                    400, f"'{emo}' is not one of this scan's stems, so segments "
+                         "cannot be cast into it")
+            if not idxs:
+                raise HTTPException(
+                    400, f"leave at least one segment in {emo} - to drop the "
+                         "emotion entirely, descope it instead")
+            if len(idxs) > MAX_ASSIGNED_SEGMENTS:
+                raise HTTPException(
+                    400, f"too many segments for one stem (max {MAX_ASSIGNED_SEGMENTS})")
+            picked: list[int] = []
+            for i in idxs:
+                if i not in wav_of:
+                    raise HTTPException(400, _segment_refusal(i, result))
+                if i in picked:
+                    raise HTTPException(400, f"segment {i} is listed twice in {emo}")
+                picked.append(i)
+            effective[emo] = picked
+
+    # Only what actually CHANGED is re-spliced: the same assignments twice write
+    # nothing the second time and answer identically (the endpoint is a debounce
+    # target, so idempotence is not a nicety here).
+    changed = [e for e in effective if effective[e] != current.get(e)]
+    edited = sorted(e for e in effective if effective[e] != proposed.get(e))
+
+    with _STEM_LOCK:
+        for emo in changed:
+            try:
+                sp = ingest.concat_wavs([wav_of[i] for i in effective[emo]],
+                                        wd / f"stem_{emo}.wav")
+            except Exception as exc:  # noqa: BLE001 - never leak splice internals
+                raise errors.sanitized_500("re-splicing this stem", exc)
+            stem = stem_of.get(emo)
+            if stem is None:
+                continue
+            stem["seconds"], stem["segments"] = sp.seconds, sp.segments
+            # Re-measured on the WRITTEN file, exactly as label_and_stem and
+            # commit do — the badge and the clone must agree.
+            stem["eligible"] = sp.seconds >= min_stem
+            # A hand-assembled stem's identity score described the previous
+            # splice. Absent is the honest state; a stale number is not.
+            stem.pop("identity", None)
+        if reset and changed:
+            # Back to the pipeline's own splice, so its own candidate takes are
+            # true again. Cleared first: build_recipes only ADDS offers, and a
+            # stem that no longer qualifies for a choice must not keep one.
+            for stem in result.get("stems") or []:
+                stem.pop("recipes", None)
+            job["recipe_plan"] = {}
+            try:
+                plan, _why = build_recipes(wd, result)
+                job["recipe_plan"] = plan
+            except Exception as exc:  # noqa: BLE001 - takes are advisory, always
+                logger.warning("ingest job %s: recipes not rebuilt after reset: %s",
+                               job_id, exc)
+        else:
+            for emo in changed:
+                stem = stem_of.get(emo)
+                if stem is not None:
+                    _withdraw_recipes(job, wd, stem, emo)
+
+    with _LOCK:
+        if job.get("cancel"):
+            raise HTTPException(409, "this scan was cancelled")
+        casting = dict(job.get("casting") or {})
+        # The pipeline's own per-stem notes, snapshotted ONCE so a reset can put
+        # them back. plan_baseline's "topped up with 2x calm" is a statement
+        # about the proposed splice; it is restored, never recomputed.
+        if "proposed_notes" not in casting:
+            casting["proposed_notes"] = {s.get("emotion"): s.get("note")
+                                         for s in result.get("stems") or []}
+        for emo, stem in stem_of.items():
+            if emo in edited:
+                stem["note"] = _mixed_note(emo, effective[emo], label_of)
+            else:
+                stem["note"] = casting["proposed_notes"].get(emo)
+        casting["assignments"] = effective
+        casting["edited"] = edited
+        job["casting"] = casting
+        job["result"] = result
+        _persist(job)
+
+    return {
+        "min_stem": min_stem,
+        "reset": reset,
+        "edited": edited,
+        "changed": sorted(changed),
+        "stems": [{"emotion": emo,
+                   "seconds": stem.get("seconds"),
+                   "segments": stem.get("segments"),
+                   "eligible": bool(stem.get("eligible")),
+                   "note": stem.get("note"),
+                   "assigned": effective.get(emo, []),
+                   "proposed": proposed.get(emo, []),
+                   "edited": emo in edited,
+                   # Whether an A/B of alternative takes still exists for this
+                   # row. False after an edit, and the studio must stop offering
+                   # one rather than let it 404 at commit.
+                   "takes": bool(stem.get("recipes"))}
+                  for emo, stem in stem_of.items() if emo in proposed],
+    }
+
+
+@router.get(INGEST + "/{job_id}/segment/{index}")
+def segment(job_id: str, index: int):
+    """One labelled segment's own audio. The sibling of `speaker-preview`.
+
+    The scan has always written these (`seg_%03d.wav`) and always thrown them
+    away behind a single per-stem number. Serving them is what makes the "mixed"
+    note, an outlier badge and a 3.6s stem explicable instead of assertions the
+    user has to take on faith — including for segments the pipeline REJECTED,
+    which are precisely the ones somebody wants to hear.
+    """
+    job = _get_job(job_id)
+    if not job:
+        return job_expired()
+    result = job.get("result") or {}
+    segs = result.get("segments") or []
+    if index < 0 or index >= len(segs):
+        raise HTTPException(404, "that segment is not part of this scan")
+    p = Path(job["work_dir"]) / f"seg_{index:03d}.wav"
+    if not p.is_file():
+        raise HTTPException(404, _segment_refusal(index, result))
+    return FileResponse(str(p), media_type="audio/wav")
+
+
 class CommitReq(BaseModel):
     character: str
     emotions: list[str]
@@ -643,9 +1572,18 @@ class CommitReq(BaseModel):
     # the statement is stored as a receipt on every created Voice.
     attested: bool = False
     statement: str = ""
+    # {emotion: recipe_id} — the candidate splice the user auditioned and chose.
+    # Absent, empty or `full` for an emotion all mean the same thing: clone what
+    # the ledger showed. The fast path never sends this.
+    recipes: dict[str, str] | None = None
+    # Keep this recording's segments, labels, stems and levels for this
+    # character (see ingest.capture_corpus). None = whatever the scan asked for
+    # (default OFF); an explicit true/false here wins, because the decision to
+    # RETAIN belongs at the moment of consent, not at upload.
+    corpus: bool | None = None
 
 
-@router.post("/{job_id}/commit")
+@router.post(INGEST + "/{job_id}/commit")
 def commit(job_id: str, req: CommitReq):
     """Kick off cloning as a background phase and return immediately. Progress
     (emotions_done / total / current) streams via `partial`; the job ends
@@ -662,6 +1600,18 @@ def commit(job_id: str, req: CommitReq):
         raise HTTPException(400, str(exc))
     if req.character_id is not None and req.character_id != voices._slug(req.character_id):
         raise HTTPException(400, "character_id is not a valid character id")
+    # Recipe choices are keys into a server-side plan, and BOTH halves reach a
+    # filename (`stem_{emotion}__{recipe}.wav`) — so both are validated the same
+    # way the emotions above are: normalized/enumerated, never sanitised.
+    chosen: dict[str, str] = {}
+    for emo, rid in (req.recipes or {}).items():
+        try:
+            emo = normalize_emotion(emo)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        if rid not in RECIPE_ORDER:
+            raise HTTPException(400, "unknown recipe")
+        chosen[emo] = rid
     _admit()  # cloning loads the TTS model in a child process — the heaviest phase
     with _LOCK:
         job = JOBS.get(job_id)
@@ -674,19 +1624,144 @@ def commit(job_id: str, req: CommitReq):
         statement = req.statement.strip()
         if not req.attested or not statement:
             raise HTTPException(422, "ownership attestation required to clone a voice")
+        want_corpus = ((job.get("corpus") or {}).get("requested", False)
+                       if req.corpus is None else bool(req.corpus))
         job["status"] = "committing"
         job["cancel"] = False
         job["committed"] = None
+        job["corpus"] = {"requested": want_corpus, "captured": False,
+                         "reason": None if want_corpus
+                         else "corpus capture was not requested"}
         job["partial"] = {"emotions_done": 0, "emotions_total": len(emotions), "current": None}
         _persist(job)
     threading.Thread(
         target=_do_commit,
-        args=(job_id, req.character.strip(), emotions, req.character_id, statement),
+        args=(job_id, req.character.strip(), emotions, req.character_id, statement,
+              chosen, want_corpus),
         daemon=True).start()
     return {"status": "committing"}
 
 
-@router.delete("/{job_id}")
+class RederiveReq(BaseModel):
+    character_id: str
+    # Which emotions to rebuild. Absent = every emotion the corpus holds audio
+    # for, which is the point of the feature (one click, whole character).
+    emotions: list[str] | None = None
+
+
+def _valid_cid(character_id: str) -> str:
+    cid = (character_id or "").strip()
+    if not cid or cid != voices._slug(cid):
+        raise HTTPException(400, "character_id is not a valid character id")
+    return cid
+
+
+@router.post(INGEST + "/rederive")
+def start_rederive(req: RederiveReq) -> dict:
+    """Rebuild a character's voices from its stored corpus — no upload, no cloud
+    call, no new consent (the receipt stored with the audio is the consent).
+
+    The three refusals are answered HERE, synchronously, so a caller learns "you
+    have no corpus" as a 404 rather than as a job that fails a minute later:
+      404 — nothing has ever been captured for this character;
+      409 — the corpus is over its byte cap (prune or delete first), or holds no
+            audio for the emotions asked for.
+    Everything past that is a background job with the same poll surface as a
+    commit: GET /v1/ingest/{job_id}, DELETE to cancel.
+    """
+    cid = _valid_cid(req.character_id)
+    emotions: list[str] | None = None
+    if req.emotions is not None:
+        try:
+            emotions = [normalize_emotion(e) for e in req.emotions]
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+    try:
+        idx = ingest.load_corpus(cid)
+    except errors.UserFacing as exc:
+        raise HTTPException(400, str(exc))
+    if not idx.get("clips"):
+        raise HTTPException(
+            404, "there is no corpus for this character — capture is opt-in, so "
+                 "re-run an ingest with corpus enabled before rebuilding from it")
+    used = ingest.corpus_bytes(idx)
+    cap = SETTINGS.corpus_max_bytes
+    if cap > 0 and used > cap:
+        raise HTTPException(
+            409, f"this character's corpus is {used} bytes, over its {cap}-byte "
+                 "cap — delete recordings before rebuilding from it")
+    sel = ingest.select_best(cid, emotions, idx)
+    if not any(rows for rows in sel["picks"].values()):
+        raise HTTPException(
+            409, "nothing in this character's corpus matches what was asked "
+                 "for, so there is nothing to rebuild")
+
+    _admit()   # a rebuild loads the TTS model in a child, exactly like a commit
+    job_id = uuid.uuid4().hex[:12]
+    work_dir = WORK_ROOT / job_id
+    work_dir.mkdir(parents=True, exist_ok=True)
+    job = {
+        "id": job_id, "status": "committing", "step": None, "mode": "rederive",
+        "steps": [{**s, "state": "pending"} for s in STEPS_BY_MODE["rederive"]],
+        "partial": {"emotions_done": 0,
+                    "emotions_total": sum(1 for r in sel["picks"].values() if r),
+                    "current": None},
+        "speakers": None, "duration": 0, "result": None, "error": None,
+        "note": None, "limits": None, "detection": None,
+        "work_dir": str(work_dir), "created": time.time(),
+        "clip_sha256": None, "cancel": False, "committed": None,
+        "recipes": None, "recipe_plan": {}, "casting": None,
+        # A rebuild reads the corpus and never writes to it.
+        "corpus": {"requested": False, "captured": False,
+                   "reason": "a re-derivation reads the corpus, it never adds "
+                             "to it", "corpus_rev": sel["corpus_rev"]},
+        "character_id": cid}
+    with _LOCK:
+        JOBS[job_id] = job
+        _persist(job)
+    threading.Thread(target=_do_rederive, args=(job_id, cid, emotions),
+                     daemon=True).start()
+    return {"job_id": job_id, "mode": "rederive",
+            "selection": sel["report"], "corpus_rev": sel["corpus_rev"]}
+
+
+@router.get("/v1/characters/{character_id}/corpus")
+def get_corpus(character_id: str) -> dict:
+    """What audio of this person the box holds — clips, their segments, seconds,
+    emotions, measured fidelity and the consent receipt each was kept under.
+
+    Answers for a character with NO corpus too (empty, `totals.clips = 0`)
+    rather than 404: "this box keeps nothing of yours" is the answer to the
+    question, and a 404 would read as "we could not check".
+    """
+    cid = _valid_cid(character_id)
+    try:
+        return ingest.corpus_view(cid)
+    except errors.UserFacing as exc:
+        raise HTTPException(400, str(exc))
+
+
+@router.delete("/v1/characters/{character_id}/corpus/{clip_sha}")
+def delete_corpus_clip(character_id: str, clip_sha: str) -> dict:
+    """Remove every segment and stem derived from ONE recording, and report what
+    went. Deliberately not a 204: a deletion the user cannot see the shape of is
+    a deletion they have to take on trust, and this is the surface that makes
+    keeping the audio defensible in the first place.
+
+    The Voices already cloned from that recording are NOT touched — they are
+    embeddings the user asked for and owns; delete them through /v1/voices.
+    """
+    cid = _valid_cid(character_id)
+    try:
+        report = ingest.delete_clip(cid, clip_sha)
+    except errors.UserFacing as exc:
+        raise HTTPException(400, str(exc))
+    if report.get("removed") is None:
+        raise HTTPException(404, report.get("reason") or "no such recording")
+    return report
+
+
+@router.delete(INGEST + "/{job_id}")
 def cancel_job(job_id: str):
     """Cancel a job (between emotions during commit, between phases otherwise),
     mark it 'cancelled' and tear down its workdir."""

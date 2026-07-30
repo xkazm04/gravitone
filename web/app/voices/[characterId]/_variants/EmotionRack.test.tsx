@@ -191,6 +191,186 @@ describe("EmotionRack — a cloned embedding is never destroyed on one click", (
   });
 });
 
+// ── Emotion Algebra ──────────────────────────────────────────────────────────
+// The trust contract, in tests: a computed slot may never render as a recording,
+// a refusal must arrive as the service's own sentence, and the third action must
+// not exist at all where the page cannot perform it.
+
+function derived(id: string, emotion: string, donorName = "Mary"): Voice {
+  return {
+    ...voice(id, emotion),
+    origin: "derived",
+    derived_from: { source: "donor", donor: "mary", donor_name: donorName,
+                    emotion, basis_version: 1, alpha: 0.9 },
+  };
+}
+
+function renderDerivable(slots: Slot[], deriveVoice = vi.fn(async () => {})) {
+  render(
+    <EmotionRack
+      name="Sarah" characterId="sarah" slots={slots}
+      coverage={slots.filter((s) => s.voice).length} total={slots.length}
+      busySlot={null} addVoice={vi.fn()} removeVoice={vi.fn()} onRecord={vi.fn()}
+      addCustomEmotion={vi.fn()} removeCustomEmotion={vi.fn()}
+      deriveVoice={deriveVoice}
+    />,
+  );
+  return deriveVoice;
+}
+
+function rosterFetch(characters: unknown[]) {
+  return vi.fn(async () => new Response(JSON.stringify(characters), {
+    status: 200, headers: { "Content-Type": "application/json" },
+  }));
+}
+
+describe("EmotionRack — a derived slot is never a recording", () => {
+  it("badges the donor instead of 'recorded'", () => {
+    renderDerivable([
+      slot("baseline", "Baseline", [voice("v_base", "baseline")]),
+      slot("angry", "Angry", [derived("v_derived", "angry")]),
+    ]);
+
+    expect(screen.getByText(/derived · from Mary/)).toBeInTheDocument();
+    // Exactly one "recorded" chip on the page: the baseline's.
+    expect(screen.getAllByText("recorded")).toHaveLength(1);
+    // …and the header counts it separately from the recordings.
+    expect(screen.getByText(/1\/2 recorded/)).toBeInTheDocument();
+    expect(screen.getByText(/1 derived/)).toBeInTheDocument();
+  });
+
+  it("keeps the demand counter alive for a derived slot", () => {
+    // Computing a stand-in did not answer the appetite for a real performance,
+    // and the service keeps counting it — so the rack keeps showing it.
+    const s = slot("angry", "Angry", [derived("v_derived", "angry")]);
+    renderDerivable([{ ...s, demand: 4 }]);
+    expect(screen.getByText(/still requested 4x/)).toBeInTheDocument();
+  });
+
+  it("offers one click from computed to performed", () => {
+    const onRecord = vi.fn();
+    render(
+      <EmotionRack
+        name="Sarah" characterId="sarah"
+        slots={[slot("angry", "Angry", [derived("v_derived", "angry")])]}
+        coverage={1} total={1} busySlot={null}
+        addVoice={vi.fn()} removeVoice={vi.fn()} onRecord={onRecord}
+        addCustomEmotion={vi.fn()} removeCustomEmotion={vi.fn()}
+        deriveVoice={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", {
+      name: "Promote the derived Angry voice to a recording",
+    }));
+    expect(onRecord).toHaveBeenCalledWith("angry");
+  });
+
+  it("names the basis when no single donor supplied the direction", () => {
+    const v: Voice = {
+      ...voice("v_derived", "angry"), origin: "derived",
+      derived_from: { source: "basis", donor: null, contributors: ["a", "b", "c"] },
+    };
+    renderDerivable([slot("angry", "Angry", [v])]);
+    expect(screen.getByText(/derived · from 3 voices/)).toBeInTheDocument();
+  });
+});
+
+describe("EmotionRack — derive from…", () => {
+  it("does not exist where the page cannot derive", () => {
+    // Absent = invisible, the same rule the Signal chip follows.
+    renderSlots([slot("angry", "Angry", [])]);
+    expect(screen.queryByText(/derive from/)).toBeNull();
+  });
+
+  it("opens a donor picker over the roster's recorded takes", async () => {
+    vi.stubGlobal("fetch", rosterFetch([
+      { character_id: "sarah", name: "Sarah", voices: [{ emotion: "baseline" }] },
+      { character_id: "mary", name: "Mary",
+        voices: [{ emotion: "baseline" }, { emotion: "angry" }] },
+      { character_id: "paul", name: "Paul",
+        voices: [{ emotion: "angry", origin: "derived" }] },
+    ]));
+    renderDerivable([slot("angry", "Angry", [])]);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", {
+        name: "Derive the Angry voice from another recording",
+      }));
+    });
+
+    expect(screen.getByRole("button", { name: "shared basis" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Mary" })).toBeInTheDocument();
+    // Paul only has a DERIVED angry — deriving from a derived take compounds the
+    // approximation, and the service refuses it, so it is never offered.
+    expect(screen.queryByRole("button", { name: "Paul" })).toBeNull();
+    // …and the character itself is not its own donor.
+    expect(screen.queryByRole("button", { name: "Sarah" })).toBeNull();
+  });
+
+  it("says so when nobody else has recorded this emotion", async () => {
+    vi.stubGlobal("fetch", rosterFetch([
+      { character_id: "mary", name: "Mary", voices: [{ emotion: "baseline" }] },
+    ]));
+    renderDerivable([slot("angry", "Angry", [])]);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", {
+        name: "Derive the Angry voice from another recording",
+      }));
+    });
+    expect(screen.getByText(/no other character has recorded Angry yet/)).toBeInTheDocument();
+  });
+
+  it("derives from the shared basis with a null donor", async () => {
+    vi.stubGlobal("fetch", rosterFetch([]));
+    const deriveVoice = renderDerivable([slot("angry", "Angry", [])]);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", {
+        name: "Derive the Angry voice from another recording",
+      }));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "shared basis" }));
+    });
+    expect(deriveVoice).toHaveBeenCalledWith("angry", null);
+  });
+
+  it("derives from a named donor", async () => {
+    vi.stubGlobal("fetch", rosterFetch([
+      { character_id: "mary", name: "Mary", voices: [{ emotion: "angry" }] },
+    ]));
+    const deriveVoice = renderDerivable([slot("angry", "Angry", [])]);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", {
+        name: "Derive the Angry voice from another recording",
+      }));
+    });
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Mary" })); });
+    expect(deriveVoice).toHaveBeenCalledWith("angry", "mary");
+  });
+
+  it("renders the service's refusal verbatim, against the slot it refused", async () => {
+    // This box answers 501 ("safetensors is not installed"), which is the honest
+    // answer and the one worth reading — "derive failed" would hide it.
+    vi.stubGlobal("fetch", rosterFetch([]));
+    const reason = "deriving emotions is not available here: safetensors is not installed";
+    const deriveVoice = vi.fn(async () => { throw new Error(reason); });
+    renderDerivable([slot("angry", "Angry", [])], deriveVoice);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", {
+        name: "Derive the Angry voice from another recording",
+      }));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "shared basis" }));
+    });
+
+    expect(await screen.findByText(new RegExp(reason))).toBeInTheDocument();
+    // The slot is still empty and still offers both real routes.
+    expect(screen.getByText(/● record this/)).toBeInTheDocument();
+  });
+});
+
 describe("EmotionRack — a failed preview says WHY", () => {
   it("carries the backend's own detail instead of a bare 'preview failed'", async () => {
     // useVoicePreview used to swallow the cause entirely, so an unreachable

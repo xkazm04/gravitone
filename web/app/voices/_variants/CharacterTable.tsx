@@ -10,13 +10,14 @@ import Link from "next/link";
 import { Eyebrow } from "@/components/ui/Primitives";
 import { EMOTION_IDS, emotionMeta } from "@/lib/emotions";
 import TagEditor from "./TagEditor";
-import { hueOf, relTime, useCharacters, useVoicePreview, patchCharacterReq, deleteCharacterReq, collisionVoice, bulkDeleteQuestion, deleteCharacterQuestion, type Character } from "../_data/characters";
+import { hueOf, relTime, useCharacters, useVoicePreview, patchCharacterReq, deleteCharacterReq, collisionVoice, bulkDeleteQuestion, deleteCharacterQuestion, weakestVoice, weaknessOf, type Character } from "../_data/characters";
+import SignalChip from "./SignalChip";
 import { ApiError, readDetail } from "@/lib/apiFetch";
 import { useAuth } from "@/lib/useAuth";
 import { useMounted } from "@/lib/useMounted";
 import { CONSENT_PROMPT, recordVoiceOwnership } from "@/lib/voiceVault";
 
-type SortKey = "name" | "category" | "lang" | "coverage" | "demand" | "created";
+type SortKey = "name" | "category" | "lang" | "coverage" | "weakest" | "demand" | "created";
 
 /** Unmet demand for a Character: total requests over its STILL-MISSING emotions
  *  (a slot already recorded isn't unmet), plus the hottest missing slot to
@@ -70,6 +71,23 @@ function CoverageBar({ c }: { c: Character }) {
         })}
       </div>
       <span className="font-jetbrains text-[11px] text-white/65">{c.coverage}/{c.total}</span>
+      {/* WORST-SLOT HINT — coverage says how many voices exist, this says which
+          one is the weak one. It is a link, not a badge: the whole point of the
+          ledger is that the next action is one click away, and `?record=` is the
+          param the guided recorder already opens on. Renders nothing when no
+          Voice is flagged (a clean roster, or one measured before the ledger). */}
+      {(() => {
+        const weakest = weakestVoice(c);
+        if (!weakest) return null;
+        const label = emotionMeta(weakest.voice.emotion).label;
+        return (
+          <Link href={`/voices/${c.character_id}?record=${encodeURIComponent(weakest.voice.emotion)}`}
+            aria-label={`Re-record the ${label} voice of ${c.name} — ${weakest.signal.label}`}
+            className="transition hover:brightness-125">
+            <SignalChip signal={weakest.signal} note={`weakest slot: ${label}`} />
+          </Link>
+        );
+      })()}
       {c.category === "cloned" && c.voices.length > 0 && (() => {
         const withReceipt = c.voices.filter((v) => v.consent).length;
         const all = withReceipt === c.voices.length;
@@ -127,6 +145,7 @@ export default function CharacterTable() {
       : sort.key === "category" ? c.category
       : sort.key === "lang" ? c.lang
       : sort.key === "coverage" ? c.coverage
+      : sort.key === "weakest" ? weaknessOf(c)
       : sort.key === "demand" ? unmetDemand(c).total
       : Date.parse(c.created ?? "") || 0;
     return [...f].sort((a, b) => (val(a) > val(b) ? sort.dir : val(a) < val(b) ? -sort.dir : 0));
@@ -145,8 +164,11 @@ export default function CharacterTable() {
   const allShownSelected = rows.length > 0 && rows.every((r) => selected.has(r.character_id));
 
   function toggleSort(key: SortKey) {
-    // Demand opens hottest-first (desc); every other column opens ascending.
-    setSort((s) => (s.key === key ? { key, dir: s.dir === 1 ? -1 : 1 } : { key, dir: key === "demand" ? -1 : 1 }));
+    // Demand and weakest open worst-first (desc) — both exist to answer "what
+    // should I do next", and that answer is at the top. Everything else ascends.
+    setSort((s) => (s.key === key
+      ? { key, dir: s.dir === 1 ? -1 : 1 }
+      : { key, dir: key === "demand" || key === "weakest" ? -1 : 1 }));
   }
   function toggleOne(id: string) {
     setSelected((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
@@ -268,11 +290,16 @@ export default function CharacterTable() {
     } finally { setImporting(false); }
   }
 
+  const SortButton = ({ k, title, children }: { k: SortKey; title?: string; children: React.ReactNode }) => (
+    <button onClick={() => toggleSort(k)} title={title}
+      className="font-jetbrains inline-flex items-center gap-1 text-[11px] uppercase tracking-widest text-white/60 transition hover:text-white">
+      {children}<span className={sort.key === k ? "text-cyan-300" : "opacity-0"}>{sort.dir === 1 ? "↑" : "↓"}</span>
+    </button>
+  );
+
   const Th = ({ k, children }: { k: SortKey; children: React.ReactNode }) => (
     <th className="px-3 py-2 text-left font-normal">
-      <button onClick={() => toggleSort(k)} className="font-jetbrains inline-flex items-center gap-1 text-[11px] uppercase tracking-widest text-white/60 transition hover:text-white">
-        {children}<span className={sort.key === k ? "text-cyan-300" : "opacity-0"}>{sort.dir === 1 ? "↑" : "↓"}</span>
-      </button>
+      <SortButton k={k}>{children}</SortButton>
     </th>
   );
 
@@ -384,7 +411,21 @@ export default function CharacterTable() {
               <Th k="category">source</Th>
               <Th k="lang">lang</Th>
               <Th k="coverage">emotion coverage</Th>
-              <Th k="demand">demand</Th>
+              {/* `demand` answers "what do my API callers want next"; `weakest`
+                  answers "which voice will disappoint them when they get it".
+                  They are the two next-action sorts, so they sit together — and
+                  the weakest column has no cell of its own on purpose: the hint
+                  it ranks is the Signal chip in the coverage bar, where the
+                  slot it belongs to is. */}
+              <th className="px-3 py-2 text-left font-normal">
+                <span className="inline-flex items-center gap-3">
+                  <SortButton k="demand">demand</SortButton>
+                  <SortButton k="weakest"
+                    title="Sort by the weakest measured voice — the Characters with a flagged take first">
+                    weakest
+                  </SortButton>
+                </span>
+              </th>
               <th className="px-3 py-2 text-left"><span className="font-jetbrains text-[11px] uppercase tracking-widest text-white/60">tags</span></th>
               <Th k="created">added</Th>
               <th className="w-28 px-3 py-2" />

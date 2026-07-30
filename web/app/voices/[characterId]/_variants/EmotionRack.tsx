@@ -5,14 +5,59 @@
 // practical; every slot is visible at once with no scrolling or spatial hunting.
 
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
-import { Fragment, useState } from "react";
-import { useVoicePreview, relTime, pickAudio, deleteVoiceQuestion, type Slot } from "@/app/voices/_data/characters";
+import { Fragment, useCallback, useState } from "react";
+import { useVoicePreview, relTime, pickAudio, deleteVoiceQuestion, signalOf,
+         derivedDonorLabel, loadRoster, type Slot } from "@/app/voices/_data/characters";
 import { checkEmotion } from "@/lib/slugs";
 import EmotionArt from "@/components/ui/EmotionArt";
+import SignalChip from "@/app/voices/_variants/SignalChip";
+
+// ── donors ────────────────────────────────────────────────────────────────────
+// Emotion Algebra can take its direction from ONE named speaker's take. The
+// candidates are simply every other Character that has RECORDED this emotion —
+// derived takes are excluded because deriving from a derived voice compounds the
+// approximation (the service refuses it too, and offering a button that always
+// 422s is worse than not offering it).
+//
+// Loaded LAZILY, on the first time somebody opens the picker: the rack is the
+// page's main view and most visits never derive anything, so this must not become
+// a second roster fetch on every mount.
+type Donor = { characterId: string; name: string; emotions: string[] };
+
+function useDonors(selfId: string) {
+  const [donors, setDonors] = useState<Donor[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    if (donors || loading) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const roster = await loadRoster();
+      setDonors(roster
+        .filter((c) => c.character_id !== selfId)
+        .map((c) => ({
+          characterId: c.character_id,
+          name: c.name,
+          emotions: c.voices.filter((v) => v.origin !== "derived").map((v) => v.emotion),
+        }))
+        .filter((d) => d.emotions.length > 0));
+    } catch (e) {
+      // Named: "no donors" and "the roster could not be read" are different
+      // things, and only one of them means recording is the way forward.
+      setError(e instanceof Error ? e.message : "the roster could not be loaded");
+    } finally {
+      setLoading(false);
+    }
+  }, [donors, loading, selfId]);
+
+  return { donors, loading, error, load };
+}
 
 export default function EmotionRack({
   name, characterId, slots, coverage, total, busySlot, addVoice, removeVoice, onRecord,
-  addCustomEmotion, removeCustomEmotion, removingVoiceId = null,
+  addCustomEmotion, removeCustomEmotion, removingVoiceId = null, deriveVoice,
 }: {
   name: string;
   // The address the API actually answers on. Previously derived from `name` by
@@ -27,12 +72,56 @@ export default function EmotionRack({
   /** The voice whose DELETE is in flight — its remove button stops taking
    *  clicks instead of firing a second request behind the first. */
   removingVoiceId?: string | null;
+  /** Compute an empty slot instead of recording it. OPTIONAL: where it is not
+   *  supplied the third action simply does not exist — absent is invisible, the
+   *  same rule the Signal chip follows. Must THROW the backend's reason so it can
+   *  be shown against the row it belongs to. */
+  deriveVoice?: (emotion: string, donor?: string | null) => Promise<unknown>;
 }) {
   const { preview, playingId, busyId, failedId, failedReason } = useVoicePreview();
   const [custom, setCustom] = useState("");
   const [minting, setMinting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const missing = total - coverage;
+  // Derived slots are NOT recordings, so they are counted (and labelled)
+  // separately in the header. Folding them into "recorded" would be the exact
+  // claim this whole feature must never make.
+  const derivedCount = slots.filter((s) => s.voice?.origin === "derived").length;
+  const recordedCount = coverage - derivedCount;
+
+  // Which empty slot has its donor picker open, what is in flight, and the last
+  // refusal — kept per-emotion so the reason renders against the row that earned
+  // it rather than in a page-level banner.
+  const donors = useDonors(characterId);
+  const [pickerFor, setPickerFor] = useState<string | null>(null);
+  const [derivingFrom, setDerivingFrom] = useState<string | null>(null);
+  const [deriveError, setDeriveError] = useState<{ emotion: string; reason: string } | null>(null);
+
+  function openPicker(emotion: string) {
+    setDeriveError(null);
+    setPickerFor((cur) => (cur === emotion ? null : emotion));
+    void donors.load();
+  }
+
+  async function runDerive(emotion: string, donor: string | null) {
+    if (!deriveVoice) return;
+    setDerivingFrom(donor ?? "_basis");
+    setDeriveError(null);
+    try {
+      await deriveVoice(emotion, donor);
+      setPickerFor(null);
+    } catch (e) {
+      // The service's own sentence, verbatim. On a box without the embedding
+      // stack this is a 501 that says so, and that IS the honest answer —
+      // replacing it with "derive failed" would hide the one useful fact.
+      setDeriveError({
+        emotion,
+        reason: e instanceof Error ? e.message : "this slot could not be derived",
+      });
+    } finally {
+      setDerivingFrom(null);
+    }
+  }
   // Voices sharing a slot with the one that speaks. The registry tolerates them
   // so they can be deleted; coverage counts DISTINCT emotions, so without this
   // line nothing on the page would even hint they exist.
@@ -82,7 +171,16 @@ export default function EmotionRack({
       <div className="font-jetbrains mb-3 flex items-center justify-between text-[11px] uppercase tracking-widest text-white/60">
         <span>emotion rack</span>
         <span>
-          {coverage}/{total} recorded{missing > 0 && <span className="ml-2 text-amber-300/70">· {missing} fall back to baseline</span>}
+          {recordedCount}/{total} recorded
+          {derivedCount > 0 && (
+            <span
+              className="ml-2 text-violet-200/80"
+              title="Derived slots are computed from a baseline plus a shared emotion direction. They speak, but nobody performed them — record one to replace it."
+            >
+              · {derivedCount} derived
+            </span>
+          )}
+          {missing > 0 && <span className="ml-2 text-amber-300/70">· {missing} fall back to baseline</span>}
           {shadowed > 0 && (
             <span
               className="ml-2 text-amber-300/70"
@@ -119,6 +217,15 @@ export default function EmotionRack({
               // but they are real rows in the registry — each gets its own line
               // (and its own remove button) or it cannot be deleted at all.
               const shadows = s.voices.slice(1);
+              // The measured fact about the voice that speaks this slot, or null
+              // when nothing was measured (old rows, built-ins, unreadable audio).
+              const signal = filled ? signalOf(s.voice!.fidelity) : null;
+              // Non-null ONLY for a computed slot, and it names who it came
+              // from. Everything below branches on this rather than on a
+              // string comparison, so there is one place that decides what
+              // "derived" looks like.
+              const derivedFrom = derivedDonorLabel(s.voice);
+              const failedDerive = deriveError?.emotion === s.emotion ? deriveError.reason : null;
 
               return (
                 <Fragment key={s.emotion}>
@@ -165,8 +272,39 @@ export default function EmotionRack({
 
                   <td className="px-3 py-2">
                     {filled ? (
-                      <span className="flex items-center gap-2">
-                        <span className="font-jetbrains rounded bg-cyan-400/10 px-1.5 py-0.5 text-[11px] text-cyan-300">recorded</span>
+                      <span className="flex flex-wrap items-center gap-2">
+                        {derivedFrom ? (
+                          <>
+                            {/* NEVER the "recorded" chip. A derived slot speaks,
+                                but nobody performed it, and its own accent
+                                (violet — the same one the custom-slot badge uses
+                                for "this is a studio construct") keeps the two
+                                unmistakable at a glance. */}
+                            <span
+                              title={`This slot was COMPUTED from ${name}'s baseline plus the emotion direction taken from ${derivedFrom}. Nobody recorded it. Promote it to a recording whenever you can.`}
+                              className="font-jetbrains rounded border border-violet-400/30 bg-violet-400/10 px-1.5 py-0.5 text-[11px] text-violet-200">
+                              derived · from {derivedFrom}
+                            </span>
+                            {s.demand > 0 && (
+                              // The demand counter stays ALIVE for a derived
+                              // slot: the appetite was for this speaker actually
+                              // performing it, and computing a stand-in did not
+                              // answer that.
+                              <span
+                                className="font-jetbrains rounded bg-amber-400/10 px-1.5 py-0.5 text-[11px] text-amber-300"
+                                title={`API callers asked for ${s.label} ${s.demand}x. They are being served the derived take — a real recording would still be better.`}
+                              >
+                                still requested {s.demand}x
+                              </span>
+                            )}
+                          </>
+                        ) : (
+                          <span className="font-jetbrains rounded bg-cyan-400/10 px-1.5 py-0.5 text-[11px] text-cyan-300">recorded</span>
+                        )}
+                        {/* What the studio HEARD in this take. Absent for every
+                            voice cloned before the ledger existed, and the chip
+                            renders nothing at all for that. */}
+                        <SignalChip signal={signal} note={`${s.label} take`} />
                         {shadows.length > 0 && (
                           <span
                             title="Two voices occupy this slot — this is the one the engine speaks with"
@@ -184,15 +322,31 @@ export default function EmotionRack({
                           </span>
                         )}
                       </span>
-                    ) : s.demand > 0 ? (
-                      <span
-                        className="font-jetbrains rounded bg-amber-400/10 px-1.5 py-0.5 text-[11px] text-amber-300"
-                        title={`API callers requested ${s.label} ${s.demand}× and got baseline — record it to meet the demand`}
-                      >
-                        requested {s.demand}× → baseline
-                      </span>
                     ) : (
-                      <span className="font-jetbrains rounded bg-white/5 px-1.5 py-0.5 text-[11px] text-white/65">→ baseline</span>
+                      <span className="flex flex-wrap items-center gap-2">
+                        {s.demand > 0 ? (
+                          <span
+                            className="font-jetbrains rounded bg-amber-400/10 px-1.5 py-0.5 text-[11px] text-amber-300"
+                            title={`API callers requested ${s.label} ${s.demand}× and got baseline — record it to meet the demand`}
+                          >
+                            requested {s.demand}× → baseline
+                          </span>
+                        ) : (
+                          <span className="font-jetbrains rounded bg-white/5 px-1.5 py-0.5 text-[11px] text-white/65">→ baseline</span>
+                        )}
+                        {failedDerive && (
+                          // The service's refusal, in full, against the slot it
+                          // refused. Amber (advisory) rather than rose: nothing
+                          // broke, and "no basis has been built yet" is a step
+                          // the user can take, not an error they suffered.
+                          <span
+                            role="status"
+                            title={failedDerive}
+                            className="font-jetbrains max-w-md rounded bg-amber-400/10 px-1.5 py-0.5 text-[11px] leading-relaxed text-amber-300">
+                            can’t derive yet — {failedDerive}
+                          </span>
+                        )}
+                      </span>
                     )}
                   </td>
 
@@ -202,12 +356,40 @@ export default function EmotionRack({
 
                   <td className="px-3 py-2 text-right">
                     {filled ? (
+                      <>
+                      {/* A measurement is only worth showing if it is
+                          actionable: a flagged slot gets the one action that
+                          fixes it, right where the flag is. It opens the SAME
+                          guided recorder as an empty slot — the recorder names
+                          the defect — and it is additive: nothing is deleted, the
+                          new take replaces the slot only once it is cloned. */}
+                      {derivedFrom && (
+                        // One click from computed to performed. Same guided
+                        // recorder every other slot opens — the derived voice is
+                        // only replaced once the real take is cloned, so this
+                        // costs nothing to start and nothing to abandon.
+                        <button onClick={() => onRecord(s.emotion)} disabled={isBusy}
+                          aria-label={`Promote the derived ${s.label} voice to a recording`}
+                          title={`Record ${name}'s own ${s.label} and replace this computed slot with it.`}
+                          className="font-jetbrains mr-3 text-[11px] text-violet-200/90 transition hover:text-violet-100 disabled:opacity-40">
+                          ↥ promote to recording
+                        </button>
+                      )}
+                      {signal?.flag && (
+                        <button onClick={() => onRecord(s.emotion)} disabled={isBusy}
+                          aria-label={`Re-record the ${s.label} voice`}
+                          title={`${signal.title} Re-record this slot with the fix in hand.`}
+                          className="font-jetbrains mr-3 text-[11px] text-amber-300/90 transition hover:text-amber-200 disabled:opacity-40">
+                          ↻ re-record
+                        </button>
+                      )}
                       <button onClick={() => confirmRemove(s.voice!.voice_id, s.label)}
                         disabled={removingVoiceId === s.voice!.voice_id}
                         aria-label={`Remove the ${s.label} voice`}
                         className="font-jetbrains text-[11px] text-white/55 transition hover:text-rose-300 disabled:opacity-40">
                         {removingVoiceId === s.voice!.voice_id ? "removing…" : "remove"}
                       </button>
+                      </>
                     ) : (
                       <>
                         <button onClick={() => onRecord(s.emotion)} disabled={isBusy}
@@ -218,6 +400,15 @@ export default function EmotionRack({
                           className="font-jetbrains ml-3 text-[11px] text-white/45 transition hover:text-white/80 disabled:opacity-50">
                           upload
                         </button>
+                        {deriveVoice && (
+                          <button onClick={() => openPicker(s.emotion)} disabled={isBusy}
+                            aria-expanded={pickerFor === s.emotion}
+                            aria-label={`Derive the ${s.label} voice from another recording`}
+                            title="Compute this slot from a baseline plus an emotion direction taken from a voice that already has it. It will be marked as derived, never as recorded."
+                            className="font-jetbrains ml-3 text-[11px] text-violet-200/80 transition hover:text-violet-100 disabled:opacity-50">
+                            derive from…
+                          </button>
+                        )}
                         {s.custom && (
                           <button onClick={() => void dropSlot(s.emotion)} disabled={isBusy}
                             title="Remove this custom slot"
@@ -229,6 +420,69 @@ export default function EmotionRack({
                     )}
                   </td>
                 </tr>
+
+                {pickerFor === s.emotion && !filled && (
+                  // The donor picker. Compact and in place — a modal for a
+                  // choice between four names would be a bigger interruption
+                  // than the action deserves, and the slot it belongs to has to
+                  // stay visible while you choose.
+                  <tr className="border-b border-white/5 bg-violet-400/[0.04]">
+                    <td />
+                    <td colSpan={6} className="px-3 py-3">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-jetbrains text-[11px] uppercase tracking-widest text-white/55">
+                          derive {s.label} from
+                        </span>
+                        <button
+                          onClick={() => void runDerive(s.emotion, null)}
+                          disabled={derivingFrom !== null}
+                          title="The shared emotion basis: the average direction across every speaker in this install that has recorded this emotion. Refused unless that direction was measured to transfer between speakers."
+                          className="font-jetbrains rounded-full border border-violet-400/30 bg-violet-400/10 px-3 py-1 text-[11px] text-violet-200 transition hover:bg-violet-400/20 disabled:opacity-40">
+                          {derivingFrom === "_basis" ? "deriving…" : "shared basis"}
+                        </button>
+                        {(donors.donors ?? [])
+                          .filter((d) => d.emotions.includes(s.emotion))
+                          .map((d) => (
+                            <button
+                              key={d.characterId}
+                              onClick={() => void runDerive(s.emotion, d.characterId)}
+                              disabled={derivingFrom !== null}
+                              title={`Take the ${s.label} direction from ${d.name}'s own recording of it.`}
+                              className="font-jetbrains rounded-full border border-white/12 bg-white/[0.03] px-3 py-1 text-[11px] text-white/75 transition hover:border-violet-400/30 hover:text-violet-100 disabled:opacity-40">
+                              {derivingFrom === d.characterId ? "deriving…" : d.name}
+                            </button>
+                          ))}
+                        {donors.loading && (
+                          <span className="font-jetbrains text-[11px] text-white/45">loading donors…</span>
+                        )}
+                        {donors.error && (
+                          <span className="font-jetbrains text-[11px] text-amber-300">
+                            donors unavailable — {donors.error}
+                          </span>
+                        )}
+                        {donors.donors !== null && !donors.loading &&
+                         !donors.donors.some((d) => d.emotions.includes(s.emotion)) && (
+                          // Absent, and said out loud: with no donor for THIS
+                          // emotion the shared basis is the only route, and
+                          // recording it is the only certain one.
+                          <span className="font-jetbrains text-[11px] text-white/45">
+                            no other character has recorded {s.label} yet
+                          </span>
+                        )}
+                        <button
+                          onClick={() => setPickerFor(null)}
+                          className="font-jetbrains ml-auto text-[11px] text-white/45 transition hover:text-white/80">
+                          cancel
+                        </button>
+                      </div>
+                      <p className="font-jetbrains mt-2 text-[11px] leading-relaxed text-white/45">
+                        A derived slot is computed, not performed — it is badged{" "}
+                        <span className="text-violet-200">derived</span> everywhere,
+                        keeps asking to be recorded, and can be deleted or promoted at any time.
+                      </p>
+                    </td>
+                  </tr>
+                )}
 
                 {shadows.map((v) => {
                   const vBusy = busyId === v.voice_id;

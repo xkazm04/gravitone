@@ -4,6 +4,8 @@ import { useCallback, useEffect, useState } from "react";
 
 import { throwDetail } from "@/lib/apiFetch";
 import { useMounted } from "@/lib/useMounted";
+import { forgetAttestation } from "./attestation";
+import type { Posture, Sweep } from "./probes";
 
 export type ApiKey = {
   id: string;
@@ -16,14 +18,13 @@ export type ApiKey = {
 };
 export type ApiKeyWithSecret = ApiKey & { secret: string };
 
-export const SCOPES: { id: string; label: string; hint: string }[] = [
-  { id: "tts", label: "Synthesize", hint: "generate speech" },
-  { id: "voices", label: "Manage voices", hint: "rename / retag / delete" },
-  { id: "clone", label: "Clone", hint: "upload & create voices" },
-  { id: "performance", label: "Performance", hint: "multi-character scripts (/v1/performance) — the premium tier" },
-  { id: "stt", label: "Transcribe", hint: "turn a recording into text (/v1/speech-to-text)" },
-  { id: "convai", label: "Converse", hint: "hold a spoken conversation — listens and speaks (/v1/convai)" },
-];
+// SCOPES now lives in `capabilities.ts` — a PURE module, so the manifest route,
+// the well-known document and the agent-config blocks can import the same list
+// this create bar renders (a "use client" module cannot be imported by a server
+// route, which is why the scope→endpoint mapping had nowhere to live). Re-
+// exported here so every existing importer is unchanged.
+export { SCOPES } from "./capabilities";
+export type { ScopeInfo } from "./capabilities";
 
 export function relTime(iso?: string | null): string {
   if (!iso) return "never";
@@ -37,55 +38,23 @@ export function relTime(iso?: string | null): string {
   return `${Math.floor(h / 24)}d ago`;
 }
 
-/** What the studio can HONESTLY say about whether this backend checks keys.
- *
- *  With `TTS_API_KEY` unset the service serves every unauthenticated request
- *  (`service/auth.py::_authorize` returns immediately), so the keys managed on
- *  this page enforce nothing at all. That is the single most misleading thing
- *  this surface can hide, so it is derived rather than assumed — and the three
- *  values are exactly what the studio can prove, no more:
- *
- *  - `enforced`  — the backend answered 401. Only a configured `TTS_API_KEY`
- *                  can produce that (open mode never rejects anyone), so key
- *                  enforcement is definitely ON.
- *  - `unknown`   — the list came back. This proves NOTHING about the posture:
- *                  the request went through the studio's server-side proxy,
- *                  which attaches its own root key when it has one
- *                  (`lib/backend.ts`), so a keyed backend and an open one look
- *                  identical from the browser. The studio says "I can't tell"
- *                  instead of guessing.
- *  - `unreachable` — nothing answered; there is no deployment to describe.
- *
- *  Determining `unknown` apart from open-mode would need an UNAUTHENTICATED
- *  probe of the backend, which only a server route could make (the browser
- *  can't: CORS is default-closed) — see the follow-ups in the build report. */
-export type Enforcement = "enforced" | "unknown" | "unreachable";
-
 export function useKeys() {
   const [keys, setKeys] = useState<ApiKey[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [enforcement, setEnforcement] = useState<Enforcement>("unknown");
+  // `unmeasured` until the probe answers — the absence of a posture, never
+  // rendered as reassurance. See probes.ts::Posture for what each value proves.
+  const [posture, setPosture] = useState<Posture>("unmeasured");
+  const [postureCheckedAt, setPostureCheckedAt] = useState<string | null>(null);
   const mounted = useMounted();
 
   const refresh = useCallback(async () => {
     try {
       const r = await fetch("/api/keys", { cache: "no-store" });
-      if (!r.ok) {
-        if (mounted.current) {
-          // 401 is the ONE status that proves a root key is configured. Every
-          // other failure (503 unreachable, a 5xx, a proxy hiccup) says
-          // nothing about the posture, so it must not be read as one.
-          setEnforcement(r.status === 401 ? "enforced" : r.status === 503 ? "unreachable" : "unknown");
-        }
-        return await throwDetail(r, "failed to load keys");
-      }
+      if (!r.ok) return await throwDetail(r, "failed to load keys");
       const list = (await r.json()) as ApiKey[];
       if (!mounted.current) return;
       setKeys(list);
-      // A served list means the proxy's credential (or the absence of any
-      // check) was accepted — which of the two, this side cannot see.
-      setEnforcement("unknown");
       setError(null);
     } catch (e) {
       if (!mounted.current) return;
@@ -95,7 +64,31 @@ export function useKeys() {
     }
   }, [mounted]);
 
+  /** Measure the posture: ONE unauthenticated GET, made by the server route so
+   *  no root key is attached (`/api/keys/probe`). It carries no secret, spends
+   *  no synth slot and mutates nothing — which is why this single probe is the
+   *  one that may run without a click, while the scope sweep (a real synthesis
+   *  among six requests) never does. An open deployment that nobody asked about
+   *  is precisely the failure this feature exists to make impossible to miss. */
+  const provePosture = useCallback(async (): Promise<Sweep | null> => {
+    try {
+      const r = await fetch("/api/keys/probe", { cache: "no-store" });
+      if (!r.ok) return null;
+      const sweep = (await r.json()) as Sweep;
+      if (mounted.current) {
+        setPosture(sweep.posture);
+        setPostureCheckedAt(sweep.checkedAt);
+      }
+      return sweep;
+    } catch {
+      // A probe that could not even be dispatched says nothing; leaving the
+      // posture as it was beats inventing "unreachable" for a studio-side fault.
+      return null;
+    }
+  }, [mounted]);
+
   useEffect(() => { void refresh(); }, [refresh]);
+  useEffect(() => { void provePosture(); }, [provePosture]);
 
   const createKey = useCallback(async (name: string, scopes: string[]) => {
     const r = await fetch("/api/keys", {
@@ -162,6 +155,9 @@ export function useKeys() {
         setError(`destroy failed (${r.status}) — the key still exists`);
         return;
       }
+      // The proof outlives nothing: a destroyed key's attestation is a
+      // statement about a credential that no longer exists.
+      forgetAttestation(id);
       setError(null);
       await refresh();
     } catch {
@@ -171,5 +167,8 @@ export function useKeys() {
     }
   }, [keys, mounted, refresh]);
 
-  return { keys, loading, error, enforcement, refresh, createKey, rotateKey, revokeKey, destroyKey };
+  return {
+    keys, loading, error, posture, postureCheckedAt, provePosture,
+    refresh, createKey, rotateKey, revokeKey, destroyKey,
+  };
 }

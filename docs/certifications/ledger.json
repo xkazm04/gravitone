@@ -1,0 +1,5 @@
+{
+  "version": "gravitone-ledger/1",
+  "note": "append-only index of hardware certifications. Rows are a projection of docs/certifications/<hw_fingerprint>/<git_sha>.json and are re-derived from those files to detect edits; existing rows are NEVER rewritten. See README.md.",
+  "rows": []
+}

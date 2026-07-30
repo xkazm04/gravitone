@@ -1,11 +1,18 @@
 "use client";
 
 import { SURFACE } from "./tokens";
+import { EqBars, type BarColor } from "./Equalizer";
+
+/** The eyebrow pill's class list, exported so surfaces that need their own
+ *  element (StudioDark animates its eyebrow with framer-motion) share the
+ *  definition instead of re-typing it — this markup was duplicated. */
+export const EYEBROW_CLASS =
+  "font-jetbrains inline-flex items-center gap-2 rounded-full border border-cyan-400/30 bg-cyan-400/5 px-3 py-1 text-[11px] uppercase tracking-[0.18em] text-cyan-300";
 
 /** Mono uppercase eyebrow pill with a live dot. */
 export function Eyebrow({ children }: { children: React.ReactNode }) {
   return (
-    <span className="font-jetbrains inline-flex items-center gap-2 rounded-full border border-cyan-400/30 bg-cyan-400/5 px-3 py-1 text-[11px] uppercase tracking-[0.18em] text-cyan-300">
+    <span className={EYEBROW_CLASS}>
       <span className="h-1.5 w-1.5 rounded-full bg-cyan-300" />
       {children}
     </span>
@@ -43,7 +50,9 @@ export function Button({ variant = "primary", className = "", children, ...rest 
   );
 }
 
-/** Live equalizer / waveform — entry-friendly, respects reduced-motion via CSS. */
+/** Live equalizer / waveform. Decorative keyframe when nothing is playing; real
+ *  amplitude off the AudioBus the moment a source is registered (see EqBars).
+ *  Reduced motion is honoured at the bus + in globals.css. */
 export function Waveform({
   bars = 28,
   className = "",
@@ -51,27 +60,11 @@ export function Waveform({
 }: {
   bars?: number;
   className?: string;
-  color?: "cyan" | "violet" | "emerald";
+  color?: BarColor;
 }) {
-  const grad =
-    color === "violet"
-      ? "from-violet-400/40 to-violet-200"
-      : color === "emerald"
-      ? "from-emerald-400/40 to-emerald-200"
-      : "from-cyan-400/40 to-cyan-200";
   return (
     <div className={`flex items-end gap-[3px] ${className}`} aria-hidden>
-      {Array.from({ length: bars }).map((_, i) => (
-        <span
-          key={i}
-          className={`eq-bar w-[3px] rounded-full bg-gradient-to-t ${grad}`}
-          style={{
-            height: "100%",
-            animationDelay: `${(i % 9) * 0.09}s`,
-            animationDuration: `${0.9 + (i % 5) * 0.12}s`,
-          }}
-        />
-      ))}
+      <EqBars bars={bars} color={color} height="100%" />
     </div>
   );
 }

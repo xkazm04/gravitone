@@ -118,8 +118,12 @@ class ParallelLabelingTests(unittest.TestCase):
         self.assertEqual(segs[2]["model"], "error")
         for i in (0, 1, 3, 4):                               # neighbours intact
             self.assertEqual(segs[i]["emotion"], "happy")
-        self.assertEqual(partials[-1]["label_errors"], 1)    # surfaced in partial
-        self.assertEqual(partials[-1]["segments_done"], n)
+        # The last LABELLING partial: the phase publishes a fidelity-only partial
+        # after it (ingest.measure_segments), and job partials merge rather than
+        # replace (ingest_api._partial).
+        last = [p for p in partials if "label_errors" in p][-1]
+        self.assertEqual(last["label_errors"], 1)            # surfaced in partial
+        self.assertEqual(last["segments_done"], n)
 
 
 class OneLoadCommitTests(unittest.TestCase):

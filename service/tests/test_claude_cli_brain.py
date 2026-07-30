@@ -73,6 +73,13 @@ _FAKE = textwrap.dedent('''
         sys.exit(2)
     elif scenario == "hang":
         time.sleep(60)
+    elif scenario == "directives":
+        # A directive SPLIT across stream events, which is how a real model
+        # emits one: the pieces must never reach a synthesizer as text.
+        for piece in ["Of course. ", "[la", "ng:c", "s] ", "Ahoj, jak se ",
+                      "mate? ", "[end_ca", "ll]"]:
+            emit(delta("text_delta", piece))
+        emit({"type": "result", "subtype": "success"})
     elif scenario == "junk":
         sys.stdout.write("this is not json\\n")
         sys.stdout.flush()
@@ -130,6 +137,17 @@ class StreamingTests(_FakeCliCase):
     def test_one_unparseable_line_does_not_lose_the_turn(self) -> None:
         out = collect(_FakeCliBackend(self.script, "junk"), AGENT, [])
         self.assertEqual(out, ["Still fine."])
+
+    def test_a_directive_split_across_stream_events_is_never_spoken(self) -> None:
+        """The model directs the performance; the caller must not hear the tags."""
+        out = collect(_FakeCliBackend(self.script, "directives"), AGENT, [])
+        spoken = [p for p in out if p.speakable()]
+        self.assertEqual(spoken, ["Of course.", "Ahoj, jak se mate?"])
+        joined = " ".join(out)
+        for leak in ("[", "]", "lang", "end_call"):
+            self.assertNotIn(leak, joined, leak)
+        self.assertEqual([p.language for p in spoken], [None, "cs"])
+        self.assertTrue(out[-1].end_call)   # the hang-up survived the stream
 
 
 class ToolGuardTests(_FakeCliCase):
@@ -240,6 +258,15 @@ class TranscriptTests(unittest.TestCase):
         ])
         self.assertIn("You: Tell me about your background.", text)
         self.assertIn("Candidate: Six years of Python.", text)
+
+    def test_the_detected_language_of_a_caller_turn_is_shown(self) -> None:
+        """The brain cannot follow the caller into Czech without being told."""
+        text = dialog.ClaudeCliBackend._transcript(AGENT, [
+            {"role": "assistant", "content": "Tell me about your background."},
+            {"role": "user", "content": "Ano, jiste.", "language": "cs-CZ"},
+        ])
+        self.assertIn("Candidate [cs]: Ano, jiste.", text)
+        self.assertIn("You: Tell me", text)   # the agent's own turns stay unlabelled
 
     def test_the_first_turn_says_the_call_just_connected(self) -> None:
         self.assertIn("just connected", dialog.ClaudeCliBackend._transcript(AGENT, []))

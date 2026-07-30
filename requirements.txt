@@ -1,5 +1,20 @@
+# THIS FILE IS THE IMAGE'S DEPENDENCY SET. The Dockerfile installs from it
+# (`pip install -c <pinned-torch> -r requirements.txt`) instead of the inline
+# hand-list it used to carry, which had drifted and shipped an image with no
+# faster-whisper, no sherpa-onnx and no piper-tts — a container that could not
+# listen, diarize or speak a non-English language. Adding a dependency here is
+# now enough; a build-time import gate fails the build if a capability module
+# stops importing.
+#
+# "Fetched on first use" below describes a bare pip install. In the SEALED
+# image every one of those fetches happens at BUILD time in the Dockerfile's
+# `bake` stage, into /opt/gravitone/models, and the runtime sets
+# HF_HUB_OFFLINE=1 so a missing bake fails loudly instead of phoning home.
+#
 # torch is pulled in by pocket-tts. On aarch64 Linux, pip installs the
-# manylinux ARM wheel with oneDNN + Arm Compute Library kernels.
+# manylinux ARM wheel with oneDNN + Arm Compute Library kernels. In the image
+# torch comes from the Arm base image and is PINNED as a pip constraint so it
+# is never replaced by a generic wheel.
 pocket-tts>=2.1.0
 # Local speech-to-text (service/stt.py) and therefore the ears of the
 # conversational agent. CTranslate2 int8 on CPU — no GPU, no API key, and the

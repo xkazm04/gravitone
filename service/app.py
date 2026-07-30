@@ -40,6 +40,7 @@ from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -50,7 +51,9 @@ import base64
 import json
 
 from service.auth import authorize_headers, optional_scope, require_read_write, require_scope
+from service import buildstore
 from service import errors
+from service import stt, verify
 from service.cache import CachedAudio, SynthCache
 from service.config import SETTINGS
 from service.demand import record_fallback
@@ -59,15 +62,20 @@ from service.engine import (
     AdmissionRejected, ShuttingDown, TtsEngine, concat_wavs,
     resample_pcm16, resample_wav_bytes, wav_bytes_to_mp3,
 )
-from service.voices import BUILTIN, emotion_map, router as voices_router
+from service.voices import BUILTIN, emotion_map, prosody_map, router as voices_router
 from service.keys import router as keys_router
 from service.ingest_api import (
     router as ingest_router, start_background as ingest_start_background,
 )
 from service.packs import router as packs_router
+from service.direction import router as direction_router
 from service.takes import router as takes_router, reviews_router
 from service import convai
+from service.appliance import router as appliance_router
 from service.convai import router as convai_router, ws_router as convai_ws_router
+from service import engines as engines_plane
+from service.engines import router as engines_router
+from service.gym import router as gym_router
 from service.stt import router as stt_router
 
 ENGINE: TtsEngine | None = None
@@ -76,6 +84,24 @@ ENGINE: TtsEngine | None = None
 # service runs as N single-worker replicas, so a hit here is a hit for this
 # replica only. See service/cache.py.
 SYNTH_CACHE = SynthCache(SETTINGS.cache_bytes)
+
+# Word/character alignments, cached BESIDE the audio: same key discipline
+# (``_alignment_key`` = the audio's identity plus the route that produced it),
+# same single-flight collapse, its own byte budget. A separate instance rather
+# than a second entry SHAPE inside SYNTH_CACHE because service/cache.py states
+# the invariant plainly — "stored in separate cache instances and never mix in
+# one keyspace" — and an alignment is not audio. The budget follows the audio
+# cache's on/off: with synthesis caching disabled, nothing is remembered here
+# either. Alignments are small (a few KB of times per clip), so a sixteenth of
+# the audio budget holds far more of them than the audio cache holds clips.
+ALIGN_CACHE: SynthCache = SynthCache(SETTINGS.cache_bytes // 16)
+
+# Finished ARTIFACTS, on disk, addressed by their public digest. Where
+# SYNTH_CACHE is this process's memory of what it just rendered, this is the
+# durable, shareable half: it survives a restart, it is visible to every replica
+# pointed at the same directory, and its keys are the names clients hold
+# (X-Speech-Digest / a lockfile). See service/buildstore.py.
+BUILD_STORE = buildstore.STORE
 
 logger = logging.getLogger("gravitone")
 
@@ -130,12 +156,16 @@ errors.install_catch_all(app)
 # publishes (X-Cache, X-Realtime-Factor, X-Emotion-Fallback, ...) and the
 # backoff hint on a 429 (Retry-After).
 CORS_EXPOSE_HEADERS = [
-    "Retry-After",
+    "ETag", "Retry-After",
+    "X-Alignment-Cache",
     "X-Audio-Seconds", "X-Cache", "X-Character", "X-Emotion-Fallback",
-    "X-Emotion-Requested", "X-Emotion-Used", "X-Gravitone-Cache",
-    "X-Ignored-Settings", "X-Performance-Report", "X-Queue-Seconds",
-    "X-Realtime-Factor", "X-Sample-Rate", "X-Segments", "X-Stream",
-    "X-Stream-Segments", "X-Synth-Seconds", "X-Synth-Segments",
+    "X-Emotion-Requested", "X-Emotion-Used", "X-Fidelity-Deltas",
+    "X-Fidelity-Retries", "X-Fidelity-Score", "X-Fidelity-Unavailable",
+    "X-Gravitone-Cache", "X-Gravitone-Deadline",
+    "X-Ignored-Settings", "X-Performance-Report", "X-Quality-Level",
+    "X-Queue-Seconds",
+    "X-Realtime-Factor", "X-Sample-Rate", "X-Segments", "X-Speech-Digest",
+    "X-Stream", "X-Stream-Segments", "X-Synth-Seconds", "X-Synth-Segments",
 ]
 # What the API actually accepts. Named explicitly rather than "*": the
 # allow-list IS the policy, and a browser's preflight asks about exactly these.
@@ -265,6 +295,11 @@ class TTSRequest(BaseModel):
     model_id: str | None = "pocket_tts"
     voice_settings: VoiceSettings | None = None
     frames_after_eos: int | None = None
+    # The deadline contract. Absent = the previous behaviour exactly: bulk
+    # class, arrival order, full quality. degrade_allowed is opt-in because a
+    # cheaper render nobody asked for is silent quality loss.
+    deadline_s: float | None = Field(None, gt=0, le=3600)
+    degrade_allowed: bool = False
 
 
 async def _await_result(job):
@@ -311,15 +346,39 @@ async def _await_result(job):
 
 
 async def _submit_and_wait(voice_id: str, text: str, overrides: dict,
-                           frames_after_eos: int | None = None):
+                           frames_after_eos: int | None = None,
+                           deadline_s: float | None = None,
+                           job_class: str | None = None,
+                           degrade_allowed: bool = False,
+                           promise: dict | None = None):
     """Submit one synthesis job and await its result (shared by the TTS,
-    speak and performance endpoints). Raises the endpoint-shaped errors."""
+    speak and performance endpoints). Raises the endpoint-shaped errors.
+
+    ``promise`` is an out-parameter: the caller passes a dict and gets back the
+    engine's numeric promise and the quality level actually used, which become
+    X-Gravitone-Deadline / X-Quality-Level. Returning it would change this
+    function's return type at ~6 call sites for a header two of them want.
+    """
     assert ENGINE is not None
+    # Only pass the contract kwargs when the caller actually used them: engine
+    # doubles in the test suite predate them, and a request that named no
+    # deadline must reach submit() as the exact call it always made.
+    extra: dict = {}
+    if deadline_s is not None:
+        extra["deadline_s"] = deadline_s
+    if job_class is not None:
+        extra["job_class"] = job_class
+    if degrade_allowed:
+        extra["degrade_allowed"] = degrade_allowed
     try:
         job = ENGINE.submit(voice_id=voice_id, text=text, overrides=overrides,
-                            frames_after_eos=frames_after_eos)
+                            frames_after_eos=frames_after_eos, **extra)
     except AdmissionRejected as exc:
-        raise _Backpressure(str(exc))
+        raise _Backpressure(str(exc), exc)
+    if promise is not None:
+        # None promised_s = a cold window: send NO header rather than a guess.
+        promise["deadline"] = getattr(job, "promised_s", None)
+        promise["quality"] = getattr(job, "quality_level", "full")
     return await _await_result(job)
 
 
@@ -425,7 +484,15 @@ async def _offload(fn, *args):
 
 
 class _Backpressure(Exception):
-    """Queue full — translated to the 429 + Retry-After response."""
+    """Queue full — translated to the 429 + Retry-After response.
+
+    Carries the engine's AdmissionRejected when there is one, so the 429 can
+    report the predicted wait instead of an unconditional "Retry-After: 1".
+    """
+
+    def __init__(self, message: str, rejection: AdmissionRejected | None = None):
+        super().__init__(message)
+        self.rejection = rejection
 
 
 def _backpressure_response(exc: _Backpressure) -> JSONResponse:
@@ -435,9 +502,16 @@ def _backpressure_response(exc: _Backpressure) -> JSONResponse:
     # percentiles — work on the event loop that no rejected caller reads. The
     # queue depth, in-flight count and rejection tally are what make a 429
     # actionable, and they are O(1).
-    return JSONResponse(status_code=429,
-                        content={"detail": str(exc), "queue": ENGINE.metrics.counters()},
-                        headers={"Retry-After": "1"})
+    rejection = getattr(exc, "rejection", None)
+    admission = rejection.payload() if rejection is not None else {}
+    retry_after = admission.get("retry_after_s") or 1
+    return JSONResponse(
+        status_code=429,
+        content={"detail": str(exc), "queue": ENGINE.metrics.counters(),
+                 # The truth about the refusal: how long this caller would have
+                 # waited, and when it is worth coming back.
+                 "admission": admission},
+        headers={"Retry-After": str(int(retry_after))})
 
 
 def _require_known_voice(voice_id: str) -> None:
@@ -580,7 +654,7 @@ async def _resolve_emotion_address(voice_id: str, emotion: str | None) -> tuple[
     emap = emotion_map(character_id)
     if not emap:
         raise HTTPException(status_code=404, detail=f"unknown character '{character_id}'")
-    resolved_id, used, fell_back = resolve(requested, emap)
+    resolved_id, used, fell_back = resolve(requested, emap, prosody=prosody_map(character_id))
     if fell_back:
         await _offload(_record_fallbacks, [(character_id, requested)])
     return resolved_id, {
@@ -874,50 +948,63 @@ async def _encode_audio(fmt: _AudioFormat, wav_bytes: bytes,
     return body, headers
 
 
-@app.post("/v1/text-to-speech/{voice_id}", dependencies=[Depends(require_scope("tts"))])
-async def text_to_speech(
-    voice_id: str,
-    req: TTSRequest,
-    output_format: str = Query("wav_24000"),
-    emotion: str | None = Query(None, description="Gravitone extension: address a Character's emotion voice (or use {character_id}:{emotion} as the path voice_id)"),
-    request: Request = None,
-):
-    """Drop-in ElevenLabs synthesis.
+@dataclass
+class _Rendered:
+    """One finished synthesis, before it is turned into a response.
 
-    Long text is segmented (``_chunk_text``) only as far as this process can
-    actually run in parallel. The units are submitted as ONE batch, so a unit
-    beyond ``SETTINGS.workers`` would not occupy another worker — it would queue
-    behind its own siblings — and ``_max_batch_units()`` caps the count at the
-    real worker count for exactly that reason.
+    The shared result of the drop-in route and its ``/with-timestamps`` twin:
+    the two must never be two synthesis paths (that is how "the same request
+    returns different audio depending on which URL you used" happens), so the
+    rendering, the cache lookup and the timing truth live here exactly once and
+    each route decides only how to SHAPE it.
+    """
+    audio: CachedAudio
+    key: tuple
+    was_cached: bool
+    bypass: bool
+    synth_seconds: float
+    queue_seconds: float
+    extra_headers: dict
+    emotion_headers: dict
 
-    On the SHIPPED single-worker replica (``workers`` defaults to 1 and
-    ``replicas.py`` pins ``TTS_WORKERS=1``) that cap is 1, so EVERY body, long
-    or short, takes the plain single-job path — no batch, no concat seams, no
-    multi-slot admission cost, bytes and headers exactly as before segmentation
-    existed. With ``TTS_WORKERS=N`` a long body splits into at most N units that
-    do run concurrently and are re-joined with the engine's own ``concat_wavs``
-    (the identical path /v1/speak uses, so seams behave the same); that request
-    reports ``X-Synth-Segments``.
+    def timing_headers(self) -> dict[str, str]:
+        return {
+            "X-Audio-Seconds": str(self.audio.audio_seconds),
+            "X-Synth-Seconds": str(self.synth_seconds),
+            "X-Queue-Seconds": str(self.queue_seconds),
+            # A realtime factor is a claim about the MODEL. A cache hit ran no
+            # model, so audio/serve-time (audio ÷ ~1e-6 s → millions) would be a
+            # fabricated number that a benchmark would happily average and a
+            # certificate would happily sign. Say "n/a" instead: X-Synth-Seconds
+            # still reports this request's true serve cost, and X-Cache says why.
+            "X-Realtime-Factor": "n/a" if self.was_cached else (
+                str(round(self.audio.audio_seconds / self.synth_seconds, 3))
+                if self.synth_seconds else "n/a"),
+        }
 
-    Long text on a single worker is not slower than it was — it is the same one
-    job it always was. For lower latency on long text whatever the worker count,
-    use ``/stream``: its rolling window drops time-to-first-byte to
-    first-segment time with one worker just as well as with N.
 
-    Results are cached per process (``SYNTH_CACHE``) on the full request
-    identity, and concurrent identical requests collapse onto one synthesis.
-    Every response says which it was via ``X-Cache: hit|miss|bypass``; on a hit
-    the timing headers report the REAL (near-zero) serve cost, never a replay of
-    what the original render cost — and ``X-Realtime-Factor`` is ``n/a``,
-    because a cache lookup is not a measurement of the model (a hit's
-    audio/serve-time ratio is a number in the millions and means nothing).
-    ``Cache-Control: no-store`` / ``X-Gravitone-Cache: bypass`` renders from
-    scratch without reading or writing the cache — that is how the benchmark
-    harness measures synthesis (see ``cache_bypass_requested``).
+async def _render_tts(voice_id: str, req: TTSRequest, emotion: str | None,
+                      request: Request | None,
+                      resolved: tuple[str, dict] | None = None,
+                      ) -> "_Rendered | JSONResponse":
+    """Synthesize (or serve from cache) one drop-in TTS request.
+
+    Pure code motion out of ``text_to_speech``: same segmentation, same cache
+    identity, same metrics accounting, same truthful timings. Returns the 429
+    JSONResponse directly when admission refuses, because backpressure is a
+    RESPONSE, not an exception the callers should each re-derive.
+
+    ``resolved`` lets a caller that has ALREADY resolved the emotion address
+    (because it needed the concrete voice id to compute the request's digest
+    before deciding whether to synthesize at all) hand the answer in. Resolving
+    twice would not merely be wasted work: ``_resolve_emotion_address`` records a
+    fallback to disk, so the same request would be counted twice in the emotion
+    demand ledger.
     """
     assert ENGINE is not None
-    fmt = _parse_format(output_format)  # 400s early on an unsupported format
-    voice_id, emotion_headers = await _resolve_emotion_address(voice_id, emotion)
+    if resolved is None:
+        resolved = await _resolve_emotion_address(voice_id, emotion)
+    voice_id, emotion_headers = resolved
 
     overrides = _overrides(req.voice_settings)
     extra_headers: dict[str, str] = {}
@@ -936,8 +1023,20 @@ async def text_to_speech(
             # including the timing headers (X-Synth-Seconds stays the job's own
             # synthesis time, which for one job IS the request's synthesis
             # wall-clock minus the queue wait already in X-Queue-Seconds).
-            result = await _submit_and_wait(voice_id, req.text, overrides,
-                                            frames_after_eos=req.frames_after_eos)
+            promise: dict = {}
+            result = await _submit_and_wait(
+                voice_id, req.text, overrides,
+                frames_after_eos=req.frames_after_eos,
+                deadline_s=req.deadline_s,
+                degrade_allowed=req.degrade_allowed,
+                promise=promise)
+            # Visible, never silent: a caller who allowed degradation is TOLD
+            # which level ran, and a promise is only ever sent when the engine
+            # was willing to make one (warm window).
+            if promise.get("deadline") is not None:
+                extra_headers["X-Gravitone-Deadline"] = str(promise["deadline"])
+            if promise.get("quality") not in (None, "full"):
+                extra_headers["X-Quality-Level"] = str(promise["quality"])
             timing["synth"] = result.synth_seconds
             timing["queue"] = result.queue_seconds
             return CachedAudio(wav_bytes=result.wav_bytes,
@@ -951,7 +1050,7 @@ async def text_to_speech(
         except AdmissionRejected as exc:
             # Admission is decided for the whole batch; _submit_batch already
             # abandoned the siblings that did get in.
-            raise _Backpressure(str(exc))
+            raise _Backpressure(str(exc), exc)
         results = await _gather_results(jobs)
         wav_bytes = await _offload(concat_wavs, [r.wav_bytes for r in results])
         # Wall-clock for the WHOLE request, not the sum of per-segment synth
@@ -1007,30 +1106,492 @@ async def text_to_speech(
     if audio.segments > 1:
         extra_headers["X-Synth-Segments"] = str(audio.segments)
 
-    wav_bytes = audio.wav_bytes
-    native_rate = audio.sample_rate
-    audio_seconds = audio.audio_seconds
+    return _Rendered(audio=audio, key=key, was_cached=was_cached, bypass=bypass,
+                     synth_seconds=synth_seconds, queue_seconds=queue_seconds,
+                     extra_headers=extra_headers,
+                     emotion_headers=emotion_headers)
 
-    body, format_headers = await _encode_audio(fmt, wav_bytes, native_rate)
+
+# ---------------------------------------------------------------------------
+# Speech as a build artifact — the public identity of a render
+# ---------------------------------------------------------------------------
+# The identity function itself lives in service/buildstore.py (with the DIGEST
+# LAW it must be maintained under); what belongs HERE is the part only this
+# module knows: which engine config a render happened under, and how this
+# process segments text. Both are folded into the digest, so a replica
+# configured differently cannot hand out the same NAME for different bytes.
+
+def _engine_version() -> str:
+    """Model/engine identity plus the process-wide generation config.
+
+    ``MODEL_VERSION`` covers the weights (bump it when they change — DIGEST
+    LAW); the rest are the ``SETTINGS`` values that reach every generation and
+    genuinely change the audio, exactly the ones ``_cache_key`` already folds in.
+    Read from SETTINGS at call time so a test that rebinds them is honoured.
+    """
+    return (f"{buildstore.MODEL_VERSION}"
+            f"/lang={SETTINGS.language}/quant={int(bool(SETTINGS.quantize))}"
+            f"/max_tokens={SETTINGS.max_tokens}")
+
+
+def _segmentation_version() -> str:
+    """How this process cuts text into synthesis units.
+
+    ``SEGMENTATION_VERSION`` names the ALGORITHM (bump it when ``_chunk_text``
+    or the concat discipline changes); ``chunk_chars`` and the batch cap are the
+    two inputs that decide where the seams actually land on this box. Seams are
+    audible, so they are part of the artifact's identity rather than an
+    implementation detail hidden behind the name.
+    """
+    return (f"{buildstore.SEGMENTATION_VERSION}"
+            f"/chunk={SETTINGS.chunk_chars}/units={_max_batch_units()}")
+
+
+def _speech_digest(voice_id: str, text: str, overrides: dict,
+                   frames_after_eos: int | None, output_format: str) -> str:
+    """``sha256:<hex>`` for a RESOLVED (voice, text, settings, format) request.
+
+    One function, every route: the drop-in route and a ``/v1/build`` line with
+    identical inputs MUST produce the same string, because that identity is the
+    entire product claim — a lockfile written by a build is what an ordinary
+    synthesis call answers to.
+    """
+    return buildstore.speech_digest(
+        voice_id=voice_id,
+        voice_fingerprint=_voice_fingerprint(voice_id),
+        text=text,
+        overrides=overrides,
+        frames_after_eos=frames_after_eos,
+        output_format=output_format,
+        engine_version=_engine_version(),
+        segmentation=_segmentation_version(),
+    )
+
+
+def _digest_headers(digest: str) -> dict[str, str]:
+    """The two ways a client can hold onto a digest.
+
+    ``X-Speech-Digest`` is the product-facing name (it goes in a lockfile);
+    ``ETag`` is the same value in the shape HTTP already knows how to
+    revalidate, so ``If-None-Match`` works with a plain HTTP cache and with
+    ``curl -H`` alike.
+    """
+    return {"X-Speech-Digest": digest, "ETag": f'"{digest}"'}
+
+
+async def _store_artifact(digest: str, body: bytes, fmt: _AudioFormat,
+                          audio: CachedAudio) -> None:
+    """Put a finished artifact in the durable store. Never fails a request.
+
+    Off the event loop (disk + a cross-process lock). A store that is disabled,
+    full or unwritable is a non-event for the caller: the audio it asked for is
+    already in the response, and ``buildstore`` logs the reason.
+    """
+    await _offload(lambda: BUILD_STORE.put(
+        digest, body, content_type=fmt.content_type,
+        audio_seconds=audio.audio_seconds, sample_rate=fmt.sample_rate))
+
+
+@app.post("/v1/text-to-speech/{voice_id}", dependencies=[Depends(require_scope("tts"))])
+async def text_to_speech(
+    voice_id: str,
+    req: TTSRequest,
+    output_format: str = Query("wav_24000"),
+    emotion: str | None = Query(None, description="Gravitone extension: address a Character's emotion voice (or use {character_id}:{emotion} as the path voice_id)"),
+    # Annotated (not `= Query(...)`) so the DEFAULT is a real None: the cache
+    # and parallelism suites call this handler directly, in process, where
+    # nothing resolves a Query object into a value.
+    verify_mode: Annotated[str | None, Query(
+        alias="verify",
+        description="Opt-in verification: true (score the audio against the "
+                    "text) or strict (also re-render once when it scores "
+                    "badly)")] = None,
+    request: Request = None,
+):
+    """Drop-in ElevenLabs synthesis.
+
+    Long text is segmented (``_chunk_text``) only as far as this process can
+    actually run in parallel. The units are submitted as ONE batch, so a unit
+    beyond ``SETTINGS.workers`` would not occupy another worker — it would queue
+    behind its own siblings — and ``_max_batch_units()`` caps the count at the
+    real worker count for exactly that reason.
+
+    On the SHIPPED single-worker replica (``workers`` defaults to 1 and
+    ``replicas.py`` pins ``TTS_WORKERS=1``) that cap is 1, so EVERY body, long
+    or short, takes the plain single-job path — no batch, no concat seams, no
+    multi-slot admission cost, bytes and headers exactly as before segmentation
+    existed. With ``TTS_WORKERS=N`` a long body splits into at most N units that
+    do run concurrently and are re-joined with the engine's own ``concat_wavs``
+    (the identical path /v1/speak uses, so seams behave the same); that request
+    reports ``X-Synth-Segments``.
+
+    Long text on a single worker is not slower than it was — it is the same one
+    job it always was. For lower latency on long text whatever the worker count,
+    use ``/stream``: its rolling window drops time-to-first-byte to
+    first-segment time with one worker just as well as with N.
+
+    Results are cached per process (``SYNTH_CACHE``) on the full request
+    identity, and concurrent identical requests collapse onto one synthesis.
+    Every response says which it was via ``X-Cache: hit|miss|bypass``; on a hit
+    the timing headers report the REAL (near-zero) serve cost, never a replay of
+    what the original render cost — and ``X-Realtime-Factor`` is ``n/a``,
+    because a cache lookup is not a measurement of the model (a hit's
+    audio/serve-time ratio is a number in the millions and means nothing).
+    ``Cache-Control: no-store`` / ``X-Gravitone-Cache: bypass`` renders from
+    scratch without reading or writing the cache — that is how the benchmark
+    harness measures synthesis (see ``cache_bypass_requested``).
+
+    Every response carries ``X-Speech-Digest: sha256:…`` (and the same value as
+    an ``ETag``): the PUBLIC name of this piece of speech, computed from the
+    inputs alone — resolved voice + its weights' fingerprint, normalized text,
+    settings, frames_after_eos, engine/model version, output format and
+    segmentation (see service/buildstore.py and its DIGEST LAW). Send it back as
+    ``If-None-Match`` and an unchanged request answers ``304`` without
+    synthesizing anything at all. The artifact is also written to the durable
+    content-addressed store, so the same digest is fetchable from
+    ``GET /v1/audio/{digest}`` after a restart and a ``POST /v1/build`` line with
+    identical inputs reports the SAME digest.
+
+    ``?verify=true`` (opt-in, off by default) additionally listens to the
+    finished audio with the local ASR and reports what it heard as
+    ``X-Fidelity-Score`` + ``X-Fidelity-Deltas``; ``?verify=strict`` may
+    re-render ONCE when the score is bad (``X-Fidelity-Retries``). Without the
+    parameter this route does not touch the transcriber, costs exactly what it
+    always did, and returns byte-identical bytes and headers — verification
+    roughly doubles the CPU of a request, so it can never be the default.
+    """
+    assert ENGINE is not None
+    fmt = _parse_format(output_format)  # 400s early on an unsupported format
+    mode = _verify_mode(verify_mode)    # 400s early on an unknown verify value
+
+    # Identity BEFORE synthesis: a digest is over the inputs, so it is knowable
+    # without a worker — which is exactly what makes If-None-Match cheap.
+    resolved = await _resolve_emotion_address(voice_id, emotion)
+    digest = _speech_digest(resolved[0], req.text, _overrides(req.voice_settings),
+                            req.frames_after_eos, output_format)
+    digest_headers = _digest_headers(digest)
+    if buildstore.etag_matches(
+            request.headers.get("if-none-match") if request is not None else None,
+            digest):
+        # The caller already holds these exact bytes. Answering 304 here costs
+        # no synthesis at all: nothing was rendered, no admission slot was
+        # taken, and the response carries no body by definition.
+        return Response(status_code=304, headers={**digest_headers,
+                                                  **resolved[1]})
+
+    rendered = await _render_tts(voice_id, req, emotion, request,
+                                 resolved=resolved)
+    if isinstance(rendered, JSONResponse):
+        return rendered  # backpressure
+
+    verify_headers: dict[str, str] = {}
+    if mode != "off":
+        rendered, verify_headers = await _verify_rendered(rendered, voice_id,
+                                                          req, mode)
+
+    body, format_headers = await _encode_audio(fmt, rendered.audio.wav_bytes,
+                                               rendered.audio.sample_rate)
+    extra_headers = dict(rendered.extra_headers)
     extra_headers.update(format_headers)
+
+    # Publish the artifact under its public name — unless this request opted out
+    # of caching (`Cache-Control: no-store` covers the durable copy too) or
+    # `verify=strict` may have served a RE-RENDER: a retry exists because the
+    # first render was wrong, and storing a coin-flip under a stable name is
+    # exactly the lie the DIGEST LAW exists to prevent.
+    if not rendered.bypass and mode != "strict":
+        await _store_artifact(digest, body, fmt, rendered.audio)
 
     return Response(
         content=body, media_type=fmt.content_type,
         headers={
-            "X-Audio-Seconds": str(audio_seconds),
-            "X-Synth-Seconds": str(synth_seconds),
-            "X-Queue-Seconds": str(queue_seconds),
-            # A realtime factor is a claim about the MODEL. A cache hit ran no
-            # model, so audio/serve-time (audio ÷ ~1e-6 s → millions) would be a
-            # fabricated number that a benchmark would happily average and a
-            # certificate would happily sign. Say "n/a" instead: X-Synth-Seconds
-            # still reports this request's true serve cost, and X-Cache says why.
-            "X-Realtime-Factor": "n/a" if was_cached else (
-                str(round(audio_seconds / synth_seconds, 3))
-                if synth_seconds else "n/a"),
+            **rendered.timing_headers(),
             **extra_headers,
-            **emotion_headers,
+            **rendered.emotion_headers,
+            **digest_headers,
             **_ignored_headers(req.voice_settings),
+            **verify_headers,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Verified speech — the API listens to its own output
+# ---------------------------------------------------------------------------
+# Below this score, ``verify=strict`` spends ONE more render. Deliberately not
+# 1.0: a single fumbled word in a long paragraph is not worth doubling the cost
+# of the request, while any error in a short line drops the score under this
+# floor immediately. Bounded by the same admission window as everything else —
+# a busy box refuses the retry and the first render is served with
+# X-Fidelity-Retries: 0.
+STRICT_FIDELITY_FLOOR = 0.98
+
+_VERIFY_MODES = {"": "off", "0": "off", "false": "off", "no": "off",
+                 "off": "off", "1": "on", "true": "on", "yes": "on",
+                 "on": "on", "strict": "strict"}
+
+_NO_EARS = (
+    "verification needs local speech-to-text, which is not available on this "
+    "replica (install faster-whisper via `pip install -r requirements.txt` and "
+    "restart, or set STT_MODEL to a model this box can load). Synthesis itself "
+    "is unaffected: call this route without ?verify, or use the plain "
+    "/v1/text-to-speech route."
+)
+
+
+def _verify_mode(raw: str | None) -> str:
+    """``off`` | ``on`` | ``strict`` from the ``?verify=`` parameter.
+
+    An unrecognised value is a 400, never a silent "off": a client that asked
+    for verification and got none must be told, not quietly billed for an
+    unverified clip it believes was checked.
+    """
+    if raw is None:
+        return "off"
+    mode = _VERIFY_MODES.get(str(raw).strip().lower())
+    if mode is None:
+        raise HTTPException(
+            status_code=400,
+            detail="unsupported verify value; use verify=true (score the audio "
+                   "against the text) or verify=strict (also re-render once "
+                   "when it scores badly)")
+    return mode
+
+
+async def _ears_available() -> bool:
+    """Whether this replica can transcribe right now. Never on the loop:
+    the first call loads the Whisper weights (seconds)."""
+    return bool(await _offload(stt.available))
+
+
+def _transcribe_words(pcm: bytes):
+    """Transcribe verification audio WITH word timestamps. Blocking.
+
+    ``stt.transcribe_pcm`` is the conversation path and asks for no word
+    timestamps (a turn is waiting on it), so this prefers the kwarg — which is
+    what the module SHOULD grow, see the report hook — and falls back to
+    ``stt.transcribe``, the public entry point that does take it. Both are
+    module-level lookups so the existing test convention (monkeypatching
+    ``stt.transcribe_pcm``) keeps working unchanged.
+    """
+    try:
+        return stt.transcribe_pcm(pcm, rate=stt.TARGET_RATE,
+                                  word_timestamps=True)
+    except TypeError:
+        pass
+    return stt.transcribe(stt.pcm16_to_float32(pcm), word_timestamps=True)
+
+
+def _transcribe_plain(pcm: bytes):
+    """Transcribe for SCORING only — no word timestamps, no second decode pass.
+
+    Fidelity compares words, not times; buying timestamps for a verdict that
+    ignores them would be spending the caller's CPU on nothing.
+    """
+    return stt.transcribe_pcm(pcm, rate=stt.TARGET_RATE)
+
+
+async def _listen(audio: CachedAudio, *, words: bool):
+    """Feed finished audio back through the ear. Returns an ``stt.Transcript``.
+
+    Both hops are offloaded: WAV → PCM is a wave parse plus a resample, and the
+    decode is seconds of CPU. On the event loop either one stalls every other
+    request on the replica (repo law; guarded by test_handler_modes).
+    """
+    pcm = await _offload(convai.wav_to_pcm, audio.wav_bytes, stt.TARGET_RATE)
+    return await _offload(_transcribe_words if words else _transcribe_plain, pcm)
+
+
+def _heard(transcript) -> object:
+    """What ``verify.compare`` should score against: timed words when the ear
+    produced them, otherwise the flat text (still a real comparison, just
+    without spans)."""
+    return getattr(transcript, "words", None) or getattr(transcript, "text", "")
+
+
+async def _retry_once(voice_id: str, req: TTSRequest) -> CachedAudio | None:
+    """One extra render of the offending text, or None if it cannot be had.
+
+    Deliberately modest: ONE re-render, submitted through the same admission
+    window as any other request, never stored in the cache (the retry exists
+    because the first render was wrong — caching it would let a coin-flip decide
+    what every later caller hears). A 429 or a timeout here is not an error for
+    the caller: the first render is still a complete, honest response, and
+    X-Fidelity-Retries reports what actually happened.
+    """
+    try:
+        result = await _submit_and_wait(
+            voice_id, req.text, _overrides(req.voice_settings),
+            frames_after_eos=req.frames_after_eos)
+    except (_Backpressure, HTTPException):
+        return None
+    return CachedAudio(wav_bytes=result.wav_bytes, sample_rate=result.sample_rate,
+                       audio_seconds=result.audio_seconds, segments=1)
+
+
+async def _verify_rendered(rendered: _Rendered, voice_id: str, req: TTSRequest,
+                           mode: str) -> tuple[_Rendered, dict[str, str]]:
+    """Score a finished render, optionally re-rendering once (``strict``).
+
+    Degrades exactly like the conversation surface does when a capability is
+    missing: the request SUCCEEDS, and the absence is NAMED
+    (``X-Fidelity-Unavailable: stt-model-absent``) rather than crashing a
+    synthesis that is perfectly good — the caller asked for audio and an
+    opinion, and the audio is not in doubt.
+    """
+    if not await _ears_available():
+        logger.info("verify=%s requested but the transcriber is absent: %s",
+                    mode, _NO_EARS)
+        return rendered, {"X-Fidelity-Score": "unavailable",
+                          "X-Fidelity-Unavailable": "stt-model-absent"}
+
+    transcript = await _listen(rendered.audio, words=False)
+    report = verify.compare(req.text, _heard(transcript))
+    retries = 0
+    if (mode == "strict" and report.score is not None
+            and report.score < STRICT_FIDELITY_FLOOR):
+        second = await _retry_once(voice_id, req)
+        if second is not None:
+            retries = 1
+            again = verify.compare(req.text, _heard(
+                await _listen(second, words=False)))
+            if again.score is not None and again.score > report.score:
+                # The retry really is better — serve it, and say so in the
+                # timings: this response now carries audio that was rendered,
+                # not replayed, so X-Cache cannot keep claiming a hit.
+                rendered.audio = second
+                rendered.extra_headers = dict(rendered.extra_headers)
+                rendered.extra_headers["X-Cache"] = "miss"
+                rendered.extra_headers.pop("X-Synth-Segments", None)
+                rendered.was_cached = False
+                report = again
+
+    headers = {"X-Fidelity-Score": verify.score_header(report),
+               "X-Fidelity-Deltas": verify.deltas_header(report)}
+    if mode == "strict":
+        headers["X-Fidelity-Retries"] = str(retries)
+    return rendered, headers
+
+
+@dataclass(frozen=True)
+class _CachedAlignment:
+    """An alignment payload sitting in ALIGN_CACHE beside its audio."""
+    data: dict
+    size: int
+
+    @property
+    def nbytes(self) -> int:
+        return self.size
+
+
+def _alignment_key(key: tuple) -> tuple:
+    """The audio's cache identity, plus the ROUTE that derived this entry.
+
+    Without the route component an alignment would share a key with the audio
+    it describes — two different things answering to one name, which is how a
+    cache starts serving a timeline as a clip.
+    """
+    return key + ("with-timestamps",)
+
+
+def _alignment_payload(text: str, transcript, audio: CachedAudio) -> _CachedAlignment:
+    """Build the ElevenLabs-shaped alignment block. Pure (service/verify.py)."""
+    words = getattr(transcript, "words", None) or []
+    alignment = verify.align(text, words, duration_s=audio.audio_seconds)
+    report = verify.compare(text, words or getattr(transcript, "text", ""))
+    data = {
+        "alignment": alignment.characters(text),
+        "normalized_alignment": alignment.normalized(),
+        # Ours, on top of the compatible shape: the word timeline the character
+        # arrays are derived FROM (a caption renderer wants words, not chars),
+        # and the verdict the second pass reached while it was in there.
+        "words": [w.to_dict() for w in alignment.words],
+        "fidelity": report.to_dict(),
+        "transcript": getattr(transcript, "text", ""),
+        # Say how much of this timeline was measured and how much was inferred.
+        # An alignment with anchored=0 (silence, or an ear with no word spans)
+        # is evenly spread guesswork, and a dubbing pipeline must be able to
+        # tell that apart from a measurement.
+        "anchored_words": alignment.anchored,
+        "interpolated_words": alignment.interpolated,
+    }
+    return _CachedAlignment(data, len(json.dumps(data)))
+
+
+@app.post("/v1/text-to-speech/{voice_id}/with-timestamps",
+          dependencies=[Depends(require_scope("tts"))])
+async def text_to_speech_with_timestamps(
+    voice_id: str,
+    req: TTSRequest,
+    output_format: str = Query("wav_24000"),
+    emotion: str | None = Query(None, description="Gravitone extension: address a Character's emotion voice (or use {character_id}:{emotion} as the path voice_id)"),
+    request: Request = None,
+):
+    """Synthesis WITH a word/character timeline — and a verdict.
+
+    The ElevenLabs-compatible shape (``audio_base64`` + ``alignment`` +
+    ``normalized_alignment``), so client code that already consumes
+    with-timestamps repoints at this base URL. What is NOT compatible is how it
+    is obtained: there is no alignment model here and none is claimed. The
+    finished WAV is fed back through the local ASR (service/stt.py) and its word
+    spans are mapped onto the words of YOUR text (service/verify.py) — so the
+    timeline is over the text you sent, not over what the ear heard, and every
+    word says whether its span was measured (``matched: true``) or interpolated
+    between its neighbours.
+
+    The synthesis path is the drop-in route's, unchanged and shared
+    (``_render_tts``): same segmentation, same cache, same admission, same
+    timing headers. Alignment is a POST-step, cached beside the audio in
+    ALIGN_CACHE under a route-distinguished key, so a repeated request pays for
+    neither the synthesis nor the transcription.
+
+    Without a transcriber this route refuses by NAME (501) instead of returning
+    an invented timeline: a fabricated alignment is worse than no alignment,
+    because a dubbing pipeline cannot tell it is fabricated.
+    """
+    assert ENGINE is not None
+    fmt = _parse_format(output_format)  # 400s early on an unsupported format
+    if not await _ears_available():
+        # Refuse BEFORE synthesizing: the caller cannot be given what this route
+        # exists to return, so burning a worker on the audio half would be
+        # charging for a request that fails anyway.
+        raise HTTPException(status_code=501, detail=_NO_EARS)
+
+    rendered = await _render_tts(voice_id, req, emotion, request)
+    if isinstance(rendered, JSONResponse):
+        return rendered  # backpressure
+
+    async def _build() -> _CachedAlignment:
+        transcript = await _listen(rendered.audio, words=True)
+        return _alignment_payload(req.text, transcript, rendered.audio)
+
+    if rendered.bypass:
+        # The caller said no-store; that covers the alignment too.
+        entry, align_cached = await _build(), False
+    else:
+        entry, align_cached = await ALIGN_CACHE.get_or_synthesize(
+            _alignment_key(rendered.key), _build)
+
+    body, format_headers = await _encode_audio(fmt, rendered.audio.wav_bytes,
+                                               rendered.audio.sample_rate)
+    extra_headers = dict(rendered.extra_headers)
+    extra_headers.update(format_headers)
+    return JSONResponse(
+        content={
+            "audio_base64": base64.b64encode(body).decode("ascii"),
+            "content_type": fmt.content_type,
+            **entry.data,
+        },
+        headers={
+            **rendered.timing_headers(),
+            **extra_headers,
+            **rendered.emotion_headers,
+            **_ignored_headers(req.voice_settings),
+            # The verdict travels as a header too, so a client that only wants
+            # "was it right?" does not have to parse the timeline to find out.
+            "X-Fidelity-Score": verify.format_score(
+                entry.data["fidelity"]["score"]),
+            "X-Alignment-Cache": "hit" if align_cached else "miss",
         },
     )
 
@@ -1099,7 +1660,7 @@ async def text_to_speech_stream(
                                    for text in chunks[:window]],
                                   frames_after_eos=req.frames_after_eos)
     except AdmissionRejected as exc:
-        return _backpressure_response(_Backpressure(str(exc)))
+        return _backpressure_response(_Backpressure(str(exc), exc))
 
     pending = deque(chunks[window:])
     total = len(chunks)
@@ -1208,6 +1769,170 @@ async def text_to_speech_stream(
     )
 
 
+# ---------------------------------------------------------------------------
+# The build plane: /v1/audio/{digest}, /v1/build, /v1/build/plan
+# ---------------------------------------------------------------------------
+
+@app.api_route("/v1/audio/{digest}", methods=["GET", "HEAD"],
+               dependencies=[Depends(require_scope("tts"))])
+async def get_audio(digest: str, request: Request = None):
+    """Fetch an artifact by its digest — the read half of the build plane.
+
+    A digest is a NAME, not a promise that anything was rendered, so an absent
+    one is an ordinary 404 that says so by name (``buildstore.AUDIO_NOT_FOUND``)
+    and tells the caller how to make it exist. A malformed one is a 400: nothing
+    that is not 64 hex characters is allowed anywhere near a filesystem path.
+
+    ``HEAD`` answers the existence question without moving the bytes — that is
+    what a CI job asks 5,000 times before deciding what to render.
+
+    The stored ``Content-Type`` is served back verbatim because the digest is
+    FORMAT-AWARE: ``mp3_24000_128`` and ``wav_24000`` of the same line are
+    different names, so an artifact is never re-encoded on the way out and can
+    never contradict the name it was fetched under.
+    """
+    try:
+        buildstore.parse_digest(digest)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    head_only = request is not None and request.method == "HEAD"
+    entry = await _offload(BUILD_STORE.head if head_only else BUILD_STORE.get,
+                           digest)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=buildstore.AUDIO_NOT_FOUND)
+
+    headers = {
+        **_digest_headers(f"sha256:{entry.digest}"),
+        "X-Audio-Seconds": str(entry.audio_seconds),
+        "Cache-Control": "public, max-age=31536000, immutable",
+    }
+    if entry.sample_rate:
+        headers["X-Sample-Rate"] = str(entry.sample_rate)
+    if head_only:
+        # A HEAD carries the metadata of the GET and none of its bytes — so the
+        # length is stated explicitly rather than derived from an empty body.
+        headers["Content-Length"] = str(await _offload(BUILD_STORE.size_of, digest))
+        return Response(status_code=200, media_type=entry.content_type,
+                        headers=headers)
+    return Response(content=entry.data, media_type=entry.content_type,
+                    headers=headers)
+
+
+class BuildLine(BaseModel):
+    """One line of a manifest: who says what, and in which format."""
+    id: str = Field(..., min_length=1, max_length=200)
+    voice: str = Field(..., min_length=1, max_length=200)
+    text: str = Field(..., min_length=1, max_length=8000)
+    emotion: str | None = None
+    settings: VoiceSettings | None = None
+    format: str | None = None
+    frames_after_eos: int | None = None
+
+
+class BuildRequest(BaseModel):
+    # Capped by a NAMED setting (buildstore.BUILD_MANIFEST_MAX_LINES): every
+    # line is submitted through the same admission window as any other request,
+    # so an unbounded manifest is a way for one caller to hold the pool.
+    lines: list[BuildLine] = Field(
+        ..., min_length=1, max_length=buildstore.BUILD_MANIFEST_MAX_LINES)
+
+
+async def _line_identity(line: BuildLine, index: int) -> tuple[str, str, str, dict]:
+    """(resolved voice, output_format, digest, emotion headers) for one line.
+
+    Fails the whole manifest on an unknown voice/character, naming the line — a
+    build that silently skipped a line would produce a lockfile with a hole in it.
+    """
+    fmt_str = (line.format or "wav_24000")
+    _parse_format(fmt_str)  # 400s on an unsupported format, before any work
+    try:
+        resolved, emotion_headers = await _resolve_emotion_address(line.voice,
+                                                                   line.emotion)
+    except HTTPException as exc:
+        raise HTTPException(status_code=exc.status_code,
+                            detail=f"line {index} ({line.id!r}): {exc.detail}")
+    digest = _speech_digest(resolved, line.text, _overrides(line.settings),
+                            line.frames_after_eos, fmt_str)
+    return resolved, fmt_str, digest, emotion_headers
+
+
+@app.post("/v1/build/plan", dependencies=[Depends(require_scope("tts"))])
+async def build_plan(req: BuildRequest):
+    """Dry run: what WOULD this manifest change? No synthesis, no bytes.
+
+    The CI primitive. Because a digest is computed from the inputs, this answer
+    is exact and costs nothing: a 5,000-line script where two lines were edited
+    reports 4,998 ``fresh`` and 2 ``would_render`` without waking a worker.
+    Run it in a pull request and you know the audio diff before you pay for it.
+    """
+    lines = []
+    for i, line in enumerate(req.lines):
+        _resolved, fmt_str, digest, _emotion = await _line_identity(line, i)
+        stored = await _offload(BUILD_STORE.has, digest)
+        lines.append({"id": line.id, "digest": digest, "format": fmt_str,
+                      "state": "fresh" if stored else "would_render"})
+    return {
+        "lines": lines,
+        "fresh": sum(1 for l in lines if l["state"] == "fresh"),
+        "would_render": sum(1 for l in lines if l["state"] == "would_render"),
+        "identity_version": buildstore.IDENTITY_VERSION,
+    }
+
+
+@app.post("/v1/build", dependencies=[Depends(require_scope("tts"))])
+async def build(req: BuildRequest):
+    """Render a manifest incrementally. Returns digests, never audio bytes.
+
+    Per line: ``fresh`` (the artifact is already in the store under that exact
+    digest — nothing was rendered) or ``rendered`` (it was synthesized now and
+    stored). The response is deliberately byte-free: a build's product is a
+    LOCKFILE, and the audio is fetched by digest from ``/v1/audio/{digest}`` by
+    whoever actually needs it. Two lines with identical inputs share one digest
+    and are rendered once.
+
+    Synthesis goes through the SAME path as a plain ``/v1/text-to-speech`` call
+    (``_render_tts`` → ``_encode_audio``), which is why a build line and an
+    ordinary call with the same inputs report the same digest and produce the
+    same artifact — the two must never be two synthesis paths.
+
+    Admission is untouched and shared: a saturated pool returns the ordinary 429
+    + ``Retry-After``, and the lines already rendered are already stored, so a
+    retried build resumes instead of restarting.
+    """
+    assert ENGINE is not None
+    results = []
+    rendered_now: set[str] = set()
+    for i, line in enumerate(req.lines):
+        resolved, fmt_str, digest, _emotion = await _line_identity(line, i)
+        if digest in rendered_now or await _offload(BUILD_STORE.has, digest):
+            results.append({"id": line.id, "digest": digest, "format": fmt_str,
+                            "state": "fresh"})
+            continue
+        fmt = _parse_format(fmt_str)
+        tts_req = TTSRequest(text=line.text, voice_settings=line.settings,
+                             frames_after_eos=line.frames_after_eos)
+        rendered = await _render_tts(line.voice, tts_req, line.emotion, None,
+                                     resolved=(resolved, {}))
+        if isinstance(rendered, JSONResponse):
+            return rendered  # backpressure — same 429 every other route returns
+        body, _format_headers = await _encode_audio(
+            fmt, rendered.audio.wav_bytes, rendered.audio.sample_rate)
+        await _store_artifact(digest, body, fmt, rendered.audio)
+        rendered_now.add(digest)
+        results.append({
+            "id": line.id, "digest": digest, "format": fmt_str,
+            "state": "rendered", "bytes": len(body),
+            "audio_seconds": rendered.audio.audio_seconds,
+        })
+    return {
+        "lines": results,
+        "fresh": sum(1 for l in results if l["state"] == "fresh"),
+        "rendered": sum(1 for l in results if l["state"] == "rendered"),
+        "identity_version": buildstore.IDENTITY_VERSION,
+    }
+
+
 # Voice + Character management lives in service/voices.py. Read endpoints
 # (list voices/characters/emotions) accept a tts-scoped key so ElevenLabs
 # drop-in clients work; mutations need the "voices" scope.
@@ -1224,6 +1949,8 @@ app.include_router(packs_router, dependencies=[Depends(require_scope("voices"))]
 app.include_router(takes_router, dependencies=[Depends(require_scope("tts"))])
 # Review sets (client approval links) — same surface, same scope.
 app.include_router(reviews_router, dependencies=[Depends(require_scope("tts"))])
+# Direction corpus (what re-performances change) - same surface, same scope.
+app.include_router(direction_router, dependencies=[Depends(require_scope("tts"))])
 # Local transcription (service/stt.py) — its own scope: hearing a recording is
 # a different capability from speaking one, and a drop-in TTS client has no
 # business transcribing.
@@ -1235,12 +1962,27 @@ app.include_router(stt_router, dependencies=[Depends(require_scope("stt"))])
 # the socket would lock out the exact client this surface exists for.
 app.include_router(convai_router, dependencies=[Depends(require_scope("convai"))])
 app.include_router(convai_ws_router)
+# Replay drives the same conversation surface it tests, so it carries the same scope.
+app.include_router(gym_router, dependencies=[Depends(require_scope("convai"))])
+# What this artifact IS. Root-only for now — the manifest names every model on disk.
+app.include_router(appliance_router, dependencies=[Depends(require_scope("admin"))])
+# The engine plane (service/engines.py): what each adapter DECLARES it can do,
+# and what conformance actually observed. Read-only, so a tts-scoped key sees it
+# — a drop-in client choosing a language needs to know which engines exist.
+app.include_router(engines_router, dependencies=[Depends(require_scope("tts"))])
 # The conversation session speaks through the same worker pool as every other
 # route, but it cannot import this module to reach it (that is the import cycle
 # — app imports the router). So the pool is handed over instead; the lambda
 # defers the read until a session actually synthesizes, by which time the
 # lifespan has built it.
 convai.set_engine_provider(lambda: ENGINE)
+# Same seam, same reason, for the engine plane: service/engines.py describes the
+# pocket-tts adapter (its voices, its observed sample rate) and needs the LIVE
+# pool to do it, but importing this module would be the cycle. The lambda defers
+# the read until an engine is actually asked about itself, by which time the
+# lifespan has built ENGINE. Without this it falls back to convai's provider —
+# the same object, one indirection further away.
+engines_plane.set_pool_provider(lambda: ENGINE)
 
 
 class SpeakRequest(BaseModel):
@@ -1286,6 +2028,7 @@ async def speak(
     emap = emotion_map(req.character_id)
     if not emap:
         raise HTTPException(status_code=404, detail=f"unknown character '{req.character_id}'")
+    pmap = prosody_map(req.character_id)  # one registry read, not one per segment
 
     segments = parse_segments(req.text)
     overrides = _overrides(req.voice_settings)
@@ -1302,7 +2045,7 @@ async def speak(
     resolved: list[tuple] = []
     fallbacks: list[tuple[str, str]] = []
     for seg in segments:
-        voice_id, used, fell_back = resolve(seg.emotion, emap)
+        voice_id, used, fell_back = resolve(seg.emotion, emap, prosody=pmap)
         if fell_back:
             fallbacks.append((req.character_id, seg.emotion))
         resolved.append((seg, voice_id, used, fell_back))
@@ -1315,7 +2058,7 @@ async def speak(
             [(voice_id, seg.text, overrides)
              for (seg, voice_id, used, fell_back) in resolved])
     except AdmissionRejected as exc:
-        return _backpressure_response(_Backpressure(str(exc)))
+        return _backpressure_response(_Backpressure(str(exc), exc))
 
     wavs: list[bytes] = []
     report: list[dict] = []
@@ -1396,6 +2139,7 @@ async def performance(req: PerformanceRequest,
 
     # Fail fast: validate every character before synthesizing anything.
     emaps: dict[str, dict[str, str]] = {}
+    pmaps: dict[str, dict[str, dict]] = {}
     for i, line in enumerate(req.lines):
         if line.character_id not in emaps:
             emap = emotion_map(line.character_id)
@@ -1403,6 +2147,7 @@ async def performance(req: PerformanceRequest,
                 raise HTTPException(status_code=404,
                                     detail=f"unknown character '{line.character_id}' (line {i})")
             emaps[line.character_id] = emap
+            pmaps[line.character_id] = prosody_map(line.character_id)
 
     # Flatten every line into its emotion segments, resolving voices first, then
     # submit in waves bounded by real parallelism and gather in order — an
@@ -1416,7 +2161,8 @@ async def performance(req: PerformanceRequest,
         emap = emaps[line.character_id]
         overrides = _overrides(line.voice_settings)
         for seg in parse_segments(line.text):
-            voice_id, used, fell_back = resolve(seg.emotion, emap)
+            voice_id, used, fell_back = resolve(seg.emotion, emap,
+                                                prosody=pmaps[line.character_id])
             if fell_back:
                 fallbacks.append((line.character_id, seg.emotion))
             tasks.append((i, line.character_id, seg, voice_id, used, fell_back, overrides))
@@ -1428,7 +2174,7 @@ async def performance(req: PerformanceRequest,
         results = await _submit_and_gather_in_waves(
             [(t[3], t[2].text, t[6]) for t in tasks])
     except AdmissionRejected as exc:
-        return _backpressure_response(_Backpressure(str(exc)))
+        return _backpressure_response(_Backpressure(str(exc), exc))
 
     wavs: list[bytes] = []
     report: list[dict] = []

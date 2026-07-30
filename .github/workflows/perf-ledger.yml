@@ -1,0 +1,383 @@
+# Arm Performance Ledger - the performance claim, re-proven and gated.
+#
+# ############################################################################
+# # AUTHORED, NEVER RUN. Every step below was written against the repo and    #
+# # reviewed structurally; NOT ONE OF THEM HAS EXECUTED. The authoring box is #
+# # Windows x86 with no Arm runner, no AWS profile and no load-test capable   #
+# # hardware, so neither job could be attempted. Treat the first real run as  #
+# # a debugging session, not a verification: expect to fix the runner label,  #
+# # the pocket-tts weight download path, the warm-up timeout, and the SSM     #
+# # output parsing in the matrix job. Until it has gone green once, the ONLY  #
+# # thing this file proves is intent - and `docs/certifications/ledger.json`  #
+# # is deliberately EMPTY for exactly the same reason.                        #
+# ############################################################################
+#
+# Why this exists: `docs/SUPPORTED_HARDWARE.md` is a table someone typed, and
+# `web/lib/benchmarks.ts` holds numbers transcribed from the README by hand.
+# Neither can rot LOUDLY. This workflow makes performance a tracked property:
+#
+#   * every PR that touches the inference path runs a short ramp on Arm,
+#     compares it against the newest ledger row for THAT hardware class, and
+#     fails on a regression beyond tolerance (service/compare.py, exit 2);
+#   * a scheduled matrix drives the EXISTING aws/run_benchmark.sh over three
+#     Graviton generations and appends a signed certificate per box.
+#
+# Nothing here invents a number. `service/compare.py` refuses to diff runs whose
+# cache mode, route, corpus, schema or fpmath mode differ, and excludes
+# low-confidence / driver-saturated levels from the verdict by name - so a noisy
+# shared runner produces an honest "cannot substantiate a pass", not a false red.
+
+name: perf-ledger
+
+on:
+  pull_request:
+    paths:
+      - "service/**"
+      - "requirements.txt"
+      - "benchmark_arm*.sh"
+      - ".github/workflows/perf-ledger.yml"
+  # The cloud matrix costs money and takes ~40 min per box, so it is NEVER
+  # per-PR: weekly, or on demand.
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      types:
+        description: "instance types to bench (space-separated)"
+        default: "t4g.small c8g.2xlarge m8g.xlarge"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # One perf run at a time per ref: two ramps sharing a runner measure each
+  # other. This is not a tidiness setting, it is a correctness one.
+  group: perf-ledger-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # =========================================================================
+  # 1. PR gate - a short ramp on a hosted Arm runner, diffed against history
+  # =========================================================================
+  pr-ramp:
+    if: github.event_name == 'pull_request'
+    # GitHub's hosted aarch64 runner. The whole product claim is "realtime CPU
+    # TTS on Arm", so an x86 runner would gate on a number nobody ships.
+    # A self-hosted Graviton with the `gravitone-bench` label is the quieter
+    # alternative (hosted runners are shared silicon and noisier).
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+
+    env:
+      # Fixed for the LIFE of the gate: a diff across fast-math modes is a
+      # configuration difference wearing a regression's clothes, and
+      # service/compare.py refuses it outright. Changing this value starts a
+      # new comparable series and every prior row stops being diffable.
+      ONEDNN_DEFAULT_FPMATH_MODE: bf16
+      # Built-in voice = no HuggingFace token needed for the ramp itself.
+      VOICE: alba
+      TTS_HOST: 127.0.0.1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sanity - this must be an aarch64 runner
+        run: |
+          set -eu
+          arch="$(uname -m)"
+          echo "runner arch: $arch"
+          [ "$arch" = "aarch64" ] || { echo "!! the Arm claim needs an Arm runner"; exit 1; }
+          nproc
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Model weights are hundreds of MB. Without this cache every run pays the
+      # download twice over (pocket-tts + piper), which dwarfs the benchmark
+      # itself and adds network variance to a latency measurement.
+      - name: Cache model weights
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+            ~/.local/share/piper
+          key: gravitone-weights-${{ runner.os }}-${{ runner.arch }}-v1
+          restore-keys: gravitone-weights-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install deps (CPU torch FIRST - see benchmark_arm.sh)
+        run: |
+          set -eu
+          sudo apt-get update -y
+          sudo apt-get install -y ffmpeg
+          python -m pip install -q -U pip
+          # On aarch64, plain PyPI torch is a CUDA (GH200) build that bypasses
+          # the oneDNN + Arm Compute Library CPU path. Install the CPU wheel
+          # explicitly first, exactly as benchmark_arm.sh does, or the gate
+          # measures a different inference path from the one we ship.
+          pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -q -r requirements.txt
+          python -c "import torch; print('torch', torch.__version__, 'threads', torch.get_num_threads())"
+
+      - name: Start the service and warm the model
+        run: |
+          set -eu
+          mkdir -p logs
+          TTS_WORKERS=1 TTS_TORCH_THREADS="$(nproc)" TTS_PORT=8080 \
+            python -m service.app >logs/server.log 2>&1 &
+          echo "$!" > logs/server.pid
+          for _ in $(seq 1 120); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/health || true)"
+            [ "$code" = "200" ] && break
+            sleep 5
+          done
+          curl -sf http://127.0.0.1:8080/health >/dev/null || {
+            echo "!! service never became ready"; tail -50 logs/server.log; exit 1; }
+          # One warm request so the ramp does not measure lazy initialisation.
+          curl -s -X POST "http://127.0.0.1:8080/v1/text-to-speech/$VOICE?output_format=wav_24000" \
+            -H 'Content-Type: application/json' -d '{"text":"warmup sentence."}' -o /dev/null
+
+      # SHORT ramp on purpose: a PR gate that takes 40 minutes is a PR gate
+      # people learn to ignore. --server-pid gives the honest CPU split so the
+      # runner's own load-generator CPU cannot be blamed on the server.
+      - name: Short ramp
+        run: |
+          set -eu
+          python -m service.loadtest \
+            --url http://127.0.0.1:8080 --voice "$VOICE" \
+            --levels 1,2,4 --requests 24 \
+            --cache-mode bypass \
+            --server-pid "$(cat logs/server.pid)" \
+            --out service/loadtest_result.json
+
+      # Which history does this box belong to? The fingerprint is computed from
+      # THIS runner's hardware, so a runner-fleet change starts a new series
+      # instead of silently diffing across silicon.
+      - name: Find the newest ledger row for this hardware class
+        id: baseline
+        run: |
+          set -eu
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, pathlib
+          from service import certify
+
+          root = pathlib.Path("docs/certifications")
+          fingerprint = certify.hw_fingerprint(certify.gather_hardware())
+          ledger = certify.load_ledger(root / certify.LEDGER_INDEX)
+          report = certify.verify_ledger(ledger, root)
+          if not report["ok"]:
+              # A ledger whose rows no longer match their certificates cannot be
+              # a baseline for anything. Loud, not silently ignored.
+              raise SystemExit("!! ledger integrity failure: " + json.dumps(
+                  [t["reason"] for t in report["tampered"]]))
+          row = certify.newest_row(ledger, fingerprint)
+          print(f"fingerprint={fingerprint}")
+          print(f"baseline={(root / row['cert_path']) if row else ''}")
+          PY
+
+      # The first PR on a fresh runner class has nothing to diff against. That
+      # is a fact, not a failure: report it and move on. The gate becomes real
+      # the moment the scheduled job has written a row for this fingerprint.
+      - name: Compare against the baseline (or say there isn't one)
+        run: |
+          set -eu
+          base='${{ steps.baseline.outputs.baseline }}'
+          if [ -z "$base" ]; then
+            echo "no ledger row yet for hardware class ${{ steps.baseline.outputs.fingerprint }}"
+            echo "this PR cannot regress against a history that does not exist;"
+            echo "the scheduled job writes the first row for this class."
+            exit 0
+          fi
+          # NOTE: the baseline artifact is a CERTIFICATE, not a load-test
+          # result, so it carries no `levels`. Diffing needs the result the
+          # certificate was minted from. Until the scheduled job also uploads
+          # its result JSON alongside the certificate (follow-up), this step
+          # compares result-to-result using the artifact stored next to the
+          # certificate under the same stem.
+          result="${base%.json}.result.json"
+          if [ ! -f "$result" ]; then
+            echo "baseline certificate $base has no companion result JSON"
+            echo "(nothing to diff yet - see the follow-up note in this file)"
+            exit 0
+          fi
+          python -m service.compare \
+            --old "$result" \
+            --new service/loadtest_result.json \
+            --fail-on-regress 5% \
+            --json perf-diff.json
+
+      - name: Certify (never appended from a PR - history is a trunk artifact)
+        if: always()
+        run: |
+          set -eu
+          # No --append-ledger here, deliberately: a PR branch must not be able
+          # to write history, and a hosted shared runner is too noisy to be a
+          # published capacity claim. The PR gets a verdict; the ledger gets
+          # rows only from the scheduled job below.
+          python -m service.certify --result service/loadtest_result.json \
+            --out certification.json || true
+
+      - name: Upload the run
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-pr-${{ github.event.pull_request.number }}
+          path: |
+            service/loadtest_result.json
+            certification.json
+            perf-diff.json
+            logs/server.log
+          if-no-files-found: warn
+
+      - name: Stop the service
+        if: always()
+        run: kill "$(cat logs/server.pid)" 2>/dev/null || true
+
+  # =========================================================================
+  # 2. Scheduled matrix - real Graviton silicon via the EXISTING driver script
+  # =========================================================================
+  # aws/run_benchmark.sh already does up -> bench -> fetch -> terminate over
+  # SSM. This job does not reimplement any of that; it sets TYPE and calls it.
+  cloud-matrix:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest      # a driver, not a benchmark: x86 is fine here
+    timeout-minutes: 90
+
+    strategy:
+      # NEVER parallel: `find_instance` in aws/run_benchmark.sh looks the box up
+      # by the tag `gravitone-bench`, so two concurrent matrix legs would fight
+      # over one instance. Serial is a correctness requirement of that script.
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        include:
+          # Graviton2, burstable. CPU CREDITS make its numbers advisory only:
+          # a t4g that has exhausted its credits reports a "regression" that is
+          # an accounting artifact, not a code change. It is benched because
+          # it is the cheapest box a self-hoster will try, and never gated on.
+          - type: t4g.small
+            advisory: true
+          - type: c8g.2xlarge
+            advisory: false
+          - type: m8g.xlarge
+            advisory: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # OIDC would be better than a long-lived key; both need an AWS account
+      # that does not exist yet on this project (aws/README.md, aws/iam-policy.json).
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: us-east-1
+          role-to-assume: ${{ secrets.AWS_BENCH_ROLE_ARN }}
+
+      - name: Launch, benchmark, fetch, terminate
+        env:
+          PROFILE: default          # the OIDC session, not a named profile
+          REGION: us-east-1
+          TYPE: ${{ matrix.type }}
+          REPO: ${{ github.server_url }}/${{ github.repository }}.git
+        run: |
+          set -eu
+          bash aws/run_benchmark.sh up
+          # `bench` clones this repo on the box and runs benchmark_arm.sh, which
+          # writes service/loadtest_result.json there. It streams the tail of the
+          # run to stdout; the result JSON is fetched in the next step.
+          bash aws/run_benchmark.sh bench | tee bench-${{ matrix.type }}.log
+
+      # FOLLOW-UP, not yet implemented: aws/run_benchmark.sh prints the summary
+      # but does not copy the result JSON back. Until it grows a `fetch`
+      # subcommand (or an S3 hop), this step is the seam where the artifact
+      # arrives, and the certify/append below has nothing to act on. Named here
+      # rather than faked so the first real run fails on a MISSING FILE with an
+      # explanation, instead of appending an invented row.
+      - name: Collect the result JSON from the box
+        id: collect
+        run: |
+          set -eu
+          if [ ! -f service/loadtest_result.json ]; then
+            echo "!! aws/run_benchmark.sh does not yet copy the result JSON back"
+            echo "   (see the FOLLOW-UP note in .github/workflows/perf-ledger.yml)"
+            echo "have_result=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "have_result=true" >> "$GITHUB_OUTPUT"
+
+      - name: Certify and append the ledger row
+        if: steps.collect.outputs.have_result == 'true'
+        env:
+          # Signs the certificate, so a row's integrity can be checked by anyone
+          # holding the secret - and a third-party submission can be validated.
+          GRAVITONE_CERT_SECRET: ${{ secrets.GRAVITONE_CERT_SECRET }}
+        run: |
+          set -eu
+          # Exit 2 = "failed certification". A failed run is still recorded:
+          # a ledger that keeps only its good days is marketing. `|| true`
+          # therefore covers the verdict, not the append (which raises loudly
+          # on an integrity problem and is not swallowed).
+          python -m service.certify \
+            --result service/loadtest_result.json \
+            --out certification-${{ matrix.type }}.json \
+            --instance-type ${{ matrix.type }} \
+            --append-ledger || rc=$?
+          # Keep the result next to the certificate: service/compare.py diffs
+          # RESULTS (levels), and a certificate alone cannot be a baseline.
+          row_dir="$(python -c "
+          import json,pathlib
+          from service import certify
+          led = certify.load_ledger(pathlib.Path('docs/certifications')/certify.LEDGER_INDEX)
+          print(led['rows'][-1]['cert_path'])")"
+          cp service/loadtest_result.json \
+             "docs/certifications/${row_dir%.json}.result.json"
+          echo "advisory=${{ matrix.advisory }}"
+
+      # The ledger is a git-native artifact: the CI is the moderator, and the
+      # row lands as a commit on the default branch. Opening a PR (rather than
+      # pushing) keeps the append reviewable and keeps branch protection intact.
+      - name: Open a PR with the new ledger row
+        if: steps.collect.outputs.have_result == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: perf-ledger/${{ matrix.type }}
+          commit-message: "perf(ledger): ${{ matrix.type }} row at ${{ github.sha }}"
+          title: "perf(ledger): ${{ matrix.type }} certification"
+          body: |
+            Automated ledger row from the scheduled `perf-ledger` matrix.
+
+            * instance type: `${{ matrix.type }}`
+            * advisory only (CPU credits): `${{ matrix.advisory }}`
+            * commit benchmarked: `${{ github.sha }}`
+
+            The certificate carries its own sha256 (and HMAC when the secret is
+            set). `python -m service.certify --append-ledger` verified every
+            existing row against its artifact before appending this one.
+          add-paths: |
+            docs/certifications/**
+
+      - name: Upload the raw run
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-cloud-${{ matrix.type }}
+          path: |
+            bench-${{ matrix.type }}.log
+            certification-${{ matrix.type }}.json
+            service/loadtest_result.json
+          if-no-files-found: warn
+
+      # ALWAYS. An instance left running because a step failed is a bill that
+      # grows until someone notices, and `terminate` is idempotent.
+      - name: Terminate the instance
+        if: always()
+        env:
+          PROFILE: default
+          REGION: us-east-1
+          TYPE: ${{ matrix.type }}
+        run: bash aws/run_benchmark.sh terminate || true

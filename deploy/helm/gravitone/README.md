@@ -35,8 +35,20 @@ helm upgrade voice deploy/helm/gravitone --reuse-values \
 | c8g.2xlarge (8 vCPU Graviton4) | 4 × 2 | ~10.9 aud-s/s ≈ 650 audio-min/hour |
 | c7g.xlarge (4 vCPU Graviton3) | 2 × 2 | ~4 aud-s/s |
 
-Run `python -m service.loadtest --plan` (or the studio's /benchmarks
-capacity planner) to size from your own measured knee.
+Both rows are somebody else's box. To size from your own measured knee, compile
+the values instead of copying a preset:
+
+```bash
+bash benchmark_arm.sh && python -m service.certify
+python -m service.plan certification.json --emit helm-values   # gravitone-values.yaml
+helm upgrade voice deploy/helm/gravitone -f gravitone-values.yaml
+```
+
+The overlay sets only `replicaCount`, `tts.*`, `resources` and `autoscaling`
+(with `autoscaling.mode` chosen from the measured topology — see the KEDA caveat
+in `values.yaml`), and its header carries the certificate sha + hardware
+fingerprint it was derived from. `python -m service.loadtest --plan` and the
+studio's /benchmarks planner remain the interactive views of the same numbers.
 
 ## Voices across the fleet
 

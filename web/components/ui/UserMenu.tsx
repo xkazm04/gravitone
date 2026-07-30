@@ -6,6 +6,7 @@ import { AnimatePresence, motion } from "framer-motion";
 import { useAuth } from "@/lib/useAuth";
 import { getStoredKey } from "@/lib/mintKey";
 import { useCopyFeedback } from "@/lib/useCopyFeedback";
+import { listSpeakerConsents } from "@/lib/voiceVault";
 import { Button } from "./Primitives";
 
 export default function UserMenu() {
@@ -13,6 +14,20 @@ export default function UserMenu() {
   const [open, setOpen] = useState(false);
   const { copy, copied: keyCopied, failed: keyCopyFailed } = useCopyFeedback();
   const ref = useRef<HTMLDivElement>(null);
+  // Voices OTHER accounts cloned from this user. Read only when the menu is
+  // opened — a badge is not worth a Firestore round-trip on every page load.
+  const [signedOver, setSignedOver] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (!open || !user || signedOver !== null) return;
+    let alive = true;
+    void listSpeakerConsents(user.uid)
+      .then((cs) => { if (alive) setSignedOver(cs.filter((c) => !c.withdrawnAt).length); })
+      // A badge must never be the thing that breaks the account menu; absent is
+      // the honest render for "we don't know".
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [open, user, signedOver]);
 
   // The credential is one click away from any page (localStorage, this browser).
   const copyKey = async () => {
@@ -71,7 +86,16 @@ export default function UserMenu() {
               </span>
             </div>
             <div className="my-1 h-px bg-white/8" />
-            <Link href="/profile" onClick={() => setOpen(false)} className="block rounded-lg px-3 py-2 text-sm text-white/80 transition hover:bg-white/5">Profile</Link>
+            <Link href="/profile" onClick={() => setOpen(false)} className="flex items-center justify-between gap-2 rounded-lg px-3 py-2 text-sm text-white/80 transition hover:bg-white/5">
+              Profile
+              {/* Absent = invisible: no badge until this account is actually a
+                  speaker on someone else's clone. */}
+              {signedOver ? (
+                <span className="font-jetbrains rounded-full border border-emerald-400/40 bg-emerald-400/10 px-2 py-0.5 text-[10px] text-emerald-200">
+                  {signedOver} voice{signedOver === 1 ? "" : "s"} of mine
+                </span>
+              ) : null}
+            </Link>
             {user && getStoredKey(user.uid) && (
               <button onClick={() => void copyKey()} className="w-full cursor-pointer rounded-lg px-3 py-2 text-left text-sm text-white/80 transition hover:bg-white/5">
                 {keyCopyFailed ? "copy blocked" : keyCopied ? "✓ key copied" : "Copy API key"}

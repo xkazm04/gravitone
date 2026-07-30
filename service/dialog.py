@@ -15,6 +15,15 @@ the protocol file is only ever about the protocol:
   model is still writing sentence two, so time-to-first-audio stops scaling
   with reply length.
 
+* **The directing channel.** A brain answers with ``TurnPart``s, not bare
+  strings: a part carries its text AND how the text should be performed —
+  which language to speak it in, which emotion, and whether the call ends
+  after it. The parts are ``str`` subclasses, so every consumer written
+  against the old "stream of sentences" contract keeps working untouched;
+  the direction is metadata riding along beside the words. Models express it
+  inline (``[lang:cs]``, ``[emotion:warm]``, ``[end_call]``) and the sentence
+  buffer strips it before the text can reach a synthesizer or a transcript.
+
 The scripted backend is the default and is not a placeholder. A test that
 asserts word error rate, turn latency or transcript structure needs the
 interviewer to say the same thing every run; an LLM makes all three
@@ -79,10 +88,50 @@ class Agent:
     counterpart: str = "Candidate"
     # Which conversation_config_override fields a client may set.
     allow_overrides: list[str] = field(
-        default_factory=lambda: ["prompt", "first_message", "language", "voice_id"])
+        default_factory=lambda: ["prompt", "first_message", "language", "voice_id",
+                                 "script"])
+    # Languages this agent will FOLLOW the caller into, beyond its own. Declared
+    # rather than inferred: the ear hears dozens of languages, but an agent
+    # switching into one nobody checked a voice for is a worse conversation than
+    # one that stays put. Appended LAST so no positional construction breaks.
+    languages: list[str] = field(default_factory=list)
 
     def voice(self) -> str:
         return self.voice_id or SETTINGS.default_voice
+
+    def switch_languages(self) -> list[str]:
+        """Every language this agent may speak, its own first.
+
+        Deduplicated and region-stripped ("cs-CZ" -> "cs") because that is the
+        form both the transcriber's detection and ``piper.voice_for_language``
+        speak. This list is what ``/v1/convai/agents`` reports as a matrix and
+        what the language tracker is allowed to switch into.
+        """
+        out = [_tag(self.language) or "en"]
+        for lang in self.languages:
+            tag = _tag(lang)
+            if tag and tag not in out:
+                out.append(tag)
+        return out
+
+    def honours(self, language: str | None) -> bool:
+        """Whether a switch into ``language`` is one this agent agreed to."""
+        tag = _tag(language)
+        return bool(tag) and tag in self.switch_languages()
+
+
+def language_tag(language: str | None) -> str:
+    """"cs-CZ" -> "cs". ONE idea of what a language is.
+
+    Public because the session layer has to agree with this module about it: the
+    transcriber reports "cs", an agent file may say "cs-CZ", and a Piper voice is
+    called "cs_CZ-jirka-medium". Comparing any two of those without normalizing
+    is how a language switch silently never fires.
+    """
+    return (language or "").strip().split("-", 1)[0].lower()
+
+
+_tag = language_tag   # the short name this module reads better with
 
 
 _INTERVIEWER_PROMPT = (
@@ -230,6 +279,22 @@ def apply_overrides(agent: Agent, override: dict | None) -> Agent:
     if first is not None:
         (changes.__setitem__("first_message", str(first))
          if "first_message" in allowed else refused.append("first_message"))
+    script = override.get("script")
+    if script is not None:
+        # A client-supplied script, which is what lets a browser rehearse a scene
+        # with NO language model configured: the lines come from the page and the
+        # scripted backend reads them back, so the whole Live path works on a box
+        # with no LLM at all. Same trust model as ``prompt`` (see the module
+        # docstring) — an agent that must keep its own words drops "script" from
+        # allow_overrides. Each line may carry the inline directives a script line
+        # always could ("[lang:cs] Ahoj."), because it goes through the same buffer.
+        if not isinstance(script, list):
+            logger.warning("agent %s ignored a non-list script override (%s)",
+                           agent.agent_id, type(script).__name__)
+        elif "script" not in allowed:
+            refused.append("script")
+        else:
+            changes["script"] = [str(line) for line in script if str(line).strip()]
     lang = override.get("language")
     if lang:
         (changes.__setitem__("language", str(lang)) if "language" in allowed
@@ -248,24 +313,159 @@ def apply_overrides(agent: Agent, override: dict | None) -> Agent:
 # ---------------------------------------------------------------------------
 # Sentence streaming
 # ---------------------------------------------------------------------------
-def split_sentences(text: str) -> list[str]:
-    parts = [p.strip() for p in _SENTENCE_END.split((text or "").strip())]
-    return [p for p in parts if p]
+@dataclass(frozen=True, eq=False, repr=False)
+class TurnPart(str):
+    """One speakable unit of a turn, and how it is to be performed.
+
+    ``language``/``emotion`` of ``None`` mean "the agent's own", so a brain that
+    directs nothing produces parts indistinguishable from the plain sentences
+    this used to emit — which is the point.
+
+    **It IS a string.** Subclassing ``str`` is the compatibility shim: the whole
+    pipeline downstream of a brain (``" ".join(parts)``, ``text.strip()``,
+    ``synthesize_pcm(voice, part)``, every existing test that compares a reply to
+    a list of strings) was written against a stream of sentences and keeps
+    working with no change at all. Equality and hashing are the string's, on
+    purpose: a part IS its speakable text, and the direction is metadata beside
+    it. Two parts with the same words and different languages therefore compare
+    equal — read ``.language`` when that distinction is what you mean.
+    """
+
+    text: str = ""
+    language: str | None = None
+    emotion: str | None = None
+    end_call: bool = False
+
+    def __new__(cls, text: str = "", *_args, **_kwargs):
+        return super().__new__(cls, text)
+
+    def __repr__(self) -> str:
+        extra = "".join(
+            f" {name}={value!r}" for name, value in
+            (("language", self.language), ("emotion", self.emotion))
+            if value is not None)
+        return (f"TurnPart({str.__repr__(str(self))}{extra}"
+                f"{' end_call' if self.end_call else ''})")
+
+    def directed(self) -> bool:
+        """Whether the brain asked for anything beyond the default performance."""
+        return bool(self.language or self.emotion or self.end_call)
+
+    def speakable(self) -> bool:
+        """Whether there are words here at all.
+
+        A part with no text is a PURE DIRECTION — the shape ``[end_call]`` takes
+        when it is written after the last sentence, which is where a model
+        naturally puts it. A consumer must honour its fields and synthesize
+        nothing; see ``_SentenceBuffer.drain``.
+        """
+        return bool(str(self).strip())
+
+
+# The inline grammar a model uses to direct its own turn. Deliberately bracketed
+# and single-token: it is cheap for a model to emit, trivial to strip with
+# certainty, and impossible to confuse with prose punctuation.
+_BRACKET = re.compile(r"\[([^\[\]]*)\]")
+_DIRECTIVES = {"lang": "language", "language": "language",
+               "emotion": "emotion", "style": "emotion",
+               "end_call": "end_call", "endcall": "end_call", "hangup": "end_call"}
+# How much unterminated "[..." the buffer will hold back waiting for the closing
+# bracket. Bounded because a model that writes a lone "[" and never closes it
+# must not stall the turn forever; past this the bracket is ordinary text.
+_DIRECTIVE_HOLD_CHARS = 48
+
+
+def split_sentences(text: str) -> list[TurnPart]:
+    """A finished piece of text as speakable parts, directives stripped.
+
+    Runs the same buffer the streaming brains use, so an agent's
+    ``first_message`` cannot smuggle directive text into the synthesizer either.
+    """
+    buf = _SentenceBuffer()
+    return buf.push(text or "") + buf.drain()
 
 
 class _SentenceBuffer:
-    """Turns a stream of model deltas into a stream of speakable sentences."""
+    """Turns a stream of model deltas into a stream of speakable ``TurnPart``s.
+
+    Two jobs, in this order: strip the direction out of the stream, and cut what
+    is left at sentence boundaries. The order matters — the stripping happens on
+    the RAW tail before anything is considered speakable, so no partially
+    received directive can ever be emitted, however the deltas were chunked.
+    """
 
     def __init__(self) -> None:
-        self._buf = ""
+        self._buf = ""      # cleaned text, waiting for a boundary
+        self._raw = ""      # the tail, which may still hold a partial directive
+        self._language: str | None = None
+        self._emotion: str | None = None
+        self._end_call = False
+        self._end_call_sent = False
 
-    def push(self, delta: str) -> list[str]:
-        self._buf += delta
-        out: list[str] = []
+    def push(self, delta: str) -> list[TurnPart]:
+        self._raw += delta
+        out: list[TurnPart] = []
+        while self._raw:
+            start = self._raw.find("[")
+            if start < 0:
+                self._buf += self._raw
+                self._raw = ""
+                break
+            if start:
+                self._buf += self._raw[:start]
+                self._raw = self._raw[start:]
+            match = _BRACKET.match(self._raw)
+            if match is None:
+                if len(self._raw) <= _DIRECTIVE_HOLD_CHARS:
+                    break  # a directive may still be arriving: hold it back
+                # Not a directive at all — an unclosed bracket in ordinary
+                # prose. Speak it rather than swallow the rest of the turn.
+                self._buf += self._raw[0]
+                self._raw = self._raw[1:]
+                continue
+            out += self._direct(match.group(1))
+            self._raw = self._raw[match.end():]
+        return out + self._cut()
+
+    def _direct(self, body: str) -> list[TurnPart]:
+        """Apply one directive, returning any part it closed off."""
+        name, _, value = body.partition(":")
+        key = _DIRECTIVES.get(name.strip().lower())
+        value = value.strip()
+        if key is None or (key != "end_call" and not value):
+            # Dropped and NAMED. A model that invents a directive (or writes
+            # "[laughs]") must not have it read out loud, and an operator has to
+            # be able to see that it happened.
+            logger.warning("dropped an unknown dialog directive [%s]; it was not "
+                           "spoken", body[:40].replace("\n", " "))
+            return []
+        if key == "end_call":
+            # Latched rather than a boundary, so it rides out with whatever words
+            # follow it. A model normally writes it AFTER its last sentence
+            # ("Thanks for your time. [end_call]"), by which point that sentence
+            # has already been released for synthesis — holding sentences back on
+            # the chance a directive follows would give away the whole streaming
+            # latency win. So when there is nothing left to attach it to,
+            # ``drain`` emits it as a pure direction; see there.
+            self._end_call = True
+            return []
+        # A change of language or emotion IS a boundary: whatever is already
+        # buffered was written to be performed the old way, and switching the
+        # mouth mid-sentence is the audible discontinuity this whole feature
+        # exists to avoid.
+        closed = self._cut(force=True)
+        if key == "language":
+            self._language = _tag(value)
+        else:
+            self._emotion = value.lower()
+        return closed
+
+    def _cut(self, *, force: bool = False) -> list[TurnPart]:
+        out: list[TurnPart] = []
         while True:
             match = _SENTENCE_END.search(self._buf)
             if match:
-                out.append(self._buf[:match.start()].strip())
+                out.append(self._part(self._buf[:match.start()]))
                 self._buf = self._buf[match.end():]
                 continue
             if len(self._buf) >= _FORCE_FLUSH_CHARS:
@@ -278,31 +478,219 @@ class _SentenceBuffer:
                 cut = comma + 1 if comma > 0 else head.rfind(" ")
                 if cut <= 0:
                     break  # one unbroken 220-character word: leave it to drain
-                out.append(self._buf[:cut].strip())
+                out.append(self._part(self._buf[:cut]))
                 self._buf = self._buf[cut:].lstrip()
                 continue
             break
-        return [s for s in out if s]
+        if force and self._buf.strip():
+            out.append(self._part(self._buf))
+            self._buf = ""
+        return [p for p in out if p]
+
+    def _part(self, text: str) -> TurnPart:
+        text = text.strip()
+        if text and self._end_call:
+            self._end_call_sent = True
+        return TurnPart(text, language=self._language, emotion=self._emotion,
+                        end_call=self._end_call)
 
     def pending(self) -> bool:
-        return bool(self._buf.strip())
+        return bool(self._buf.strip() or self._raw.strip())
 
-    def drain(self) -> list[str]:
+    def drain(self) -> list[TurnPart]:
+        out = self.push("")   # consume anything the tail can still resolve to
+        if self._raw.strip():
+            # A directive that was cut off when the stream ended. Dropped, not
+            # spoken: half of "[lang:c" is not text anybody wrote to be heard.
+            logger.warning("dropped a truncated dialog directive %r at the end of "
+                           "a turn", self._raw[:40])
+        self._raw = ""
         rest, self._buf = self._buf.strip(), ""
-        return [rest] if rest else []
+        if rest:
+            out.append(self._part(rest))
+        out = [p for p in out if p]
+        if self._end_call and not self._end_call_sent:
+            # "[end_call]" written after the last sentence. It has no words of its
+            # own, so it goes out as a pure direction rather than being lost — the
+            # session hangs up on it, and a consumer that only wants text skips it
+            # with ``TurnPart.speakable()``.
+            self._end_call_sent = True
+            out.append(TurnPart("", language=self._language,
+                                emotion=self._emotion, end_call=True))
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Directing: what the brain is told, and what it is allowed to change mid-call
+# ---------------------------------------------------------------------------
+# Language names in the grammatical form each language's apology needs: nouns in
+# English and French ("I can't speak German"), adverbs in Czech ("nemluvim
+# nemecky"). Small on purpose — a tag is a usable fallback, a mistranslation is
+# not, so an unlisted language is named by its code rather than guessed at.
+_LANGUAGE_NAMES: dict[str, dict[str, str]] = {
+    "en": {"en": "English", "fr": "French", "cs": "Czech", "de": "German",
+           "es": "Spanish", "it": "Italian", "pl": "Polish", "sk": "Slovak",
+           "pt": "Portuguese", "nl": "Dutch", "uk": "Ukrainian", "ru": "Russian"},
+    "fr": {"en": "anglais", "fr": "français", "cs": "tchèque", "de": "allemand",
+           "es": "espagnol", "it": "italien", "pl": "polonais", "sk": "slovaque"},
+    "cs": {"en": "anglicky", "fr": "francouzsky", "cs": "česky", "de": "německy",
+           "es": "španělsky", "it": "italsky", "pl": "polsky", "sk": "slovensky"},
+}
+
+# The authored refusal for a switch this replica cannot make, in the language it
+# CAN still speak. The point of the whole feature is not reading one language
+# with another's phonemes, and that applies to the apology most of all.
+_SWITCH_APOLOGY = {
+    "en": "I'm sorry — I can't speak {wanted} on this line, so I'll carry on in "
+          "English.",
+    "fr": "Je suis désolé, je ne parle pas {wanted} sur cette ligne ; je continue "
+          "en français.",
+    "cs": "Omlouvám se, {wanted} tady neumím. Budu pokračovat česky.",
+}
+
+_DIRECTIVE_BRIEF = (
+    "You may direct your own delivery with inline tags. They are removed before "
+    "anything is spoken, so never read one out loud and never mention them: "
+    "[lang:XX] changes the language of the words that follow, [emotion:NAME] "
+    "changes the tone, and [end_call] on your final turn ends the call.")
+
+
+def language_name(speak_language: str, wanted_language: str | None) -> str:
+    """``wanted_language`` as a speaker of ``speak_language`` would name it."""
+    speak, wanted = _tag(speak_language) or "en", _tag(wanted_language)
+    names = _LANGUAGE_NAMES.get(speak, _LANGUAGE_NAMES["en"])
+    return names.get(wanted, wanted or "")
+
+
+def switch_apology(speak_language: str, wanted_language: str | None) -> str:
+    """"The caller switched to a language we have no mouth for" — said out loud.
+
+    Spoken in ``speak_language``, which is the whole point: an English apology
+    read by a Czech voice is the mispronunciation this refuses to produce.
+    """
+    speak = _tag(speak_language) or "en"
+    template = _SWITCH_APOLOGY.get(speak, _SWITCH_APOLOGY["en"])
+    wanted = language_name(speak, wanted_language) or _tag(wanted_language)
+    return template.format(wanted=wanted or "that language")
+
+
+def directing_prompt(agent: Agent, *, speaking: str | None = None,
+                     heard: str | None = None) -> str:
+    """The agent's brief, plus what it may direct on THIS call.
+
+    Kept out of ``Agent.prompt`` so the stored agent stays the operator's text:
+    this is assembled per turn from what the session currently knows (which
+    language is being spoken, which one the ear just heard), and an agent that
+    declared no extra languages is told to stay put rather than being handed a
+    switching instruction it has no voice for.
+    """
+    speaking = _tag(speaking) or _tag(agent.language) or "en"
+    extra = [lang for lang in agent.switch_languages() if lang != speaking]
+    clauses = [_DIRECTIVE_BRIEF]
+    if extra:
+        names = ", ".join(language_name("en", lang) or lang for lang in extra)
+        clauses.append(
+            "Answer in the language the caller is speaking. Besides "
+            f"{language_name('en', speaking) or speaking} you may switch into "
+            f"{names} — begin the first sentence in the new language with "
+            "[lang:XX] and stay there until the caller changes again.")
+    else:
+        clauses.append(
+            f"This call is in {language_name('en', speaking) or speaking}. Stay in "
+            "it even if the caller uses another language: no other voice is "
+            "installed, and answering in one that cannot be spoken produces "
+            "unusable audio.")
+    if heard and _tag(heard) != speaking:
+        clauses.append(f"The caller's last turn was heard as "
+                       f"{language_name('en', heard) or _tag(heard)}.")
+    return f"{agent.prompt}\n\n" + " ".join(clauses)
+
+
+class LanguageTracker:
+    """Which language the caller is in, and which one we are speaking.
+
+    They are deliberately two things. ``caller`` is what the EAR reports and only
+    ever informs the prompt; ``language`` is what the MOUTH speaks and moves only
+    when the BRAIN says ``[lang:xx]``. Collapsing them was the first design here
+    and it is wrong: the ear confirming Czech does not mean the brain answered in
+    Czech, and a Czech voice reading an English sentence is precisely the
+    mispronunciation this whole feature exists to refuse.
+
+    On the ear side the guessing needs damping. faster-whisper's guess on two
+    seconds of speech is a guess — one "ano" inside an English sentence comes
+    back as Czech — so a caller switch needs ``CONFIRMATIONS`` consecutive
+    utterances in the same new language, above a confidence floor, and it has to
+    be a language the agent DECLARED (``Agent.languages``).
+
+    Refusals are counted rather than dropped: "callers keep switching into a
+    language this replica cannot speak" is the demand signal that says which
+    Piper voice to install next, the same shape the emotion coverage loop uses.
+    """
+
+    CONFIRMATIONS = 2
+    MIN_PROBABILITY = 0.5
+
+    def __init__(self, agent: Agent):
+        self.agent = agent
+        self.language = _tag(agent.language) or "en"   # what we SPEAK
+        self.caller = self.language                    # what we HEAR
+        self.declined: dict[str, int] = {}
+        self._candidate: str | None = None
+        self._streak = 0
+
+    def heard(self, language: str | None, probability: float = 1.0) -> str | None:
+        """One utterance's detected language -> the caller's NEW language, or None.
+
+        Reporting a switch does not move the mouth; it is what the brain gets
+        told, so that the brain can decide (and say so with ``[lang:xx]``).
+        """
+        tag = _tag(language)
+        if not tag or tag == self.caller or probability < self.MIN_PROBABILITY:
+            self._candidate, self._streak = None, 0
+            return None
+        if not self.agent.honours(tag):
+            self.declined[tag] = self.declined.get(tag, 0) + 1
+            self._candidate, self._streak = None, 0
+            return None
+        self._streak = self._streak + 1 if tag == self._candidate else 1
+        self._candidate = tag
+        if self._streak < self.CONFIRMATIONS:
+            return None
+        self.caller, self._candidate, self._streak = tag, None, 0
+        return tag
+
+    def directed(self, language: str | None) -> str | None:
+        """The BRAIN said ``[lang:xx]``. No hysteresis: it is explicit, not a guess.
+
+        Returns the new spoken language when it is one the agent declared,
+        otherwise None — an undeclared switch is a directive we cannot honour, and
+        the caller hears ``switch_apology`` instead of the wrong phonemes.
+        """
+        tag = _tag(language)
+        if not tag or tag == self.language:
+            return None
+        if not self.agent.honours(tag):
+            self.declined[tag] = self.declined.get(tag, 0) + 1
+            return None
+        self.language = tag
+        return tag
 
 
 # ---------------------------------------------------------------------------
 # Backends
 # ---------------------------------------------------------------------------
 class DialogBackend:
-    """Given the turns so far, stream what the agent says next."""
+    """Given the turns so far, stream what the agent says next.
+
+    Yields ``TurnPart``s — which are strings, so a consumer that only wants the
+    words needs no change (see ``TurnPart``).
+    """
 
     name = "base"
 
-    async def reply(self, agent: Agent, history: list[dict]) -> AsyncIterator[str]:
+    async def reply(self, agent: Agent, history: list[dict]) -> AsyncIterator[TurnPart]:
         raise NotImplementedError
-        yield ""  # pragma: no cover - makes this an async generator for typing
+        yield TurnPart("")  # pragma: no cover - makes this an async generator
 
     def describe(self) -> dict:
         return {"backend": self.name}
@@ -322,11 +710,17 @@ class ScriptedBackend(DialogBackend):
     name = "scripted"
 
     # What a script CANNOT do, stated so it is not rediscovered as a bug: it
-    # cannot follow the speaker into another language, cannot react to what was
-    # actually said, and cannot answer a question. Anything a test asserts about
-    # adaptive behaviour needs the model-backed backend; this one is for the
-    # assertions that require the interviewer to be identical every run.
-    async def reply(self, agent: Agent, history: list[dict]) -> AsyncIterator[str]:
+    # cannot react to what was actually said, and cannot answer a question.
+    # Anything a test asserts about adaptive behaviour needs the model-backed
+    # backend; this one is for the assertions that require the interviewer to be
+    # identical every run.
+    #
+    # It CAN direct itself, though, since a script line goes through the same
+    # buffer a model's deltas do: a line may carry the same inline directives
+    # ("[lang:cs] Ahoj.", "[emotion:warm] Thanks for that.", "Goodbye.
+    # [end_call]"), which is how a language-switch or end-of-call test stays
+    # deterministic without a model.
+    async def reply(self, agent: Agent, history: list[dict]) -> AsyncIterator[TurnPart]:
         spoken = sum(1 for m in history if m.get("role") == "assistant")
         # The first message is turn 0 and is sent by the session itself, so the
         # script picks up after however many turns the agent has already taken.
@@ -336,8 +730,8 @@ class ScriptedBackend(DialogBackend):
             "That's everything I wanted to cover. Thanks for your time.",
         ]
         line = script[idx] if idx < len(script) else script[-1]
-        for sentence in split_sentences(line):
-            yield sentence
+        for part in split_sentences(line):
+            yield part
 
 
 class OpenAiCompatBackend(DialogBackend):
@@ -357,10 +751,16 @@ class OpenAiCompatBackend(DialogBackend):
     def describe(self) -> dict:
         return {"backend": self.name, "base_url": self.base_url, "model": self.model}
 
-    async def reply(self, agent: Agent, history: list[dict]) -> AsyncIterator[str]:
+    async def reply(self, agent: Agent, history: list[dict]) -> AsyncIterator[TurnPart]:
         import httpx
 
-        messages = [{"role": "system", "content": agent.prompt}] + history
+        # History entries may carry annotations this service uses internally (the
+        # language the caller was heard speaking, for one). They are stripped
+        # here rather than at the call site: an OpenAI-compatible server is
+        # entitled to reject a message object with fields it does not know.
+        messages = [{"role": "system", "content": agent.prompt}] + [
+            {"role": m.get("role", "user"), "content": m.get("content", "")}
+            for m in history]
         payload = {"model": self.model, "messages": messages, "stream": True,
                    "temperature": agent.temperature,
                    "max_tokens": SETTINGS.convai_llm_max_tokens}
@@ -499,13 +899,21 @@ class ClaudeCliBackend(DialogBackend):
 
     @staticmethod
     def _transcript(agent: Agent, history: list[dict]) -> str:
-        lines = [f"{'You' if m.get('role') == 'assistant' else agent.counterpart}: "
-                 f"{m.get('content', '')}" for m in history]
+        lines = []
+        for m in history:
+            # main's counterpart naming + the branch's heard-language tag,
+            # composed: an agent that IS the candidate must not call the
+            # interviewer one, and the model still cannot follow the caller
+            # into another language if nobody tells it which one they used.
+            who = "You" if m.get("role") == "assistant" else agent.counterpart
+            heard = _tag(m.get("language")) if m.get("role") != "assistant" else ""
+            tag = f" [{heard}]" if heard else ""
+            lines.append(f"{who}{tag}: {m.get('content', '')}")
         body = "\n".join(lines) if lines else "(the call has just connected)"
         return (f"This is a spoken interview in progress.\n\n{body}\n\n"
                 "Say your next turn.")
 
-    async def reply(self, agent: Agent, history: list[dict]) -> AsyncIterator[str]:
+    async def reply(self, agent: Agent, history: list[dict]) -> AsyncIterator[TurnPart]:
         argv = self._argv(agent)
         env = dict(os.environ)
         # Run on the interactive subscription, not metered API billing — the
@@ -537,7 +945,7 @@ class ClaudeCliBackend(DialogBackend):
                 with contextlib.suppress(ProcessLookupError, OSError):
                     await proc.wait()
 
-    async def _stream(self, proc, buf: "_SentenceBuffer") -> AsyncIterator[str]:
+    async def _stream(self, proc, buf: "_SentenceBuffer") -> AsyncIterator[TurnPart]:
         deadline = SETTINGS.claude_cli_timeout_s
         saw_text = False
         while True:

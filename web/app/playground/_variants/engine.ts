@@ -1,8 +1,19 @@
 "use client";
 
-import { apiJson, readDetail, throwDetail } from "@/lib/apiFetch";
+import { apiJson } from "@/lib/apiFetch";
 import { DEFAULT_OUTPUT_FORMAT, formatMeta, type OutputFormat } from "@/lib/audioFormats";
-import { stripTags, waveHeights, type Expression, type PerfLine, type Segment, type Take } from "./shared";
+import {
+  EngineDegraded, getEngine,
+  type FallbackReason, type TakeAudio,
+} from "@/lib/engineSeam";
+import {
+  crossfadeConcat, encodeWav, fromDecodedAudio, peaksFromPcm, peaksFromSamples, pcmDuration,
+  slicePcm, type Pcm,
+} from "@/lib/wavEncode";
+import {
+  scaleSegmentSeconds, segmentRegions, stripTags, waveHeights,
+  type Expression, type PerfLine, type Segment, type Take,
+} from "./shared";
 
 // One module-level AudioContext shared across every peak computation. Browsers
 // cap the number of live AudioContexts (~6), so minting a fresh one per take
@@ -26,20 +37,21 @@ function peakContext(): AudioContext {
 export async function computePeaks(blob: Blob, n = 56): Promise<{ peaks: number[]; duration: number }> {
   const ctx = peakContext();
   const buf = await ctx.decodeAudioData(await blob.arrayBuffer());
-  const data = buf.getChannelData(0);
-  const chunk = Math.max(1, Math.floor(data.length / n));
-  const peaks: number[] = [];
-  for (let i = 0; i < n; i++) {
-    let peak = 0;
-    const start = i * chunk;
-    for (let j = start; j < start + chunk && j < data.length; j++) {
-      const v = Math.abs(data[j]);
-      if (v > peak) peak = v;
-    }
-    peaks.push(peak);
-  }
-  const max = Math.max(...peaks, 0.001);
-  return { peaks: peaks.map((p) => Math.max(0.06, p / max)), duration: buf.duration };
+  // The reduction itself lives in lib/wavEncode so a SPLICED take's bars are
+  // computed by exactly the same arithmetic as a rendered one's.
+  return { peaks: peaksFromSamples(buf.getChannelData(0), n), duration: buf.duration };
+}
+
+/**
+ * Decode any take/fragment blob into samples on the shared AudioContext.
+ *
+ * This is where "mp3 takes are decoded and re-mastered as WAV" happens: the
+ * decoder does not care what container it was handed, and everything downstream
+ * of here is Float32 at the context's rate.
+ */
+export async function decodePcm(blob: Blob): Promise<Pcm> {
+  const ctx = peakContext();
+  return fromDecodedAudio(await ctx.decodeAudioData(await blob.arrayBuffer()));
 }
 
 /**
@@ -75,9 +87,14 @@ export async function uploadTake(t: Take): Promise<string> {
   // The filename carries the take's real extension — an mp3 posted as
   // "take.wav" would be a second lie on top of the one the backend rejects.
   fd.append("file", blob, `take.${formatMeta(t.format).ext}`);
+  // Remix lineage: /t/[id]'s "open in the rack" leaves the source take id in
+  // sessionStorage, so the take rendered from it publishes as that take's CHILD.
+  let parentId = "";
+  try { parentId = sessionStorage.getItem("gravitone.remix.parent") ?? ""; } catch { /* no storage - publish unlinked */ }
   fd.append("meta", JSON.stringify({
     character_id: t.characterId, character_name: t.characterName,
     text: t.text, seconds: t.seconds, rtf: t.rtf, segments: t.segments,
+    ...(parentId ? { parent_id: parentId, derived_from: { kind: "remix" } } : {}),
   }));
   // Through the apiFetch contract so the backend's sanitized `detail` (request
   // id included) reaches the caller's banner instead of a generic sentence.
@@ -86,17 +103,13 @@ export async function uploadTake(t: Take): Promise<string> {
   return j.take_id;
 }
 
-/**
- * WHY the browser voice was used. The fallback itself is deliberate (the
- * playground should always produce something), but the three causes are not
- * the same event and the UI must not report them identically:
- *   unreachable — the request never completed (network / proxy down)
- *   draining    — the backend is shutting down; it will be back
- *   failed      — the engine answered with an error (5xx): it IS reachable,
- *                 synthesis is what broke
- * Saying "backend unreachable" for a 500 is the lie this type exists to stop.
- */
-export type FallbackReason = "unreachable" | "draining" | "failed";
+// WHY the browser voice was used — "unreachable" / "draining" / "failed". The
+// vocabulary now belongs to the engine seam (lib/engineSeam), because deciding
+// which of the three happened is the ENGINE's knowledge; deciding to speak the
+// line in a browser voice anyway is the PLAYGROUND's policy, and that policy
+// still lives here. Re-exported so every existing importer of "./engine" is
+// unchanged.
+export { EngineBusyError, isAbort, type FallbackReason } from "@/lib/engineSeam";
 
 export type SpeakResult = {
   mode: "gravitone" | "browser";
@@ -141,19 +154,6 @@ export type SpeakResult = {
   fallbackDetail?: string;
 };
 
-/**
- * The backend refused with 429 backpressure (queue full). This is NOT a reason
- * to drop to the browser voice — the engine is up and will accept a retry — so
- * it is thrown distinctly instead of collapsing into the fallback path.
- */
-/** True for a cancel triggered through an AbortSignal (fetch rejects with a
- *  DOMException named "AbortError"; jsdom/node shapes vary, so check both). */
-export function isAbort(e: unknown): boolean {
-  return e instanceof DOMException
-    ? e.name === "AbortError"
-    : (e as { name?: string } | null)?.name === "AbortError";
-}
-
 /** The browser-speech take, tagged with WHY we fell back to it. */
 function browserFallback(plain: string, reason: FallbackReason, detail?: string): SpeakResult {
   const seconds = Math.max(1.5, Math.round(plain.length * 0.055 * 10) / 10);
@@ -166,115 +166,25 @@ function browserFallback(plain: string, reason: FallbackReason, detail?: string)
   };
 }
 
-export class EngineBusyError extends Error {
-  readonly retryAfterSec: number;
-  constructor(retryAfterSec: number) {
-    super("engine busy — retry in a moment");
-    this.name = "EngineBusyError";
-    this.retryAfterSec = retryAfterSec;
-  }
-}
-
-/** Parse a Retry-After header (delta-seconds form) into a number, default 1. */
-function parseRetryAfter(header: string | null): number {
-  const n = Number(header);
-  return Number.isFinite(n) && n > 0 ? Math.ceil(n) : 1;
-}
-
-/** Split an X-Ignored-Settings CSV header into its setting names. */
-function decodeIgnored(header: string | null): string[] {
-  if (!header) return [];
-  return header.split(",").map((s) => s.trim()).filter(Boolean);
-}
-
-function decodeSegments(header: string | null): Segment[] {
-  if (!header) return [];
-  try {
-    return JSON.parse(atob(header)) as Segment[];
-  } catch {
-    return [];
-  }
-}
-
 /**
- * Decode the X-Performance-Report header (base64 JSON, one entry per rendered
- * segment) into Segments carrying the speaking Character + source line index,
- * mirroring how X-Segments is decoded for solo takes.
- */
-function decodePerformanceReport(header: string | null): Segment[] {
-  if (!header) return [];
-  try {
-    const rows = JSON.parse(atob(header)) as Array<
-      Segment & { character_id?: string; line?: number }
-    >;
-    return rows.map((r) => ({
-      text: r.text, requested: r.requested, used: r.used, fallback: r.fallback,
-      voice_id: r.voice_id, seconds: r.seconds,
-      characterId: r.character_id, line: r.line,
-    }));
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Triage a non-OK synthesis response — the ONE place speak() and perform()
- * decide "fall back" vs "tell the user". Everything goes through the apiFetch
- * contract (`readDetail`/`throwDetail`) so the backend's user-showable `detail`
- * — request id included — survives instead of being replaced by a generic
- * sentence.
+ * Dress an engine's TakeAudio as a playground take.
  *
- * Throws (no browser take at all) for the two statuses the fallback would lie
- * about:
- *   429 — the engine is up and will accept a retry (EngineBusyError)
- *   404 — the Character is GONE. Speaking the line in a browser voice hid a
- *         roster that no longer matches the backend; the user must be told.
- * Everything else keeps the deliberate browser-voice fallback and returns the
- * reason + detail to report alongside it.
+ * The take ships with SYNTHETIC bars and the caller refines them (see
+ * refinePeaks) once it is on screen — decoding the whole WAV before returning
+ * delayed the take's APPEARANCE by a full main-thread decode for a decoration.
+ * Bars are the reason this wrapper exists at all: they are a screen's idea, not
+ * an engine's, so no engine is asked to invent them.
  */
-async function triageFailure(res: Response): Promise<{ reason: FallbackReason; detail?: string }> {
-  if (res.status === 429) {
-    throw new EngineBusyError(parseRetryAfter(res.headers.get("Retry-After")));
-  }
-  if (res.status === 404) {
-    await throwDetail(res, "that Character no longer exists on the backend");
-  }
-  const detail = await readDetail(res);
-  // A 503 is two different events: the studio's own proxy answers "backend
-  // unreachable" when it cannot reach the engine at all, while the engine
-  // itself answers 503 only while draining. Read them apart instead of
-  // reporting a dead backend as "restarting".
-  const unreachable = res.status === 503 && detail?.includes("unreachable");
+function takeFrom(audio: TakeAudio, seed: number): SpeakResult {
+  // The assignment of audio.segments into Segment[] is the compile-time proof
+  // that the seam's wire shape and the playground's Segment have not drifted.
+  const segments: Segment[] = audio.segments;
   return {
-    reason: res.status === 503 ? (unreachable ? "unreachable" : "draining") : "failed",
-    detail,
-  };
-}
-
-/** Build a gravitone SpeakResult from a successful audio response. */
-async function gravitoneResult(res: Response, segments: Segment[], seed: number,
-                                format: OutputFormat): Promise<SpeakResult> {
-  const blob = await res.blob();
-  const url = URL.createObjectURL(blob);
-  const hdrSec = Number(res.headers.get("X-Audio-Seconds"));
-  const hdrRtf = Number(res.headers.get("X-Realtime-Factor"));
-  const hdrSynth = Number(res.headers.get("X-Synth-Seconds"));
-  const hdrQueue = Number(res.headers.get("X-Queue-Seconds"));
-  // The take ships with synthetic bars and the caller refines them (see
-  // refinePeaks) once it is on screen. Decoding the whole WAV here delayed the
-  // take's APPEARANCE by a full main-thread decode for a decoration; the
-  // degrade-to-synthetic-bars path is now simply "the refinement never landed".
-  return {
-    mode: "gravitone", url, blob, peaks: waveHeights(seed, 56),
-    seconds: Math.round((hdrSec || 0) * 10) / 10,
-    kb: Math.round(blob.size / 1024),
-    rtf: hdrRtf || 0,
-    synthSeconds: Number.isFinite(hdrSynth) ? hdrSynth : 0,
-    queueSeconds: Number.isFinite(hdrQueue) ? hdrQueue : 0,
-    ignoredSettings: decodeIgnored(res.headers.get("X-Ignored-Settings")),
-    segments,
-    synthSegments: Math.max(0, Number(res.headers.get("X-Synth-Segments")) || 0),
-    format,
+    mode: "gravitone", url: audio.url, blob: audio.blob, peaks: waveHeights(seed, 56),
+    seconds: audio.seconds, kb: audio.kb, rtf: audio.rtf,
+    synthSeconds: audio.synthSeconds, queueSeconds: audio.queueSeconds,
+    ignoredSettings: audio.ignoredSettings, segments,
+    synthSegments: audio.synthSegments, format: audio.format,
   };
 }
 
@@ -284,46 +194,30 @@ async function gravitoneResult(res: Response, segments: Segment[], seed: number,
  * service/emotions.py::resolve); the per-segment report says what actually
  * happened. Falls back to browser speech (tags stripped) when synthesis fails;
  * 429 backpressure and a 404 unknown Character throw instead.
+ *
+ * The request itself is the engine's job now (lib/engineSeam). What stays here
+ * is the DECISION to speak the line in a browser voice anyway — a playground
+ * policy that no engine should be allowed to make on the studio's behalf.
  */
 export async function speak(text: string, characterId: string, expr: Expression,
                             signal?: AbortSignal,
                             format: OutputFormat = DEFAULT_OUTPUT_FORMAT): Promise<SpeakResult> {
   const trimmed = text.trim();
-  let res: Response | null = null;
-  let reason: FallbackReason = "unreachable";
-  let detail: string | undefined;
   try {
-    res = await fetch(`/api/speak?output_format=${encodeURIComponent(format)}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        character_id: characterId,
-        text: trimmed,
-        voice_settings: { temperature: expr.temperature, stability: expr.stability, quality: expr.quality },
-      }),
-      signal,
+    const audio = await getEngine().synthesize({
+      kind: "solo", text: trimmed, characterId, settings: expr, format, signal,
     });
+    return takeFrom(audio, trimmed.length * 31 + 7);
   } catch (e) {
-    // A user-initiated cancel is NOT a backend failure — propagate it so the
-    // caller can just drop the request instead of fabricating a browser take.
-    if (isAbort(e)) throw e;
-    // Network / proxy-unreachable — the engine is genuinely out of reach, so
-    // the browser voice is the honest fallback (handled below).
-    res = null;
-  }
-
-  if (res) {
-    if (res.ok) {
-      return gravitoneResult(res, decodeSegments(res.headers.get("X-Segments")),
-                             trimmed.length * 31 + 7, format);
+    // Backpressure (429), a gone Character (404) and a user cancel all throw
+    // past this point; only a degradable failure earns the browser voice, and
+    // it carries WHAT the backend said so the user gets more than "something
+    // went wrong".
+    if (e instanceof EngineDegraded) {
+      return browserFallback(stripTags(trimmed), e.reason, e.detail);
     }
-    // Backpressure (429) and a gone Character (404) throw out of here; anything
-    // else still falls back to the browser voice, carrying WHAT the backend
-    // said so the user gets more than "something went wrong".
-    ({ reason, detail } = await triageFailure(res));
+    throw e;
   }
-
-  return browserFallback(stripTags(trimmed), reason, detail);
 }
 
 /**
@@ -332,41 +226,127 @@ export async function speak(text: string, characterId: string, expr: Expression,
  * character and per emotion. Returns a single concatenated take whose segments
  * carry who spoke what. Falls back to browser speech (whole script, tags
  * stripped) when synthesis fails; 429 backpressure and a 404 unknown Character
- * throw distinctly (see triageFailure).
+ * throw distinctly (see lib/engineSeam).
  */
 export async function perform(lines: PerfLine[], expr: Expression,
                               signal?: AbortSignal,
                               format: OutputFormat = DEFAULT_OUTPUT_FORMAT): Promise<SpeakResult> {
-  const body = {
-    lines: lines.map((l) => ({
-      character_id: l.character_id,
-      text: l.text.trim(),
-      voice_settings: { temperature: expr.temperature, stability: expr.stability, quality: expr.quality },
-    })),
-  };
-  let res: Response | null = null;
-  let reason: FallbackReason = "unreachable";
-  let detail: string | undefined;
   try {
-    res = await fetch(`/api/performance?output_format=${encodeURIComponent(format)}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal,
+    const audio = await getEngine().synthesize({
+      kind: "performance", lines, settings: expr, format, signal,
     });
+    return takeFrom(audio, lines.reduce((n, l) => n + l.text.length, 0) * 31 + 7);
   } catch (e) {
-    if (isAbort(e)) throw e;  // user cancelled — not a backend failure
-    res = null;
-  }
-
-  if (res) {
-    if (res.ok) {
-      const seed = lines.reduce((n, l) => n + l.text.length, 0) * 31 + 7;
-      return gravitoneResult(res, decodePerformanceReport(res.headers.get("X-Performance-Report")),
-                             seed, format);
+    if (e instanceof EngineDegraded) {
+      return browserFallback(stripTags(lines.map((l) => l.text).join(" ")), e.reason, e.detail);
     }
-    ({ reason, detail } = await triageFailure(res));
+    throw e;
   }
+}
 
-  return browserFallback(stripTags(lines.map((l) => l.text).join(" ")), reason, detail);
+// ── the splice kernel ───────────────────────────────────────────────────────
+
+export type SpliceInput = {
+  /** The take being punched. Must carry its audio blob (every gravitone take
+   *  does, restored ones included). */
+  base: Take;
+  /** Which segment of `base.segments` the fragment replaces. */
+  regionIndex: number;
+  /** The re-rendered region, in whatever format it was rendered as. */
+  fragment: Blob;
+  /** The fragment's own per-segment report (X-Segments). May be empty. */
+  fragmentSegments: Segment[];
+};
+
+export type SpliceResult = {
+  /** The new master. ALWAYS wav: a spliced mp3 would mean re-encoding a lossy
+   *  file every time a word is fixed, and the studio's lossless format is what
+   *  the share/review paths accept. */
+  blob: Blob;
+  /** Decoded duration of the result — the truth, not a sum of reports. */
+  seconds: number;
+  peaks: number[];
+  segments: Segment[];
+  /** Where the patched region now sits, so the caller can play just the edit. */
+  start: number;
+  end: number;
+};
+
+/**
+ * Replace one segment's audio with a re-rendered fragment.
+ *
+ * Boundaries come from `segmentRegions`, which snaps them to segment edges —
+ * exactly where the engine already cut — and the seams get a short crossfade
+ * (lib/wavEncode) so a splice does not click.
+ *
+ * Returns null on ANY failure, the same degrade as refinePeaks: a browser that
+ * cannot decode the take, a fragment that will not decode, a context that was
+ * never granted. The caller keeps the original take and offers a full
+ * re-render, which is always the escape hatch. Losing the user's take to fix
+ * one word would be the worst possible trade.
+ */
+export async function spliceRegion(input: SpliceInput): Promise<SpliceResult | null> {
+  const { base, regionIndex, fragment, fragmentSegments } = input;
+  if (!base.blob || regionIndex < 0 || regionIndex >= base.segments.length) return null;
+  try {
+    const [basePcm, fragPcm] = await Promise.all([decodePcm(base.blob), decodePcm(fragment)]);
+    const duration = pcmDuration(basePcm);
+    const regions = segmentRegions(base.segments, duration);
+    const region = regions[regionIndex];
+    if (!region) return null;
+
+    const head = slicePcm(basePcm, 0, region.start);
+    const tail = slicePcm(basePcm, region.end, duration);
+    const out = crossfadeConcat([head, fragPcm, tail]);
+    const fragSeconds = pcmDuration(fragPcm);
+
+    // The replaced segment's Character and source line survive the patch — a
+    // punched performance take must stay attributable line by line.
+    const carrier = base.segments[regionIndex];
+    const replacement: Segment[] = (fragmentSegments.length > 0
+      ? scaleSegmentSeconds(fragmentSegments, fragSeconds)
+      : [{ ...carrier, seconds: Math.round(fragSeconds * 100) / 100 }]
+    ).map((s) => ({ ...s, characterId: s.characterId ?? carrier.characterId, line: s.line ?? carrier.line }));
+    const segments = [...base.segments];
+    segments.splice(regionIndex, 1, ...replacement);
+
+    return {
+      blob: encodeWav(out),
+      seconds: Math.round(pcmDuration(out) * 10) / 10,
+      peaks: peaksFromPcm(out),
+      segments,
+      start: pcmDuration(head),
+      end: pcmDuration(head) + fragSeconds,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// ── word timestamps (the studio's own ears) ─────────────────────────────────
+
+export type WordStamp = { text: string; start: number; end: number };
+
+/**
+ * Word timings for a take, through the local ASR (`/api/stt` → the service's
+ * `/v1/speech-to-text`). Used to narrow a punch-in from a whole segment to the
+ * smallest re-renderable span.
+ *
+ * The route answers 503 with the install hint when faster-whisper weights are
+ * absent, which is a legitimate state on a fresh box — the caller reports it and
+ * keeps offering segment-level punch-in.
+ */
+export async function transcribeWords(blob: Blob, format?: OutputFormat,
+                                      signal?: AbortSignal): Promise<{ text: string; words: WordStamp[] }> {
+  const fd = new FormData();
+  fd.append("file", blob, `take.${formatMeta(format).ext}`);
+  fd.append("timestamps_granularity", "word");
+  const j = await apiJson<{ text?: string; words?: Array<{ text?: string; start?: number; end?: number }> }>(
+    "/api/stt", { method: "POST", body: fd, signal }, "could not transcribe this take");
+  return {
+    text: j.text ?? "",
+    words: (j.words ?? [])
+      .filter((w) => typeof w.start === "number" && typeof w.end === "number" && !!w.text)
+      .map((w) => ({ text: String(w.text), start: w.start as number, end: w.end as number })),
+  };
 }

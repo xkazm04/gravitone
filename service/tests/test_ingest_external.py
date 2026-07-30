@@ -434,7 +434,10 @@ class LabelPhaseSpendTests(unittest.TestCase):
                                             partial=partials.append)
         kinds = sorted(str(s["failure"]) for s in res["segments"])
         self.assertEqual(kinds, ["None", "None", "classify", "extract"])
-        last = partials[-1]
+        # The LAST LABELLING partial — the phase also publishes a fidelity-only
+        # partial after labelling (see ingest.measure_segments), and job partials
+        # are merged (ingest_api._partial), not replaced.
+        last = [p for p in partials if "extract_errors" in p][-1]
         self.assertEqual(last["extract_errors"], 1)
         self.assertEqual(last["classify_errors"], 1)
         self.assertEqual(last["label_errors"], 2)        # the total the UI shows

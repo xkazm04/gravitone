@@ -7,7 +7,7 @@ import { Eyebrow } from "@/components/ui/Primitives";
 import { EMOTION_IDS } from "@/lib/emotions";
 import { CONSENT_PROMPT } from "@/lib/voiceVault";
 import { useMounted } from "@/lib/useMounted";
-import { useCharacter } from "@/app/voices/_data/characters";
+import { useCharacter, defectDirection } from "@/app/voices/_data/characters";
 import EmotionRack from "./_variants/EmotionRack";
 import GuidedRecorder from "./_variants/GuidedRecorder";
 import ApiPanel from "./_variants/ApiPanel";
@@ -16,7 +16,7 @@ import ApiPanel from "./_variants/ApiPanel";
 export default function CharacterVoices({ characterId }: { characterId: string }) {
   const { character, slots, coverage, total, loading, error, notFound, busySlot, vaultWarning,
           removingVoiceId, addVoice, removeVoice, addCustomEmotion, removeCustomEmotion,
-          refresh } = useCharacter(characterId);
+          deriveVoice, refresh } = useCharacter(characterId);
   const [recording, setRecording] = useState<string | null>(null);
   const [retrying, setRetrying] = useState(false);
   const mounted = useMounted();
@@ -146,6 +146,7 @@ export default function CharacterVoices({ characterId }: { characterId: string }
           busySlot={busySlot} addVoice={addVoiceWithConsent} removeVoice={removeVoice}
           removingVoiceId={removingVoiceId} onRecord={setRecording}
           addCustomEmotion={addCustomEmotion} removeCustomEmotion={removeCustomEmotion}
+          deriveVoice={deriveVoice}
         />
       </div>
 
@@ -154,6 +155,13 @@ export default function CharacterVoices({ characterId }: { characterId: string }
         characterName={character.name}
         scale={slots.map((s) => s.emotion)}
         filledEmotions={slots.filter((s) => s.voice).map((s) => s.emotion)}
+        // When the session was opened over an ALREADY RECORDED slot, it is a
+        // re-record — carry the measured defect into the recorder so the fix is
+        // in front of the user while they record, not two clicks behind them.
+        // Derived here (the slots are already assembled) rather than plumbed
+        // through the rack's onRecord signature.
+        defect={defectDirection(
+          slots.find((s) => s.emotion === recording)?.voice?.fidelity)}
         onClone={cloneForRecorder}
         onClose={() => setRecording(null)}
         onSwitch={setRecording}

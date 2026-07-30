@@ -1,6 +1,8 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
-import { EngineBusyError, isAbort, perform, refinePeaks, speak, uploadTake } from "./engine";
-import { DEFAULT_EXPRESSION, type Take } from "./shared";
+import {
+  EngineBusyError, isAbort, perform, refinePeaks, speak, spliceRegion, transcribeWords, uploadTake,
+} from "./engine";
+import { DEFAULT_EXPRESSION, type Segment, type Take } from "./shared";
 
 const EXPR = DEFAULT_EXPRESSION;
 
@@ -244,5 +246,185 @@ describe("output format", () => {
     })));
     stubObjectUrl();
     expect((await speak("hi", "sarah", EXPR)).synthSegments).toBe(6);
+  });
+});
+
+// ── the splice kernel ────────────────────────────────────────────────────────
+// jsdom has no AudioContext at all, so the ONE browser dependency here
+// (decodeAudioData) is faked: it returns the buffer matching the blob's marker
+// byte, which keeps base-vs-fragment deterministic whatever order the two
+// decodes settle in. The context is a single object because engine.ts caches one
+// for the page's lifetime — the fake has to behave the same way.
+
+const RATE = 8000;
+
+class FakeBuffer {
+  constructor(readonly chans: Float32Array[], readonly sampleRate: number) {}
+  get numberOfChannels() { return this.chans.length; }
+  get length() { return this.chans[0].length; }
+  get duration() { return this.length / this.sampleRate; }
+  getChannelData(i: number) { return this.chans[i]; }
+}
+
+let decodeTable: Record<number, FakeBuffer | "fail"> = {};
+const fakeCtx = {
+  state: "running" as AudioContextState,
+  resume: () => Promise.resolve(),
+  async decodeAudioData(buf: ArrayBuffer) {
+    const found = decodeTable[new Uint8Array(buf)[0]];
+    if (!found || found === "fail") throw new Error("could not decode");
+    return found as unknown as AudioBuffer;
+  },
+};
+
+/** A blob whose first byte says which fake buffer it decodes to. */
+function marked(mark: number): Blob {
+  return new Blob([new Uint8Array([mark, 0, 0, 0])]);
+}
+
+function fakeAudio(table: Record<number, FakeBuffer | "fail">) {
+  decodeTable = table;
+  vi.stubGlobal("AudioContext", function AC() { return fakeCtx; } as unknown as typeof AudioContext);
+}
+
+describe("spliceRegion", () => {
+  const seg = (text: string, seconds: number, over: Partial<Segment> = {}): Segment => ({
+    text, requested: "baseline", used: "baseline", fallback: false,
+    voice_id: "v1", seconds, ...over,
+  });
+
+  const base = (over: Partial<Take> = {}): Take => ({
+    id: "take-base", text: "one two three", characterId: "sarah", characterName: "Sarah",
+    mode: "gravitone", url: "blob:base", blob: marked(1),
+    peaks: [], seconds: 3, kb: 10, rtf: 1, synthSeconds: 1, queueSeconds: 0,
+    ignoredSettings: [], segments: [seg("one", 1), seg("two", 1), seg("three", 1)],
+    expr: EXPR, createdAt: 1, ...over,
+  });
+
+  const threeSeconds = () => new FakeBuffer([new Float32Array(3 * RATE).fill(0.5)], RATE);
+  const twoSeconds = () => new FakeBuffer([new Float32Array(2 * RATE).fill(0.9)], RATE);
+
+  it("replaces the middle region and masters a longer wav", async () => {
+    fakeAudio({ 1: threeSeconds(), 2: twoSeconds() });
+    const r = await spliceRegion({
+      base: base(), regionIndex: 1, fragment: marked(2), fragmentSegments: [],
+    });
+    expect(r).not.toBeNull();
+    // 1s head + 2s fragment + 1s tail, minus two 12 ms crossfades.
+    expect(r!.seconds).toBeCloseTo(4, 1);
+    expect(r!.blob.type).toBe("audio/wav");
+    expect(r!.blob.size).toBeGreaterThan(44);
+    expect(r!.peaks).toHaveLength(56);
+    // The patched region's own bounds, so the caller can play just the edit.
+    expect(r!.start).toBeCloseTo(1, 2);
+    expect(r!.end).toBeCloseTo(3, 2);
+  });
+
+  it("uses the DECODED duration as truth, not the take's header seconds", async () => {
+    // The header claims 30s; the samples say 3. A splice that trusted the header
+    // would cut its boundaries a factor of ten out.
+    fakeAudio({ 1: threeSeconds(), 2: twoSeconds() });
+    const r = await spliceRegion({
+      base: base({ seconds: 30 }), regionIndex: 0, fragment: marked(2), fragmentSegments: [],
+    });
+    expect(r!.seconds).toBeCloseTo(4, 1);
+    expect(r!.start).toBe(0);
+  });
+
+  it("patches the segment report with the fragment's real length", async () => {
+    fakeAudio({ 1: threeSeconds(), 2: twoSeconds() });
+    const r = await spliceRegion({
+      base: base(), regionIndex: 1, fragment: marked(2), fragmentSegments: [],
+    });
+    expect(r!.segments).toHaveLength(3);
+    expect(r!.segments[1].seconds).toBeCloseTo(2, 2);
+    expect(r!.segments.map((s) => s.text)).toEqual(["one", "two", "three"]);
+  });
+
+  it("splices a MULTI-segment fragment in, re-based onto its decoded length", async () => {
+    fakeAudio({ 1: threeSeconds(), 2: twoSeconds() });
+    const r = await spliceRegion({
+      base: base(), regionIndex: 1, fragment: marked(2),
+      fragmentSegments: [seg("two", 1, { used: "sad" }), seg("again", 3, { used: "sad" })],
+    });
+    expect(r!.segments.map((s) => s.text)).toEqual(["one", "two", "again", "three"]);
+    // Reported 1 + 3, decoded 2 → 0.5 + 1.5.
+    expect(r!.segments[1].seconds + r!.segments[2].seconds).toBeCloseTo(2, 2);
+  });
+
+  it("keeps the replaced segment's Character and source line", async () => {
+    // A punched performance take must stay attributable line by line.
+    fakeAudio({ 1: threeSeconds(), 2: twoSeconds() });
+    const perf = base({
+      segments: [
+        seg("one", 1, { characterId: "sarah", line: 0 }),
+        seg("two", 1, { characterId: "bo", line: 1 }),
+        seg("three", 1, { characterId: "sarah", line: 2 }),
+      ],
+    });
+    const r = await spliceRegion({
+      base: perf, regionIndex: 1, fragment: marked(2), fragmentSegments: [seg("two", 1)],
+    });
+    expect(r!.segments[1].characterId).toBe("bo");
+    expect(r!.segments[1].line).toBe(1);
+  });
+
+  it("degrades to null when the take will not decode — never costs the take", async () => {
+    // The refinePeaks contract: a decode hiccup leaves the user's take exactly
+    // where it was, and the console offers a full re-render instead.
+    fakeAudio({ 1: "fail", 2: twoSeconds() });
+    expect(await spliceRegion({
+      base: base(), regionIndex: 1, fragment: marked(2), fragmentSegments: [],
+    })).toBeNull();
+  });
+
+  it("degrades to null when the FRAGMENT will not decode", async () => {
+    fakeAudio({ 1: threeSeconds(), 2: "fail" });
+    expect(await spliceRegion({
+      base: base(), regionIndex: 1, fragment: marked(2), fragmentSegments: [],
+    })).toBeNull();
+  });
+
+  it("refuses a take with no audio, and a region that does not exist", async () => {
+    fakeAudio({ 1: threeSeconds(), 2: twoSeconds() });
+    expect(await spliceRegion({
+      base: base({ blob: undefined }), regionIndex: 0, fragment: marked(2), fragmentSegments: [],
+    })).toBeNull();
+    expect(await spliceRegion({
+      base: base(), regionIndex: 9, fragment: marked(2), fragmentSegments: [],
+    })).toBeNull();
+  });
+});
+
+describe("transcribeWords", () => {
+  it("posts the take to /api/stt and keeps only usable word timings", async () => {
+    const f = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      text: "one two",
+      words: [
+        { text: "one", start: 0, end: 0.4, type: "word" },
+        { text: "two", start: 0.4, end: 0.9 },
+        { text: "", start: 1, end: 2 },
+        { text: "broken" },
+      ],
+    }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    vi.stubGlobal("fetch", f);
+    const got = await transcribeWords(new Blob(["wav"]));
+    expect(f.mock.calls[0][0]).toBe("/api/stt");
+    expect(f.mock.calls[0][1]).toMatchObject({ method: "POST" });
+    expect(got.text).toBe("one two");
+    expect(got.words).toEqual([
+      { text: "one", start: 0, end: 0.4 },
+      { text: "two", start: 0.4, end: 0.9 },
+    ]);
+  });
+
+  it("throws the service's own answer when whisper is not installed", async () => {
+    // A 503 with the install hint is a legitimate state on a fresh box; the
+    // caller keeps offering segment-level punch-in.
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(
+      JSON.stringify({ detail: "local speech-to-text needs faster-whisper" }), { status: 503 })));
+    await expect(transcribeWords(new Blob(["wav"]))).rejects.toMatchObject({
+      message: "local speech-to-text needs faster-whisper",
+    });
   });
 });

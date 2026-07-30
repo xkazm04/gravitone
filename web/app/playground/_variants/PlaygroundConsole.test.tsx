@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import type { Character } from "@/app/voices/_data/characters";
-import { DEFAULT_EXPRESSION, TAKE_TIMING_VERSION, type Take } from "./shared";
+import { DEFAULT_EXPRESSION, TAKE_TIMING_VERSION, type Segment, type Take } from "./shared";
 import type { SpeakResult } from "./engine";
 
 // ── the harness ───────────────────────────────────────────────────────────────
@@ -375,6 +375,69 @@ describe("PlaygroundConsole — reuse loads a take back into the composer", () =
     // Each line keeps the Character that spoke it.
     expect((screen.getByLabelText("Character for line 1") as HTMLSelectElement).value).toBe("sarah");
     expect((screen.getByLabelText("Character for line 2") as HTMLSelectElement).value).toBe("bo");
+  });
+});
+
+// ── direction 3: the take log became editable ────────────────────────────────
+
+describe("PlaygroundConsole — punch-in is a drill-down, not a new card layout", () => {
+  const seg = (text: string, seconds: number): Segment => ({
+    text, requested: "baseline", used: "baseline", fallback: false,
+    voice_id: "v1", seconds,
+  });
+  const editable = (over: Partial<Take> = {}) => [take({
+    url: "blob:r", blob: new Blob(["wav"]), seconds: 2,
+    segments: [seg("one", 1), seg("two", 1)], ...over,
+  })];
+
+  it("keeps the card uncluttered until the timeline is asked for", async () => {
+    // The editor must not cost every take card its density: nothing about a take
+    // row changes until the user opens it.
+    await mountConsole({ restored: editable() });
+    expect(screen.queryByRole("button", { name: /Segment 1 of 2/ })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /timeline/ }));
+    expect(screen.getByRole("button", { name: /Segment 1 of 2/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Segment 2 of 2/ })).toBeInTheDocument();
+    // …and it collapses again.
+    fireEvent.click(screen.getByRole("button", { name: /timeline/ }));
+    expect(screen.queryByRole("button", { name: /Segment 1 of 2/ })).toBeNull();
+  });
+
+  it("offers a retake of the clicked region, prefilled with what it says", async () => {
+    await mountConsole({ restored: editable() });
+    fireEvent.click(screen.getByRole("button", { name: /timeline/ }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Segment 2 of 2/ }));
+    });
+    const area = screen.getByLabelText("Text for segment 2") as HTMLTextAreaElement;
+    expect(area.value).toBe("two");
+    expect(screen.getByRole("button", { name: /render lane X/ })).toBeInTheDocument();
+  });
+
+  it("has no timeline to offer for a browser-fallback take", async () => {
+    // Nothing was synthesized, so there is no audio to seek and nothing to
+    // splice — the button says why instead of failing on the click.
+    await mountConsole({ restored: [take({ mode: "browser", url: undefined, blob: undefined })] });
+    expect(screen.getByRole("button", { name: /timeline/ })).toBeDisabled();
+  });
+
+  it("says a take is a splice, and names the take it came from", async () => {
+    await mountConsole({
+      restored: editable({
+        id: "take-spliced", edits: { v: 1, source: "take-base-7", regions: [{ i: 1, text: "two again" }] },
+      }),
+    });
+    expect(screen.getByText(/punched · segment 2 re-rendered and spliced/i)).toBeInTheDocument();
+    expect(screen.getByText(/base take-base-7/)).toBeInTheDocument();
+  });
+
+  it("restores a take written before the editor existed, with no provenance claimed", async () => {
+    // Takes are durable: the log reads records from builds that had no `edits`
+    // field. They must restore, play and export exactly as they did.
+    await mountConsole({ restored: editable({ text: "Older stored line." }) });
+    expect(screen.getByText("Older stored line.")).toBeInTheDocument();
+    expect(screen.queryByText(/punched ·/i)).toBeNull();
+    expect(screen.getByRole("button", { name: /timeline/ })).toBeEnabled();
   });
 });
 

@@ -33,7 +33,10 @@ export default function AppFrame({ children }: { children: React.ReactNode }) {
   const blocked = authResolved && !loading && !user; // redirecting
 
   return (
-    <div className="font-hanken relative min-h-screen overflow-hidden bg-[#080a10] text-slate-200 grain">
+    <div className="font-hanken relative min-h-screen overflow-hidden bg-[var(--gt-ink)] text-slate-200 grain">
+      {/* The aurora reads --gt-level / --gt-working (globals.css, filter only),
+          so the studio's atmosphere leans into whatever is actually playing or
+          rendering. Idle values are the identity filter — same frame as before. */}
       <div className="pointer-events-none absolute inset-0 aurora" />
       <div className="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-cyan-400/40 to-transparent" />
       <div className="relative mx-auto max-w-6xl px-6">

@@ -15,6 +15,24 @@ import { EMOTIONS, emotionMeta, isBaseEmotion } from "@/lib/emotions";
 import { useAuth } from "@/lib/useAuth";
 import { recordVoiceOwnership, type ConsentMethod } from "@/lib/voiceVault";
 
+/**
+ * What the studio MEASURED about the recording a Voice was cloned from.
+ *
+ * Absent (`undefined`) means **not measured** — every Voice cloned before the
+ * ledger existed, every built-in, and every clip whose audio could not be
+ * parsed. Nothing is rendered for it: no placeholder, no "not measured" noise, no
+ * zero. A zero would read as "this voice is bad", which is a claim nothing made.
+ *
+ * `identity` is cosine similarity to the speaker's own reference and is
+ * presented as **identity match**, never as "quality" — it says whether this
+ * still sounds like the same person, and nothing about whether the take is good.
+ */
+export type Fidelity = {
+  identity?: number;
+  speechSeconds?: number;
+  flags: string[];
+};
+
 /** One speaker in ONE emotion. */
 export type Voice = {
   voice_id: string;
@@ -28,7 +46,51 @@ export type Voice = {
   // True when a consent receipt is on file for this voice (ingest / attested
   // clone). Pre-consent and built-in voices report false.
   consent?: boolean;
+  // Measured signal facts, normalized off the wire by `readFidelity`. Optional
+  // on purpose — see the Fidelity docstring: absent renders as nothing.
+  fidelity?: Fidelity;
+  /**
+   * How this Voice came to exist. `"recorded"` — the default, and what every
+   * Voice that predates Emotion Algebra reports — means a human performed it.
+   * `"derived"` means the studio COMPUTED it from a baseline plus a shared
+   * emotion direction: a real embedding that makes a real sound, and not a
+   * performance anybody gave.
+   *
+   * **A derived Voice must never be rendered as recorded.** That is the whole
+   * trust contract of the feature, so the field is read here at the fetch
+   * boundary and anything unrecognised is treated as `"recorded"` — the honest
+   * failure mode is to under-claim the algebra, never to over-claim the human.
+   */
+  origin?: "recorded" | "derived";
+  /** Provenance for a derived Voice (donor, basis version, step). Absent for
+   *  recorded ones — absent, not an empty object. */
+  derived_from?: DerivedFrom;
 };
+
+/** Where a derived Voice's emotion came from. */
+export type DerivedFrom = {
+  source: "basis" | "donor";
+  /** The donor Character, or null when the roster-wide basis supplied it. */
+  donor?: string | null;
+  donor_name?: string | null;
+  donor_voice_id?: string | null;
+  contributors?: string[];
+  emotion?: string;
+  from_voice_id?: string;
+  basis_version?: number | null;
+  alpha?: number;
+  at?: string;
+};
+
+/** Who to credit for a derived slot, in the rack's own words. Null when the
+ *  Voice is a recording (there is nobody to credit — they performed it). */
+export function derivedDonorLabel(v: Voice | null | undefined): string | null {
+  if (!v || v.origin !== "derived") return null;
+  const d = v.derived_from;
+  if (d?.source === "donor") return d.donor_name || d.donor || "another character";
+  const n = d?.contributors?.length ?? 0;
+  return n > 0 ? `${n} voice${n === 1 ? "" : "s"}` : "the shared basis";
+}
 
 /** A group of Voices across the emotion scale. */
 export type Character = {
@@ -69,6 +131,155 @@ export type Slot = {
   demand: number; // unmet requests for this emotion (fallback telemetry)
 };
 
+// ── the fidelity ledger ───────────────────────────────────────────────────────
+//
+// The service reports named facts, not a score: flags that are TRUE, plus the
+// numbers behind them. This half of the module turns that wire object into the
+// one thing the UI shows — a single Signal chip stating the most actionable fact
+// — and into the recorder direction that fixes it.
+//
+// Deliberately NOT a 0-100: "clipped" and "1.4s speech" are things a user can
+// act on, where a 73 is a number they can only distrust. The numeric identity
+// match appears as a secondary detail, never as the headline.
+
+/** Flags in DESCENDING severity: the first one present is the one to show.
+ *  Order = how much of the clone it ruins, and how fixable it is by re-recording. */
+export const SIGNAL_FLAGS = ["clipped", "low_sample_rate", "noisy", "short_speech"] as const;
+
+type FlagCopy = {
+  /** The chip label. Prefers the measured number when there is one. */
+  label: (f: Fidelity) => string;
+  /** Why it matters — shown on hover/focus, never truncated into the chip. */
+  why: string;
+  /** What to do about it, addressed to someone about to record again. */
+  direction: string;
+};
+
+const FLAG_COPY: Record<string, FlagCopy> = {
+  clipped: {
+    label: () => "clipped",
+    why: "This recording hits the rail — the loudest parts are flat-topped, and that distortion is cloned into every line the voice speaks.",
+    direction: "clipped — move further from the mic, or lower the input gain, and record it again",
+  },
+  low_sample_rate: {
+    label: () => "low sample rate",
+    why: "The source audio was below 16 kHz (a phone call, a compressed export), so there is no high band for the model to clone.",
+    direction: "the source was low-bandwidth (below 16 kHz) — record straight into this page instead of uploading a compressed file",
+  },
+  noisy: {
+    label: () => "noisy",
+    why: "The background of this recording is loud — a fan, traffic, a live room. The model clones the room along with the voice.",
+    direction: "the background was loud — a fan, traffic, a live room; record somewhere quieter",
+  },
+  short_speech: {
+    label: (f) => (f.speechSeconds !== undefined ? `${f.speechSeconds}s speech` : "little speech"),
+    why: "Most of this clip is silence. Only the speech in it teaches the model anything.",
+    direction: "there was very little actual speech — aim for 10–30 seconds of talking, not of silence",
+  },
+};
+
+/** One measured fact, ready to render. `flag` is null for a clean measurement. */
+export type Signal = {
+  flag: string | null;
+  label: string;
+  title: string;
+  /** 0 = clean. Higher = worse, comparable across Voices (roster `weakest` sort). */
+  severity: number;
+};
+
+/**
+ * Read the service's fidelity object off the wire.
+ *
+ * The wire is snake_case and every field is independently nullable — a clip can
+ * report its sample rate and nothing else. Anything unrecognisable (a
+ * hand-edited registry, an older service) is treated as NOT MEASURED rather than
+ * partially believed, and an object with no facts in it at all comes back
+ * undefined so it renders as nothing.
+ */
+export function readFidelity(raw: unknown): Fidelity | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const o = raw as Record<string, unknown>;
+  const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
+  const flags = Array.isArray(o.flags)
+    ? o.flags.filter((f): f is string => typeof f === "string")
+    : [];
+  const f: Fidelity = {
+    identity: num(o.identity),
+    speechSeconds: num(o.speech_seconds),
+    flags,
+  };
+  if (f.identity === undefined && f.speechSeconds === undefined && flags.length === 0) {
+    return undefined; // nothing to say — say nothing
+  }
+  return f;
+}
+
+/** The one fact worth a chip, or null when there is nothing measured to state. */
+export function signalOf(fidelity?: Fidelity): Signal | null {
+  if (!fidelity) return null;
+  for (let i = 0; i < SIGNAL_FLAGS.length; i++) {
+    const flag = SIGNAL_FLAGS[i];
+    if (!fidelity.flags.includes(flag)) continue;
+    const copy = FLAG_COPY[flag];
+    return {
+      flag,
+      label: copy.label(fidelity),
+      title: copy.why,
+      severity: SIGNAL_FLAGS.length - i,
+    };
+  }
+  // An unknown flag from a newer service is still a real finding — name it
+  // verbatim rather than dropping it, and rank it below the ones we understand.
+  const unknown = fidelity.flags[0];
+  if (unknown) {
+    return { flag: unknown, label: unknown.replace(/_/g, " "), severity: 1,
+             title: `The service flagged “${unknown}” on this recording.` };
+  }
+  if (fidelity.identity !== undefined) {
+    return {
+      flag: null,
+      label: `identity ${fidelity.identity.toFixed(2)}`,
+      title: "Identity match: how closely this take still sounds like the same "
+        + "speaker (1.00 is identical). It says nothing about whether the take is good.",
+      severity: 0,
+    };
+  }
+  if (fidelity.speechSeconds !== undefined) {
+    return { flag: null, label: `${fidelity.speechSeconds}s speech`, severity: 0,
+             title: "Effective speech in the recording this voice was cloned from — "
+               + "silence excluded." };
+  }
+  return null;
+}
+
+/** What to tell someone re-recording this slot, or null if nothing is wrong. */
+export function defectDirection(fidelity?: Fidelity): string | null {
+  const signal = signalOf(fidelity);
+  if (!signal?.flag) return null;
+  return FLAG_COPY[signal.flag]?.direction ?? null;
+}
+
+/** This Character's weakest measured Voice — the one to re-record next.
+ *
+ *  Only FLAGGED voices count: a roster of clean takes has no weakest one, and
+ *  inventing a ranking over measurements that all came back fine would send the
+ *  user to re-record something that is not broken. Unmeasured voices are not
+ *  candidates either — absence is not a defect. */
+export function weakestVoice(c: Character): { voice: Voice; signal: Signal } | null {
+  let worst: { voice: Voice; signal: Signal } | null = null;
+  for (const voice of c.voices) {
+    const signal = signalOf(voice.fidelity);
+    if (!signal?.flag) continue;
+    if (!worst || signal.severity > worst.signal.severity) worst = { voice, signal };
+  }
+  return worst;
+}
+
+/** Sort weight for the roster's `weakest` column: 0 = nothing flagged. */
+export function weaknessOf(c: Character): number {
+  return weakestVoice(c)?.signal.severity ?? 0;
+}
+
 export function hueOf(id: string): number {
   let h = 0;
   for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) % 360;
@@ -101,6 +312,37 @@ export function relTime(iso?: string | null): string {
 // request that is IN FLIGHT AT THIS MOMENT, so every mount still sees server
 // truth, and any mutation detaches the in-flight request (invalidateRoster) so
 // a post-mutation refresh can never be served pre-mutation data.
+/**
+ * Map ONE character off the wire into the shape this app's types promise.
+ *
+ * The only translation is the fidelity object (snake_case, independently
+ * nullable fields — see `readFidelity`), and it happens HERE, at the single
+ * fetch boundary, so no component has to know what the service's JSON looks
+ * like and no two components can disagree about it.
+ */
+export function normalizeCharacter(c: Character): Character {
+  // A payload with no voices array has nothing to normalize, and inventing an
+  // empty one would turn "the response was partial" into "this Character has no
+  // voices" — the same absent-vs-zero mistake the ledger exists to avoid.
+  if (!c || !Array.isArray(c.voices)) return c;
+  return {
+    ...c,
+    voices: c.voices.map((v) => {
+      const fidelity = readFidelity((v as { fidelity?: unknown }).fidelity);
+      // Only the literal string counts as derived. An older service (no field),
+      // a hand-edited registry, a future third value — all read as a recording,
+      // because the UI's job is to refuse to present a computed slot as a
+      // performance, not to invent a state it cannot render.
+      const origin = v.origin === "derived" ? "derived" : "recorded";
+      return {
+        ...v, origin,
+        derived_from: origin === "derived" && v.derived_from ? v.derived_from : undefined,
+        fidelity: fidelity ?? undefined,
+      };
+    }),
+  };
+}
+
 type RosterReq = { promise: Promise<Character[]>; ctrl: AbortController; waiters: number };
 let current: RosterReq | null = null;
 
@@ -124,7 +366,8 @@ export function loadRoster(signal?: AbortSignal): Promise<Character[]> {
     req.promise = apiJson<Character[]>(
       "/api/characters", { cache: "no-store", signal: ctrl.signal },
       "failed to load characters",
-    ).finally(() => { if (current === req) current = null; });
+    ).then((cs) => cs.map(normalizeCharacter))
+      .finally(() => { if (current === req) current = null; });
     current = req;
   }
   const req = current;
@@ -171,7 +414,7 @@ async function fetchCharacter(id: string): Promise<Character | null> {
   const r = await fetch(`/api/characters/${encodeURIComponent(id)}`, { cache: "no-store" });
   if (r.status === 404) return null;
   if (!r.ok) return throwDetail(r, `error ${r.status}`);
-  return (await r.json()) as Character;
+  return normalizeCharacter((await r.json()) as Character);
 }
 
 /** Clone one Voice (character + emotion) from a recording. Throws on failure. */
@@ -191,7 +434,11 @@ export async function cloneVoice(
   const r = await fetch("/api/voices", { method: "POST", body: fd });
   if (!r.ok) return throwDetail(r, `clone failed (${r.status})`);
   invalidateRoster(); // the roster now has a voice (or a character) it didn't
-  return (await r.json()) as Voice;
+  const v = (await r.json()) as Voice;
+  // The clone response carries the measurement taken at clone time; normalize it
+  // through the SAME reader the roster uses so a caller can show the chip
+  // immediately instead of waiting for a re-read.
+  return { ...v, fidelity: readFidelity((v as { fidelity?: unknown }).fidelity) };
 }
 
 /** Delete a cloned Voice. Throws on failure (404 included — the slot is gone). */
@@ -230,6 +477,32 @@ export async function addCustomEmotionReq(id: string, name: string): Promise<voi
   });
   if (!r.ok) return throwDetail(r, `could not add "${name}"`);
   invalidateRoster();
+}
+
+/**
+ * Ask the studio to COMPUTE an emotion instead of recording it.
+ *
+ * `donorCharacterId` picks one speaker's own take as the direction; omitting it
+ * uses the roster-wide basis. The service refuses far more often than it
+ * succeeds (no basis built, the emotion does not transfer between speakers, this
+ * server cannot read embeddings at all) and every refusal is a sentence written
+ * to be shown — so the error is thrown with the backend's own detail intact and
+ * the rack renders it verbatim rather than replacing it with "derive failed".
+ */
+export async function deriveVoiceReq(
+  id: string, emotion: string, donorCharacterId?: string | null,
+): Promise<Voice> {
+  const r = await fetch(
+    `/api/characters/${encodeURIComponent(id)}/emotions/${encodeURIComponent(emotion)}/derive`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ donor_character_id: donorCharacterId ?? null }),
+    },
+  );
+  if (!r.ok) return throwDetail(r, `could not derive "${emotion}"`);
+  invalidateRoster();
+  return (await r.json()) as Voice;
 }
 
 export async function removeCustomEmotionReq(id: string, emotion: string): Promise<void> {
@@ -531,6 +804,23 @@ export function useCharacter(characterId: string) {
     await refresh();
   }, [characterId, refresh]);
 
+  /** Compute an empty slot instead of recording it (Emotion Algebra).
+   *
+   *  THROWS on refusal, deliberately: the reasons are per-slot and specific
+   *  ("no basis has been built", "angry does not transfer between speakers well
+   *  enough"), and the rack shows each one against the row it belongs to. The
+   *  hook's shared error banner would strip that placement away. */
+  const deriveVoice = useCallback(async (emotion: string, donor?: string | null) => {
+    setBusySlot(emotion);
+    try {
+      const v = await deriveVoiceReq(characterId, emotion, donor);
+      await refresh();
+      return v;
+    } finally {
+      if (mounted.current) setBusySlot(null);
+    }
+  }, [characterId, mounted, refresh]);
+
   /** Clone a new Voice into an empty emotion slot.
    *  `rethrow` lets callers with their own error UI (GuidedRecorder) get the
    *  failure instead of the hook's shared error banner. `consent` names how
@@ -603,7 +893,7 @@ export function useCharacter(characterId: string) {
 
   return { character, slots, coverage, total: slots.length, loading, error, notFound, busySlot,
            vaultWarning, removingVoiceId, addVoice, removeVoice, addCustomEmotion,
-           removeCustomEmotion, refresh };
+           removeCustomEmotion, deriveVoice, refresh };
 }
 
 // ── preview hook ────────────────────────────────────────────────────────────

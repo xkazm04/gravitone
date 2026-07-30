@@ -533,5 +533,342 @@ class SingleServerMetricsScrapeTests(unittest.TestCase):
         self.assertEqual(got, {"scope": lt.SCOPE_UNKNOWN, "counters": {}})
 
 
+# ---------------------------------------------------------------------------
+# SLO capacity contract — open-loop arrivals, breaker, SLO knee
+# ---------------------------------------------------------------------------
+class ArrivalModeTests(unittest.TestCase):
+    def test_closed_loop_stays_the_default(self) -> None:
+        # The concurrency ramp is what every existing script/CI invocation
+        # expects; open-loop must be opted into, never inherited.
+        self.assertEqual(lt.DEFAULT_ARRIVAL, "closed")
+        import argparse
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--arrival", choices=lt.ARRIVAL_MODES,
+                        default=lt.DEFAULT_ARRIVAL)
+        self.assertEqual(ap.parse_args([]).arrival, "closed")
+
+    def test_parse_rates(self) -> None:
+        self.assertEqual(lt.parse_rates("2,4,6.5"), [2.0, 4.0, 6.5])
+        self.assertEqual(lt.parse_rates("6, 2 ,2"), [2.0, 6.0])   # sorted, dedup
+        self.assertEqual(lt.parse_rates("0,-3"), [])              # positives only
+        self.assertEqual(lt.parse_rates(4), [4.0])
+
+    def test_corpus_description_names_the_generated_workload(self) -> None:
+        import argparse
+        closed = argparse.Namespace(arrival="closed", text="one sentence")
+        self.assertEqual(lt.corpus_description(closed), "one sentence")
+        openl = argparse.Namespace(arrival="poisson", text="one sentence",
+                                   corpus_profile="mixed", seed=7)
+        desc = lt.corpus_description(openl)
+        self.assertIn("mixed", desc)
+        self.assertIn("seed=7", desc)
+        self.assertIn("distinct body", desc)
+
+
+class AdmissionGateTests(unittest.TestCase):
+    """The breaker must refuse-and-count, never queue — and never melt the box."""
+
+    def test_refuses_past_the_ceiling_and_counts_refusals(self) -> None:
+        gate = lt.AdmissionGate(2)
+        self.assertTrue(gate.try_acquire())
+        self.assertTrue(gate.try_acquire())
+        self.assertFalse(gate.try_acquire())   # ceiling reached -> refused
+        self.assertFalse(gate.try_acquire())
+        self.assertEqual(gate.refused, 2)
+        self.assertEqual(gate.in_flight, 2)
+        self.assertEqual(gate.peak_in_flight, 2)
+
+    def test_release_frees_a_slot(self) -> None:
+        gate = lt.AdmissionGate(1)
+        self.assertTrue(gate.try_acquire())
+        self.assertFalse(gate.try_acquire())
+        gate.release()
+        self.assertTrue(gate.try_acquire())
+        self.assertEqual(gate.refused, 1)
+
+    def test_peak_is_remembered_after_release(self) -> None:
+        gate = lt.AdmissionGate(8)
+        for _ in range(5):
+            gate.try_acquire()
+        for _ in range(5):
+            gate.release()
+        self.assertEqual(gate.in_flight, 0)
+        self.assertEqual(gate.peak_in_flight, 5)
+
+    def test_zero_disables_the_breaker(self) -> None:
+        gate = lt.AdmissionGate(0)
+        for _ in range(200):
+            self.assertTrue(gate.try_acquire())
+        self.assertEqual(gate.refused, 0)
+
+
+class SloArithmeticTests(unittest.TestCase):
+    def test_violation_rate(self) -> None:
+        self.assertEqual(lt.violation_rate([0.5, 1.0, 3.0, 4.0], 2.0), 0.5)
+        self.assertEqual(lt.violation_rate([0.5, 1.0], 2.0), 0.0)
+        self.assertIsNone(lt.violation_rate([], 2.0))     # nothing succeeded
+        self.assertIsNone(lt.violation_rate([1.0], None))  # no SLO declared
+
+    def test_queue_wait_is_little_law_over_sampled_depth(self) -> None:
+        # depth p95 = 10 items, goodput 5/s -> ~2s of waiting
+        self.assertEqual(lt.queue_wait_p95_s([0, 2, 4, 10], 5.0), 2.0)
+        self.assertIsNone(lt.queue_wait_p95_s([], 5.0))
+        self.assertIsNone(lt.queue_wait_p95_s([3], 0))     # no goodput, no wait
+
+    def test_concurrent_users_is_rate_times_think_time(self) -> None:
+        self.assertEqual(lt.concurrent_users(7.4, 30.0), 222)
+        self.assertEqual(lt.concurrent_users(7.4, 5.0), 37)   # assumption drives it
+        self.assertIsNone(lt.concurrent_users(None, 30.0))
+        self.assertIsNone(lt.concurrent_users(4.0, 0))
+
+
+class SloPredicateTests(unittest.TestCase):
+    def _row(self, **kw):
+        base = {"offered_rate_rps": 4.0, "rejected_429": 0, "timeouts": 0,
+                "errors": 0, "lat_p95_s": 1.0, "slo_violation_rate": 0.0,
+                "cpu_mean_pct": 99.0, "server_rtf_mean": 0.4}
+        base.update(kw)
+        return base
+
+    def test_slo_replaces_the_relative_rules(self) -> None:
+        # CPU pinned and sub-realtime — the fallback rules would call this
+        # degraded, but the users are being served inside the promise.
+        row = self._row()
+        self.assertTrue(lt.level_degraded(row, 1.0, 2.0, 95.0))
+        self.assertFalse(lt.level_degraded(row, 1.0, 2.0, 95.0, slo_p95=2.0,
+                                           slo_violations_max=0.01))
+
+    def test_p95_over_the_slo_degrades(self) -> None:
+        row = self._row(lat_p95_s=2.5)
+        self.assertTrue(lt.level_degraded(row, None, 2.0, 95.0, slo_p95=2.0))
+
+    def test_violation_budget_is_enforced(self) -> None:
+        row = self._row(slo_violation_rate=0.05)
+        self.assertTrue(lt.level_degraded(row, None, 2.0, 95.0, slo_p95=2.0,
+                                          slo_violations_max=0.01))
+        self.assertFalse(lt.level_degraded(row, None, 2.0, 95.0, slo_p95=2.0,
+                                           slo_violations_max=0.10))
+
+    def test_a_level_with_no_successes_never_meets_an_slo(self) -> None:
+        row = self._row(lat_p95_s=None)
+        self.assertTrue(lt.level_degraded(row, None, 2.0, 95.0, slo_p95=2.0))
+
+    def test_breaker_refusals_degrade_the_level(self) -> None:
+        # The driver had to protect the box: the rate was NOT sustained.
+        row = self._row(refused_in_flight=3)
+        self.assertTrue(lt.level_degraded(row, None, 2.0, 95.0, slo_p95=2.0))
+        self.assertTrue(lt.level_degraded(row, 1.0, 2.0, 95.0))
+
+    def test_hard_failures_still_degrade_under_an_slo(self) -> None:
+        for bad in ("rejected_429", "timeouts", "errors"):
+            row = self._row(**{bad: 1})
+            self.assertTrue(lt.level_degraded(row, None, 2.0, 95.0, slo_p95=2.0),
+                            bad)
+
+
+class SloKneeTests(unittest.TestCase):
+    def _row(self, rate, p95, **kw):
+        row = {"offered_rate_rps": rate, "lat_p95_s": p95, "rejected_429": 0,
+               "timeouts": 0, "errors": 0, "slo_violation_rate": 0.0}
+        row.update(kw)
+        return row
+
+    def test_knee_is_the_highest_rate_meeting_the_slo(self) -> None:
+        rows = [self._row(2, 0.8), self._row(4, 1.2), self._row(6, 3.0)]
+        self.assertEqual(lt.slo_knee(rows, 2.0, 0.01), (4, 6))
+
+    def test_a_pass_above_a_failure_is_not_counted(self) -> None:
+        # Passing at 8 after failing at 6 is luck (or too short a run), not
+        # capacity: the contract stops at the first failure.
+        rows = [self._row(2, 0.8), self._row(6, 3.0), self._row(8, 1.0)]
+        sustained, first_fail = lt.slo_knee(rows, 2.0, 0.01)
+        self.assertEqual(sustained, 2)
+        self.assertEqual(first_fail, 6)
+
+    def test_no_rate_meets_the_slo(self) -> None:
+        rows = [self._row(2, 5.0), self._row(4, 6.0)]
+        self.assertEqual(lt.slo_knee(rows, 2.0, 0.01), (None, 2))
+
+    def test_recommended_cap_is_peak_in_flight_at_the_sustained_rate(self) -> None:
+        rows = [self._row(2, 0.8, peak_in_flight=3),
+                self._row(4, 1.2, peak_in_flight=9),
+                self._row(4, 1.3, peak_in_flight=11, soak=True)]
+        slo = {"max_rate_rps": 4}
+        self.assertEqual(lt.open_loop_recommended_cap(rows, slo), 9)
+        self.assertIsNone(lt.open_loop_recommended_cap(rows, {"max_rate_rps": None}))
+
+
+class OpenLoopRowTests(unittest.TestCase):
+    def _results(self, lats, **kw):
+        r = {"lat": list(lats), "ttfb": [], "rtf": [2.0] * len(lats),
+             "audio": [3.0] * len(lats), "rejected": 0, "errors": 0,
+             "timeouts": 0, "unsupported": 0, "cache_hits": 0}
+        r.update(kw)
+        return r
+
+    def test_row_reports_offered_goodput_violations_and_refusals(self) -> None:
+        row = lt.open_loop_row(
+            offered_rate=4.0, duration_s=10.0, scheduled=40, refused=4,
+            results=self._results([0.5] * 30 + [3.0] * 6), wall_s=10.0,
+            samples={"cpu": [50.0], "mem": [40.0]},
+            queue_depths=[0, 5, 10], slo_p95=2.0, slo_violations_max=0.01,
+            peak_in_flight=12)
+        self.assertEqual(row["arrival"], "poisson")
+        self.assertEqual(row["offered_rate_rps"], 4.0)
+        self.assertEqual(row["scheduled"], 40)
+        self.assertEqual(row["fired"], 36)
+        self.assertEqual(row["refused_in_flight"], 4)
+        self.assertEqual(row["ok"], 36)
+        self.assertEqual(row["goodput_req_s"], 3.6)
+        self.assertAlmostEqual(row["slo_violation_rate"], 6 / 36, places=3)
+        self.assertEqual(row["queue_depth_p95"], 10)
+        self.assertEqual(row["queue_wait_p95_s"], round(10 / 3.6, 4))
+        # concurrency is DISCOVERED here, not configured -- say so.
+        self.assertEqual(row["peak_in_flight"], 12)
+        self.assertEqual(row["concurrency"], 12)
+        self.assertEqual(row["cpu_mean_pct"], 50.0)
+        self.assertTrue(row["measures_synthesis"])
+
+    def test_row_is_judged_by_the_slo_predicate(self) -> None:
+        good = lt.open_loop_row(offered_rate=4.0, duration_s=10.0, scheduled=40,
+                                refused=0, results=self._results([0.5] * 40),
+                                wall_s=10.0, slo_p95=2.0)
+        self.assertFalse(lt.level_degraded(good, None, 2.0, 95.0, slo_p95=2.0,
+                                           slo_violations_max=0.01))
+        slow = lt.open_loop_row(offered_rate=8.0, duration_s=10.0, scheduled=80,
+                                refused=0, results=self._results([5.0] * 80),
+                                wall_s=10.0, slo_p95=2.0)
+        self.assertTrue(lt.level_degraded(slow, None, 2.0, 95.0, slo_p95=2.0,
+                                          slo_violations_max=0.01))
+
+    def test_low_confidence_still_applies(self) -> None:
+        row = lt.open_loop_row(offered_rate=0.5, duration_s=10.0, scheduled=5,
+                               refused=0, results=self._results([0.5] * 5),
+                               wall_s=10.0, slo_p95=2.0)
+        self.assertTrue(row["low_confidence"])
+
+
+class HonestyBlockTests(unittest.TestCase):
+    def test_workload_block_carries_the_idle_box_warning_and_breaker_state(self) -> None:
+        rows = [{"refused_in_flight": 0}, {"refused_in_flight": 5,
+                                           "driver_saturated": True}]
+        block = lt.workload_block(rates=[2, 4], duration_s=60.0, seed=1,
+                                  profile="typical", max_in_flight=64, rows=rows)
+        self.assertEqual(block["arrival"], "poisson")
+        self.assertEqual(block["refused_in_flight_total"], 5)
+        self.assertTrue(block["breaker_tripped"])
+        self.assertTrue(block["driver_saturated_any"])
+        self.assertTrue(block["corpus_distinct_bodies"])
+        self.assertIn("IDLE box", block["idle_box_warning"])
+        self.assertIn("cache", block["corpus_note"])
+
+    def test_slo_block_states_the_promise(self) -> None:
+        blk = lt.slo_block(slo_p95=2.0, violations_max=0.01, max_rate=7.4,
+                           first_fail=8.0, soak_minutes=30, soak_ok=True,
+                           think_time_s=30.0)
+        self.assertEqual(blk["max_rate_rps"], 7.4)
+        self.assertEqual(blk["concurrent_users"], 222)
+        self.assertIn("think_time_s", blk["concurrent_users_basis"])
+        self.assertFalse(blk["predicted"])
+
+    def test_a_failed_soak_withdraws_the_claim(self) -> None:
+        # Reachable for a minute is not sustainable for thirty.
+        blk = lt.slo_block(slo_p95=2.0, violations_max=0.01, max_rate=7.4,
+                           first_fail=8.0, soak_minutes=30, soak_ok=False)
+        self.assertIsNone(blk["max_rate_rps"])
+        self.assertIsNone(blk["concurrent_users"])
+        self.assertEqual(blk["candidate_rate_rps"], 7.4)
+        self.assertIn("not sustainable", blk["note"])
+
+    def test_no_rate_found_makes_no_promise(self) -> None:
+        blk = lt.slo_block(slo_p95=2.0, violations_max=0.01, max_rate=None,
+                           first_fail=2.0, soak_minutes=0, soak_ok=None)
+        self.assertIsNone(blk["max_rate_rps"])
+        self.assertIn("no offered rate met the SLO", blk["note"])
+
+
+class OpenLoopDriverTests(unittest.TestCase):
+    """The defining behaviour: arrivals do NOT wait for in-flight work.
+
+    Driven against a fake httpx client (no server, no sockets), because the
+    difference between open and closed loop is entirely in the driver.
+    """
+
+    class _Resp:
+        status_code = 200
+        headers = {"X-Realtime-Factor": "2.0", "X-Audio-Seconds": "3.0"}
+
+    class _FakeClient:
+        """Every request takes ``delay`` seconds, so a slow server is simulated."""
+
+        def __init__(self, delay=0.4, **kw):
+            self.delay = delay
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, *a, **k):
+            import asyncio
+            await asyncio.sleep(self.delay)
+            return OpenLoopDriverTests._Resp()
+
+    def _args(self, **kw):
+        import argparse
+        base = dict(url="http://x", voice="v", format="wav_24000", route="synth",
+                    cache_mode="bypass", server_pid=None, max_in_flight=64,
+                    corpus_profile="typical", slo_p95=2.0,
+                    slo_violations_max=0.01, text=lt.TEXT_DEFAULT)
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    def _run(self, args, rate, duration):
+        import asyncio
+        from unittest import mock
+        with mock.patch.object(lt.httpx, "AsyncClient", self._FakeClient):
+            return asyncio.run(lt.run_open_loop(args, rate, duration, seed=1))
+
+    def test_requests_overlap_because_arrivals_ignore_in_flight_work(self) -> None:
+        # 20 req/s of 0.4s-long requests: a closed loop would peak at 1 in
+        # flight; open loop must pile them up (that IS queueing appearing).
+        row = self._run(self._args(), rate_rps := 20.0, 1.0)
+        self.assertGreater(row["peak_in_flight"], 3)
+        self.assertEqual(row["refused_in_flight"], 0)
+        self.assertGreater(row["ok"], 5)
+        self.assertEqual(row["errors"], 0)
+        self.assertEqual(row["offered_rate_rps"], rate_rps)
+        self.assertIsNotNone(row["goodput_req_s"])
+
+    def test_max_in_flight_is_a_hard_refusal_not_a_wait(self) -> None:
+        row = self._run(self._args(max_in_flight=2), 20.0, 1.0)
+        self.assertLessEqual(row["peak_in_flight"], 2)
+        self.assertGreater(row["refused_in_flight"], 0)
+        # A level that needed the breaker did not sustain its offered rate.
+        self.assertTrue(lt.level_degraded(row, None, 2.0, 95.0, slo_p95=2.0))
+
+    def test_every_request_carries_its_own_body(self) -> None:
+        sent = []
+
+        class _Recording(OpenLoopDriverTests._FakeClient):
+            async def post(self, *a, **k):
+                sent.append(k["json"]["text"])
+                return await super().post(*a, **k)
+
+        import asyncio
+        from unittest import mock
+        with mock.patch.object(lt.httpx, "AsyncClient", _Recording):
+            asyncio.run(lt.run_open_loop(self._args(), 10.0, 1.0, seed=3))
+        self.assertGreater(len(sent), 3)
+        self.assertEqual(len(set(sent)), len(sent))   # cache defeated by design
+        self.assertNotIn(lt.TEXT_DEFAULT, sent)
+
+    def test_an_exhausted_corpus_refuses_instead_of_repeating(self) -> None:
+        # 'short' cannot supply thousands of distinct bodies: fail loudly.
+        row = self._run(self._args(corpus_profile="short"), 300.0, 5.0)
+        self.assertIsNone(row)
+
+
 if __name__ == "__main__":
     unittest.main()

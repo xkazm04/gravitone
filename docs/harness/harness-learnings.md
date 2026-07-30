@@ -37,3 +37,29 @@ Read this before the next Phase 4.1 to avoid re-discovering them.
 - **Ingest commit/GC lifecycle** (svc-ingest-pipeline #2/#3/#4): partial-commit orphans consent voices; GC deletes stems mid-review (age-not-idleness); empty-plan commit reports success. Deferred — need rollback/status design + Linux testing.
 - **keys.py event-loop caching** (svc-synthesis-api #1): every managed-key request does a sync file read+parse on the asyncio loop under a global lock. Fix = mtime-cached parse + `run_in_executor`; deferred to a perf pass (multi-process cache-coherency care needed).
 - **Deferred from earlier waves**: web privileged-write proxy auth model (firebase-admin session gate vs same-origin/CSRF); memory-only API secret (removes copy-later UX); the service-side consent finding for streaming errors swallowed (`app.py`). See `followups-2026-07-10.md` for the pre-campaign backlog.
+
+## Structural facts (moonshot campaign, 2026-07-30)
+- **2026-07-30** — Engine dispatch seam: `service/engines.py` is the capability registry + resolver; `convai._resolve_voice` is a re-export. New engines = adapter + `engine_conformance.py` pass.
+- **2026-07-30** — `service/app.py` synthesis core is `_render_tts` (shared by the drop-in and with-timestamps routes); request identity is `buildstore.speech_digest` under the DIGEST LAW (any identity-affecting change must bump a version component — golden digests pin it).
+- **2026-07-30** — Dialog brains emit `TurnPart` (a str subclass) — every legacy consumer works on plain strings; directives `[lang:]/[emotion:]/[end_call]` are stripped on the raw tail so no stream chunking can leak them.
+- **2026-07-30** — Web token system: `tokens.ts` → `<GravitoneTokens>` → `--gt-*` CSS vars; AudioBus writes live signal vars on ONE scoped node. `web/lib/serviceHeaders.ts` must mirror `app.py::CORS_EXPOSE_HEADERS` — its drift test caught new headers in 4 separate batches; adding a header in app.py is a TWO-file change.
+- **2026-07-30** — Registry rows now carry `fidelity`, `prosody`, `origin`("recorded"|"derived"), `derived_from`; `voices/_basis.safetensors` must stay excluded from the roster glob (phantom-Character hazard).
+- **2026-07-30** — Ingest job results carry per-segment `i`/`ok`/outlier + `casting` board + audition `recipes`; editing stems WITHDRAWS audition recipes (coherence invariant, tested).
+- **2026-07-30** — replicas.py children spawn via `--child` (admin thread + uvicorn); service imports must stay lazy child-only — an AST test pins top-level imports.
+
+## Conventions enforced (added 2026-07-30)
+- Parallel-builder batches: per-batch DESIGN doc with exact contracts + single-owner file matrix; hot files have ONE owner; cross-owner changes ship as exact patches applied by the orchestrator; builders never run git.
+- Ship-gate = full per-module unittest loop (subprocess per module) + full web tsc/vitest/next-build. A wave is never green on a subset.
+- Measured facts UX: named facts not scores; "identity match" never "quality"; absent renders nothing; advisory never blocking; refusals named verbatim.
+
+## Anti-patterns to avoid (added 2026-07-30)
+- Believing a builder's "green" without the orchestrator's own full loop (transient cross-file failures during parallel flight are normal; the FINAL loop is the truth).
+- Letting FastAPI auto-bind new function params on routed handlers — `fidelity_identity` became a spoofable query param; keyword-only + a schema-pinning test is the pattern.
+- Cache keyspace mixing: alignments live in a sibling ALIGN_CACHE, never inside SYNTH_CACHE (cache.py's stated law).
+
+## Open follow-ups (from moonshot campaign, 2026-07-30)
+- Firestore rules for speakers/** (batch3/REPORT-SIGN-OFF.md) — USER action, blocks real two-party consent.
+- Arm-box session: sealed image build + sealed.yml run + license review; emotion_residuals go/no-go; real loadtest→certify→plan→ledger cycle.
+- aws/run_benchmark.sh fetch step (perf-ledger matrix appends are inert without it, fail loudly).
+- Public re-perform + hero-demo shared per-IP rate limiter; /v1/narrate + narrate.js embed; gravitone.lock client; utterance fan-out; local browser engine (quarters); algebra autofill/blending/pack-origin travel.
+- PlaygroundConsole "keyed backend/unkeyed studio" test remains load-flaky (green standalone; predates campaign) — stabilization candidate.
