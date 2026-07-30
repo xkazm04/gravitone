@@ -4,8 +4,10 @@
   GET  /v1/ingest/{job}                     → { status, step, steps[], partial, speakers, result }
   GET  /v1/ingest/{job}/speaker-preview/{id}→ per-speaker sample wav
   POST /v1/ingest/{job}/speaker             { speaker_id }  [start label+stem for that speaker]
-  GET  /v1/ingest/{job}/preview/{emotion}   → stem wav
-  POST /v1/ingest/{job}/commit              { character, emotions[], character_id? } → voices
+  GET  /v1/ingest/{job}/preview/{emotion}   → stem wav (the SPEAKER's own audio)
+  POST /v1/ingest/{job}/audition            { emotion, text, recipe? } → wav (a CLONE)
+  POST /v1/ingest/{job}/commit              { character, emotions[], character_id?,
+                                              recipes? } → voices
 
 Status flow: running → awaiting_speaker → running → done. `partial` streams live
 intermediate data (word count, speakers, per-emotion tally) for a data-rich loader.
@@ -26,10 +28,23 @@ stem and both paths otherwise leave a partial Character behind. Phase failures
 reach the client through `errors.sanitize_detail`, never as raw tool output.
 
 Admission: `Settings.ingest_max_jobs` bounds how many jobs may be working at
-once; the phase-starting routes answer 429 above it.
+once; the phase-starting routes answer 429 above it. Auditions are admitted
+SEPARATELY (`_audition_slot`): they hold no job slot, because an audition is a
+read-only experiment on a finished scan and queueing one behind two long scans
+would make "hear it first" unavailable exactly when someone is deciding.
+
+Auditions (the Audition Room): `/preview/{emotion}` serves the SOURCE stem — the
+speaker's own spliced audio — and always has. `/audition` serves a CLONE of a
+candidate stem speaking a chosen line: a throwaway voice, exported and spoken in
+one child process, never registered in the roster, deleted before the response is
+written. Candidate stems come from `recipes`: 2-3 deterministic splices per
+emotion computed from the segment labels the scan already produced, so a user can
+compare "all of it" against "the longest takes" against "the cleanest signal"
+before anything irreversible happens. `commit` re-splices to the chosen recipe.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -38,14 +53,15 @@ import subprocess
 import threading
 import time
 import uuid
+import wave
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
-from service import errors, ingest, voices
+from service import errors, export_stems, ingest, voices
 from service.config import SETTINGS
 from service.emotions import normalize_emotion
 from service.errors import job_expired
@@ -95,6 +111,264 @@ MAX_ACTIVE_JOBS = SETTINGS.ingest_max_jobs
 # holds a slot is a whole scan or commit (minutes), so any precise-looking
 # number would be a guess dressed as an ETA. See `_admit`.
 ADMISSION_RETRY_AFTER_S = 5
+
+# ── auditions ─────────────────────────────────────────────────────────────────
+# How many auditions may be synthesizing at once, ACROSS jobs. Deliberately its
+# own budget rather than a job slot: an audition neither transcribes nor
+# registers anything, it is a finished scan being sampled, and the whole feature
+# is worthless if it is unavailable while somebody else's scan runs. It is still
+# bounded, because each one is a real CPU model load in a child process.
+MAX_ACTIVE_AUDITIONS = 2
+AUDITION_RETRY_AFTER_S = 8
+# One cold model load (~15s) plus one line of CPU synthesis. Generous, and a
+# timeout is REPORTED as a timeout (export_stems.audition names it).
+AUDITION_TIMEOUT_S = 240.0
+# The line a candidate speaks when the caller does not choose one. Short, plainly
+# declarative, and emotionally uncommitted, so the recipe is what differs between
+# two takes rather than the reading.
+DEFAULT_AUDITION_TEXT = "This is how I sound when I say something I mean."
+MAX_AUDITION_TEXT = 240
+_audition_lock = threading.Lock()
+_active_auditions = 0
+
+
+@contextlib.contextmanager
+def _audition_slot() -> Iterator[None]:
+    """Cheap admission for one audition. 429 (named, with Retry-After) when the
+    audition budget is full — never counted against, and never blocked by,
+    `MAX_ACTIVE_JOBS`. Released in a `finally`, so a failed synthesis cannot
+    strand the budget the way a leaked counter would."""
+    global _active_auditions
+    with _audition_lock:
+        if _active_auditions >= MAX_ACTIVE_AUDITIONS:
+            raise HTTPException(
+                429, f"{_active_auditions} audition(s) are already being "
+                     "synthesized on the CPU engine — try again in a moment",
+                headers={"Retry-After": str(AUDITION_RETRY_AFTER_S)})
+        _active_auditions += 1
+    try:
+        yield
+    finally:
+        with _audition_lock:
+            _active_auditions -= 1
+
+
+# ── recipes ───────────────────────────────────────────────────────────────────
+# A recipe is one DETERMINISTIC way to splice an emotion's segments into a stem.
+# The scan already knows each segment's emotion, confidence, duration and levels;
+# collapsing all of that into a single stem threw away every alternative reading
+# of the same recording. These are those alternatives, named:
+#
+#   full       every usable segment, recording order — what the ledger shows and
+#              what commit has always cloned. Always present, always the default.
+#   longest    the longest takes only — sustained phonation teaches a voice more
+#              than a pile of two-word fragments.
+#   confident  only the segments the classifier was most sure about — a stem with
+#              no mislabelled audio in it, at the cost of length.
+#   tightest   the best speech-to-noise-floor segments (`ingest.measure_levels`,
+#              the same measurement the sovereign path takes) — drops the noisy
+#              spans rather than the short ones.
+#
+# Determinism is a contract, not an accident: every ordering breaks ties on the
+# segment index, so the same job produces the same recipes on every rebuild, and
+# a test can assert the exact index sets.
+RECIPE_FULL = "full"
+RECIPE_ORDER = (RECIPE_FULL, "longest", "confident", "tightest")
+RECIPE_LABELS = {
+    RECIPE_FULL: ("everything", "every usable segment, in recording order"),
+    "longest": ("longest takes", "the longest segments only — more sustained speech"),
+    "confident": ("surest labels", "only the segments the classifier was most sure about"),
+    "tightest": ("cleanest signal", "the segments with the most speech above the noise floor"),
+}
+# 3 = the default plus two alternatives. Beyond that an A/B becomes a menu, and
+# the proposal's own risk note is decision fatigue on the critical path.
+MAX_RECIPES_PER_EMOTION = 3
+# How much audio a subset recipe aims for before it stops adding segments. The
+# floor is the backend's own clone minimum, so no alternative is offered that is
+# knowably too short to commit; above that a little headroom beats a bare pass.
+RECIPE_TARGET_SECONDS = 8.0
+# ...but never so much of what is available that every "subset" is the whole set.
+# A target at or above the emotion's total length makes each ordering select
+# everything, the variants collapse into `full`, and the drill-down silently
+# disappears on exactly the recordings it was built for (a 6s stem). The share is
+# therefore relative to what this emotion actually has.
+RECIPE_TARGET_SHARE = 0.7
+
+
+def _wav_seconds(path: Path) -> float:
+    try:
+        with wave.open(str(path), "rb") as w:
+            return round(w.getnframes() / w.getframerate(), 2)
+    except (OSError, wave.Error):
+        return 0.0
+
+
+def segment_rows(work_dir: Path, result: dict) -> tuple[list[dict], str | None]:
+    """The scan's per-segment labels re-joined to their extracted wavs.
+
+    `label_and_stem` reports segments in index order but publishes neither the
+    index nor the wav path, so the join is positional — and a positional join
+    that is wrong would silently splice the wrong audio into a recipe. It is
+    therefore VERIFIED: each row's labelled duration must match the wav on disk
+    (they are the same span, extracted by `to_wav`). A mismatch abandons recipes
+    entirely with a named reason rather than offering candidates built from
+    misattributed audio.
+
+    Returns (rows, reason-recipes-are-unavailable).
+    """
+    segs = result.get("segments")
+    if not isinstance(segs, list) or not segs:
+        return [], "no per-segment labels on this scan"
+    rows: list[dict] = []
+    for i, s in enumerate(segs):
+        wav = work_dir / f"seg_{i:03d}.wav"
+        if not wav.is_file():
+            # A segment that failed extraction has no audio and feeds no stem —
+            # exactly as the pipeline's own `usable` filter treats it.
+            if not s.get("failure"):
+                return [], "segment audio is missing for this scan"
+            continue
+        seconds = _wav_seconds(wav)
+        declared = float(s.get("dur") or 0.0)
+        if declared and abs(seconds - declared) > 0.35:
+            return [], "segment audio could not be matched to its labels"
+        if s.get("failure"):
+            continue
+        if s.get("outlier") == "dropped":
+            # The pipeline measured this segment as not the target speaker and
+            # removed it from every stem (ingest.label_and_stem). A recipe that
+            # re-introduced it would quietly undo that decision — and "the user
+            # picked it" is not consent to clone a bystander. "flagged" segments
+            # ARE in the stems, so they stay candidates.
+            continue
+        rows.append({"i": i, "wav": str(wav), "emotion": s.get("emotion"),
+                     "confidence": float(s.get("confidence") or 0.0),
+                     "seconds": seconds})
+    if not rows:
+        return [], "no usable segments on this scan"
+    return rows, None
+
+
+def _prefix_to_target(cands: list[dict], order: list[dict], target: float) -> list[dict]:
+    """Take segments in `order` until `target` seconds are covered, then return
+    them in RECORDING order. The selection is by merit; the splice is always
+    chronological, because `concat_wavs` level-matches and crossfades a sequence
+    and re-ordering utterances is the one thing that makes a stem sound assembled."""
+    picked: list[dict] = []
+    have = 0.0
+    for row in order:
+        if have >= target:
+            break
+        picked.append(row)
+        have += row["seconds"]
+    return sorted(picked, key=lambda r: r["i"])
+
+
+def _variants(cands: list[dict], target: float) -> list[tuple[str, list[dict]]]:
+    """Every candidate splice for one emotion, in offer order. A variant that
+    would be identical to one already offered is not offered — an A/B between two
+    identical takes is a fake choice, and this flow's whole problem was fake
+    information about audio."""
+    out: list[tuple[str, list[dict]]] = [(RECIPE_FULL, cands)]
+    if len(cands) >= 2:
+        out.append(("longest", _prefix_to_target(
+            cands, sorted(cands, key=lambda r: (-r["seconds"], r["i"])), target)))
+        confs = {r["confidence"] for r in cands}
+        if len(confs) > 1:
+            # All-equal confidence (sovereign mode labels everything 1.0) would
+            # make "surest labels" a lie dressed as a measurement.
+            out.append(("confident", _prefix_to_target(
+                cands, sorted(cands, key=lambda r: (-r["confidence"], r["i"])), target)))
+        snr: list[tuple[float, dict]] = []
+        for r in cands:
+            lv = ingest.measure_levels(Path(r["wav"]))
+            if lv.measured:
+                snr.append((lv.speech_db - lv.floor_db, r))
+        if len(snr) == len(cands) and len(cands) >= 3:
+            out.append(("tightest", _prefix_to_target(
+                cands, [r for _, r in sorted(snr, key=lambda t: (-t[0], t[1]["i"]))], target)))
+
+    seen: set[tuple[int, ...]] = set()
+    deduped: list[tuple[str, list[dict]]] = []
+    for kind, rows in out:
+        key = tuple(r["i"] for r in rows)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append((kind, rows))
+    return deduped[:MAX_RECIPES_PER_EMOTION]
+
+
+def build_recipes(work_dir: Path, result: dict) -> tuple[dict[str, dict[str, list[int]]], str | None]:
+    """Compute + splice the candidate stems for a finished scan, IN PLACE.
+
+    Grows every `result["stems"][*]` entry with `recipes: [{id, label, how,
+    seconds, segments, default}]` and writes one `stem_{emotion}__{id}.wav` per
+    non-default recipe (the default recipe IS `stem_{emotion}.wav`, already on
+    disk and already measured — it is never re-spliced, so the number the ledger
+    showed stays the number the ledger shows).
+
+    Returns (plan, reason) where `plan` is `{emotion: {recipe_id: [segment
+    indices]}}` — kept on the job and NEVER published: a client names a recipe by
+    id, so no caller can ever hand this service a segment selection of its own.
+    `reason` names a degraded outcome for the payload; recipes are advisory and
+    their absence must never fail a scan.
+    """
+    stems = result.get("stems")
+    if not isinstance(stems, list) or not stems:
+        return {}, "this scan produced no stems"
+    rows, reason = segment_rows(work_dir, result)
+    if reason:
+        return {}, reason
+
+    min_stem = float(result.get("min_stem") or ingest.MIN_STEM_SECONDS)
+    by_emotion: dict[str, list[dict]] = {}
+    for r in rows:
+        by_emotion.setdefault(r["emotion"], []).append(r)
+
+    plan: dict[str, dict[str, list[int]]] = {}
+    for stem in stems:
+        emo = stem.get("emotion")
+        if emo == ingest.BASELINE:
+            # The baseline stem is not "the neutral segments": plan_baseline may
+            # have topped it up from other emotions to clear the minimum, and it
+            # reports that. Recipes must start from the SAME material the shipped
+            # stem started from, or "everything" would mean something different
+            # here than it does one row above.
+            cands = list(ingest.plan_baseline(by_emotion, min_stem).labs)
+            for c in cands:
+                c.setdefault("seconds", _wav_seconds(Path(c["wav"])))
+        else:
+            cands = sorted(by_emotion.get(emo, []), key=lambda r: r["i"])
+        if len(cands) < 2:
+            continue   # one segment has exactly one splice; absent = invisible
+        total = sum(c["seconds"] for c in cands)
+        target = max(min_stem, min(RECIPE_TARGET_SECONDS, total * RECIPE_TARGET_SHARE))
+
+        offers: list[dict] = []
+        for kind, sel in _variants(cands, target):
+            label, how = RECIPE_LABELS[kind]
+            if kind == RECIPE_FULL:
+                seconds, segments = stem.get("seconds"), stem.get("segments")
+            else:
+                dst = work_dir / f"stem_{emo}__{kind}.wav"
+                try:
+                    sp = ingest.concat_wavs([Path(r["wav"]) for r in sel], dst)
+                except Exception as exc:  # noqa: BLE001 - one recipe, never the scan
+                    logger.warning("recipe %s/%s could not be spliced: %s", emo, kind, exc)
+                    continue
+                seconds, segments = sp.seconds, sp.segments
+            offers.append({"id": kind, "label": label, "how": how,
+                           "seconds": seconds, "segments": segments,
+                           "default": kind == RECIPE_FULL})
+            plan.setdefault(emo, {})[kind] = [r["i"] for r in sel]
+        if len(offers) > 1:
+            # A lone "everything" is not a choice worth rendering.
+            stem["recipes"] = offers
+        else:
+            plan.pop(emo, None)
+    return plan, None
+
 
 # One external-spend ledger per job, shared by its analyze and label phases so
 # the retry/escalation budgets are per JOB (the point of them) and the reported
@@ -326,6 +600,18 @@ def _gc_once() -> None:
             JOBS.pop(jid, None)
             _SPEND.pop(jid, None)
         live = {v["work_dir"] for v in JOBS.values()}
+    # Scratch audition artefacts inside a LIVE job's workdir. `export_stems
+    # .audition` removes its own scratch dir in a `finally`, so anything left
+    # here outlived a crash — log it rather than tidy up in silence.
+    for wd in live:
+        try:
+            leaked = export_stems.gc_scratch(wd)
+        except Exception as exc:  # noqa: BLE001 - the sweep must never break GC
+            logger.warning("audition scratch sweep failed for %s: %s", wd, exc)
+            continue
+        if leaked:
+            logger.warning("swept %d leaked audition scratch artefact(s) in %s: %s",
+                           len(leaked), wd, leaked)
     # orphan workdirs with no live job (e.g. left by a crash) age out too
     if WORK_ROOT.is_dir():
         for d in WORK_ROOT.iterdir():
@@ -432,9 +718,21 @@ def _label(job_id: str, target: str) -> None:
             partial=lambda d: _partial(job, d),
             mode=job["mode"],
             should_cancel=_canceller(job), spend=_spend_for(job_id))
+        # Candidate stems for the Audition Room. Advisory by construction: a
+        # failure here costs the user the drill-down, never the scan, and the
+        # reason is published rather than swallowed (`recipes.unavailable`).
+        plan: dict[str, dict[str, list[int]]] = {}
+        why: str | None = None
+        try:
+            plan, why = build_recipes(Path(job["work_dir"]), res)
+        except Exception as exc:  # noqa: BLE001 - never fail a scan over recipes
+            logger.warning("ingest job %s: recipes skipped: %s", job_id, exc)
+            why = "candidate stems could not be built for this scan"
         _update(job, result={"duration": job.get("duration", 0),
                              "speakers": [s["id"] for s in job.get("speakers", [])],
                              "mode": job["mode"], **res},
+                recipe_plan=plan,
+                recipes={"applied": {}, "skipped": [], "unavailable": why},
                 status="done")
     except ingest.Cancelled:
         logger.info("ingest job %s: labelling abandoned (cancelled)", job_id)
@@ -476,11 +774,63 @@ def _rollback(job_id: str, created: list[dict], why: str) -> None:
             job_id, why, ids, exc)
 
 
+def _apply_recipes(job: dict, emotions: list[str], chosen: dict[str, str]) -> None:
+    """Re-splice each chosen emotion's stem to the recipe the user auditioned.
+
+    `ingest.commit` clones `stem_{emotion}.wav`, so committing a choice means
+    making that file BE the chosen splice — the recipe wavs were written next to
+    it at scan time, so this is a copy, not a re-render, and the audition the user
+    heard is byte-identical to what gets cloned.
+
+    Every outcome is named on the job (`recipes.applied` / `recipes.skipped`): a
+    chosen recipe whose audio has since been swept, or which was never offered
+    for that emotion, must not silently clone the default and let the user
+    believe their pick shipped.
+    """
+    wd = Path(job["work_dir"])
+    plan = job.get("recipe_plan") or {}
+    applied: dict[str, str] = {}
+    skipped: list[dict] = []
+    for emo in emotions:
+        rid = chosen.get(emo)
+        if not rid or rid == RECIPE_FULL:
+            continue
+        if rid not in (plan.get(emo) or {}):
+            skipped.append({"emotion": emo, "recipe": rid,
+                            "why": "that recipe was not offered for this emotion"})
+            continue
+        src = wd / f"stem_{emo}__{rid}.wav"
+        dst = wd / f"stem_{emo}.wav"
+        try:
+            shutil.copyfile(src, dst)
+        except OSError as exc:
+            logger.warning("ingest job %s: recipe %s/%s not applied: %s",
+                           job.get("id"), emo, rid, exc)
+            skipped.append({"emotion": emo, "recipe": rid,
+                            "why": "the recipe audio is no longer available"})
+            continue
+        applied[emo] = rid
+    with _LOCK:
+        if job.get("cancel"):
+            return
+        cur = job.get("recipes") or {}
+        job["recipes"] = {"applied": applied, "skipped": skipped,
+                          "unavailable": cur.get("unavailable")}
+        _persist(job)
+
+
 def _do_commit(job_id: str, character: str, emotions: list[str], character_id: str | None,
-               statement: str) -> None:
+               statement: str, recipes: dict[str, str] | None = None) -> None:
     job = _get_job(job_id)
     if job is None:  # cancelled between Thread.start() and here
         return
+    if recipes:
+        # BEFORE the clone: the stems must be what the user chose by the time the
+        # exporter reads them.
+        try:
+            _apply_recipes(job, emotions, recipes)
+        except Exception as exc:  # noqa: BLE001 - a commit must not die over this
+            logger.warning("ingest job %s: recipe application failed: %s", job_id, exc)
     total = len(emotions)
     cancelled = _canceller(job)
 
@@ -551,7 +901,10 @@ def start_scan(file: UploadFile = File(...), mode: str = Form("auto")) -> dict:
         "note": None, "limits": None, "detection": None,
         "work_dir": str(work_dir), "created": time.time(),
         "clip_sha256": hashlib.sha256(data).hexdigest(), "cancel": False,
-        "committed": None}
+        "committed": None,
+        # Audition Room state: `recipes` is public (choices + named outcomes),
+        # `recipe_plan` is the server-side index map behind them.
+        "recipes": None, "recipe_plan": {}}
     with _LOCK:
         JOBS[job_id] = job
         _persist(job)
@@ -561,6 +914,11 @@ def start_scan(file: UploadFile = File(...), mode: str = Form("auto")) -> dict:
 
 _PUBLIC_KEYS = ("id", "status", "step", "steps", "partial", "speakers",
                 "duration", "result", "error", "mode", "committed",
+                # What happened to the user's recipe choices at commit, plus the
+                # reason candidate stems are absent when they are. `recipe_plan`
+                # (the segment indices behind each recipe) is deliberately NOT
+                # here: a client names a recipe, it never selects audio.
+                "recipes",
                 # What analyze learned about THIS recording. A key the job dict
                 # holds but this tuple omits is computed and then thrown away —
                 # that is exactly what happened to these three.
@@ -624,6 +982,83 @@ def choose_speaker(job_id: str, req: SpeakerReq) -> dict:
     return {"status": "running"}
 
 
+class AuditionReq(BaseModel):
+    emotion: str
+    text: str = ""
+    recipe: str | None = None
+
+
+@router.post("/{job_id}/audition")
+def audition(job_id: str, req: AuditionReq):
+    """Hear a candidate stem AS A VOICE, before anything is committed.
+
+    The one thing this flow could never do: `/preview/{emotion}` plays the
+    speaker's own spliced audio, so the question the product exists to answer
+    ("does the clone sound like me?") was only answerable after an irreversible
+    commit had written real Voices into the roster. This synthesizes `text` with a
+    throwaway clone of the chosen candidate stem and returns the wav.
+
+    What makes it safe to call freely:
+      * it holds an AUDITION slot, not a job slot (`_audition_slot`), so it
+        neither blocks nor is blocked by scans and commits;
+      * the scratch voice lives and dies inside this job's workdir under the
+        `_audition_` prefix — never `VOICES_DIR`, never `meta.json`, never a
+        slot-holder check (`export_stems.audition`);
+      * there is no length gate: a stem too short to COMMIT can still be heard,
+        which is the point.
+
+    Meta comes back on `X-Audition-*` headers (emotion, recipe, seconds, source
+    seconds) so the studio can label what is playing without a second round trip.
+    """
+    try:
+        emotion = normalize_emotion(req.emotion)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    recipe = req.recipe or RECIPE_FULL
+    if recipe not in RECIPE_ORDER:
+        raise HTTPException(400, "unknown recipe")
+    text = (req.text or "").strip() or DEFAULT_AUDITION_TEXT
+    if len(text) > MAX_AUDITION_TEXT:
+        raise HTTPException(
+            400, f"audition line too long — keep it under {MAX_AUDITION_TEXT} characters")
+
+    job = _get_job(job_id)
+    if not job:
+        return job_expired()
+    if job.get("status") != "done":
+        raise HTTPException(409, "auditions need a finished scan")
+    wd = Path(job["work_dir"])
+    if recipe == RECIPE_FULL:
+        src = wd / f"stem_{emotion}.wav"
+    else:
+        if recipe not in ((job.get("recipe_plan") or {}).get(emotion) or {}):
+            raise HTTPException(404, "that recipe was not offered for this emotion")
+        src = wd / f"stem_{emotion}__{recipe}.wav"
+    if not src.is_file():
+        raise HTTPException(404, "no audio for that emotion")
+
+    with _audition_slot():
+        res = export_stems.audition(
+            src=src, text=text,
+            language=SETTINGS.language, quantize=SETTINGS.quantize,
+            scratch_dir=wd / f"{export_stems.AUDITION_PREFIX}{uuid.uuid4().hex[:8]}",
+            timeout=AUDITION_TIMEOUT_S)
+    if not res.get("ok") or not res.get("audio"):
+        # Named, sanitized: the child's error can carry paths and torch noise.
+        raise errors.sanitized_500("audition", res.get("error") or "audition failed")
+    return Response(
+        content=res["audio"], media_type="audio/wav",
+        headers={
+            "X-Audition-Emotion": emotion,
+            "X-Audition-Recipe": recipe,
+            "X-Audition-Seconds": str(res.get("seconds") or ""),
+            "X-Audition-Source-Seconds": str(_wav_seconds(src)),
+            # A candidate is regenerated on demand and never the same twice —
+            # nothing about it is cacheable.
+            "Cache-Control": "no-store",
+        })
+
+
 @router.get("/{job_id}/preview/{emotion}")
 def preview(job_id: str, emotion: str):
     job = _get_job(job_id)
@@ -643,6 +1078,10 @@ class CommitReq(BaseModel):
     # the statement is stored as a receipt on every created Voice.
     attested: bool = False
     statement: str = ""
+    # {emotion: recipe_id} — the candidate splice the user auditioned and chose.
+    # Absent, empty or `full` for an emotion all mean the same thing: clone what
+    # the ledger showed. The fast path never sends this.
+    recipes: dict[str, str] | None = None
 
 
 @router.post("/{job_id}/commit")
@@ -662,6 +1101,18 @@ def commit(job_id: str, req: CommitReq):
         raise HTTPException(400, str(exc))
     if req.character_id is not None and req.character_id != voices._slug(req.character_id):
         raise HTTPException(400, "character_id is not a valid character id")
+    # Recipe choices are keys into a server-side plan, and BOTH halves reach a
+    # filename (`stem_{emotion}__{recipe}.wav`) — so both are validated the same
+    # way the emotions above are: normalized/enumerated, never sanitised.
+    chosen: dict[str, str] = {}
+    for emo, rid in (req.recipes or {}).items():
+        try:
+            emo = normalize_emotion(emo)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        if rid not in RECIPE_ORDER:
+            raise HTTPException(400, "unknown recipe")
+        chosen[emo] = rid
     _admit()  # cloning loads the TTS model in a child process — the heaviest phase
     with _LOCK:
         job = JOBS.get(job_id)
@@ -681,7 +1132,8 @@ def commit(job_id: str, req: CommitReq):
         _persist(job)
     threading.Thread(
         target=_do_commit,
-        args=(job_id, req.character.strip(), emotions, req.character_id, statement),
+        args=(job_id, req.character.strip(), emotions, req.character_id, statement,
+              chosen),
         daemon=True).start()
     return {"status": "committing"}
 

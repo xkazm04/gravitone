@@ -18,7 +18,20 @@ export type Speaker = { id: string; utterances: number; seconds: number; sample_
 // the recording had too little neutral speech. It must be SHOWN, never dropped:
 // the whole point is that an emotionally blended baseline is never presented as
 // a clean one (service/ingest.py::plan_baseline).
-export type Stem = { emotion: string; seconds: number; segments: number; eligible: boolean; cues: string[]; note?: string | null };
+// One candidate splice of an emotion's segments, computed by the backend from
+// the labels the scan already produced (service/ingest_api.py::build_recipes).
+// `label`/`how` are the backend's own words for what makes this take different —
+// the UI never invents a description of audio it did not measure. `default` marks
+// the splice the ledger row is already reporting, which is what commits when
+// nobody auditions anything.
+export type Recipe = {
+  id: string; label: string; how: string;
+  seconds: number; segments: number; default?: boolean;
+};
+// `recipes` is optional and absent whenever there is no real choice (a single
+// segment, or every candidate splice identical). Absent = the drill-down simply
+// does not exist for that row — never an empty "no alternatives" affordance.
+export type Stem = { emotion: string; seconds: number; segments: number; eligible: boolean; cues: string[]; note?: string | null; recipes?: Recipe[] };
 // `min_stem` is the seconds-of-audio floor a stem must clear to be cloneable
 // (service/ingest.py::MIN_STEM_SECONDS, echoed back per job) and `mode` is the
 // pipeline that produced this ledger. Both are served on every result and both
@@ -42,6 +55,16 @@ export type Job = {
   note?: string | null;
   limits?: string[] | null;
   detection?: Detection | null;
+  // What the backend DID with the recipe choices at commit, plus why candidate
+  // takes are absent when they are. `skipped` is the honesty half: a pick that
+  // could not be applied is stated, never quietly downgraded to the default.
+  recipes?: RecipeOutcome | null;
+};
+
+export type RecipeOutcome = {
+  applied: Record<string, string>;
+  skipped: { emotion: string; recipe: string; why: string }[];
+  unavailable?: string | null;
 };
 
 /** GET /api/ingest/modes — the backend's own description of each ingest mode. */
@@ -97,6 +120,10 @@ export type State = {
   committedCid: string | null;
   pendingCommit: { character: string; cid: string } | null;
   created: Created[];
+  // Audition Room: {emotion -> recipe id} the user's EAR chose. Empty is the
+  // normal case — auditioning is an opt-in drill-down, and an emotion missing
+  // from here commits the default splice the ledger already showed.
+  auditions: Record<string, string>;
 };
 
 export const initialState: State = {
@@ -112,6 +139,7 @@ export const initialState: State = {
   committedCid: null,
   pendingCommit: null,
   created: [],
+  auditions: {},
 };
 
 export type Action =
@@ -126,6 +154,9 @@ export type Action =
   // message — the page states the recoverable truth separately (amber).
   | { type: "COMMIT_FAILED"; error: string | null }
   | { type: "TOGGLE_EMOTION"; emotion: string }
+  // The winner of an audition. `recipeId: null` returns the emotion to the
+  // default splice — a vote must be undoable, or the drill-down becomes a trap.
+  | { type: "CHOOSE_RECIPE"; emotion: string; recipeId: string | null }
   | { type: "SET_MODE"; mode: "new" | "extend" }
   | { type: "SET_CHAR_NAME"; name: string }
   | { type: "SET_EXTEND_CID"; cid: string }
@@ -140,7 +171,7 @@ export function reducer(state: State, action: Action): State {
       // No fabricated step labels: job stays null until the first poll brings
       // the server's own steps (~1.5s). The loader shows a neutral placeholder.
       return { ...state, jobId: action.jobId, job: null, result: null,
-        selected: new Set(), error: null, phase: "processing" };
+        selected: new Set(), auditions: {}, error: null, phase: "processing" };
 
     case "JOB_POLLED": {
       const job = action.job;
@@ -157,6 +188,9 @@ export function reducer(state: State, action: Action): State {
         if (backTo === "upload") {
           return { ...state, phase: "upload", error,
             job: null, jobId: null, result: null, selected: new Set(),
+            // The recipes were candidates OF that discarded recording; keeping
+            // them would send a dead emotion→recipe map with the next commit.
+            auditions: {},
             pendingCommit: null };
         }
         return { ...state, job, phase: "review", error };
@@ -167,6 +201,9 @@ export function reducer(state: State, action: Action): State {
       if (job.status === "done" && job.result) {
         next.result = job.result;
         next.selected = new Set(job.result.stems.filter((s) => s.eligible).map((s) => s.emotion));
+        // A fresh ledger is a fresh set of candidates; a recipe id chosen for a
+        // previous scan means nothing here.
+        next.auditions = {};
       }
       if (job.status === "committed") {
         next.created = job.committed ?? [];
@@ -201,6 +238,13 @@ export function reducer(state: State, action: Action): State {
       return { ...state, selected };
     }
 
+    case "CHOOSE_RECIPE": {
+      const auditions = { ...state.auditions };
+      if (action.recipeId === null) delete auditions[action.emotion];
+      else auditions[action.emotion] = action.recipeId;
+      return { ...state, auditions };
+    }
+
     case "SET_MODE":
       return { ...state, mode: action.mode };
     case "SET_CHAR_NAME":
@@ -221,12 +265,13 @@ export function reducer(state: State, action: Action): State {
         return {
           ...initialState,
           selected: new Set(),
+          auditions: {},
           mode: "extend",
           extendCid: state.committedCid ?? state.extendCid,
           committedCid: state.committedCid,
         };
       }
-      return { ...initialState, selected: new Set() };
+      return { ...initialState, selected: new Set(), auditions: {} };
     }
 
     default:

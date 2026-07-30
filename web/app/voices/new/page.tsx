@@ -1,7 +1,7 @@
 "use client";
 
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
-import { useEffect, useReducer, useRef, useState } from "react";
+import { Fragment, useEffect, useReducer, useRef, useState } from "react";
 import Link from "next/link";
 import AppFrame from "@/components/ui/AppFrame";
 import { Button, Eyebrow } from "@/components/ui/Primitives";
@@ -16,14 +16,17 @@ import { recordVoiceOwnership } from "@/lib/voiceVault";
 import { CONSENT_STATEMENT } from "@/lib/consent";
 import WaveformLab from "./_loaders/WaveformLab";
 import { DetectionFinding, SovereignLimits, segmentFailureNote, type LoaderData } from "./_loaders/shared";
+import AuditionPanel from "./_review/AuditionPanel";
 import {
   reducer, initialState, POLLING_PHASES,
-  type Character, type Job, type ModeInfo,
+  type Character, type Job, type ModeInfo, type Stem,
 } from "./_state/machine";
+import { candidates, commitRecipes, recipeById } from "./_state/audition";
 import {
   ACCEPT_ATTR, LIMITS_HINT, checkBytes, checkDuration,
 } from "./_state/uploadLimits";
 import { useIngestJob } from "./_state/useIngestJob";
+import { takeKey, useAudition } from "./_state/useAudition";
 
 // Phases where a scanned recording is on screen and the mode that produced it
 // is still load-bearing for what the user is reading.
@@ -61,7 +64,7 @@ export default function NewCharacterPage() {
   // The whole create-flow state graph in one reducer.
   const [state, dispatch] = useReducer(reducer, initialState);
   const { phase, jobId, job, result, selected, error,
-    mode, charName, extendCid, committedCid, created } = state;
+    mode, charName, extendCid, committedCid, created, auditions } = state;
 
   // Ephemeral input/UI state — not part of the flow's state graph.
   const [consented, setConsented] = useState(false); // Voice Vault attestation
@@ -86,6 +89,10 @@ export default function NewCharacterPage() {
   const [pending, setPending] = useState<Pending>(null); // the same fact, visible
   const [playing, setPlaying] = useState<string | null>(null);
   const mounted = useMounted();
+  // Which ledger row has its Audition Room open. Exactly one at a time, and null
+  // is the normal state: the fast path is still keep/descope then commit.
+  const [auditionFor, setAuditionFor] = useState<string | null>(null);
+  const { takes, request: requestTake } = useAudition(jobId);
 
   // 429 from the ingest admission gate. Recoverable, so it never becomes the
   // rose `error` — a full queue is "try again in a moment", not "it failed".
@@ -261,6 +268,19 @@ export default function NewCharacterPage() {
     void a.play().catch(() => setPlaying((cur) => (cur === id ? null : cur)));
   }
 
+  /** Hear an emotion AS A VOICE — the clone of its chosen (or default) take,
+   *  speaking the studio's line. One click, no drill-down: the audition is
+   *  optional, but hearing one is not something a user should have to opt into
+   *  a sub-view for. */
+  async function hearAsVoice(st: Stem) {
+    const rid = auditions[st.emotion] ?? "full";
+    const id = `voice-${st.emotion}`;
+    const known = takes[takeKey(st.emotion, rid, "")];
+    if (known?.url) { playClip(known.url, id); return; }
+    const url = await requestTake(st.emotion, rid, "");
+    if (url) playClip(url, id);
+  }
+
   async function commit() {
     if (selected.size === 0 || submitting.current) return; // guard the double-click window
     const character = mode === "new" ? charName.trim() : (characters.find((c) => c.character_id === extendCid)?.name ?? "");
@@ -274,7 +294,10 @@ export default function NewCharacterPage() {
     try {
       // async commit: the backend returns immediately; the poller follows
       // per-emotion progress through to 'committed' / 'error'.
-      const r = await fetch(`/api/ingest/${jobId}/commit`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ character, emotions: [...selected], character_id, attested: consented, statement: CONSENT_STATEMENT }) });
+      // `recipes` is present ONLY when an audition actually changed something —
+      // the fast path sends exactly the body it always sent.
+      const recipes = commitRecipes(auditions, selected, result?.stems ?? []);
+      const r = await fetch(`/api/ingest/${jobId}/commit`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ character, emotions: [...selected], character_id, attested: consented, statement: CONSENT_STATEMENT, ...(recipes ? { recipes } : {}) }) });
       // Refused before any cloning started: the ledger is intact, so go back to
       // it with NO error — the amber notice carries the whole truth.
       if (r.status === 429) {
@@ -545,9 +568,12 @@ export default function NewCharacterPage() {
             <div className="mt-6 flex items-end justify-between">
               <div>
                 <h2 className="font-instrument text-2xl text-white">Proposed voices</h2>
-                <p className="mt-1 text-sm text-white/60">
+                <p className="mt-1 max-w-2xl text-sm text-white/60">
                   Keep or descope each emotion. “Short” stems hold under{" "}
                   {result.min_stem}s of audio, the minimum this backend clones from.
+                  Play <span className="text-white/80">stem</span> to hear the speaker&apos;s own
+                  recording, or <span className="text-cyan-200">as a voice</span> to hear the
+                  clone itself — before anything is created.
                 </p>
               </div>
               <span className="font-jetbrains text-[12px] text-white/60">{selected.size} selected</span>
@@ -562,7 +588,9 @@ export default function NewCharacterPage() {
                     <th className="px-3 py-2 text-left font-normal">length</th>
                     <th className="px-3 py-2 text-left font-normal">segments</th>
                     <th className="px-3 py-2 text-left font-normal">vocal cue</th>
-                    <th className="w-24 px-3 py-2" />
+                    {/* Two different things to listen to, so both are named:
+                        the source recording, and the clone of it. */}
+                    <th className="w-44 px-3 py-2 text-left font-normal">listen</th>
                     <th className="w-28 px-3 py-2" />
                   </tr>
                 </thead>
@@ -570,8 +598,15 @@ export default function NewCharacterPage() {
                   {result.stems.map((st) => {
                     const on = selected.has(st.emotion);
                     const m = emotionMeta(st.emotion);
+                    // The candidate takes for this row (>=2 or nothing at all),
+                    // the one the ear chose, and the state of the quick clone.
+                    const takesFor = candidates(st);
+                    const chosen = recipeById(st, auditions[st.emotion]);
+                    const quick = takes[takeKey(st.emotion, auditions[st.emotion] ?? "full", "")];
+                    const open = auditionFor === st.emotion;
                     return (
-                      <tr key={st.emotion} className={`border-b border-white/5 transition hover:bg-white/[0.03] ${on ? "" : "opacity-55"}`}>
+                      <Fragment key={st.emotion}>
+                      <tr className={`border-b border-white/5 transition hover:bg-white/[0.03] ${on ? "" : "opacity-55"}`}>
                         <td className="px-3 py-2">
                           <span className="grid h-9 w-9 place-items-center overflow-hidden rounded-lg border border-white/8 bg-black/40">
                             <EmotionArt emotion={st.emotion} size={30} dim={!on} />
@@ -584,16 +619,61 @@ export default function NewCharacterPage() {
                             {st.note && <span className="font-jetbrains rounded bg-amber-400/10 px-1.5 py-0.5 text-[10px] text-amber-200">mixed</span>}
                           </span>
                           {st.note && <span className="mt-1 block max-w-[26rem] text-[11px] leading-snug text-amber-200/70">{st.note}</span>}
+                          {/* What the EAR chose, stated where the emotion is
+                              named — a decision the user made must be visible
+                              at commit time, not buried in a closed panel. */}
+                          {chosen && !chosen.default && (
+                            <span className="font-jetbrains mt-1 flex items-center gap-1.5 text-[10px] text-cyan-200/85">
+                              cloning “{chosen.label}” · {chosen.seconds}s
+                              <button
+                                onClick={() => dispatch({ type: "CHOOSE_RECIPE", emotion: st.emotion, recipeId: null })}
+                                title="clone the full stem instead"
+                                className="cursor-pointer text-white/45 underline decoration-dotted transition hover:text-white"
+                              >
+                                undo
+                              </button>
+                            </span>
+                          )}
                         </td>
                         <td className="font-jetbrains px-3 py-2 text-[12px] text-white/70">{st.seconds}s</td>
                         <td className="font-jetbrains px-3 py-2 text-[12px] text-white/60">{st.segments}</td>
                         <td className="px-3 py-2 text-[12px] italic text-white/50">{st.cues[0] ? `“${st.cues[0]}”` : "—"}</td>
                         <td className="px-3 py-2">
-                          <button onClick={() => playClip(`/api/ingest/${jobId}/preview/${st.emotion}`, `stem-${st.emotion}`)}
-                            aria-label={`${playing === `stem-${st.emotion}` ? "Pause" : "Play"} ${m.label} stem`}
-                            className="grid h-8 w-8 place-items-center rounded-full bg-cyan-300 text-[12px] text-slate-950 transition hover:brightness-110">
-                            {playing === `stem-${st.emotion}` ? "⏸" : "▶"}
-                          </button>
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            {/* SOURCE audio: the speaker's own recording. */}
+                            <button onClick={() => playClip(`/api/ingest/${jobId}/preview/${st.emotion}`, `stem-${st.emotion}`)}
+                              aria-label={`${playing === `stem-${st.emotion}` ? "Pause" : "Play"} the source recording for ${m.label}`}
+                              title="source audio — the speaker's own recording"
+                              className="font-jetbrains flex cursor-pointer items-center gap-1.5 rounded-full border border-white/15 px-2.5 py-1 text-[11px] text-white/75 transition hover:border-white/35 hover:text-white">
+                              <span aria-hidden>{playing === `stem-${st.emotion}` ? "⏸" : "▶"}</span>
+                              stem
+                            </button>
+                            {/* CLONED voice: what committing this row would make. */}
+                            <button onClick={() => void hearAsVoice(st)}
+                              disabled={quick?.loading}
+                              aria-label={`${playing === `voice-${st.emotion}` ? "Pause" : "Play"} ${m.label} as a cloned voice`}
+                              title="cloned voice — synthesized from this stem, before anything is committed"
+                              className="font-jetbrains flex cursor-pointer items-center gap-1.5 rounded-full border border-cyan-400/35 bg-cyan-400/10 px-2.5 py-1 text-[11px] text-cyan-100 transition hover:bg-cyan-400/20 disabled:cursor-default disabled:opacity-45">
+                              <span aria-hidden>{quick?.loading ? "◌" : playing === `voice-${st.emotion}` ? "⏸" : "▶"}</span>
+                              {quick?.loading ? "cloning…" : "as a voice"}
+                            </button>
+                          </div>
+                          {/* A refused or failed audition says so here, in amber:
+                              nothing about the ledger row has gone wrong. */}
+                          {quick?.error && (
+                            <span className="font-jetbrains mt-1 block max-w-[16rem] text-[10px] leading-snug text-amber-200/80">
+                              {quick.error}
+                              {quick.busySec ? ` — retry in ${quick.busySec}s.` : ""}
+                            </span>
+                          )}
+                          {takesFor.length > 0 && (
+                            <button onClick={() => setAuditionFor(open ? null : st.emotion)}
+                              aria-expanded={open}
+                              aria-label={`${open ? "Close" : "Open"} the audition for ${m.label}`}
+                              className="font-jetbrains mt-1.5 cursor-pointer text-[10px] text-white/45 underline decoration-dotted transition hover:text-white">
+                              {open ? "close audition" : `compare ${takesFor.length} takes →`}
+                            </button>
+                          )}
                         </td>
                         <td className="px-3 py-2 text-right">
                           <button onClick={() => dispatch({ type: "TOGGLE_EMOTION", emotion: st.emotion })} aria-pressed={on}
@@ -602,11 +682,39 @@ export default function NewCharacterPage() {
                           </button>
                         </td>
                       </tr>
+                      {open && (
+                        <tr className="border-b border-white/5">
+                          <td colSpan={7} className="px-3 pb-4 pt-1">
+                            <AuditionPanel
+                              emotion={st.emotion}
+                              label={m.label}
+                              hue={m.hue}
+                              recipes={takesFor}
+                              chosenId={auditions[st.emotion]}
+                              takes={takes}
+                              request={requestTake}
+                              play={playClip}
+                              playing={playing}
+                              onChoose={(recipeId) => dispatch({ type: "CHOOSE_RECIPE", emotion: st.emotion, recipeId })}
+                              onClose={() => setAuditionFor(null)}
+                            />
+                          </td>
+                        </tr>
+                      )}
+                      </Fragment>
                     );
                   })}
                 </tbody>
               </table>
             </div>
+            {/* Why there is nothing to compare, when the backend knows. Named
+                rather than silent, and never dressed up as a failure. */}
+            {job?.recipes?.unavailable && (
+              <p className="font-jetbrains mt-2 text-[11px] text-white/40">
+                alternative takes aren&apos;t available for this scan — {job.recipes.unavailable}.
+                You can still hear each emotion as a voice.
+              </p>
+            )}
 
             <div className="glass-panel mt-6 max-w-2xl rounded-2xl p-5">
               <div className="flex gap-2">
@@ -703,6 +811,20 @@ export default function NewCharacterPage() {
             <div className="glass-panel rounded-2xl p-6">
               <div className="font-jetbrains text-[11px] uppercase tracking-widest text-emerald-300">character ready</div>
               <h2 className="font-instrument mt-2 text-3xl text-white">{created.length} voices cloned.</h2>
+              {/* A pick that could not be honoured is STATED: the voice exists,
+                  but it is not the take the user chose, and only the backend
+                  knows that. Silence here would be the flow claiming the
+                  audition mattered when it did not. */}
+              {(job?.recipes?.skipped?.length ?? 0) > 0 && (
+                <p className="font-jetbrains mt-3 rounded-lg border border-amber-400/25 bg-amber-400/5 px-3 py-2 text-[11px] leading-relaxed text-amber-200/85">
+                  {job!.recipes!.skipped.map((s) => (
+                    <span key={`${s.emotion}-${s.recipe}`} className="block">
+                      {emotionMeta(s.emotion).label}: the take you picked wasn&apos;t used — {s.why}.
+                      The full stem was cloned instead.
+                    </span>
+                  ))}
+                </p>
+              )}
               {vaultWarn && (
                 <p className="font-jetbrains mt-3 rounded-lg border border-amber-400/25 bg-amber-400/5 px-3 py-2 text-[11px] text-amber-200/85">
                   Voices cloned, but the consent receipt couldn’t be saved to your vault. Reload “My Voices” — if they’re missing, re-open the character to re-record ownership.

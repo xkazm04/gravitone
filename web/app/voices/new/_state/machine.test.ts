@@ -205,6 +205,30 @@ describe("the rest of the transitions", () => {
     expect(reducer(raised, { type: "SET_ERROR", error: null }).error).toBeNull();
   });
 
+  it("CHOOSE_RECIPE records the take the ear picked, and undoes it", () => {
+    const picked = reducer(initialState, { type: "CHOOSE_RECIPE", emotion: "angry", recipeId: "longest" });
+    expect(picked.auditions).toEqual({ angry: "longest" });
+    // null = "back to the default splice", not "remember an empty choice".
+    const undone = reducer(picked, { type: "CHOOSE_RECIPE", emotion: "angry", recipeId: null });
+    expect(undone.auditions).toEqual({});
+    // Auditioning one emotion never touches another.
+    const two = reducer(picked, { type: "CHOOSE_RECIPE", emotion: "sad", recipeId: "tightest" });
+    expect(two.auditions).toEqual({ angry: "longest", sad: "tightest" });
+  });
+
+  it("a fresh ledger discards takes chosen for the previous scan", () => {
+    const picked = reducer(scanned, { type: "CHOOSE_RECIPE", emotion: "angry", recipeId: "longest" });
+    const polled = reducer(picked, { type: "JOB_POLLED", job: job({ status: "done", result: result() }) });
+    expect(polled.auditions).toEqual({});
+  });
+
+  it("an analyze failure drops the takes along with the ledger it discarded", () => {
+    const picked = reducer(scanned, { type: "CHOOSE_RECIPE", emotion: "angry", recipeId: "longest" });
+    const failed = reducer(picked, { type: "JOB_POLLED", job: job({ status: "error", error: "nope" }) });
+    expect(failed.phase).toBe("upload");
+    expect(failed.auditions).toEqual({});
+  });
+
   it("ignores an action it does not know", () => {
     const s = reducer(scanned, { type: "NOPE" } as unknown as Action);
     expect(s).toBe(scanned);
@@ -249,6 +273,12 @@ describe("RESET", () => {
   it("scan-another with nothing committed falls back to whatever was chosen", () => {
     const s = reducer({ ...initialState, extendCid: "vera" }, { type: "RESET", kind: "scan-another" });
     expect(s.extendCid).toBe("vera");
+  });
+
+  it("start-over and scan-another both forget the takes the ear chose", () => {
+    const picked = reducer(committed, { type: "CHOOSE_RECIPE", emotion: "angry", recipeId: "longest" });
+    expect(reducer(picked, { type: "RESET", kind: "start-over" }).auditions).toEqual({});
+    expect(reducer(picked, { type: "RESET", kind: "scan-another" }).auditions).toEqual({});
   });
 
   it("does not hand out a shared selection set between resets", () => {
