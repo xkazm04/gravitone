@@ -12,13 +12,19 @@ body { margin: 0; }
 
 /* ---------------------------------------------------------------------------
    A · OBSIDIAN STUDIO — dark cinematic
+
+   Every colour/motion literal below now comes from `components/ui/tokens.ts`,
+   published as `--gt-*` custom properties by <GravitoneTokens> in layout.tsx.
+   The values are identical to the ones that used to be hand-copied here, so
+   this is a zero-pixel change — it just makes the design language addressable
+   at runtime, which is what the Signal Layer reads.
 --------------------------------------------------------------------------- */
 .aurora {
   background:
-    radial-gradient(60% 50% at 20% 10%, rgba(34,211,238,0.18), transparent 60%),
-    radial-gradient(50% 45% at 85% 20%, rgba(139,92,246,0.16), transparent 60%),
-    radial-gradient(70% 60% at 60% 100%, rgba(16,185,129,0.10), transparent 60%);
-  animation: aurora-drift 22s ease-in-out infinite alternate;
+    radial-gradient(60% 50% at 20% 10%, var(--gt-aurora-1), transparent 60%),
+    radial-gradient(50% 45% at 85% 20%, var(--gt-aurora-2), transparent 60%),
+    radial-gradient(70% 60% at 60% 100%, var(--gt-aurora-3), transparent 60%);
+  animation: aurora-drift var(--gt-aurora-period) ease-in-out infinite alternate;
 }
 @keyframes aurora-drift {
   0%   { transform: translate3d(-2%, -1%, 0) scale(1.02); }
@@ -29,40 +35,85 @@ body { margin: 0; }
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
 }
 .glass-panel {
-  background: linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0.015));
-  border: 1px solid rgba(255,255,255,0.08);
-  backdrop-filter: blur(14px);
+  background: linear-gradient(180deg, var(--gt-surface-top), var(--gt-surface-bottom));
+  border: 1px solid var(--gt-hairline);
+  backdrop-filter: blur(var(--gt-blur));
 }
 .text-aurora {
-  background: linear-gradient(92deg, #67e8f9, #a78bfa 55%, #6ee7b7);
+  background: linear-gradient(92deg, var(--gt-accent-cyan), var(--gt-accent-violet) 55%, var(--gt-accent-emerald));
   -webkit-background-clip: text; background-clip: text; color: transparent;
 }
-.cta-glow { box-shadow: 0 0 0 1px rgba(103,232,249,0.3), 0 8px 40px -8px rgba(103,232,249,0.45); }
+.cta-glow { box-shadow: 0 0 0 1px var(--gt-ring-cyan), 0 8px 40px -8px var(--gt-glow-cyan); }
 
 /* live equalizer bars (used in A + C) */
 @keyframes eq {
   0%,100% { transform: scaleY(0.25); } 50% { transform: scaleY(1); }
 }
-.eq-bar { transform-origin: bottom; animation: eq 1.1s ease-in-out infinite; }
+.eq-bar { transform-origin: bottom; animation: eq var(--gt-eq-period) ease-in-out infinite; }
 
 /* Off-viewport pause: toggled by usePauseOffscreen so background loops
    (aurora, equalizer) stop when scrolled out of view. */
 .anim-paused, .anim-paused * { animation-play-state: paused !important; }
 
+/* ---------------------------------------------------------------------------
+   SIGNAL LAYER readers (contract C4)
+
+   AudioBus writes --gt-level / --gt-peak / --gt-centroid / --gt-hue /
+   --gt-working on ONE scoped node ([data-gt-bus]); everything below reads them
+   through transform / opacity / filter only, so a reacting studio costs no
+   layout and no React renders. At the :root defaults (level 0, working 0) every
+   rule here is the identity transform — the idle studio looks exactly as it did.
+--------------------------------------------------------------------------- */
+
+/* A registered source replaces the fake keyframe with the real amplitude.
+   --gt-bar-lo / --gt-bar-hi are per-bar weights set inline by Equalizer: the
+   low band leans on raw level, the high band on level × brightness, so the bar
+   field tilts with the voice's timbre instead of running a fixed sine. */
+[data-gt-live="1"] .eq-bar {
+  animation: none;
+  transform: scaleY(clamp(0.08, calc(
+      0.1
+    + var(--gt-level) * var(--gt-bar-lo, 0.8)
+    + var(--gt-level) * var(--gt-centroid) * var(--gt-bar-hi, 0.4)
+    + var(--gt-peak) * 0.12
+  ), 1));
+  transition: transform 90ms linear;
+}
+
+/* Ambient: the atmosphere leans into real sound and into "the model is
+   working". Filter only — no repaint of the gradient itself. */
+[data-gt-bus] .aurora {
+  filter:
+    saturate(calc(1 + var(--gt-level) * 0.5))
+    brightness(calc(1 + var(--gt-level) * 0.22 + var(--gt-working) * 0.1));
+}
+/* The CTA breathes on level. The glow lives on a pseudo-element whose shadow is
+   STATIC and whose opacity is the only thing reading the channel: one composited
+   property per frame, no shadow re-rasterisation. It is also why this is not a
+   `filter` on .cta-glow itself — an unlayered filter here would outrank
+   Tailwind's layered `hover:brightness-110` and kill the hover state. */
+[data-gt-bus] .cta-glow { position: relative; }
+[data-gt-bus] .cta-glow::after {
+  content: ""; position: absolute; inset: 0; pointer-events: none;
+  border-radius: inherit;
+  box-shadow: 0 0 26px var(--gt-glow-cyan);
+  opacity: var(--gt-level);
+}
+
 /* switch-kit volume slider (landing bill calculator) */
 .switch-slider {
   appearance: none; height: 4px; border-radius: 999px; cursor: pointer;
-  background: linear-gradient(90deg, rgba(103,232,249,0.55), rgba(167,139,250,0.55));
+  background: linear-gradient(90deg, var(--gt-track-cyan), var(--gt-track-violet));
 }
 .switch-slider::-webkit-slider-thumb {
   appearance: none; height: 18px; width: 18px; border-radius: 999px;
-  background: #67e8f9; border: 2px solid rgba(8,10,16,0.9);
-  box-shadow: 0 0 14px rgba(103,232,249,0.6);
+  background: var(--gt-accent-cyan); border: 2px solid var(--gt-thumb-ring);
+  box-shadow: 0 0 14px var(--gt-glow-cyan-strong);
 }
 .switch-slider::-moz-range-thumb {
   height: 18px; width: 18px; border-radius: 999px;
-  background: #67e8f9; border: 2px solid rgba(8,10,16,0.9);
-  box-shadow: 0 0 14px rgba(103,232,249,0.6);
+  background: var(--gt-accent-cyan); border: 2px solid var(--gt-thumb-ring);
+  box-shadow: 0 0 14px var(--gt-glow-cyan-strong);
 }
 
 /* ---------------------------------------------------------------------------

@@ -14,15 +14,18 @@ import { HERO_DEMO, SAMPLE_TEXT } from "@/lib/content";
 import { useAuth } from "@/lib/useAuth";
 import { CONSENT_STATEMENT } from "@/lib/consent";
 import Equalizer from "@/components/ui/Equalizer";
+import TakePlayer from "@/components/ui/TakePlayer";
+import { useAudioBus, useSignalWorking } from "@/components/ui/AudioBus";
+import { EASE } from "@/components/ui/tokens";
 
 const MIN_SECONDS = 8;
 const MAX_SECONDS = 20;
-const ease = [0.22, 1, 0.36, 1] as const;
 
 type Phase = "idle" | "recording" | "cloning" | "rendering" | "ready" | "error";
 
 export default function HeroMicDemo() {
   const { ready, signIn } = useAuth();
+  const bus = useAudioBus();
   const [phase, setPhase] = useState<Phase>("idle");
   const [seconds, setSeconds] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -33,12 +36,18 @@ export default function HeroMicDemo() {
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
+  // `--gt-working`: while the CPU is cloning/rendering, the whole frame leans in.
+  // The pitch of this demo is "no GPU" — the studio showing it is working is the
+  // proof, and it replaces nothing (the spinner copy stays).
+  useSignalWorking(phase === "cloning" || phase === "rendering");
+
   const cleanupMic = useCallback(() => {
     if (timerRef.current) clearInterval(timerRef.current);
     timerRef.current = null;
+    bus.unregisterStream(recRef.current?.stream);
     recRef.current?.stream.getTracks().forEach((t) => t.stop());
     recRef.current = null;
-  }, []);
+  }, [bus]);
   useEffect(() => () => { cleanupMic(); if (audioUrl) URL.revokeObjectURL(audioUrl); }, [cleanupMic, audioUrl]);
 
   const fail = (msg: string) => { setError(msg); setPhase("error"); };
@@ -112,6 +121,9 @@ export default function HeroMicDemo() {
     setError(null);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // The equalizer above the recorder now shows the visitor's OWN voice —
+      // tapped, never routed to the speakers (that would be feedback).
+      bus.registerStream(stream);
       const rec = new MediaRecorder(stream);
       chunksRef.current = [];
       rec.ondataavailable = (e) => { if (e.data.size) chunksRef.current.push(e.data); };
@@ -135,13 +147,13 @@ export default function HeroMicDemo() {
     } catch {
       fail("microphone unavailable — allow mic access and try again");
     }
-  }, [cleanupMic, runPipeline]);
+  }, [bus, cleanupMic, runPipeline]);
 
   return (
     <motion.div
       initial={{ opacity: 0, scale: 0.96, y: 20 }}
       animate={{ opacity: 1, scale: 1, y: 0 }}
-      transition={{ duration: 0.9, ease, delay: 0.2 }}
+      transition={{ duration: 0.9, ease: EASE, delay: 0.2 }}
       className="glass-panel relative rounded-3xl p-6 shadow-2xl"
     >
       <div className="flex items-center justify-between">
@@ -185,6 +197,9 @@ export default function HeroMicDemo() {
           <blockquote className="font-hanken mt-3 rounded-2xl border border-white/8 bg-black/30 p-4 text-[15px] leading-relaxed text-white/90">
             {HERO_DEMO.readScript}
           </blockquote>
+          {/* These bars are the live mic, not a CSS timer — the visitor can see
+              the studio hearing them before they trust it with a clone. */}
+          <Equalizer bars={40} className="mt-4 h-10" />
           <div className="mt-4 flex items-center justify-between">
             <span className="font-jetbrains inline-flex items-center gap-2 text-[13px] text-rose-300">
               <span className="h-2 w-2 animate-pulse rounded-full bg-rose-400" /> {seconds}s / {MAX_SECONDS}s
@@ -218,7 +233,9 @@ export default function HeroMicDemo() {
         <>
           <p className="font-instrument mt-5 text-xl italic leading-snug text-white/90">“{SAMPLE_TEXT}”</p>
           <div className="mt-4 rounded-2xl border border-cyan-400/20 bg-black/30 p-5">
-            <audio src={audioUrl} controls autoPlay className="w-full" />
+            {/* Obsidian transport, not browser chrome — and registered on the
+                bus, so the bars beside it move with the cloned voice. */}
+            <TakePlayer src={audioUrl} autoPlay label="your cloned voice" className="w-full" />
             <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
               <span className="font-jetbrains text-[11px] text-white/55">{HERO_DEMO.note}</span>
               <div className="flex gap-2">

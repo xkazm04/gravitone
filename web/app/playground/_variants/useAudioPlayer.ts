@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { busRegister } from "@/components/ui/AudioBus";
 import { stripTags, type Take } from "./shared";
 
 /**
@@ -39,6 +40,11 @@ export function useAudioPlayer() {
         setProgress(0);
       });
       audioRef.current = a;
+      // Signal Layer: hand this element to the AudioBus so the playground's
+      // waveform/equalizer show the take that is actually playing. The bus
+      // re-routes it to the speakers (createMediaElementSource captures the
+      // output) and no-ops when no bus is mounted.
+      busRegister(a);
     }
     return audioRef.current;
   };

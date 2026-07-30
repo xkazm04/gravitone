@@ -34,7 +34,15 @@ export default function GeneratedGlyph({
       role="img"
       aria-label={`${label} emotion`}
       className={`pointer-events-none select-none transition ${dim ? "opacity-25 grayscale" : "opacity-100"} ${className}`}
-      style={{ color: `hsl(${hue} 85% 62%)`, filter: dim ? undefined : `drop-shadow(0 0 10px hsl(${hue} 90% 60% / .45))` }}
+      style={{
+        color: `hsl(${hue} 85% 62%)`,
+        // Signal Layer: the sigil's halo breathes with the audio actually
+        // playing (--gt-level). At level 0 this is byte-identical to the static
+        // 10px / .45 glow it replaces, so nothing changes until sound does.
+        filter: dim
+          ? undefined
+          : `drop-shadow(0 0 calc(10px + var(--gt-level) * 14px) hsl(${hue} 90% 60% / calc(.45 + var(--gt-level) * .35)))`,
+      }}
     >
       {glyph.paths.map((p, i) =>
         animate ? (
