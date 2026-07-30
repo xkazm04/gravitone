@@ -6,9 +6,10 @@
 
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { Fragment, useState } from "react";
-import { useVoicePreview, relTime, pickAudio, deleteVoiceQuestion, type Slot } from "@/app/voices/_data/characters";
+import { useVoicePreview, relTime, pickAudio, deleteVoiceQuestion, signalOf, type Slot } from "@/app/voices/_data/characters";
 import { checkEmotion } from "@/lib/slugs";
 import EmotionArt from "@/components/ui/EmotionArt";
+import SignalChip from "@/app/voices/_variants/SignalChip";
 
 export default function EmotionRack({
   name, characterId, slots, coverage, total, busySlot, addVoice, removeVoice, onRecord,
@@ -119,6 +120,9 @@ export default function EmotionRack({
               // but they are real rows in the registry — each gets its own line
               // (and its own remove button) or it cannot be deleted at all.
               const shadows = s.voices.slice(1);
+              // The measured fact about the voice that speaks this slot, or null
+              // when nothing was measured (old rows, built-ins, unreadable audio).
+              const signal = filled ? signalOf(s.voice!.fidelity) : null;
 
               return (
                 <Fragment key={s.emotion}>
@@ -165,8 +169,12 @@ export default function EmotionRack({
 
                   <td className="px-3 py-2">
                     {filled ? (
-                      <span className="flex items-center gap-2">
+                      <span className="flex flex-wrap items-center gap-2">
                         <span className="font-jetbrains rounded bg-cyan-400/10 px-1.5 py-0.5 text-[11px] text-cyan-300">recorded</span>
+                        {/* What the studio HEARD in this take. Absent for every
+                            voice cloned before the ledger existed, and the chip
+                            renders nothing at all for that. */}
+                        <SignalChip signal={signal} note={`${s.label} take`} />
                         {shadows.length > 0 && (
                           <span
                             title="Two voices occupy this slot — this is the one the engine speaks with"
@@ -202,12 +210,28 @@ export default function EmotionRack({
 
                   <td className="px-3 py-2 text-right">
                     {filled ? (
+                      <>
+                      {/* A measurement is only worth showing if it is
+                          actionable: a flagged slot gets the one action that
+                          fixes it, right where the flag is. It opens the SAME
+                          guided recorder as an empty slot — the recorder names
+                          the defect — and it is additive: nothing is deleted, the
+                          new take replaces the slot only once it is cloned. */}
+                      {signal?.flag && (
+                        <button onClick={() => onRecord(s.emotion)} disabled={isBusy}
+                          aria-label={`Re-record the ${s.label} voice`}
+                          title={`${signal.title} Re-record this slot with the fix in hand.`}
+                          className="font-jetbrains mr-3 text-[11px] text-amber-300/90 transition hover:text-amber-200 disabled:opacity-40">
+                          ↻ re-record
+                        </button>
+                      )}
                       <button onClick={() => confirmRemove(s.voice!.voice_id, s.label)}
                         disabled={removingVoiceId === s.voice!.voice_id}
                         aria-label={`Remove the ${s.label} voice`}
                         className="font-jetbrains text-[11px] text-white/55 transition hover:text-rose-300 disabled:opacity-40">
                         {removingVoiceId === s.voice!.voice_id ? "removing…" : "remove"}
                       </button>
+                      </>
                     ) : (
                       <>
                         <button onClick={() => onRecord(s.emotion)} disabled={isBusy}

@@ -11,6 +11,7 @@ import { AnimatePresence, motion } from "framer-motion";
 import { Button } from "@/components/ui/Primitives";
 import { EASE } from "@/components/ui/tokens";
 import EmotionArt from "@/components/ui/EmotionArt";
+import TakePlayer from "@/components/ui/TakePlayer";
 import { emotionMeta } from "@/lib/emotions";
 import { CAPTURE_ORDER, scriptFor } from "@/lib/emotionScripts";
 
@@ -33,11 +34,17 @@ function nextInScale(scale: string[], filled: string[]): string | null {
 
 export default function GuidedRecorder({
   emotion, characterName, scale, filledEmotions, onClone, onClose, onSwitch,
+  defect = null,
 }: {
   emotion: string | null; // null = closed
   characterName: string;
   scale: string[]; // this Character's effective palette (base + custom slots)
   filledEmotions: string[];
+  /** Why this slot is being re-recorded, in the recorder's own voice
+   *  ("clipped — move further from the mic…"). Null for a first take. A
+   *  measurement is only worth taking if it changes what the user does next, so
+   *  the defect travels with the session instead of being left in the rack. */
+  defect?: string | null;
   onClone: (emotion: string, file: File) => Promise<void>; // throws on failure
   onClose: () => void;
   onSwitch: (emotion: string) => void; // jump to the next slot in the session
@@ -157,6 +164,15 @@ export default function GuidedRecorder({
               </div>
             </div>
 
+            {defect && (
+              // Advisory, above the acting direction because it is the reason
+              // this session exists. Never a blocker: the previous take is still
+              // in the rack and stays there until a new one is cloned.
+              <p role="status"
+                className="font-jetbrains mt-4 rounded-lg border border-amber-400/25 bg-amber-400/[0.07] px-3 py-2 text-[12px] leading-relaxed text-amber-200">
+                ↻ re-recording — the last {meta.label} take was {defect}.
+              </p>
+            )}
             <p className="mt-4 text-sm italic text-white/70">🎭 {es.direction}</p>
             <blockquote className="font-hanken mt-3 rounded-2xl border border-white/10 bg-black/30 p-4 text-[15px] leading-relaxed text-white/90">
               {es.script}
@@ -181,7 +197,9 @@ export default function GuidedRecorder({
               )}
               {phase === "preview" && (
                 <>
-                  {previewUrl && <audio src={previewUrl} controls className="h-9 max-w-[240px]" />}
+                  {previewUrl && (
+                    <TakePlayer src={previewUrl} compact hue={meta.hue} label={`${meta.label} preview`} className="max-w-[260px]" />
+                  )}
                   <Button onClick={() => void clone()} disabled={tooShort} className="cursor-pointer">
                     Clone {meta.label} ✓
                   </Button>

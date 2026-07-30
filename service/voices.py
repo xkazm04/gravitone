@@ -28,7 +28,9 @@ from pathlib import Path
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, ConfigDict
 
-from service import errors, export_stems
+import numpy as np
+
+from service import errors, export_stems, vad
 from service.atomicio import file_lock
 from service.config import SETTINGS
 from service.demand import all_demand, demand_for
@@ -39,6 +41,10 @@ from service.emotions import (
 router = APIRouter(tags=["voices"])
 
 logger = logging.getLogger("gravitone")
+# Alias so the shared prosody hook (batch-1 contract C2) reads exactly as it was
+# specified — `log.warning("prosody probe skipped: %s", exc)` — instead of a
+# near-copy that drifts from the contract every other module implements.
+log = logger
 
 VOICES_DIR = Path(SETTINGS.voices_dir)
 META_PATH = VOICES_DIR / "_meta.json"
@@ -69,6 +75,19 @@ class Voice(BaseModel):
     # True when a consent receipt is stored for this voice (ingest flow).
     # Pre-existing / built-in voices report False (never migrated).
     consent: bool = False
+    # Measured signal facts about the recording this Voice was cloned from
+    # (see :func:`measure_fidelity`). **None means NOT MEASURED**, never
+    # "measured zero": every Voice cloned before this field existed, every
+    # built-in, and every clip whose audio could not be parsed reports null, and
+    # readers must render nothing at all for that — a fabricated 0 would read as
+    # "this voice is bad".
+    fidelity: dict | None = None
+    # Advisory only, and only on the CREATE response: "this take reads closer to
+    # `nearest` than to the emotion you filed it under". Never stored on the
+    # registry row and never returned by a list/read route, because it is a
+    # remark about one recording at the moment it was made — not a property of
+    # the Voice. Absent (the normal case) means no check was available.
+    label_check: dict | None = None
 
 
 class Character(BaseModel):
@@ -359,6 +378,246 @@ def _wav_seconds(path: Path) -> float | None:
         return None
 
 
+def _wav_rate(path: Path) -> int | None:
+    """The sample rate of a wav, or None for anything else.
+
+    Used for the `low_sample_rate` flag, which has to be judged on the SOURCE:
+    `ingest.clean_audio` resamples every clone to 24 kHz, so the cleaned file it
+    hands us cannot report an 8 kHz phone recording. A non-wav upload (mp3, m4a,
+    mp4) is simply unknown here rather than guessed — no flag is the honest
+    answer, and a wrong flag is worse than a missing one (see §"named facts").
+    """
+    try:
+        with wave.open(str(path), "rb") as w:
+            return int(w.getframerate())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# ── fidelity: what the studio HEARD in the clip it cloned from (contract C1) ───
+#
+# The cheap, signal-only half of the Fidelity Ledger: peak/clipping ratio, noise
+# floor, effective speech seconds, sample-rate adequacy. Everything here is
+# numpy + the stdlib `wave` module over audio this process already has on disk,
+# computed ONCE at clone time — never on the synthesis hot path.
+#
+# `identity` (cosine similarity to the speaker's reference) is the model-side
+# half and is NOT computed here: it needs the speaker-embedding stack
+# (`service/voiceprint.py`), which the ingest close-the-loop path owns. It is
+# merged in when supplied and stays None otherwise, which is why absence is a
+# first-class state rather than a zero.
+FIDELITY_VERSION = 1
+
+# The level statistics mirror ingest.measure_levels / vad's tracked floor — the
+# service should not disagree with itself about what "background" means
+# depending on which door the audio came in through.
+_FID_FLOOR_PCT = 10.0            # the quiet tenth of the clip ~ its background
+_FID_SPEECH_PCT = 95.0           # the loud twentieth ~ its speech, robust to clicks
+_FID_NOISE_MARGIN_DB = 8.0       # threshold sits this far ABOVE the measured floor…
+_FID_SPEECH_HEADROOM_DB = 6.0    # …and never closer than this to the speech level
+_FID_MIN_RANGE_DB = 8.0          # floor and speech this close = nothing to gate on
+_FID_SILENT_DBFS = -55.0         # louder than this is audio; quieter is silence
+_FID_THRESHOLD_CLAMP = (-75.0, -12.0)
+# A sample within 1% of full scale is at the rail. One such sample is nothing (a
+# transient); a tenth of a percent of them is audible clipping.
+_CLIP_CEILING = 0.99
+_CLIP_FLAG_RATIO = 0.001
+_NOISY_FLOOR_DB = -40.0          # a floor this high is a fan/room, not silence
+_SHORT_SPEECH_SECONDS = 3.0      # same bar create_voice refuses outright at
+_MIN_SAMPLE_RATE = 16000         # below this the model has no high band to clone
+
+
+def _pcm16_mono(path: Path) -> tuple[np.ndarray, int] | None:
+    """(samples, rate) as mono int16, or None when this isn't readable PCM16."""
+    try:
+        with wave.open(str(path), "rb") as w:
+            if w.getsampwidth() != vad.SAMPLE_WIDTH:
+                return None
+            channels, rate, frames = w.getnchannels(), w.getframerate(), w.getnframes()
+            raw = w.readframes(frames)
+    except Exception:  # noqa: BLE001 — unparseable audio is "not measured"
+        return None
+    a = np.frombuffer(raw, dtype="<i2")
+    if channels > 1:
+        usable = (a.size // channels) * channels
+        if usable == 0:
+            return None
+        a = a[:usable].reshape(-1, channels).mean(axis=1).astype("<i2")
+    return a, int(rate)
+
+
+def measure_fidelity(wav_path: Path, *, identity: float | None = None,
+                     source_rate: int | None = None) -> dict | None:
+    """The signal-only fidelity object for one clip, or None if unmeasurable.
+
+    Returns the C1 shape::
+
+        {"version", "measured_at", "identity", "speech_seconds", "clip_ratio",
+         "noise_floor_db", "flags"}
+
+    `flags` carries ONLY the ones that are true, because named facts are the
+    product here: "clipped" and "1.4s speech" are things a user can act on,
+    where a 73/100 is a number they can only distrust. Every metric is
+    independently optional — a clip whose levels cannot be measured still
+    reports the sample-rate flag, and vice versa.
+
+    Returning None (rather than an object full of nulls) is deliberate: it is the
+    difference between "the studio measured nothing about this voice" — which the
+    UI renders as nothing at all — and "the studio measured this voice and found
+    silence".
+
+    Effective speech is derived with `vad.frame_db`, the level primitive the
+    streaming gate uses, over a threshold measured from the WHOLE file. The
+    `vad.SpeechGate` state machine is deliberately not reused: it tracks its
+    floor forward with no lookahead, so (per its own docstring) a recording whose
+    first frame is already speech takes that level as background and hears
+    nothing until the first pause. A cleaned, loudness-normalised clone clip is
+    exactly that recording, and it would report a false `short_speech`.
+    """
+    read = _pcm16_mono(Path(wav_path))
+    rate = source_rate if source_rate is not None else (read[1] if read else None)
+
+    speech_seconds: float | None = None
+    clip_ratio: float | None = None
+    noise_floor_db: float | None = None
+
+    if read is not None:
+        samples, wav_rate = read
+        if samples.size:
+            ceiling = _CLIP_CEILING * 32768.0
+            clip_ratio = round(
+                float(np.count_nonzero(np.abs(samples.astype(np.int32)) >= ceiling))
+                / float(samples.size), 5)
+        frame_len = max(1, int(wav_rate * vad.FRAME_MS / 1000))
+        whole = (samples.size // frame_len) * frame_len
+        if whole:
+            frames = samples[:whole].reshape(-1, frame_len)
+            levels = np.array([vad.frame_db(f) for f in frames], dtype=np.float64)
+            floor = float(np.percentile(levels, _FID_FLOOR_PCT))
+            speech = float(np.percentile(levels, _FID_SPEECH_PCT))
+            frame_seconds = vad.FRAME_MS / 1000.0
+            if speech - floor >= _FID_MIN_RANGE_DB:
+                # Normal case: the clip contains both speech and background, so
+                # the threshold is derived from its own distribution — the same
+                # two-ended derivation ingest.measure_levels uses, rather than
+                # floor+margin alone (which a clip with NO silence in it turns
+                # into "the speech is the background", reporting 0 s of speech
+                # and a -15 dB noise floor for a perfectly good take).
+                noise_floor_db = round(floor, 1)
+                threshold = min(floor + _FID_NOISE_MARGIN_DB,
+                                speech - _FID_SPEECH_HEADROOM_DB)
+                threshold = min(max(threshold, _FID_THRESHOLD_CLAMP[0]),
+                                _FID_THRESHOLD_CLAMP[1])
+                voiced = int(np.count_nonzero(levels >= threshold))
+                speech_seconds = round(voiced * frame_seconds, 2)
+            else:
+                # Degenerate distribution: one level throughout, so there is no
+                # gate to derive and no background to measure. Decide by absolute
+                # level (ingest's own "louder than this is audio" constant) and
+                # leave the noise floor UNMEASURED rather than reporting the
+                # speech level as if it were room tone.
+                if speech > _FID_SILENT_DBFS:
+                    speech_seconds = round(levels.size * frame_seconds, 2)
+                else:
+                    speech_seconds = 0.0
+                    noise_floor_db = round(floor, 1)
+
+    if read is None and rate is None:
+        return None  # nothing was measured; say so by being absent
+
+    flags: list[str] = []
+    if clip_ratio is not None and clip_ratio > _CLIP_FLAG_RATIO:
+        flags.append("clipped")
+    if noise_floor_db is not None and noise_floor_db > _NOISY_FLOOR_DB:
+        flags.append("noisy")
+    if speech_seconds is not None and speech_seconds < _SHORT_SPEECH_SECONDS:
+        flags.append("short_speech")
+    if rate is not None and rate < _MIN_SAMPLE_RATE:
+        flags.append("low_sample_rate")
+
+    return {
+        "version": FIDELITY_VERSION,
+        "measured_at": datetime.now(timezone.utc)
+            .isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "identity": identity,
+        "speech_seconds": speech_seconds,
+        "clip_ratio": clip_ratio,
+        "noise_floor_db": noise_floor_db,
+        "flags": flags,
+    }
+
+
+def _clean_identity(value: float | None) -> float | None:
+    """A cosine similarity, or None. Advisory: a nonsense number is dropped.
+
+    `identity` is measured elsewhere (the ingest close-the-loop path) and merely
+    carried here, so this is where an impossible value stops. Cosine similarity
+    lives in [-1, 1]; anything else — NaN from a degenerate embedding, a 0-100
+    "score" from a future caller that misread the field — is named in the log and
+    dropped, never stored. Per the batch rule that measurement is ADVISORY, a bad
+    identity number can not fail a clone.
+    """
+    if value is None:
+        return None
+    # Strictly numeric: `float("0.9")` would succeed, and a string arriving here
+    # means a caller is passing something this field is not (the HTTP layer
+    # coerces its own numbers). bool is an int in Python — reject it too.
+    if isinstance(value, bool) or not isinstance(value, (int, float, np.floating)):
+        log.warning("fidelity identity ignored: %r is not a number", value)
+        return None
+    f = float(value)
+    if not (-1.0 <= f <= 1.0):  # NaN fails this comparison too, as intended
+        log.warning("fidelity identity ignored: %r is not a cosine similarity", value)
+        return None
+    return round(f, 4)
+
+
+def _probe_prosody(meta_row: dict, clean_wav_path: Path) -> None:
+    """Attach the measured prosody vector to a registry row, if we can.
+
+    The hook is contract C2 verbatim: `service/prosody.py` is owned by the
+    Measured Emotion Space work and may not exist yet, so the import lives
+    INSIDE the guard. A probe is a measurement, not a gate — a clone that
+    succeeded must never be failed by it.
+    """
+    try:
+        from service import prosody
+        meta_row["prosody"] = prosody.probe(clean_wav_path)
+    except Exception as exc:  # advisory: never fail a clone over a probe
+        log.warning("prosody probe skipped: %s", exc)
+
+
+def label_check_for(meta_row: dict, emotion: str, character_id: str) -> dict | None:
+    """"Does this recording read as the emotion it was filed under?" — or None.
+
+    The measured-emotion-space seam. `emotions.label_check` is owned by another
+    module and is optional by design: when it is absent (or the prosody probe
+    above found nothing to compare), this returns None and the create-voice
+    response carries no label check at all — the advisory simply does not appear.
+    Never raises, never blocks: a label check that disagrees with the user is
+    information, not a refusal.
+    """
+    vec = meta_row.get("prosody")
+    if not vec:
+        return None
+    from service import emotions as emotions_module
+    check = getattr(emotions_module, "label_check", None)
+    if check is None:
+        return None
+    try:
+        # An ITERABLE OF ROWS, not the vid->row mapping: iterating the registry
+        # dict would hand `label_check` a sequence of id strings, every one of
+        # which it (correctly) skips as not-a-row — so the check would return
+        # None forever and look like "no measured space yet".
+        rows = [m for m in _load_meta()["voices"].values()
+                if m.get("character_id") == character_id]
+        result = check(vec, emotion, rows)
+    except Exception as exc:  # noqa: BLE001 — advisory, like the probe
+        log.warning("label check skipped: %s", exc)
+        return None
+    return result if isinstance(result, dict) else None
+
+
 # ── assembly ──────────────────────────────────────────────────────────────────
 def _cloned_voices(meta: dict) -> list[Voice]:
     out: list[Voice] = []
@@ -374,6 +633,11 @@ def _cloned_voices(meta: dict) -> list[Voice]:
             name=f"{cname} · {emo}", category="cloned", lang=m.get("lang", "EN"),
             created=m.get("created"), sample_seconds=m.get("sample_seconds"),
             consent=bool(m.get("consent")),
+            # Registry rows written before the ledger existed have no `fidelity`
+            # key at all, and that is exactly what they must report: null, not a
+            # zeroed object. A dict guard (rather than a bare .get) means a
+            # hand-edited or half-written value can't reach the response model.
+            fidelity=m["fidelity"] if isinstance(m.get("fidelity"), dict) else None,
         ))
     return out
 
@@ -572,6 +836,24 @@ def emotion_map(character_id: str) -> dict[str, str]:
     return {e: v.voice_id for e, v in _by_emotion(c.voices).items()} if c else {}
 
 
+def prosody_map(character_id: str) -> dict[str, dict]:
+    """emotion -> stored prosody probe for one Character (measured slots only).
+
+    Same one-voice-per-emotion reduction as emotion_map, so the measured
+    fallback can never pick a slot the synthesis path wouldn't serve.
+    """
+    c = find_character(character_id)
+    if not c:
+        return {}
+    meta = _load_meta()["voices"]
+    out: dict[str, dict] = {}
+    for e, v in _by_emotion(c.voices).items():
+        row = meta.get(v.voice_id)
+        if isinstance(row, dict) and isinstance(row.get("prosody"), dict):
+            out[e] = row["prosody"]
+    return out
+
+
 # ── endpoints ─────────────────────────────────────────────────────────────────
 @router.get("/v1/emotions")
 def get_scale(character_id: str | None = None) -> list[str]:
@@ -699,9 +981,12 @@ def character_manifest(character_id: str) -> dict:
     # never advertise a voice_id the synthesis path wouldn't pick (a dict
     # comprehension here let the LAST duplicate win while emotion_map took the
     # first).
+    # `fidelity` is published here so a pack's (or an API consumer's) quality is
+    # inspectable BEFORE anyone synthesizes with it. Null for every voice cloned
+    # before the ledger existed — a consumer reads "not measured", never a zero.
     native = {
         e: {"voice_id": v.voice_id, "sample_seconds": v.sample_seconds,
-            "consent": v.consent}
+            "consent": v.consent, "fidelity": v.fidelity}
         for e, v in _by_emotion(c.voices).items()
     }
     # Same deterministic pick resolve() uses, so the manifest can never
@@ -729,9 +1014,11 @@ def character_manifest(character_id: str) -> dict:
 # NOT async: this handler runs ffmpeg and a `service.export_stems` child
 # process (seconds). On the event loop that froze every concurrent
 # synthesis response and stream; as a `def` handler FastAPI runs it in the
-# anyio threadpool where blocking is correct.
+# anyio threadpool where blocking is correct. (The same rule binds
+# `create_voice` below, which is where that work actually happens —
+# test_handler_modes asserts it, and test_fidelity asserts it for this door.)
 @router.post("/v1/voices", response_model=Voice, status_code=201)
-def create_voice(
+def clone_voice_endpoint(
     file: UploadFile = File(...),
     character: str = Form(...),
     emotion: str = Form(BASELINE),
@@ -739,13 +1026,48 @@ def create_voice(
     attested: str = Form(""),
     statement: str = Form(""),
 ) -> Voice:
+    """The HTTP door onto :func:`create_voice`.
+
+    A separate function for ONE reason: `create_voice` carries the
+    `fidelity_identity` seam (contract C1) that the ingest close-the-loop path
+    fills in-process, and FastAPI binds every parameter it can see to the
+    request. Declared on the route, that kwarg becomes an optional query
+    parameter — i.e. any caller could assert `identity 0.99` for a voice this
+    service never measured, and the roster would present that fabricated number
+    as a measured "identity match". The whole point of the ledger is that its
+    numbers were measured here, so the seam stays off the wire.
+    """
+    return create_voice(
+        file=file, character=character, emotion=emotion, tags=tags,
+        attested=attested, statement=statement)
+
+
+def create_voice(
+    *,
+    file: UploadFile,
+    character: str,
+    emotion: str = BASELINE,
+    tags: str = "",
+    attested: str = "",
+    statement: str = "",
+    fidelity_identity: float | None = None,
+) -> Voice:
     """Clone one Voice (a character in a given emotion) from a recording.
     A novel emotion name self-registers as a custom slot on this Character.
 
     Cloning requires an ownership attestation: `attested` must be "true" and
     `statement` non-empty. On success a consent receipt — the SAME shape ingest
     stamps ({consented_at, clip_sha256, statement}) — is written into the
-    Voice's meta entry, so an API-cloned Voice carries provenance too."""
+    Voice's meta entry, so an API-cloned Voice carries provenance too.
+
+    The clone is also MEASURED (:func:`measure_fidelity`): clipping, noise floor,
+    effective speech seconds and sample-rate adequacy are computed from the
+    cleaned audio this call already has, once, and stored on the registry row.
+    `fidelity_identity` is the one half this module cannot measure — cosine
+    similarity to the speaker's reference, produced by the ingest
+    close-the-loop path — and is merged in when supplied. Both are advisory:
+    nothing here can fail a clone that otherwise succeeded, and an unmeasurable
+    clip stores no fidelity at all rather than a zeroed one."""
     if attested.strip().lower() != "true" or not statement.strip():
         raise HTTPException(422, "ownership attestation required to clone a voice")
     statement = statement.strip()
@@ -820,6 +1142,33 @@ def create_voice(
 
         created = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
+        # ── measurement (contracts C1 + C2) ───────────────────────────────────
+        # After the export succeeded and before the registry row is written, so
+        # the row lands complete: the ledger is never a second write that could
+        # be interrupted, and nothing here runs on a request that is going to
+        # fail anyway. Both probes are advisory (see measure_fidelity /
+        # _probe_prosody) — neither can turn a finished clone into an error.
+        row: dict = {
+            "name": character.strip(), "character_id": cid, "emotion": emotion,
+            "created": created, "sample_seconds": seconds, "lang": "EN",
+            # Same consent-receipt shape ingest stamps (see ingest.commit).
+            "consent": {
+                "consented_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "clip_sha256": clip_sha256, "statement": statement},
+        }
+        fidelity = measure_fidelity(
+            clean, identity=_clean_identity(fidelity_identity),
+            # The SOURCE rate, not the cleaned one: clean_audio resamples
+            # everything to 24 kHz, so only the upload can report 8 kHz.
+            source_rate=_wav_rate(raw))
+        if fidelity is not None:
+            row["fidelity"] = fidelity
+        else:
+            log.warning("fidelity not measured for %s: the cleaned clip is not "
+                        "readable PCM16 audio", voice_id)
+        _probe_prosody(row, clean)
+        label_check = label_check_for(row, emotion, cid)
+
         def _commit(meta: dict) -> None:
             # Re-check the emotion slot UNDER the registry lock. The check at
             # the top of create_voice is a fast fail, but the multi-second clone
@@ -829,14 +1178,7 @@ def create_voice(
             # slot). Mirrors import_pack. The embedding is still staged in the
             # temp dir here, so this refusal has nothing to clean up.
             reject_slot_collision(meta, cid, emotion)
-            meta["voices"][voice_id] = {
-                "name": character.strip(), "character_id": cid, "emotion": emotion,
-                "created": created, "sample_seconds": seconds, "lang": "EN",
-                # Same consent-receipt shape ingest stamps (see ingest.commit).
-                "consent": {
-                    "consented_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                    "clip_sha256": clip_sha256, "statement": statement},
-            }
+            meta["voices"][voice_id] = row
             cm = meta["characters"].setdefault(cid, {"name": character.strip(), "tags": []})
             for t in (t.strip().lower() for t in tags.split(",") if t.strip()):
                 if t not in cm["tags"]:
@@ -861,7 +1203,8 @@ def create_voice(
 
     return Voice(voice_id=voice_id, character_id=cid, emotion=emotion,
                  name=f"{character.strip()} · {emotion}", category="cloned",
-                 created=created, sample_seconds=seconds, consent=True)
+                 created=created, sample_seconds=seconds, consent=True,
+                 fidelity=row.get("fidelity"), label_check=label_check)
 
 
 @router.patch("/v1/voices/{voice_id}", response_model=Voice)
