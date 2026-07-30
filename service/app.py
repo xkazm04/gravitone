@@ -68,6 +68,7 @@ from service.packs import router as packs_router
 from service.takes import router as takes_router, reviews_router
 from service import convai
 from service.convai import router as convai_router, ws_router as convai_ws_router
+from service.gym import router as gym_router
 from service.stt import router as stt_router
 
 ENGINE: TtsEngine | None = None
@@ -1235,6 +1236,8 @@ app.include_router(stt_router, dependencies=[Depends(require_scope("stt"))])
 # the socket would lock out the exact client this surface exists for.
 app.include_router(convai_router, dependencies=[Depends(require_scope("convai"))])
 app.include_router(convai_ws_router)
+# Replay drives the same conversation surface it tests, so it carries the same scope.
+app.include_router(gym_router, dependencies=[Depends(require_scope("convai"))])
 # The conversation session speaks through the same worker pool as every other
 # route, but it cannot import this module to reach it (that is the import cycle
 # — app imports the router). So the pool is handed over instead; the lambda
