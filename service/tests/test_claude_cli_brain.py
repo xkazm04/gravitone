@@ -271,6 +271,21 @@ class TranscriptTests(unittest.TestCase):
     def test_the_first_turn_says_the_call_just_connected(self) -> None:
         self.assertIn("just connected", dialog.ClaudeCliBackend._transcript(AGENT, []))
 
+    def test_the_other_party_can_be_someone_other_than_a_candidate(self) -> None:
+        """An agent that IS the candidate must not call the interviewer one.
+
+        This is what a two-sided simulation needs: the same backend drives both
+        seats, and each has to see the other correctly labelled.
+        """
+        persona = dataclasses.replace(AGENT, counterpart="Interviewer")
+        text = dialog.ClaudeCliBackend._transcript(persona, [
+            {"role": "user", "content": "Tell me about your background."},
+            {"role": "assistant", "content": "Eight years in payments."},
+        ])
+        self.assertIn("Interviewer: Tell me about your background.", text)
+        self.assertIn("You: Eight years in payments.", text)
+        self.assertNotIn("Candidate:", text)
+
 
 class SelectionTests(unittest.TestCase):
     def test_the_name_maps_to_the_backend(self) -> None:
