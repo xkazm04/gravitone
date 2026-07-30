@@ -153,6 +153,34 @@ class Settings:
     # pro model. Escalation was uncapped and uncounted: every segment under the
     # confidence threshold silently doubled its own bill.
     ingest_escalation_budget: int = _int("INGEST_ESCALATION_BUDGET", 12)
+    # --- Voice corpus (service/ingest.py, OPT-IN per ingest job) -----------
+    # Where a character's durable ingest facts live once a commit succeeds:
+    # the segment wavs that were actually used, their labels/confidences/cues/
+    # failures/outlier flags, the spliced stems, the measured levels, the clip
+    # hash and the consent receipt. Kept beside voices/ and takes/ so a
+    # deployment still mounts ONE data volume.
+    #
+    # NOTHING is written here unless a caller asks for it (`corpus: true` on the
+    # scan or commit request). This deliberately retains human voice audio, and
+    # the product's promise is sovereignty — so the default is OFF, capture is
+    # per character, and every clip is itemized (GET /v1/characters/{id}/corpus)
+    # and deletable by clip hash. GC still reaps ingest workdirs; the corpus is
+    # purely additive.
+    corpus_dir: str = _str("CORPUS_DIR", str(REPO_ROOT / "corpus"))
+    # HARD ceiling on one character's corpus, in bytes. Voice audio grows
+    # without limit otherwise, and the target box is a small Arm appliance. When
+    # a capture pushes a character over it, whole clips are PRUNED — lowest
+    # measured identity first (an unmeasured clip is the least-evidenced, so it
+    # goes before a measured one), oldest breaking the tie — and each removal is
+    # named in the capture report. The last remaining clip is never pruned: a
+    # cap is not a reason to leave a character with no corpus at all.
+    corpus_max_bytes: int = _int("CORPUS_MAX_BYTES", 2 * 1024 * 1024 * 1024)
+    # Ceiling on a stem rebuilt by POST /v1/ingest/rederive. Same number
+    # `ingest.concat_wavs` caps a scan-time stem at, named here because
+    # re-derivation selects across EVERY take of a character rather than one
+    # recording, so without it a well-used corpus would splice minutes of audio
+    # into a reference stem that only needs seconds.
+    corpus_stem_seconds: float = float(_str("CORPUS_STEM_SECONDS", "30"))
     # Fallback built-in voice if a requested voice_id isn't found.
     default_voice: str = _str("TTS_DEFAULT_VOICE", "alba")
     # --- Piper voices (service/piper.py) -----------------------------------

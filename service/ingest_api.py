@@ -7,7 +7,17 @@
   GET  /v1/ingest/{job}/preview/{emotion}   → stem wav (the SPEAKER's own audio)
   POST /v1/ingest/{job}/audition            { emotion, text, recipe? } → wav (a CLONE)
   POST /v1/ingest/{job}/commit              { character, emotions[], character_id?,
-                                              recipes? } → voices
+                                              recipes?, corpus? } → voices
+  POST /v1/ingest/rederive                  { character_id, emotions? } → { job_id }
+  GET  /v1/characters/{id}/corpus           → what audio of this person is kept
+  DELETE /v1/characters/{id}/corpus/{sha}   → remove every segment from one clip
+
+The corpus (`service/ingest.py`, "THE VOICE CORPUS"): OPT-IN per job (`corpus:
+true` on the scan or the commit, default OFF), captured only after a commit that
+really created Voices, and only when that commit carried an ownership
+attestation. `rederive` rebuilds a character's stems from everything the corpus
+holds and re-exports through the same one-load child a commit uses — it is a
+JOB, not a blocking call, for exactly the reason commit is one.
 
 Status flow: running → awaiting_speaker → running → done. `partial` streams live
 intermediate data (word count, speakers, per-emotion tally) for a data-rich loader.
@@ -68,7 +78,15 @@ from service.errors import job_expired
 
 logger = logging.getLogger("gravitone")
 
-router = APIRouter(prefix="/v1/ingest", tags=["ingest"])
+# ONE router, NO prefix — deliberately. This module owns two path families:
+# `/v1/ingest/...` (the scan → review → commit flow) and
+# `/v1/characters/{id}/corpus...` (what audio of a person the box kept, and the
+# deletion surface for it). They are the same capability and the same "clone"
+# scope, so they ride the same router `service/app.py` already mounts; a second
+# router would need a second mount and would let the corpus surface ship
+# unwired. Every path below is therefore written out in full.
+router = APIRouter(tags=["ingest"])
+INGEST = "/v1/ingest"
 
 # Same step KEYS in both modes (the web loader keys off them); only the
 # labels differ. Sovereign = local-only ffmpeg pipeline, no network I/O.
@@ -85,7 +103,17 @@ STEPS_BY_MODE = {
         {"key": "label", "label": "Group segments (local)"},
         {"key": "stem", "label": "Build voice stem"},
     ],
+    # Re-derivation has no recording to analyze: it selects from stored audio
+    # and clones. Same step-key shape so the studio's loader needs no new case.
+    "rederive": [
+        {"key": "stem", "label": "Rebuild stems from the corpus"},
+        {"key": "clone", "label": "Re-export voices"},
+    ],
 }
+# Modes a caller may ASK for on /scan. "rederive" is a mode this service enters
+# by its own route, never by upload — kept off this tuple so the scan surface
+# cannot be talked into it.
+SCAN_MODES = ("auto", "cloud", "sovereign")
 
 # ── durable job store ─────────────────────────────────────────────────────────
 JOBS: dict[str, dict] = {}
@@ -819,8 +847,38 @@ def _apply_recipes(job: dict, emotions: list[str], chosen: dict[str, str]) -> No
         _persist(job)
 
 
+def _capture_corpus(job: dict, character_id: str, statement: str,
+                    created: list[dict]) -> None:
+    """Copy this job's durable facts into the character's corpus, after a commit
+    that really created Voices.
+
+    Runs LAST and reports on the job (`corpus`), never raises and never changes
+    the commit's outcome: the clone is already done and registered, so a corpus
+    that could not be written is a named degradation, not a failed clone. The
+    workdir is untouched — GC still owns it — because the corpus is a COPY.
+    """
+    outcome: dict
+    if not created:
+        outcome = {"requested": True, "captured": False,
+                   "reason": "this commit created no voices, so there is "
+                             "nothing whose source audio would be kept"}
+    else:
+        res = ingest.capture_corpus(
+            Path(job["work_dir"]), character_id, job.get("result") or {},
+            clip_sha256=job.get("clip_sha256"), consent=statement,
+            mode=job.get("mode") or "cloud", levels=job.get("detection"),
+            committed=created)
+        outcome = {"requested": True, **res}
+    with _LOCK:
+        if job.get("cancel"):
+            return
+        job["corpus"] = outcome
+        _persist(job)
+
+
 def _do_commit(job_id: str, character: str, emotions: list[str], character_id: str | None,
-               statement: str, recipes: dict[str, str] | None = None) -> None:
+               statement: str, recipes: dict[str, str] | None = None,
+               corpus: bool = False) -> None:
     job = _get_job(job_id)
     if job is None:  # cancelled between Thread.start() and here
         return
@@ -865,15 +923,97 @@ def _do_commit(job_id: str, character: str, emotions: list[str], character_id: s
         _rollback(job_id, registered, "failed")
     elif was_cancelled:
         _rollback(job_id, created, "cancelled")
+    elif corpus:
+        # ONLY on the clean path: a rolled-back commit's voices no longer exist,
+        # and keeping the audio that made them would be retention with nothing
+        # to justify it.
+        cid = character_id or voices._slug(character)
+        try:
+            _capture_corpus(job, cid, statement, created)
+        except Exception as exc:  # noqa: BLE001 - never turn a clone into an error
+            logger.warning("ingest job %s: corpus capture failed: %s", job_id, exc)
+
+
+def _do_rederive(job_id: str, character_id: str, emotions: list[str] | None) -> None:
+    """Rebuild + re-export one character's voices from its corpus, as a phase.
+
+    Same shape as `_do_commit`, for the same reasons: it loads the TTS model in
+    a child process (minutes on a CPU box), it registers Voices one at a time,
+    and a caller must be able to cancel it and poll it.
+
+    It does NOT roll back, and that is the deliberate difference from a commit.
+    A commit's rollback removes voices the user never had; a re-derivation
+    REPLACES voices they already had, and the embedding it replaced is gone by
+    the time the row is swapped. Removing the rebuilt voice would therefore
+    leave the character with no voice for that emotion at all — strictly worse
+    than the rebuilt one it just made. So an abandoned rebuild keeps every
+    emotion it finished, and says which ones those were.
+    """
+    job = _get_job(job_id)
+    if job is None:
+        return
+    registered: list[dict] = []
+    started = {"clone": False}
+
+    def _progress(done: int, current: str | None) -> None:
+        if not started["clone"]:
+            started["clone"] = True
+            _mk_step(job, "stem", "done")
+            _mk_step(job, "clone", "active")
+        with _LOCK:
+            if job.get("cancel"):
+                return
+            job["partial"] = {**(job.get("partial") or {}),
+                              "emotions_done": done, "current": current}
+            _persist(job)
+
+    failure: BaseException | None = None
+    res: dict = {}
+    try:
+        _mk_step(job, "stem", "active")
+        res = ingest.rederive(
+            character_id, Path(job["work_dir"]), emotions,
+            progress=_progress, should_cancel=_canceller(job),
+            on_voice=registered.append)
+    except ingest.Cancelled:
+        logger.info("ingest job %s: rederive abandoned (cancelled)", job_id)
+    except Exception as exc:  # noqa: BLE001
+        failure = exc
+
+    with _LOCK:
+        was_cancelled = bool(job.get("cancel"))
+        if not was_cancelled and failure is None:
+            _mk_step(job, "clone", "done")
+            job["committed"] = res.get("created") or []
+            job["result"] = {"mode": "rederive", **res}
+            job["partial"] = {"emotions_done": len(res.get("created") or []),
+                              "emotions_total": len(res.get("stems") or []),
+                              "current": None}
+            job["status"] = "committed"
+            _persist(job)
+
+    if failure is not None or was_cancelled:
+        done = [v.get("voice_id") for v in registered if isinstance(v, dict)]
+        logger.warning(
+            "ingest job %s: rederive %s after rebuilding %d voice(s) — they are "
+            "KEPT (see _do_rederive): %s", job_id,
+            "failed" if failure is not None else "was cancelled", len(done), done)
+    if failure is not None:
+        _fail(job, "voice re-derivation", failure)
 
 
 # ── endpoints ─────────────────────────────────────────────────────────────────
-@router.post("/scan")
-def start_scan(file: UploadFile = File(...), mode: str = Form("auto")) -> dict:
+@router.post(f"{INGEST}/scan")
+def start_scan(file: UploadFile = File(...), mode: str = Form("auto"),
+               corpus: bool = Form(False)) -> dict:
     # NOT async: the prologue writes up to 50 MB, runs ffprobe and hashes the
     # clip before handing off to the phase thread — all of that belongs on the
     # threadpool, not the event loop (every other route in this file is `def`).
-    if mode not in ("auto", "cloud", "sovereign"):
+    #
+    # `corpus` (default FALSE) is the whole opt-in: it asks this box to KEEP the
+    # audio and labels this job produces once the clone succeeds. It changes
+    # nothing about the scan itself, and the commit can still override it.
+    if mode not in SCAN_MODES:
         raise HTTPException(400, "mode must be auto, cloud or sovereign")
     _admit()  # before the 50 MB read: a rejected upload should cost nothing
     data = file.file.read()  # sync read — we're on the threadpool
@@ -904,7 +1044,14 @@ def start_scan(file: UploadFile = File(...), mode: str = Form("auto")) -> dict:
         "committed": None,
         # Audition Room state: `recipes` is public (choices + named outcomes),
         # `recipe_plan` is the server-side index map behind them.
-        "recipes": None, "recipe_plan": {}}
+        "recipes": None, "recipe_plan": {},
+        # Corpus state. `requested` is what the caller asked for at upload time
+        # (the commit may still change its mind); everything else is filled in
+        # after a successful commit and always NAMES the outcome, including
+        # "not requested" — a silent absence would be indistinguishable from a
+        # capture that failed.
+        "corpus": {"requested": bool(corpus), "captured": False,
+                   "reason": None if corpus else "corpus capture was not requested"}}
     with _LOCK:
         JOBS[job_id] = job
         _persist(job)
@@ -919,13 +1066,15 @@ _PUBLIC_KEYS = ("id", "status", "step", "steps", "partial", "speakers",
                 # (the segment indices behind each recipe) is deliberately NOT
                 # here: a client names a recipe, it never selects audio.
                 "recipes",
+                # Whether this job's audio was kept, and — always — why not.
+                "corpus",
                 # What analyze learned about THIS recording. A key the job dict
                 # holds but this tuple omits is computed and then thrown away —
                 # that is exactly what happened to these three.
                 "note", "limits", "detection")
 
 
-@router.get("/modes")
+@router.get(f"{INGEST}/modes")
 def modes() -> dict:
     """What each ingest mode does to a recording, from the backend's own
     constants — and which one `auto` resolves to right now.
@@ -942,7 +1091,7 @@ def modes() -> dict:
     }
 
 
-@router.get("/{job_id}")
+@router.get(INGEST + "/{job_id}")
 def get_job(job_id: str):
     with _LOCK:
         job = JOBS.get(job_id)
@@ -951,7 +1100,7 @@ def get_job(job_id: str):
         return {k: job.get(k) for k in _PUBLIC_KEYS}
 
 
-@router.get("/{job_id}/speaker-preview/{sid}")
+@router.get(INGEST + "/{job_id}/speaker-preview/{sid}")
 def speaker_preview(job_id: str, sid: str):
     job = _get_job(job_id)
     if not job:
@@ -966,7 +1115,7 @@ class SpeakerReq(BaseModel):
     speaker_id: str
 
 
-@router.post("/{job_id}/speaker")
+@router.post(INGEST + "/{job_id}/speaker")
 def choose_speaker(job_id: str, req: SpeakerReq) -> dict:
     _admit()  # labelling is the biggest fan-out in the pipeline
     with _LOCK:
@@ -988,7 +1137,7 @@ class AuditionReq(BaseModel):
     recipe: str | None = None
 
 
-@router.post("/{job_id}/audition")
+@router.post(INGEST + "/{job_id}/audition")
 def audition(job_id: str, req: AuditionReq):
     """Hear a candidate stem AS A VOICE, before anything is committed.
 
@@ -1059,7 +1208,7 @@ def audition(job_id: str, req: AuditionReq):
         })
 
 
-@router.get("/{job_id}/preview/{emotion}")
+@router.get(INGEST + "/{job_id}/preview/{emotion}")
 def preview(job_id: str, emotion: str):
     job = _get_job(job_id)
     if not job:
@@ -1082,9 +1231,14 @@ class CommitReq(BaseModel):
     # Absent, empty or `full` for an emotion all mean the same thing: clone what
     # the ledger showed. The fast path never sends this.
     recipes: dict[str, str] | None = None
+    # Keep this recording's segments, labels, stems and levels for this
+    # character (see ingest.capture_corpus). None = whatever the scan asked for
+    # (default OFF); an explicit true/false here wins, because the decision to
+    # RETAIN belongs at the moment of consent, not at upload.
+    corpus: bool | None = None
 
 
-@router.post("/{job_id}/commit")
+@router.post(INGEST + "/{job_id}/commit")
 def commit(job_id: str, req: CommitReq):
     """Kick off cloning as a background phase and return immediately. Progress
     (emotions_done / total / current) streams via `partial`; the job ends
@@ -1125,20 +1279,144 @@ def commit(job_id: str, req: CommitReq):
         statement = req.statement.strip()
         if not req.attested or not statement:
             raise HTTPException(422, "ownership attestation required to clone a voice")
+        want_corpus = ((job.get("corpus") or {}).get("requested", False)
+                       if req.corpus is None else bool(req.corpus))
         job["status"] = "committing"
         job["cancel"] = False
         job["committed"] = None
+        job["corpus"] = {"requested": want_corpus, "captured": False,
+                         "reason": None if want_corpus
+                         else "corpus capture was not requested"}
         job["partial"] = {"emotions_done": 0, "emotions_total": len(emotions), "current": None}
         _persist(job)
     threading.Thread(
         target=_do_commit,
         args=(job_id, req.character.strip(), emotions, req.character_id, statement,
-              chosen),
+              chosen, want_corpus),
         daemon=True).start()
     return {"status": "committing"}
 
 
-@router.delete("/{job_id}")
+class RederiveReq(BaseModel):
+    character_id: str
+    # Which emotions to rebuild. Absent = every emotion the corpus holds audio
+    # for, which is the point of the feature (one click, whole character).
+    emotions: list[str] | None = None
+
+
+def _valid_cid(character_id: str) -> str:
+    cid = (character_id or "").strip()
+    if not cid or cid != voices._slug(cid):
+        raise HTTPException(400, "character_id is not a valid character id")
+    return cid
+
+
+@router.post(INGEST + "/rederive")
+def start_rederive(req: RederiveReq) -> dict:
+    """Rebuild a character's voices from its stored corpus — no upload, no cloud
+    call, no new consent (the receipt stored with the audio is the consent).
+
+    The three refusals are answered HERE, synchronously, so a caller learns "you
+    have no corpus" as a 404 rather than as a job that fails a minute later:
+      404 — nothing has ever been captured for this character;
+      409 — the corpus is over its byte cap (prune or delete first), or holds no
+            audio for the emotions asked for.
+    Everything past that is a background job with the same poll surface as a
+    commit: GET /v1/ingest/{job_id}, DELETE to cancel.
+    """
+    cid = _valid_cid(req.character_id)
+    emotions: list[str] | None = None
+    if req.emotions is not None:
+        try:
+            emotions = [normalize_emotion(e) for e in req.emotions]
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+    try:
+        idx = ingest.load_corpus(cid)
+    except errors.UserFacing as exc:
+        raise HTTPException(400, str(exc))
+    if not idx.get("clips"):
+        raise HTTPException(
+            404, "there is no corpus for this character — capture is opt-in, so "
+                 "re-run an ingest with corpus enabled before rebuilding from it")
+    used = ingest.corpus_bytes(idx)
+    cap = SETTINGS.corpus_max_bytes
+    if cap > 0 and used > cap:
+        raise HTTPException(
+            409, f"this character's corpus is {used} bytes, over its {cap}-byte "
+                 "cap — delete recordings before rebuilding from it")
+    sel = ingest.select_best(cid, emotions, idx)
+    if not any(rows for rows in sel["picks"].values()):
+        raise HTTPException(
+            409, "nothing in this character's corpus matches what was asked "
+                 "for, so there is nothing to rebuild")
+
+    _admit()   # a rebuild loads the TTS model in a child, exactly like a commit
+    job_id = uuid.uuid4().hex[:12]
+    work_dir = WORK_ROOT / job_id
+    work_dir.mkdir(parents=True, exist_ok=True)
+    job = {
+        "id": job_id, "status": "committing", "step": None, "mode": "rederive",
+        "steps": [{**s, "state": "pending"} for s in STEPS_BY_MODE["rederive"]],
+        "partial": {"emotions_done": 0,
+                    "emotions_total": sum(1 for r in sel["picks"].values() if r),
+                    "current": None},
+        "speakers": None, "duration": 0, "result": None, "error": None,
+        "note": None, "limits": None, "detection": None,
+        "work_dir": str(work_dir), "created": time.time(),
+        "clip_sha256": None, "cancel": False, "committed": None,
+        "recipes": None, "recipe_plan": {},
+        # A rebuild reads the corpus and never writes to it.
+        "corpus": {"requested": False, "captured": False,
+                   "reason": "a re-derivation reads the corpus, it never adds "
+                             "to it", "corpus_rev": sel["corpus_rev"]},
+        "character_id": cid}
+    with _LOCK:
+        JOBS[job_id] = job
+        _persist(job)
+    threading.Thread(target=_do_rederive, args=(job_id, cid, emotions),
+                     daemon=True).start()
+    return {"job_id": job_id, "mode": "rederive",
+            "selection": sel["report"], "corpus_rev": sel["corpus_rev"]}
+
+
+@router.get("/v1/characters/{character_id}/corpus")
+def get_corpus(character_id: str) -> dict:
+    """What audio of this person the box holds — clips, their segments, seconds,
+    emotions, measured fidelity and the consent receipt each was kept under.
+
+    Answers for a character with NO corpus too (empty, `totals.clips = 0`)
+    rather than 404: "this box keeps nothing of yours" is the answer to the
+    question, and a 404 would read as "we could not check".
+    """
+    cid = _valid_cid(character_id)
+    try:
+        return ingest.corpus_view(cid)
+    except errors.UserFacing as exc:
+        raise HTTPException(400, str(exc))
+
+
+@router.delete("/v1/characters/{character_id}/corpus/{clip_sha}")
+def delete_corpus_clip(character_id: str, clip_sha: str) -> dict:
+    """Remove every segment and stem derived from ONE recording, and report what
+    went. Deliberately not a 204: a deletion the user cannot see the shape of is
+    a deletion they have to take on trust, and this is the surface that makes
+    keeping the audio defensible in the first place.
+
+    The Voices already cloned from that recording are NOT touched — they are
+    embeddings the user asked for and owns; delete them through /v1/voices.
+    """
+    cid = _valid_cid(character_id)
+    try:
+        report = ingest.delete_clip(cid, clip_sha)
+    except errors.UserFacing as exc:
+        raise HTTPException(400, str(exc))
+    if report.get("removed") is None:
+        raise HTTPException(404, report.get("reason") or "no such recording")
+    return report
+
+
+@router.delete(INGEST + "/{job_id}")
 def cancel_job(job_id: str):
     """Cancel a job (between emotions during commit, between phases otherwise),
     mark it 'cancelled' and tear down its workdir."""

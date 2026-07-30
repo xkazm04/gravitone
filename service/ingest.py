@@ -48,6 +48,7 @@ import base64
 import json
 import mimetypes
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -62,6 +63,7 @@ from typing import Callable, NamedTuple
 import numpy as np
 
 from service import voiceprint
+from service.atomicio import atomic_write_text, file_lock
 from service.config import SETTINGS
 from service.emotions import BASELINE, EMOTION_SCALE
 from service.errors import UserFacing
@@ -1595,7 +1597,9 @@ def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: st
            should_cancel: Callable[[], bool] | None = None,
            on_voice: Callable[[dict], None] | None = None,
            allow_short: bool = False,
-           synthesize: Callable[[str, str], bytes] | None = None) -> list[dict]:
+           synthesize: Callable[[str, str], bytes] | None = None,
+           replace: bool = False, source: str = "ingest",
+           derived_from: dict | None = None) -> list[dict]:
     """Clone each accepted stem into a Voice.
 
     Cloning runs in ONE child process (`python -m service.export_stems`) that
@@ -1623,6 +1627,16 @@ def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: st
     identity is then absent, never zero. NOTHING here can fail a clone: the whole
     measurement is advisory, and the reason for every skip travels back to the
     caller on the per-voice dict.
+
+    RE-DERIVATION: `replace=True` (internal callers only; never a field on an
+    HTTP request) makes a held (character_id, emotion) slot an UPGRADE instead of
+    a skip — the new stem is exported, the old embedding is unlinked and its row
+    dropped, and the new row takes the slot. The unlink happens FIRST, under the
+    registry lock, exactly as `voices._unlink_then_forget` does it: a file that
+    refuses to delete keeps its row and this emotion is treated as lost, because
+    a .safetensors with no row is a phantom Character. `derived_from` is the
+    provenance stamped on such a row (corpus revision, splice DSP version, model
+    version) and `source` names what made it. Both are inert on the normal path.
 
     Eligibility: a stem shorter than MIN_STEM_SECONDS clones poorly, so it is
     SKIPPED (never cloned) and reported — the whole commit does not fail. Pass
@@ -1658,7 +1672,7 @@ def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: st
             _log(f"commit: skipping '{emo}' — {seconds:.2f}s < {MIN_STEM_SECONDS:.0f}s minimum")
             continue
         held = slot_holder(meta, cid, emo)
-        if held is not None:
+        if held is not None and not replace:
             # (character_id, emotion) is the registry's real key: a second row
             # for a slot is a Voice the roster shows and synthesis can never
             # reach. An EXTEND of a character that already covers this emotion
@@ -1670,7 +1684,7 @@ def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: st
             continue
         voice_id = f"{cid}-{emo}-{uuid.uuid4().hex[:6]}"
         plan.append({"emotion": emo, "src": str(sw), "seconds": seconds,
-                     "voice_id": voice_id,
+                     "voice_id": voice_id, "replaces": held if replace else None,
                      # asserts the resolved destination is inside VOICES_DIR
                      "dst": str(voice_file_path(voice_id, VOICES_DIR))})
 
@@ -1752,9 +1766,14 @@ def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: st
         entry = {
             "name": name, "character_id": cid, "emotion": emo,
             "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "sample_seconds": p["seconds"], "lang": "EN", "source": "ingest"}
+            "sample_seconds": p["seconds"], "lang": "EN", "source": source}
         if identity is not None:
             _stamp_fidelity(entry, Path(p["src"]), identity)
+        if derived_from is not None:
+            # Provenance for a Voice this box REBUILT rather than recorded: what
+            # corpus revision, splice DSP and model produced it. When any of the
+            # three moves, this row is what says the voice can be improved.
+            entry["derived_from"] = dict(derived_from)
         if consent is not None:
             entry["consent"] = {
                 "consented_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -1768,7 +1787,16 @@ def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: st
             # this commit already registered — a raise here skips the save.
             held = slot_holder(meta, cid, emo, exclude=vid)
             if held is not None:
-                return held
+                if not replace:
+                    return held
+                # UPGRADE this slot: file first, row second (voices.py's rule).
+                try:
+                    Path(voice_file_path(held, VOICES_DIR)).unlink(missing_ok=True)
+                except (OSError, ValueError) as exc:
+                    _log(f"commit: '{emo}' could not replace {held} "
+                         f"(its embedding would not delete: {exc})")
+                    return held
+                meta["voices"].pop(held, None)
             meta["voices"][vid] = entry
             meta["characters"].setdefault(cid, {"name": name, "tags": ["ingested"]})
             return None
@@ -1786,6 +1814,8 @@ def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: st
                     progress(done, plan[done]["emotion"])
             continue
         made = {"voice_id": p["voice_id"], "emotion": emo, "seconds": p["seconds"]}
+        if p.get("replaces"):
+            made["replaced"] = p["replaces"]
         if identity is not None:
             made["identity"] = identity
         elif identity_reason:
@@ -1810,6 +1840,690 @@ def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: st
         err = "".join(_stderr_chunks)[-200:]
         raise RuntimeError(f"clone failed: {err or 'export_stems exited nonzero'}")
     return created
+
+
+# ── THE VOICE CORPUS: ingest stops being disposable ───────────────────────────
+# Everything above this line is thrown away. `_gc_once` rmtree's the workdir
+# thirty minutes after a scan, and the only survivor of a commit is an opaque
+# .safetensors nobody can regenerate or explain — so every quality gain is a
+# future-only gain, and a user who records a second time gets a second unrelated
+# clone attempt rather than a better voice.
+#
+# The corpus inverts that: on a successful commit the job's DURABLE FACTS are
+# COPIED (never moved — GC still owns the workdir) into
+# `SETTINGS.corpus_dir/<character_id>/`, keyed by the clip's sha256. Re-ingesting
+# the same recording is therefore a no-op, and a later `rederive` can rebuild the
+# stems from every take of that person at once.
+#
+# What makes retention defensible, and what none of this is allowed to skip:
+#   * OPT-IN. Nothing is written unless the caller asked (`corpus: true`).
+#   * CONSENT. Capture needs the same ownership attestation the clone needed,
+#     and the receipt is stored beside the audio (never re-derived, never
+#     assumed). No statement, no capture — named, not silent.
+#   * VISIBLE. `corpus_view` itemizes every clip, segment, second and emotion.
+#   * DELETABLE. `delete_clip` removes every segment and stem derived from one
+#     recording and REPORTS what went, which is the whole retention story.
+#   * BOUNDED. A hard byte cap with a named pruning order (see
+#     `Settings.corpus_max_bytes`).
+#   * VERSIONED. `corpus.json` carries a schema; a corpus written by a newer
+#     version is refused rather than half-read, because re-derive must never
+#     silently mean something different than it did when the audio was stored.
+CORPUS_SCHEMA = 1
+# The splice DSP this corpus's stems were built with (see the `stem splicing`
+# section: level matching, raised-cosine fades, the silent gap). It is stamped
+# into `derived_from` so a voice can say WHICH version of the splice made it and
+# a future improvement can be recognised as a reason to re-derive.
+DSP_VERSION = 1
+CORPUS_INDEX = "corpus.json"
+_CORPUS_LOCK = "corpus.lock"
+_CORPUS_SEGMENTS = "segments"
+_CORPUS_STEMS = "stems"
+# Same tolerance ingest_api's recipe join uses: a labelled span and its
+# extracted wav are the same audio, so a mismatch means the positional join is
+# wrong and the capture must be abandoned rather than store misattributed audio.
+_CORPUS_DUR_TOLERANCE = 0.35
+
+
+def model_version() -> str:
+    """What synthesizer a corpus-derived voice was exported with.
+
+    pocket-tts exposes no version constant, so this asks the package metadata
+    and, failing that, says so and names the export CONFIGURATION instead of
+    inventing a number — an unknown version has to be readable as unknown.
+    """
+    try:
+        from importlib.metadata import version
+        return f"pocket-tts {version('pocket-tts')}"
+    except Exception:  # noqa: BLE001 - absent metadata is not a failure
+        return (f"pocket-tts (version not reported); language={SETTINGS.language}, "
+                f"quantize={SETTINGS.quantize}")
+
+
+def corpus_root() -> Path:
+    """Read from SETTINGS at call time, so a test (or a re-pointed deployment)
+    can move the corpus without re-importing this module."""
+    return Path(SETTINGS.corpus_dir)
+
+
+def corpus_dir(character_id: str) -> Path:
+    """This character's corpus directory, with the id PROVEN to be a slug.
+
+    The id reaches a filesystem path, so it is validated the way every other
+    write path in this service validates one: rejected, never sanitised.
+    """
+    cid = (character_id or "").strip()
+    if not cid or cid != _slug(cid):
+        raise UserFacing("that is not a valid character id")
+    return corpus_root() / cid
+
+
+def _clip_dir(character_id: str, clip_sha: str) -> Path:
+    sha = (clip_sha or "").strip().lower()
+    if len(sha) < 8 or any(c not in "0123456789abcdef" for c in sha):
+        raise UserFacing("that is not a valid clip hash")
+    return corpus_dir(character_id) / sha
+
+
+def _empty_index(character_id: str) -> dict:
+    return {"schema": CORPUS_SCHEMA, "character_id": character_id,
+            "rev": 0, "updated": None, "clips": []}
+
+
+def load_corpus(character_id: str) -> dict:
+    """This character's corpus index, or an empty one. Never invents data.
+
+    A corpus written by a NEWER schema is refused: re-derivation reads segment
+    selection rules out of this file, and half-understanding a future layout is
+    how a "rebuild" quietly becomes a different voice.
+    """
+    path = corpus_dir(character_id) / CORPUS_INDEX
+    if not path.is_file():
+        return _empty_index(character_id)
+    try:
+        idx = json.loads(path.read_text("utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise UserFacing(
+            "this character's corpus index could not be read, so nothing about "
+            "the stored audio can be shown or rebuilt from it "
+            f"({type(exc).__name__})")
+    if not isinstance(idx, dict) or not isinstance(idx.get("clips"), list):
+        raise UserFacing("this character's corpus index is not in a shape this "
+                         "version understands")
+    schema = int(idx.get("schema") or 0)
+    if schema > CORPUS_SCHEMA:
+        raise UserFacing(
+            f"this corpus was written by a newer version of Gravitone (index "
+            f"schema {schema}, this build understands {CORPUS_SCHEMA}) — "
+            "upgrade before reading or rebuilding from it")
+    idx.setdefault("character_id", character_id)
+    idx.setdefault("rev", 0)
+    idx.setdefault("updated", None)
+    return idx
+
+
+def _save_corpus(character_id: str, idx: dict) -> dict:
+    """Persist the index and bump its revision.
+
+    `rev` is what `derived_from` points at, so it moves on EVERY mutation —
+    capture, deletion and pruning alike — and a voice can always say which state
+    of the corpus produced it.
+    """
+    d = corpus_dir(character_id)
+    d.mkdir(parents=True, exist_ok=True)
+    idx["schema"] = CORPUS_SCHEMA
+    idx["character_id"] = character_id
+    idx["rev"] = int(idx.get("rev") or 0) + 1
+    idx["updated"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    atomic_write_text(d / CORPUS_INDEX, json.dumps(idx, indent=2))
+    return idx
+
+
+def _corpus_lock(character_id: str):
+    """Cross-PROCESS exclusion around a corpus read-modify-write. The service
+    runs as N replica processes (replicas.py) and two concurrent captures for
+    one character would otherwise each load the index, add a clip and save —
+    losing one, exactly as the voice registry would without `mutate_meta`."""
+    d = corpus_dir(character_id)
+    d.mkdir(parents=True, exist_ok=True)
+    return file_lock(d / _CORPUS_LOCK)
+
+
+def _dir_bytes(path: Path) -> int:
+    total = 0
+    if not path.is_dir():
+        return 0
+    for p in path.rglob("*"):
+        try:
+            if p.is_file():
+                total += p.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def corpus_bytes(idx: dict) -> int:
+    return sum(int(c.get("bytes") or 0) for c in idx.get("clips", []))
+
+
+def _corpus_rows(work_dir: Path, result: dict) -> tuple[list[dict], str | None]:
+    """The scan's per-segment labels re-joined to the wavs on disk.
+
+    `label_and_stem` publishes segments in index order but not their index or
+    path, so the join is positional — and a positional join that is wrong stores
+    audio under the wrong label FOREVER, which is worse here than in a recipe.
+    It is therefore verified against the labelled duration, and a mismatch
+    abandons the capture with a named reason.
+    """
+    segs = result.get("segments")
+    if not isinstance(segs, list) or not segs:
+        return [], "this scan published no per-segment labels"
+    rows: list[dict] = []
+    for i, s in enumerate(segs):
+        wav = work_dir / f"seg_{i:03d}.wav"
+        seconds = 0.0
+        if wav.is_file():
+            try:
+                seconds = round(_wav_seconds(wav), 2)
+            except Exception:  # noqa: BLE001 - an unreadable wav is simply not copied
+                seconds = 0.0
+        declared = float(s.get("dur") or 0.0)
+        if seconds and declared and abs(seconds - declared) > _CORPUS_DUR_TOLERANCE:
+            return [], "segment audio could not be matched to its labels"
+        # A segment the pipeline could not prepare, or measured as NOT this
+        # speaker, contributed no audio to any stem — so its audio is not stored
+        # either. The label still is: "we heard this and rejected it, for this
+        # reason" is precisely the fact a corpus exists to keep.
+        used = (wav.is_file() and not s.get("failure")
+                and s.get("outlier") != "dropped" and seconds > 0)
+        rows.append({"i": i, "src": wav if used else None,
+                     "emotion": s.get("emotion"),
+                     "confidence": float(s.get("confidence") or 0.0),
+                     "cue": s.get("cue") or "", "seconds": seconds,
+                     "failure": s.get("failure"), "outlier": s.get("outlier"),
+                     "escalation": s.get("escalation"), "model": s.get("model"),
+                     "used": used})
+    if not any(r["used"] for r in rows):
+        return [], "this scan has no usable segment audio left to keep"
+    return rows, None
+
+
+def _clip_fidelity(result: dict) -> dict | None:
+    """The compact, per-clip half of the fidelity payload — the number a
+    selection or a prune can rank on. None when nothing was measured, because
+    absent and measured-badly must stay distinguishable."""
+    fid = result.get("fidelity")
+    if not isinstance(fid, dict) or not fid.get("available"):
+        return None
+    stems = {}
+    for emo, row in (fid.get("stems") or {}).items():
+        if isinstance(row, dict) and row.get("identity") is not None:
+            stems[emo] = row["identity"]
+    return {"version": fid.get("version"),
+            "reference_similarity": fid.get("reference_similarity"),
+            "cohesion_mad": fid.get("cohesion_mad"),
+            "segments_measured": fid.get("segments_measured"),
+            "stem_identity": stems, "measures": fid.get("measures")}
+
+
+def capture_corpus(work_dir: Path, character_id: str, result: dict, *,
+                   clip_sha256: str | None, consent: str | None,
+                   mode: str = "cloud", levels: dict | None = None,
+                   committed: list[dict] | None = None,
+                   max_bytes: int | None = None) -> dict:
+    """COPY one finished job's durable facts into the character's corpus.
+
+    Called after a commit that actually created Voices. Never raises and never
+    fails a commit: the clone the user asked for has already happened, and a
+    capture that could not run says why (`captured: False, reason: ...`) instead
+    of turning a success into an error.
+
+    Append-only and content-addressed: the clip's sha256 IS the directory name,
+    so re-ingesting the same recording finds it already there and does nothing.
+    """
+    try:
+        if not clip_sha256:
+            return {"captured": False,
+                    "reason": "this job has no clip hash, so its audio cannot be "
+                              "stored content-addressed (nothing was written)"}
+        statement = (consent or "").strip()
+        if not statement:
+            # The one refusal that is not about plumbing: retention of a
+            # person's voice needs the attestation the clone needed, stored with
+            # the audio. No statement, no corpus — and say so.
+            return {"captured": False,
+                    "reason": "corpus capture needs the ownership attestation "
+                              "this clone was made under; nothing was stored"}
+        with _corpus_lock(character_id):
+            idx = load_corpus(character_id)
+            if any(c.get("clip_sha256") == clip_sha256 for c in idx["clips"]):
+                return {"captured": False, "already": True, "rev": idx["rev"],
+                        "clip_sha256": clip_sha256,
+                        "reason": "this recording is already in the corpus "
+                                  "(content-addressed by clip hash)"}
+            rows, why = _corpus_rows(Path(work_dir), result)
+            if why:
+                return {"captured": False, "reason": why}
+
+            dest = _clip_dir(character_id, clip_sha256)
+            if dest.exists():
+                # On disk but not in the index: a capture that died between the
+                # copy and the save. Start it again from clean rather than
+                # merging into rubbish nobody can account for.
+                shutil.rmtree(dest, ignore_errors=True)
+            (dest / _CORPUS_SEGMENTS).mkdir(parents=True, exist_ok=True)
+            (dest / _CORPUS_STEMS).mkdir(parents=True, exist_ok=True)
+
+            seg_records: list[dict] = []
+            for r in rows:
+                rel = None
+                if r["used"]:
+                    rel = f"{_CORPUS_SEGMENTS}/seg_{r['i']:03d}.wav"
+                    shutil.copyfile(r["src"], dest / rel)
+                seg_records.append(
+                    {"i": r["i"], "emotion": r["emotion"],
+                     "confidence": round(r["confidence"], 3), "cue": r["cue"],
+                     "seconds": r["seconds"], "failure": r["failure"],
+                     "outlier": r["outlier"], "escalation": r["escalation"],
+                     "model": r["model"], "wav": rel})
+
+            fid = _clip_fidelity(result)
+            stem_records: list[dict] = []
+            for stem in result.get("stems") or []:
+                emo = stem.get("emotion")
+                src = Path(work_dir) / f"stem_{emo}.wav"
+                if not emo or not src.is_file():
+                    continue
+                rel = f"{_CORPUS_STEMS}/stem_{emo}.wav"
+                shutil.copyfile(src, dest / rel)
+                stem_records.append(
+                    {"emotion": emo, "seconds": stem.get("seconds"),
+                     "segments": stem.get("segments"),
+                     "identity": (fid or {}).get("stem_identity", {}).get(emo),
+                     "note": stem.get("note"), "wav": rel})
+
+            # segments.json beside the audio: the corpus must be readable
+            # WITHOUT the index (the index is a convenience, the clip directory
+            # is the record).
+            atomic_write_text(dest / "segments.json", json.dumps(
+                {"schema": CORPUS_SCHEMA, "clip_sha256": clip_sha256,
+                 "mode": mode, "segments": seg_records, "stems": stem_records},
+                indent=2))
+
+            clip = {
+                "clip_sha256": clip_sha256, "dir": clip_sha256, "mode": mode,
+                "added": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "dsp_version": DSP_VERSION,
+                # The receipt, stored ONCE and never re-derived — deletion and
+                # the read API both quote it back.
+                "consent": {"statement": statement, "clip_sha256": clip_sha256,
+                            "consented_at": datetime.now(timezone.utc)
+                            .isoformat(timespec="seconds")},
+                "levels": levels,
+                "fidelity": fid,
+                "segments": seg_records,
+                "stems": stem_records,
+                "voices": [v.get("voice_id") for v in (committed or [])
+                           if isinstance(v, dict) and v.get("voice_id")],
+                "bytes": _dir_bytes(dest),
+            }
+            idx["clips"].append(clip)
+            idx = _save_corpus(character_id, idx)
+            pruned = _prune_locked(character_id, idx, max_bytes)
+        kept = sum(1 for r in seg_records if r["wav"])
+        return {"captured": True, "reason": None, "clip_sha256": clip_sha256,
+                "rev": idx["rev"], "segments": kept,
+                "segments_recorded": len(seg_records),
+                "stems": len(stem_records), "bytes": clip["bytes"],
+                "pruned": pruned}
+    except Exception as exc:  # noqa: BLE001 - a capture never fails a commit
+        _log(f"corpus: capture for '{character_id}' failed: {exc}")
+        return {"captured": False,
+                "reason": f"the corpus could not be written ({type(exc).__name__})"}
+
+
+def _prune_rank(clip: dict) -> tuple:
+    """Pruning order, named: LOWEST measured identity first, then oldest.
+
+    An unmeasured clip sorts below every measured one on purpose — it is the
+    clip with the least evidence that it is worth the disk, not the clip we know
+    is worst. Ties (and unmeasured clips against each other) break oldest-first.
+    """
+    fid = clip.get("fidelity") or {}
+    sim = fid.get("reference_similarity")
+    return (0 if sim is None else 1, sim if sim is not None else 0.0,
+            clip.get("added") or "")
+
+
+def _prune_locked(character_id: str, idx: dict, max_bytes: int | None) -> list[dict]:
+    """Drop whole clips until the character is under its byte cap. Caller holds
+    the corpus lock and passes the freshly-saved index.
+
+    Whole clips, never individual segments: a half-deleted recording is a
+    retention story nobody can tell, and the deletion surface the product
+    promises is "this recording, gone".
+    """
+    cap = SETTINGS.corpus_max_bytes if max_bytes is None else max_bytes
+    removed: list[dict] = []
+    if cap <= 0:
+        return removed
+    while corpus_bytes(idx) > cap and len(idx["clips"]) > 1:
+        victim = sorted(idx["clips"], key=_prune_rank)[0]
+        sim = (victim.get("fidelity") or {}).get("reference_similarity")
+        shutil.rmtree(_clip_dir(character_id, victim["clip_sha256"]),
+                      ignore_errors=True)
+        idx["clips"] = [c for c in idx["clips"]
+                        if c.get("clip_sha256") != victim["clip_sha256"]]
+        removed.append({
+            "clip_sha256": victim["clip_sha256"], "bytes": victim.get("bytes"),
+            "why": (f"pruned to stay under the {cap}-byte corpus cap — "
+                    + ("its speaker identity was never measured, so it is the "
+                       "least-evidenced audio held"
+                       if sim is None else
+                       f"lowest measured speaker identity ({sim}) in this corpus")
+                    + f", added {victim.get('added')}")})
+    if removed:
+        _save_corpus(character_id, idx)
+    if corpus_bytes(idx) > cap and len(idx["clips"]) <= 1:
+        removed.append({
+            "clip_sha256": None, "bytes": corpus_bytes(idx),
+            "why": (f"this corpus is over its {cap}-byte cap but only one "
+                    "recording remains — nothing was pruned, because a cap is "
+                    "not a reason to leave a character with no corpus at all")})
+    return removed
+
+
+def prune_corpus(character_id: str, max_bytes: int | None = None) -> list[dict]:
+    """Bring a character's corpus back under its cap. Returns what went, named."""
+    with _corpus_lock(character_id):
+        idx = load_corpus(character_id)
+        return _prune_locked(character_id, idx, max_bytes)
+
+
+def corpus_view(character_id: str) -> dict:
+    """What audio of this person the box holds — itemized.
+
+    Clips → segments → seconds/emotions/fidelity, plus the consent receipt each
+    recording was kept under and the byte budget. This is the surface that makes
+    retention inspectable rather than a claim, and it is the same data the
+    DELETE route removes by clip hash.
+    """
+    idx = load_corpus(character_id)
+    cap = SETTINGS.corpus_max_bytes
+    clips: list[dict] = []
+    tot_secs = 0.0
+    tot_segs = 0
+    for c in idx["clips"]:
+        kept = [s for s in c.get("segments", []) if s.get("wav")]
+        secs = round(sum(float(s.get("seconds") or 0.0) for s in kept), 2)
+        emotions: dict[str, dict] = {}
+        for s in kept:
+            e = emotions.setdefault(str(s.get("emotion")),
+                                    {"segments": 0, "seconds": 0.0})
+            e["segments"] += 1
+            e["seconds"] = round(e["seconds"] + float(s.get("seconds") or 0.0), 2)
+        tot_secs += secs
+        tot_segs += len(kept)
+        consent = c.get("consent") or {}
+        clips.append({
+            "clip_sha256": c.get("clip_sha256"), "added": c.get("added"),
+            "mode": c.get("mode"), "bytes": c.get("bytes"),
+            "seconds": secs, "segments": len(kept),
+            "segments_recorded": len(c.get("segments", [])),
+            "emotions": emotions,
+            "fidelity": c.get("fidelity"),
+            "levels": c.get("levels"),
+            "voices": c.get("voices") or [],
+            "consent": {"consented_at": consent.get("consented_at"),
+                        "statement": consent.get("statement"),
+                        "clip_sha256": consent.get("clip_sha256")},
+            "stems": [{"emotion": s.get("emotion"), "seconds": s.get("seconds"),
+                       "segments": s.get("segments"),
+                       "identity": s.get("identity")}
+                      for s in c.get("stems", [])],
+            "items": [{"i": s.get("i"), "emotion": s.get("emotion"),
+                       "seconds": s.get("seconds"),
+                       "confidence": s.get("confidence"), "cue": s.get("cue"),
+                       "outlier": s.get("outlier"), "failure": s.get("failure")}
+                      for s in c.get("segments", [])],
+        })
+    used = corpus_bytes(idx)
+    return {"character_id": character_id, "schema": idx.get("schema"),
+            "corpus_rev": idx.get("rev"), "updated": idx.get("updated"),
+            "dsp_version": DSP_VERSION, "clips": clips,
+            "totals": {"clips": len(clips), "segments": tot_segs,
+                       "seconds": round(tot_secs, 2), "bytes": used},
+            "cap_bytes": cap, "over_cap": bool(cap > 0 and used > cap)}
+
+
+def delete_clip(character_id: str, clip_sha: str) -> dict:
+    """Remove EVERY segment and stem derived from one recording, and say what
+    went. The retention story in one call: what the box held, gone, itemized.
+
+    Returns None-free facts (`removed`) plus what remains, so a client can show
+    the user the consequence of the deletion instead of a bare 204.
+    """
+    with _corpus_lock(character_id):
+        idx = load_corpus(character_id)
+        target = next((c for c in idx["clips"]
+                       if c.get("clip_sha256") == clip_sha), None)
+        if target is None:
+            return {"removed": None,
+                    "reason": "no recording with that clip hash is in this "
+                              "character's corpus"}
+        d = _clip_dir(character_id, clip_sha)
+        on_disk = _dir_bytes(d)
+        shutil.rmtree(d, ignore_errors=True)
+        still_there = d.exists()
+        idx["clips"] = [c for c in idx["clips"]
+                        if c.get("clip_sha256") != clip_sha]
+        idx = _save_corpus(character_id, idx)
+        kept = [s for s in target.get("segments", []) if s.get("wav")]
+        report = {
+            "removed": {
+                "clip_sha256": clip_sha,
+                "segments": len(kept),
+                "segment_labels": len(target.get("segments", [])),
+                "stems": len(target.get("stems", [])),
+                "seconds": round(sum(float(s.get("seconds") or 0.0)
+                                     for s in kept), 2),
+                "bytes": on_disk or target.get("bytes"),
+                "added": target.get("added"),
+                # Named honestly: the index no longer references this clip
+                # either way, but "the files would not delete" is a fact an
+                # operator has to be able to act on.
+                "files_deleted": not still_there,
+            },
+            "reason": None if not still_there else
+            "the index no longer holds this recording, but some of its files "
+            "could not be deleted from disk and must be removed by hand",
+            "corpus_rev": idx["rev"],
+            "remaining": {"clips": len(idx["clips"]),
+                          "bytes": corpus_bytes(idx)},
+        }
+    return report
+
+
+# ── RE-DERIVATION: rebuild a character's stems from its whole corpus ──────────
+# The pay-off. Selection is BEST-OF across every take the box holds, so a too-
+# short emotion that could never clear MIN_STEM_SECONDS in one recording clears
+# it across takes — and a better splice DSP, a newer model or one more recording
+# retroactively improves voices that already exist.
+def _selection_basis(rows: list[dict]) -> str:
+    """Which ranking a selection is entitled to use.
+
+    Measured identity is only comparable against measured identity, so it is
+    used ONLY when every candidate has one; a mixed set falls back wholesale to
+    duration x confidence rather than ranking two different quantities against
+    each other and calling the result "best".
+    """
+    if rows and all(r.get("identity") is not None for r in rows):
+        return "fidelity"
+    return "duration_confidence"
+
+
+def corpus_candidates(character_id: str, idx: dict | None = None) -> list[dict]:
+    """Every stored segment of this character that still has audio on disk."""
+    idx = load_corpus(character_id) if idx is None else idx
+    base = corpus_dir(character_id)
+    rows: list[dict] = []
+    for c in idx.get("clips", []):
+        sha = c.get("clip_sha256")
+        ident = (c.get("fidelity") or {}).get("stem_identity") or {}
+        for s in c.get("segments", []):
+            rel = s.get("wav")
+            if not rel:
+                continue
+            wav = base / str(sha) / rel
+            if not wav.is_file():
+                continue
+            rows.append({
+                "clip_sha256": sha, "added": c.get("added") or "",
+                "i": int(s.get("i") or 0), "emotion": s.get("emotion"),
+                "seconds": float(s.get("seconds") or 0.0),
+                "confidence": float(s.get("confidence") or 0.0),
+                # Per-clip-per-emotion measured identity: the finest grain this
+                # pipeline ever measured for a stem, and named as such.
+                "identity": ident.get(s.get("emotion")),
+                "outlier": s.get("outlier"), "wav": str(wav)})
+    return rows
+
+
+def select_best(character_id: str, emotions: list[str] | None = None,
+                idx: dict | None = None,
+                cap_seconds: float | None = None) -> dict:
+    """Best-of selection per emotion, across every clip in the corpus.
+
+    Merit chooses; chronology splices — segments are picked by rank and then
+    ordered by (clip added, segment index), because `concat_wavs` level-matches
+    and crossfades a SEQUENCE and re-ordering utterances is what makes a stem
+    sound assembled. Flagged (unlike-the-rest) segments rank last but are not
+    excluded: the scan already dropped everything that was not this person.
+    """
+    idx = load_corpus(character_id) if idx is None else idx
+    cap = SETTINGS.corpus_stem_seconds if cap_seconds is None else cap_seconds
+    rows = corpus_candidates(character_id, idx)
+    by_emotion: dict[str, list[dict]] = {}
+    for r in rows:
+        by_emotion.setdefault(str(r["emotion"]), []).append(r)
+    want = list(by_emotion) if not emotions else list(dict.fromkeys(emotions))
+
+    picks: dict[str, list[dict]] = {}
+    report: dict[str, dict] = {}
+    for emo in want:
+        cands = by_emotion.get(emo) or []
+        if not cands:
+            report[emo] = {"segments": 0, "seconds": 0.0, "basis": None,
+                           "why": "no stored audio is labelled with this emotion"}
+            continue
+        basis = _selection_basis(cands)
+        if basis == "fidelity":
+            key = (lambda r: (1 if r["outlier"] else 0, -float(r["identity"]),
+                              -r["seconds"], r["added"], r["i"]))
+        else:
+            key = (lambda r: (1 if r["outlier"] else 0,
+                              -(r["seconds"] * max(r["confidence"], 0.0)),
+                              -r["seconds"], r["added"], r["i"]))
+        picked: list[dict] = []
+        have = 0.0
+        for r in sorted(cands, key=key):
+            if have >= cap:
+                break
+            picked.append(r)
+            have += r["seconds"]
+        picked.sort(key=lambda r: (r["added"], r["clip_sha256"] or "", r["i"]))
+        picks[emo] = picked
+        report[emo] = {"segments": len(picked), "seconds": round(have, 2),
+                       "basis": basis,
+                       "clips": sorted({r["clip_sha256"] for r in picked}),
+                       "why": None}
+    return {"picks": picks, "report": report, "corpus_rev": idx.get("rev", 0)}
+
+
+def rederive(character_id: str, work_dir: Path,
+             emotions: list[str] | None = None, *,
+             progress: Callable[[int, str | None], None] | None = None,
+             should_cancel: Callable[[], bool] | None = None,
+             on_voice: Callable[[dict], None] | None = None,
+             synthesize: Callable[[str, str], bytes] | None = None,
+             max_bytes: int | None = None) -> dict:
+    """Rebuild this character's stems from its corpus and re-export the Voices.
+
+    No upload, no cloud call, no new consent (the receipt stored with the audio
+    is the consent, and it is stamped forward onto every rebuilt Voice) — the
+    whole job is local by construction. Re-export goes through the SAME one-load
+    child `commit` already drives, with `replace=True` so an existing emotion is
+    upgraded in place rather than skipped as a slot collision.
+
+    Three refusals, each named rather than empty-successful:
+      * NO CORPUS       — nothing was ever captured for this character.
+      * EMPTY SELECTION — a corpus exists but holds no audio for what was asked.
+      * OVER CAP        — the corpus is above its byte cap; prune it first, so a
+        rebuild is never the thing that cements an over-budget corpus in place.
+    """
+    idx = load_corpus(character_id)
+    if not idx.get("clips"):
+        raise UserFacing(
+            "there is no corpus for this character — capture is opt-in, so "
+            "re-run an ingest with corpus enabled before rebuilding from it")
+    cap = SETTINGS.corpus_max_bytes if max_bytes is None else max_bytes
+    used = corpus_bytes(idx)
+    if cap > 0 and used > cap:
+        raise UserFacing(
+            f"this character's corpus is {used} bytes, over its {cap}-byte cap "
+            "— prune or delete recordings before rebuilding from it")
+
+    sel = select_best(character_id, emotions, idx)
+    picks = {e: rows for e, rows in sel["picks"].items() if rows}
+    if not picks:
+        raise UserFacing(
+            "nothing in this character's corpus matches what was asked for, so "
+            "there is nothing to rebuild")
+
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    built: list[dict] = []
+    for emo, rows in sorted(picks.items()):
+        dst = work_dir / f"stem_{emo}.wav"
+        try:
+            sp = concat_wavs([Path(r["wav"]) for r in rows], dst,
+                             cap_seconds=SETTINGS.corpus_stem_seconds)
+        except Exception as exc:  # noqa: BLE001 - one emotion, never the job
+            _log(f"rederive: '{emo}' could not be spliced: {exc}")
+            sel["report"].setdefault(emo, {})["why"] = (
+                "the stored segments for this emotion could not be spliced")
+            continue
+        built.append({"emotion": emo, "seconds": sp.seconds,
+                      "segments": sp.segments,
+                      "eligible": sp.seconds >= MIN_STEM_SECONDS})
+        sel["report"].setdefault(emo, {})["stem_seconds"] = sp.seconds
+    if not built:
+        raise UserFacing("none of this character's stored audio could be "
+                         "spliced into a stem")
+
+    meta = _load_meta()
+    name = meta["characters"].get(character_id, {}).get("name", character_id)
+    newest = max(idx["clips"], key=lambda c: c.get("added") or "")
+    consent = (newest.get("consent") or {}).get("statement")
+    provenance = {"corpus_rev": idx.get("rev", 0), "dsp_version": DSP_VERSION,
+                  "model_version": model_version(),
+                  "basis": {e: sel["report"].get(e, {}).get("basis")
+                            for e in picks},
+                  "clips": sorted({r["clip_sha256"] for rows in picks.values()
+                                   for r in rows}),
+                  "derived_at": datetime.now(timezone.utc)
+                  .isoformat(timespec="seconds")}
+
+    created = commit(work_dir, name, [b["emotion"] for b in built],
+                     character_id, consent=consent,
+                     clip_sha256=(newest.get("consent") or {}).get("clip_sha256"),
+                     progress=progress, should_cancel=should_cancel,
+                     on_voice=on_voice, synthesize=synthesize,
+                     replace=True, source="rederive", derived_from=provenance)
+    return {"character_id": character_id, "created": created,
+            "stems": built, "selection": sel["report"],
+            "derived_from": provenance,
+            "skipped": [b["emotion"] for b in built
+                        if b["emotion"] not in {c["emotion"] for c in created}]}
 
 
 # ── CLI (one-shot) ────────────────────────────────────────────────────────────
