@@ -10,11 +10,13 @@
 // so it is labelled destructive and confirmed. Every label names the request it
 // sends.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { Button, Eyebrow } from "@/components/ui/Primitives";
 import SecretReveal from "./SecretReveal";
-import { SCOPES, relTime, useKeys, type ApiKeyWithSecret, type Enforcement } from "./data";
+import { provenScopes, readAttestation, restate, type Attestation } from "./attestation";
+import type { Posture } from "./probes";
+import { SCOPES, relTime, useKeys, type ApiKeyWithSecret } from "./data";
 
 const Code = ({ children }: { children: string }) => (
   <span className="font-jetbrains text-cyan-200/90">{children}</span>
@@ -32,39 +34,93 @@ function RootKeyConsequences() {
   );
 }
 
-/** The posture strip. It reports only what the studio can prove; see
- *  data.ts::Enforcement for why a served key list proves nothing.
+/** The posture strip — no longer a guess.
  *
- *  A ledger full of tidy scoped keys looks like access control whether or not
- *  the deployment checks any of them, so the ambiguous case is a WARNING, not
- *  a silent omission — and the unreachable case says nothing at all about the
- *  deployment rather than inventing a posture for a box that never answered. */
-function EnforcementNote({ state }: { state: Enforcement }) {
+ *  This page used to say "can't tell from here", and it was telling the truth:
+ *  every request went through the studio's proxy, which attaches its own root
+ *  key, so an enforcing backend and a wide-open one answered identically. The
+ *  probe route (`/api/keys/probe`) makes the one measurement that separates
+ *  them — an UNAUTHENTICATED request, sent server-side with no credential at
+ *  all — and this strip reports what came back:
+ *
+ *    open        the deployment served a request carrying no key. The keys
+ *                below enforce NOTHING. This is the loudest thing on the page.
+ *    enforced    the deployment refused it. Only TTS_API_KEY does that.
+ *    unreachable nothing answered — no posture is claimed for a silent box.
+ *    unmeasured  the probe has not answered yet. Not reassurance; absence. */
+function PostureNote({ state, checkedAt }: { state: Posture; checkedAt: string | null }) {
   if (state === "unreachable") return null; // the error banner already says it
-  if (state === "enforced") {
+  if (state === "unmeasured") {
     return (
-      <p className="font-jetbrains mt-4 rounded-lg border border-cyan-400/25 bg-cyan-400/5 px-4 py-2 text-[11px] text-cyan-200/90">
-        Key enforcement is <strong className="font-semibold">ON</strong> — this backend answered 401, which only
-        a configured <Code>TTS_API_KEY</Code> does, so every request is checked and the keys below really do
-        gate access. It rejected this studio too: nothing on this page will work until{" "}
-        <Code>GRAVITONE_API_KEY</Code> in the studio&apos;s environment holds a key the backend accepts.{" "}
-        <RootKeyConsequences />
+      <p className="font-jetbrains mt-4 text-[11px] text-white/45">
+        Measuring key enforcement — sending one unauthenticated request to your deployment…
       </p>
     );
   }
+  const when = checkedAt ? ` Probed ${relTime(checkedAt)}.` : "";
+  if (state === "open") {
+    return (
+      <div role="alert" className="mt-4 rounded-xl border border-rose-400/40 bg-rose-400/10 px-4 py-3">
+        <p className="font-jetbrains text-[11px] uppercase tracking-widest text-rose-300">
+          this deployment is open to everyone
+        </p>
+        <p className="font-hanken mt-2 text-sm text-rose-100/90">
+          A request carrying <strong className="font-semibold">no key at all</strong> was served. Every key below
+          enforces nothing — anyone who can reach this host can synthesize, clone and manage voices on it. Set{" "}
+          <Code>TTS_API_KEY</Code> on the box and restart; until then the ledger is a list of names, not access
+          control.{when}
+        </p>
+        <p className="font-jetbrains mt-2 text-[10px] leading-relaxed text-rose-100/70">
+          <RootKeyConsequences />
+        </p>
+      </div>
+    );
+  }
   return (
-    <ErrorBanner severity="warning">
-      Key enforcement: <strong className="font-semibold">can&apos;t tell from here</strong>. This page reaches the
-      service through the studio&apos;s server-side proxy, which sends its own root key when it has one — so a key
-      list that loads looks identical whether the deployment checks credentials or not. If{" "}
-      <Code>TTS_API_KEY</Code> is unset on the box, the service serves <em>every</em> unauthenticated request and
-      the keys below enforce nothing. Verify it there, not here. <RootKeyConsequences />
-    </ErrorBanner>
+    <p className="font-jetbrains mt-4 rounded-lg border border-cyan-400/25 bg-cyan-400/5 px-4 py-2 text-[11px] text-cyan-200/90">
+      Key enforcement is <strong className="font-semibold">ON</strong> — an unauthenticated request to this
+      backend was refused, which only a configured <Code>TTS_API_KEY</Code> does, so the keys below really do
+      gate access.{when} If this page cannot load keys, <Code>GRAVITONE_API_KEY</Code> in the studio&apos;s
+      environment does not hold a key the backend accepts. <RootKeyConsequences />
+    </p>
+  );
+}
+
+/** Scope chips, in the honesty grammar the page already uses for revoked rows:
+ *  SOLID = proved by a probe that watched this deployment serve it, with the
+ *  timestamp of that probe; OUTLINED (dashed) = declared only — a string
+ *  somebody typed, never observed. A proof is this browser's memory of a sweep
+ *  run at mint/rotate (see attestation.ts), and it stops counting when the
+ *  posture changes underneath it. */
+function ScopeChips({ scopes, proof }: { scopes: string[]; proof: Attestation | null }) {
+  const proven = new Set(provenScopes(proof));
+  const stamp = proof?.checkedAt ? relTime(proof.checkedAt) : "";
+  return (
+    <div className="flex flex-wrap gap-1">
+      {scopes.map((s) =>
+        proven.has(s) ? (
+          <span key={s}
+            title={`Proven: this deployment served a ${s}-scoped request from this key when probed ${stamp}.`}
+            className="font-jetbrains rounded border border-emerald-400/40 bg-emerald-400/15 px-1.5 py-0.5 text-[10px] text-emerald-200">
+            {s} ✓ {stamp}
+          </span>
+        ) : (
+          <span key={s}
+            title="Declared only — nothing has ever observed this deployment accepting this key for this scope."
+            className="font-jetbrains rounded border border-dashed border-white/20 px-1.5 py-0.5 text-[10px] text-white/55">
+            {s}
+          </span>
+        ),
+      )}
+    </div>
   );
 }
 
 export default function KeysLedger() {
-  const { keys, loading, error, enforcement, createKey, rotateKey, revokeKey, destroyKey } = useKeys();
+  const {
+    keys, loading, error, posture, postureCheckedAt, provePosture,
+    createKey, rotateKey, revokeKey, destroyKey,
+  } = useKeys();
   const [name, setName] = useState("");
   const [scopes, setScopes] = useState<string[]>(["tts"]);
   const [busy, setBusy] = useState(false);
@@ -75,6 +131,31 @@ export default function KeysLedger() {
   // a double-click used to fire two requests, and a request that kills a
   // credential must not be sent twice.
   const [killing, setKilling] = useState<string | null>(null);
+  // Proofs live in this browser (attestation.ts), so they are read in an effect
+  // — never during render, which would differ between server and client HTML.
+  const [proofs, setProofs] = useState<Record<string, Attestation | null>>({});
+  const [reproving, setReproving] = useState<string | null>(null);
+
+  useEffect(() => {
+    const next: Record<string, Attestation | null> = {};
+    for (const k of keys) next[k.id] = readAttestation(k.id);
+    setProofs(next);
+  }, [keys]);
+
+  /** Re-prove, for a key whose secret is long gone. It can only re-measure the
+   *  half that needs no credential — the deployment's posture — and that is
+   *  exactly what goes stale: a matrix proved against an enforcing box says
+   *  nothing once the box is open. A changed posture retires the proof rather
+   *  than leaving solid chips sitting on top of it. */
+  async function reprove(id: string) {
+    if (reproving) return;
+    setReproving(id); setErr(null);
+    try {
+      const sweep = await provePosture();
+      if (!sweep) { setErr("re-prove failed — the probe could not be run"); return; }
+      setProofs((p) => ({ ...p, [id]: restate(id, sweep.posture, sweep.checkedAt) }));
+    } finally { setReproving(null); }
+  }
 
   const toggleScope = (s: string) => setScopes((cur) => (cur.includes(s) ? cur.filter((x) => x !== s) : [...cur, s]));
 
@@ -107,7 +188,16 @@ export default function KeysLedger() {
 
   return (
     <div className="pb-24">
-      <SecretReveal keyData={reveal} onClose={() => setReveal(null)} />
+      {/* Closing the reveal is when a sweep's verdicts become the ledger's:
+          the proof was written while this dialog was open, under the key's id. */}
+      <SecretReveal
+        keyData={reveal}
+        onClose={() => {
+          const id = reveal?.id;
+          setReveal(null);
+          if (id) setProofs((p) => ({ ...p, [id]: readAttestation(id) }));
+        }}
+      />
       <Eyebrow>security</Eyebrow>
       <h1 className="font-instrument mt-4 text-4xl text-white">API keys.</h1>
       <p className="mt-2 max-w-2xl text-base text-white/70">
@@ -120,9 +210,8 @@ export default function KeysLedger() {
 
       {(error || err) && <ErrorBanner>{error ?? err}</ErrorBanner>}
 
-      {/* Whether these keys enforce anything is not inferable from their
-          existence, so the page says which of the two it actually knows. */}
-      {!loading && <EnforcementNote state={enforcement} />}
+      {/* Whether these keys enforce anything is measured, not inferred. */}
+      <PostureNote state={posture} checkedAt={postureCheckedAt} />
 
       {/* create bar */}
       <div className="glass-panel mt-8 rounded-2xl p-4">
@@ -178,9 +267,19 @@ export default function KeysLedger() {
                 </td>
                 <td className="font-jetbrains px-3 py-2.5 text-[12px] text-cyan-200/90">{k.prefix}</td>
                 <td className="px-3 py-2.5">
-                  <div className="flex flex-wrap gap-1">
-                    {k.scopes.map((s) => <span key={s} className="font-jetbrains rounded bg-white/5 px-1.5 py-0.5 text-[10px] text-white/70">{s}</span>)}
-                  </div>
+                  <ScopeChips scopes={k.scopes} proof={proofs[k.id] ?? null} />
+                  {/* A scope this key was NOT granted, served anyway, is a live
+                      privilege escalation — it belongs on the row, not in a log. */}
+                  {(proofs[k.id]?.served.length ?? 0) > 0 && (
+                    <p className="font-jetbrains mt-1 text-[10px] text-rose-300">
+                      ⚠ served {proofs[k.id]?.served.join(", ")} — never granted
+                    </p>
+                  )}
+                  {proofs[k.id]?.stale && (
+                    <p className="font-jetbrains mt-1 text-[10px] text-amber-200/90">
+                      proof retired — the deployment&apos;s posture changed since it was taken
+                    </p>
+                  )}
                 </td>
                 <td className="font-jetbrains px-3 py-2.5 text-[12px] text-white/60">{relTime(k.created)}</td>
                 <td className="font-jetbrains px-3 py-2.5 text-[12px] text-white/60">{relTime(k.last_used)}</td>
@@ -206,6 +305,16 @@ export default function KeysLedger() {
                     }}
                     className="font-jetbrains text-[11px] text-cyan-300/80 transition hover:text-cyan-200 disabled:cursor-not-allowed disabled:text-white/30">
                     {rotating === k.id ? "rotating…" : "rotate"}
+                  </button>
+                  {/* Secretless by necessity: the secret was shown once and is
+                      gone, so this re-measures the posture the proof depends on
+                      — not the scope matrix, which would need the key itself. */}
+                  <button
+                    onClick={() => void reprove(k.id)}
+                    disabled={reproving !== null}
+                    title="Re-run the unauthenticated posture probe. It cannot re-run the scope sweep — that needs the secret, which was shown once. Rotate to prove the scopes again."
+                    className="font-jetbrains ml-3 text-[11px] text-cyan-300/60 transition hover:text-cyan-200 disabled:cursor-not-allowed disabled:text-white/25">
+                    {reproving === k.id ? "re-proving…" : "re-prove"}
                   </button>
                   {/* Revoke disappears once the key is revoked (it is already
                       dead, and the backend is idempotent about it); rotate

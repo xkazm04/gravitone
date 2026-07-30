@@ -13,6 +13,8 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 
 import KeysLedger from "./KeysLedger";
 import type { ApiKey } from "./data";
+import type { Sweep } from "./probes";
+import { writeAttestation } from "./attestation";
 
 function key(over: Partial<ApiKey> = {}): ApiKey {
   return {
@@ -27,7 +29,22 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
-type Route = { list?: () => Response; onCall?: (url: string, method: string) => Response | undefined };
+/** A posture measurement as the probe route reports it. Every mount makes one
+ *  (it is a single unauthenticated read, and an open deployment nobody asked
+ *  about is the failure the page exists to prevent), so the harness answers it
+ *  by default rather than letting tests drift into an unmeasured state. */
+function sweep(over: Partial<Sweep> = {}): Response {
+  return json({
+    posture: "enforced", checkedAt: new Date().toISOString(),
+    probes: [], negativesConclusive: false, ...over,
+  } satisfies Sweep);
+}
+
+type Route = {
+  list?: () => Response;
+  probe?: () => Response;
+  onCall?: (url: string, method: string) => Response | undefined;
+};
 
 /** Route by (url, method) exactly as the browser would. Calls are recorded so a
  *  test can assert which endpoint a button actually hit. */
@@ -39,6 +56,7 @@ function stubFetch(routes: Route) {
     calls.push({ url, method });
     const custom = routes.onCall?.(url, method);
     if (custom) return custom;
+    if (url === "/api/keys/probe") return routes.probe?.() ?? sweep();
     if (url === "/api/keys" && method === "GET") return routes.list?.() ?? json([]);
     return json({});
   });
@@ -51,6 +69,7 @@ const clipboard = { writeText: vi.fn(async () => {}) };
 beforeEach(() => {
   clipboard.writeText = vi.fn(async () => {});
   vi.stubGlobal("navigator", { clipboard });
+  localStorage.clear(); // proofs live here — a leaked one would fake a chip
 });
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
@@ -210,24 +229,107 @@ describe("KeysLedger — an empty table is not a claim about the account", () =>
   });
 });
 
-// ── enforcement posture ──────────────────────────────────────────────────────
-describe("KeysLedger — it never implies the deployment is secured", () => {
-  it("admits it cannot tell when the list loads", async () => {
-    await mount({ list: () => json([key()]) });
-    expect(screen.getByText(/can't tell from here/i)).toBeInTheDocument();
-    expect(screen.getByText(/enforce nothing/i)).toBeInTheDocument();
+// ── posture: measured, not guessed ───────────────────────────────────────────
+describe("KeysLedger — the posture is a measurement now", () => {
+  it("measures it with ONE unauthenticated probe request, not by reading the list", async () => {
+    const calls = await mount({ list: () => json([key()]) });
+    expect(calls.filter((c) => c.url === "/api/keys/probe")).toHaveLength(1);
   });
 
-  it("states enforcement is ON only when the backend actually rejected it (401)", async () => {
-    await mount({ list: () => json({ detail: "invalid or missing API key" }, 401) });
+  it("states enforcement is ON when the bare probe was refused", async () => {
+    await mount({ list: () => json([key()]), probe: () => sweep({ posture: "enforced" }) });
     expect(screen.getByText(/Key enforcement is/)).toBeInTheDocument();
     expect(screen.getByText("ON")).toBeInTheDocument();
   });
 
+  it("makes an OPEN deployment the loudest thing on the page", async () => {
+    // The probe was served without any key: these keys enforce nothing, and
+    // that must not read as a footnote.
+    await mount({ list: () => json([key()]), probe: () => sweep({ posture: "open" }) });
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent(/open to everyone/i);
+    expect(alert).toHaveTextContent(/no key at all/i);
+    expect(alert).toHaveTextContent(/TTS_API_KEY/);
+  });
+
   it("claims no posture at all for a backend that never answered", async () => {
-    await mount({ list: () => json({ detail: "backend unreachable" }, 503) });
-    expect(screen.queryByText(/Key enforcement/i)).not.toBeInTheDocument();
-    expect(screen.queryByText(/can't tell from here/i)).not.toBeInTheDocument();
+    await mount({
+      list: () => json({ detail: "backend unreachable" }, 503),
+      probe: () => sweep({ posture: "unreachable" }),
+    });
+    expect(screen.queryByText(/Key enforcement is/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/open to everyone/i)).not.toBeInTheDocument();
+  });
+
+  it("says it is still measuring rather than implying a posture it lacks", async () => {
+    await mount({ list: () => json([key()]), probe: () => json({ detail: "no" }, 500) });
+    expect(screen.getByText(/Measuring key enforcement/i)).toBeInTheDocument();
+    expect(screen.queryByText(/Key enforcement is/)).not.toBeInTheDocument();
+  });
+});
+
+// ── proven vs declared-only chips ────────────────────────────────────────────
+describe("KeysLedger — a scope chip says whether anyone ever checked", () => {
+  const provenSweep: Sweep = {
+    posture: "enforced", checkedAt: new Date().toISOString(), negativesConclusive: true,
+    probes: [
+      { scope: "tts", expected: "allowed", observed: "allowed", verdict: "proven", status: 200, request: "POST /v1/text-to-speech/alba" },
+      { scope: "clone", expected: "refused", observed: "refused", verdict: "correctly-refused", status: 401, request: "GET /v1/ingest/modes" },
+    ],
+  };
+
+  it("renders an unproved scope as declared-only — outlined, never solid", async () => {
+    await mount({ list: () => json([key({ scopes: ["tts"] })]) });
+    const chip = within(row("Mobile app")).getByText("tts");
+    expect(chip.className).toContain("dashed");
+    expect(chip.getAttribute("title")).toMatch(/declared only/i);
+  });
+
+  it("renders a proved scope solid, carrying the timestamp of the probe", async () => {
+    writeAttestation("k_1", provenSweep);
+    await mount({ list: () => json([key({ scopes: ["tts"] })]) });
+    const chip = within(row("Mobile app")).getByText(/^tts ✓/);
+    expect(chip.className).toContain("emerald");
+    expect(chip.className).not.toContain("dashed");
+    expect(chip.textContent).toMatch(/just now|m ago/);
+  });
+
+  it("refuses to call anything proven when the deployment is OPEN", async () => {
+    // Every scope is served to everyone there, granted or not, so a solid chip
+    // would be the page's own alert contradicting itself.
+    writeAttestation("k_1", { ...provenSweep, posture: "open" });
+    await mount({ list: () => json([key({ scopes: ["tts"] })]), probe: () => sweep({ posture: "open" }) });
+    expect(within(row("Mobile app")).getByText("tts").className).toContain("dashed");
+  });
+
+  it("puts an ungranted-but-served scope on the row as an alert", async () => {
+    writeAttestation("k_1", {
+      ...provenSweep,
+      probes: [...provenSweep.probes, {
+        scope: "convai", expected: "refused", observed: "allowed",
+        verdict: "REFUSED-SCOPE-SERVED", status: 200, request: "GET /v1/convai/agents",
+      }],
+    });
+    await mount({ list: () => json([key({ scopes: ["tts"] })]) });
+    expect(within(row("Mobile app")).getByText(/served convai — never granted/)).toBeInTheDocument();
+  });
+
+  it("re-prove re-measures the posture and retires a proof taken under another one", async () => {
+    writeAttestation("k_1", provenSweep);
+    let posture: Sweep["posture"] = "enforced";
+    const calls = await mount({
+      list: () => json([key({ scopes: ["tts"] })]),
+      probe: () => sweep({ posture }),
+    });
+    expect(within(row("Mobile app")).getByText(/^tts ✓/)).toBeInTheDocument();
+
+    posture = "open"; // TTS_API_KEY was unset on the box since the proof
+    await click(screen.getByRole("button", { name: /^re-prove$/ }));
+
+    expect(calls.filter((c) => c.url === "/api/keys/probe")).toHaveLength(2);
+    const tr = row("Mobile app");
+    expect(within(tr).getByText(/proof retired/i)).toBeInTheDocument();
+    expect(within(tr).getByText("tts").className).toContain("dashed");
   });
 });
 
@@ -303,6 +405,46 @@ describe("SecretReveal — the one screen where losing the text is unrecoverable
     const warning = within(dialog).getByText(/never exercised that path/i);
     expect(warning).toBeInTheDocument();
     expect(warning.className).toContain("amber"); // a caveat, not a failure
+  });
+
+  it("never sweeps until a human asks — the tts probe is real synthesis", async () => {
+    const calls = await mount({ list: () => json([]) });
+    // Mounting measured the posture (one bodyless GET) and nothing else.
+    expect(calls.filter((c) => c.url === "/api/keys/probe" && c.method === "POST")).toHaveLength(0);
+  });
+
+  it("proves the freshly minted key against the deployment, in one click", async () => {
+    const dialog = await createAKey();
+    const probe = vi.fn(async () => json({
+      posture: "enforced", checkedAt: new Date().toISOString(), negativesConclusive: true,
+      probes: [{ scope: "tts", expected: "allowed", observed: "allowed", verdict: "proven", status: 200, request: "POST /v1/text-to-speech/alba" }],
+    } satisfies Sweep));
+    vi.stubGlobal("fetch", probe);
+
+    await click(within(dialog).getByRole("button", { name: /prove this key/i }));
+
+    // The secret under test is sent to the probe route — this is the only
+    // moment it exists, which is why the sweep lives here.
+    const [, init] = probe.mock.calls[0] as unknown as [string, RequestInit];
+    expect(JSON.parse(String(init.body))).toMatchObject({ secret: "gk_live_TOPSECRET" });
+    expect(await within(dialog).findByText(/granted and served/i)).toBeInTheDocument();
+  });
+
+  it("calls out a scope the key never held that the deployment served anyway", async () => {
+    const dialog = await createAKey();
+    vi.stubGlobal("fetch", vi.fn(async () => json({
+      posture: "enforced", checkedAt: new Date().toISOString(), negativesConclusive: true,
+      probes: [
+        { scope: "tts", expected: "allowed", observed: "allowed", verdict: "proven", status: 200, request: "POST /v1/text-to-speech/alba" },
+        { scope: "clone", expected: "refused", observed: "allowed", verdict: "REFUSED-SCOPE-SERVED", status: 200, request: "GET /v1/ingest/modes" },
+      ],
+    } satisfies Sweep)));
+
+    await click(within(dialog).getByRole("button", { name: /prove this key/i }));
+
+    const alert = await within(dialog).findByText(/served .* anyway/i);
+    expect(alert).toHaveTextContent(/clone/);
+    expect(alert.className).toContain("rose"); // a finding, not a caveat
   });
 
   it("dismisses on the explicit button", async () => {

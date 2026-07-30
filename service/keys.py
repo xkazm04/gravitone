@@ -337,6 +337,24 @@ def _persist_last_used(kid: str, now_iso: str) -> None:
     _LAST_PERSIST[kid] = time.monotonic()
 
 
+def key_recognized(secret: str | None) -> bool:
+    """True if `secret` matches ANY active (non-revoked) key, scope aside.
+
+    Exists so auth can answer 403 (real key, missing scope) instead of a
+    blanket 401 — the distinction a key-prover needs. Same constant-time,
+    no-early-break scan discipline as validate_key; does NOT bump last_used
+    (recognition is not use).
+    """
+    if not secret:
+        return False
+    h = _hash(secret)
+    found = False
+    for kid, khash, scopes, revoked in _index():
+        if secrets.compare_digest(khash, h) and not revoked:
+            found = True
+    return found
+
+
 def validate_key(secret: str | None, scope: str = "tts") -> bool:
     """True if `secret` is an active (non-revoked) key with `scope`. Bumps
     last_used (in-memory always; persisted at most once per
