@@ -72,6 +72,11 @@ class Agent:
     keywords: list[str] = field(default_factory=list)
     # Fixed interviewer turns for the scripted backend, in order.
     script: list[str] = field(default_factory=list)
+    # What to call the person on the other end when the conversation is
+    # rendered for a language model. "Candidate" is right for an interviewer and
+    # wrong for everything else — including an agent that IS the candidate,
+    # which is exactly what a two-sided simulation needs.
+    counterpart: str = "Candidate"
     # Which conversation_config_override fields a client may set.
     allow_overrides: list[str] = field(
         default_factory=lambda: ["prompt", "first_message", "language", "voice_id"])
@@ -494,7 +499,7 @@ class ClaudeCliBackend(DialogBackend):
 
     @staticmethod
     def _transcript(agent: Agent, history: list[dict]) -> str:
-        lines = [f"{'You' if m.get('role') == 'assistant' else 'Candidate'}: "
+        lines = [f"{'You' if m.get('role') == 'assistant' else agent.counterpart}: "
                  f"{m.get('content', '')}" for m in history]
         body = "\n".join(lines) if lines else "(the call has just connected)"
         return (f"This is a spoken interview in progress.\n\n{body}\n\n"
