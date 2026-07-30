@@ -109,5 +109,30 @@ class MutateMetaUsesTheCrossProcessLockTests(unittest.TestCase):
                 self.assertTrue((root / "_meta.json").is_file())
 
 
+class HeldLockRecognitionTests(unittest.TestCase):
+    """What "somebody else holds it" looks like, per platform.
+
+    On POSIX ``os.open(O_CREAT|O_EXCL)`` on an existing file is always
+    ``FileExistsError``. On Windows a file another process has just unlinked but
+    still holds a handle to is in a *pending delete* state, and opening it raises
+    ``PermissionError`` (ERROR_ACCESS_DENIED) instead — which is exactly the
+    window this lock closes and reopens under contention. Treating that as fatal
+    made every concurrent registry write a coin flip: the cross-process key-store
+    test failed roughly one run in six until it was retried like the held lock it
+    is.
+    """
+
+    def test_windows_also_recognizes_a_pending_delete(self) -> None:
+        from service import atomicio
+
+        self.assertIn(FileExistsError, atomicio._LOCK_HELD)
+        if os.name == "nt":
+            self.assertIn(PermissionError, atomicio._LOCK_HELD)
+        else:
+            # On POSIX a PermissionError really does mean the directory is not
+            # writable, and retrying it until timeout would hide that.
+            self.assertNotIn(PermissionError, atomicio._LOCK_HELD)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -25,6 +25,17 @@ LOCK_TIMEOUT_S = 10.0
 LOCK_STALE_S = 60.0
 _LOCK_POLL_S = 0.02
 
+# What "somebody else holds the lock" looks like from os.open(O_CREAT|O_EXCL).
+# On POSIX it is always FileExistsError. On Windows a file that another process
+# has just unlinked but still holds a handle to is in a *pending delete* state,
+# and opening it raises PermissionError (ERROR_ACCESS_DENIED) instead — which
+# is exactly the window this lock closes and reopens under contention. Treating
+# that as a permanent failure made every concurrent registry write a coin flip;
+# it is a held lock, so it is retried like one. PermissionError stays fatal on
+# POSIX, where it really does mean the directory is not writable.
+_LOCK_HELD: tuple[type[BaseException], ...] = (
+    (FileExistsError, PermissionError) if os.name == "nt" else (FileExistsError,))
+
 
 @contextlib.contextmanager
 def file_lock(path: Path, timeout: float = LOCK_TIMEOUT_S,
@@ -51,7 +62,7 @@ def file_lock(path: Path, timeout: float = LOCK_TIMEOUT_S,
         try:
             fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             break
-        except FileExistsError:
+        except _LOCK_HELD:
             try:
                 age = time.time() - path.stat().st_mtime
             except OSError:
