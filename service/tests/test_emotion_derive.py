@@ -83,6 +83,17 @@ class _DeriveCase(unittest.TestCase):
         ]
         for p in self._patches:
             p.start()
+        # The service-wide per-IP budgets are process-global and every test
+        # client is 127.0.0.1, so a suite that derives more than the demo budget
+        # allows would 429 on its own success cases -- and would do it only when
+        # run after another suite, which is the worst kind of red. Reset them
+        # here rather than counting requests.
+        try:
+            from service import ratelimit
+
+            ratelimit.reset_all()
+        except Exception:  # noqa: BLE001 - no limiter on this build, nothing to reset
+            pass
         vc.invalidate()
         self.rows: dict = {}
         self.characters: dict = {}
@@ -292,6 +303,78 @@ class DeriveTests(_DeriveCase):
         self.assertEqual(self.client.delete(f"/v1/voices/{vid}").status_code, 204)
         self.assertNotIn(f"{vid}.safetensors", self.embeddings())
         self.assertNotIn(vid, self.meta()["voices"])
+
+
+class TransferQualityGateTests(_DeriveCase):
+    """Measured badly = refused. Never measured = allowed, and SAID so."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.build_basis()
+
+    def _measured(self, quality: float) -> None:
+        reason = eb.write_transfer(self.root, {"angry": {
+            "quality": quality, "speakers": 3, "in_sample": 2}})
+        self.assertIsNone(reason, reason)
+        vc.invalidate()
+
+    def test_an_emotion_measured_below_the_bar_is_refused_with_both_numbers(self) -> None:
+        self._measured(0.2)
+        r = self.derive()
+        self.assertEqual(r.status_code, 422)
+        detail = r.json()["detail"]
+        self.assertIn("transfer quality 0.20", detail)
+        self.assertIn(f"{eb.MIN_TRANSFER_QUALITY:.2f}", detail)
+        self.assertIn("3 speaker(s)", detail)
+        # Refused BEFORE anything is written.
+        self.assertNotIn("sarah-angry", "".join(self.embeddings()))
+
+    def test_an_emotion_measured_above_the_bar_derives_and_records_the_number(self) -> None:
+        self._measured(0.91)
+        r = self.derive()
+        self.assertEqual(r.status_code, 201, r.text)
+        transfer = self.meta()["voices"][r.json()["voice_id"]]["derived_from"]["transfer"]
+        self.assertEqual(transfer["quality"], 0.91)
+        self.assertEqual(transfer["speakers"], 3)
+        self.assertEqual(transfer["in_sample"], 2)
+
+    def test_an_unmeasured_emotion_derives_and_is_flagged_unmeasured(self) -> None:
+        # Absence of a measurement is not evidence of a bad voice -- but the row
+        # must never look like it was measured and passed.
+        r = self.derive()
+        self.assertEqual(r.status_code, 201, r.text)
+        transfer = self.meta()["voices"][r.json()["voice_id"]]["derived_from"]["transfer"]
+        self.assertIsNone(transfer["quality"])
+        self.assertEqual(transfer["state"], "unmeasured")
+
+    def test_the_marker_reaches_the_api_response(self) -> None:
+        r = self.derive()
+        self.assertEqual(r.json()["derived_from"]["transfer"]["state"], "unmeasured")
+
+    def test_a_transfer_block_this_service_cannot_read_is_absent_not_fatal(self) -> None:
+        path = self.root / eb.BASIS_JSON
+        raw = json.loads(path.read_text("utf-8"))
+        raw[eb.TRANSFER_KEY] = {"version": eb.TRANSFER_VERSION + 9,
+                                "emotions": {"angry": {"quality": 0.0,
+                                                       "speakers": 3}}}
+        path.write_text(json.dumps(raw), "utf-8")
+        vc.invalidate()
+        r = self.derive()
+        # A quality of 0.0 from a version we cannot interpret must neither
+        # refuse the derive nor be reported as this voice's quality.
+        self.assertEqual(r.status_code, 201, r.text)
+        self.assertEqual(
+            r.json()["derived_from"]["transfer"], {"quality": None,
+                                                   "state": "unmeasured"})
+
+    def test_a_donor_transplant_is_not_gated_by_a_number_about_the_basis(self) -> None:
+        # The harness measures BASIS directions. A named donor is a different,
+        # inspectable choice the user made -- and it records "unmeasured" rather
+        # than borrowing a number that was not about it.
+        self._measured(0.2)
+        r = self.derive(donor_character_id="spk_mary")
+        self.assertEqual(r.status_code, 201, r.text)
+        self.assertEqual(r.json()["derived_from"]["transfer"]["state"], "unmeasured")
 
 
 class DonorTests(_DeriveCase):

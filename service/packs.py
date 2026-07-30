@@ -30,13 +30,22 @@ from fastapi.responses import Response
 
 from service.emotions import BASELINE, normalize_emotion
 from service.voices import (
-    VOICES_DIR, Character, _load_meta, _slug, find_character,
+    DERIVED, VOICES_DIR, Character, _load_meta, _slug, find_character,
     get_character_or_404, mutate_meta, reject_builtin_collision, voice_file_path,
 )
 
 router = APIRouter(tags=["packs"])
 
 FORMAT = "gravichar/1"
+
+# Per-voice registry fields that travel with a pack, in both directions. All
+# three are dicts, all three are ABSENT when unmeasured (never a zeroed object),
+# and none of them can be believed about the sender's install — they are facts
+# about the embedding in the zip, which is the thing being copied.
+#   fidelity     — what the studio HEARD in the clip this was cloned from
+#   prosody      — the measured probe (pitch/loudness/pace/colour)
+#   derived_from — where a computed slot came from, incl. its transfer quality
+TRAVELLING_FIELDS = ("fidelity", "prosody", "derived_from")
 MAX_VOICES = 64
 MAX_VOICE_BYTES = 200 * 1024 * 1024  # per embedding; typical is ~10 MB
 
@@ -64,6 +73,7 @@ def export_pack(character_id: str) -> Response:
     if character.category != "cloned":
         raise HTTPException(400, "built-in characters cannot be exported (no embedding files)")
 
+    meta = _load_meta()
     voices = []
     blobs: list[tuple[str, bytes]] = []
     for v in character.voices:
@@ -73,11 +83,28 @@ def export_pack(character_id: str) -> Response:
         data = path.read_bytes()
         arcname = f"voices/{v.voice_id}.safetensors"
         blobs.append((arcname, data))
-        voices.append({
+        entry = {
             "file": arcname, "voice_id": v.voice_id, "emotion": v.emotion,
             "sample_seconds": v.sample_seconds, "created": v.created,
             "sha256": hashlib.sha256(data).hexdigest(),
-        })
+        }
+        # Everything MEASURED or COMPUTED about this slot travels with it, read
+        # off the registry row wholesale (`prosody` never reaches the Voice
+        # model, so the row is the only complete source). Dropping these on
+        # export was the quiet failure this is the fix for: a derived slot
+        # arrived on the far instance with `origin` gone, which means it arrived
+        # as a RECORDING — a pack that launders consent by omission. The
+        # measured pair (`fidelity`, `prosody`) travels for the same reason the
+        # manifest publishes it: a Character bought as a pack should be as
+        # inspectable as one cloned locally.
+        row = meta["voices"].get(v.voice_id) or {}
+        for field in TRAVELLING_FIELDS:
+            value = row.get(field)
+            if isinstance(value, dict):
+                entry[field] = value
+        if v.origin == DERIVED:
+            entry["origin"] = DERIVED
+        voices.append(entry)
     if not voices:
         raise HTTPException(400, "character has no exportable voice files")
 
@@ -216,6 +243,15 @@ def import_pack(
                 400,
                 f"pack rejected — {arcname} declares an invalid emotion "
                 f"{str(raw_emotion)[:64]!r}: {exc}")
+        for field in TRAVELLING_FIELDS:
+            if field in v and not isinstance(v[field], (dict, type(None))):
+                # Rejected, not sanitised — the module's rule for every manifest
+                # value that becomes a registry row. A `fidelity: "great"` that
+                # was quietly dropped would import a slot the sender believes is
+                # measured and the receiver silently is not.
+                raise HTTPException(
+                    400, f"pack rejected — {arcname} declares a malformed "
+                         f"{field} (expected an object)")
         staged.append((v, data, emotion))
 
     VOICES_DIR.mkdir(parents=True, exist_ok=True)
@@ -236,12 +272,30 @@ def import_pack(
                 path = voice_file_path(voice_id, VOICES_DIR)  # asserts containment
                 path.write_bytes(data)
                 written.append(path)
-                meta["voices"][voice_id] = {
+                row = {
                     "name": name, "character_id": cid, "emotion": emotion,
                     "created": v.get("created") or created,
                     "sample_seconds": v.get("sample_seconds"), "lang": src.get("lang", "EN"),
                     "imported": {"from": src.get("character_id"), "at": created},
                 }
+                for field in TRAVELLING_FIELDS:
+                    value = v.get(field)
+                    if isinstance(value, dict):
+                        row[field] = dict(value)
+                # A slot that arrives DERIVED stays derived, permanently. This
+                # is the consent-laundering guard, and it is one-directional on
+                # purpose: `origin` is only ever written when it says "derived",
+                # so a pack cannot promote a computed slot to a recording by
+                # claiming `origin: "recorded"` (or by omitting the field), and a
+                # recorded slot is the default everywhere as it always was. Round
+                # trip through a pack must never be a way to acquire an
+                # attestation for a performance nobody gave.
+                if v.get("origin") == DERIVED or isinstance(v.get("derived_from"), dict):
+                    row["origin"] = DERIVED
+                    # ...and a derived slot has no recording, so it must not
+                    # arrive claiming seconds of one.
+                    row["sample_seconds"] = None
+                meta["voices"][voice_id] = row
         except Exception:
             for path in written:
                 path.unlink(missing_ok=True)
