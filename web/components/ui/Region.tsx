@@ -33,6 +33,7 @@ export default function Region({
   badge,
   index,
   count,
+  spanText,
   selected = false,
   previewing = false,
   disabled = false,
@@ -53,6 +54,10 @@ export default function Region({
   badge?: ReactNode;
   index: number;
   count: number;
+  /** How this span reads out loud, when the offsets are not characters — a
+   *  segment placed in TIME says "0:03 to 0:09", not "characters 3 to 9".
+   *  Absent → the character wording, which is what the score editor means. */
+  spanText?: string;
   selected?: boolean;
   previewing?: boolean;
   disabled?: boolean;
@@ -72,7 +77,7 @@ export default function Region({
   const describe = [
     `Region ${index + 1} of ${count}`,
     label,
-    `characters ${start} to ${end}`,
+    spanText ?? `characters ${start} to ${end}`,
     text ? `text: ${text}` : null,
   ].filter(Boolean).join(", ");
 
