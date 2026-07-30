@@ -1,0 +1,109 @@
+# Audio drift gate -- narration is a build artifact, so review it like one.
+#
+# ############################################################################
+# # THIS IS AN EXAMPLE, NOT AN ACTIVE WORKFLOW. The `.example` suffix means   #
+# # GitHub ignores this file completely: nothing here runs in THIS repository #
+# # or in yours until you copy it to `.github/workflows/audio-drift.yml` and  #
+# # fill in the two things only you know -- the URL of your Gravitone         #
+# # deployment and a `tts`-scoped API key. It has never executed anywhere, so #
+# # treat the first run as a debugging session: expect to adjust the paths    #
+# # filter, the script location and the runner.                               #
+# ############################################################################
+#
+# WHAT IT GATES
+# A pull request that edits a narration script silently changes audio. This job
+# asks the service what WOULD change (POST /v1/build/plan -- no synthesis, no
+# cost) and compares the answer against the `gravitone.lock` committed in the
+# repository. If any line's digest moved, the job fails with exit code 2 and
+# prints the drift line by line, so the diff a reviewer sees includes the audio
+# and not only the words.
+#
+# WHY IT IS CHEAP
+# A digest is computed from the INPUTS (voice fingerprint + normalized text +
+# settings + engine version + format), so the plan is exact before a single
+# frame is rendered. A 5,000-line script with two edited lines answers "4,998
+# fresh, 2 would render" in one request.
+#
+# WHAT YOU NEED
+#   1. A reachable Gravitone deployment (self-hosted; there is no SaaS to sign
+#      up for). Set `GRAVITONE_URL` as a repository variable.
+#   2. A `tts`-scoped API key in the `GRAVITONE_API_KEY` secret. The plan and
+#      lock routes need `tts`; nothing here needs `voices`, `clone` or `admin`.
+#   3. A committed lockfile. Generate it once and commit it:
+#        node scripts/gravitone-build.mjs narration/script.jsonl --lock
+#   4. Your script in the JSON Lines format documented at the top of
+#      scripts/gravitone-build.mjs.
+#
+# IF YOUR SERVICE IS NOT REACHABLE FROM GITHUB-HOSTED RUNNERS
+# Use a self-hosted runner on the same network (`runs-on: [self-hosted]`), or
+# run the same command in your own CI. The client is Node stdlib only -- it has
+# no install step and no dependencies to vendor.
+
+name: audio-drift
+
+on:
+  pull_request:
+    paths:
+      # Both halves matter: a changed script drifts from the lockfile, and a
+      # changed lockfile that no script produces is just as wrong.
+      - "narration/**"
+      - "gravitone.lock"
+      - ".github/workflows/audio-drift.yml"
+
+# The gate reads code and reports a status. It writes nothing.
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    # Delete this line if your deployment is reachable from GitHub's runners.
+    # Kept here so a copied-but-unconfigured workflow is skipped rather than
+    # failing every pull request with a connection error.
+    if: vars.GRAVITONE_URL != ''
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Check narration against gravitone.lock
+        env:
+          GRAVITONE_URL: ${{ vars.GRAVITONE_URL }}
+          GRAVITONE_API_KEY: ${{ secrets.GRAVITONE_API_KEY }}
+        run: |
+          node scripts/gravitone-build.mjs narration/script.jsonl --check
+          # Exit codes this step turns into a red or green check:
+          #   0  no drift  -- the audio in the lockfile is the audio this script describes
+          #   2  DRIFT     -- a line's digest moved; the diff is printed above
+          #   1  usage / unreachable service / no lockfile to check against
+
+      # OPTIONAL: attach the rendered audio to the run so a reviewer can listen
+      # to what changed instead of reading digests. This one RENDERS (it is the
+      # only step here that costs inference time), so it is gated on a label.
+      - name: Render and upload changed audio
+        if: contains(github.event.pull_request.labels.*.name, 'listen')
+        env:
+          GRAVITONE_URL: ${{ vars.GRAVITONE_URL }}
+          GRAVITONE_API_KEY: ${{ secrets.GRAVITONE_API_KEY }}
+        run: node scripts/gravitone-build.mjs narration/script.jsonl --fetch ./audio-preview
+
+      - uses: actions/upload-artifact@v4
+        if: contains(github.event.pull_request.labels.*.name, 'listen')
+        with:
+          name: audio-preview
+          path: audio-preview/
+
+# UPDATING THE LOCKFILE (the other half of the workflow, done by a human)
+# When narration changes on purpose, regenerate and commit the lockfile in the
+# same pull request as the script edit -- that is what makes the diff reviewable:
+#
+#   node scripts/gravitone-build.mjs narration/script.jsonl --lock
+#   git add narration/script.jsonl gravitone.lock
+#
+# The lockfile holds no timestamps and no host names and its keys are sorted, so
+# its diff is exactly the set of lines whose audio changed. If `identity_version`
+# moves, the service's rendering identity changed (new weights, new chunking,
+# new normalization) and EVERY line is expected to re-render -- that is the
+# DIGEST LAW working, not a bug.
