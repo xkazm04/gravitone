@@ -8,6 +8,7 @@ import "./globals.css";
 import { AuthProvider } from "@/lib/useAuth";
 import GravitoneTokens from "@/components/ui/GravitoneTokens";
 import AudioBusProvider from "@/components/ui/AudioBus";
+import NarrationDock from "@/components/ui/NarrationDock";
 
 const instrument = Instrument_Serif({ weight: "400", subsets: ["latin"], variable: "--font-instrument", display: "swap" });
 const hanken = Hanken_Grotesk({ subsets: ["latin"], variable: "--font-hanken", display: "swap" });
@@ -43,6 +44,11 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             to real audio without building an analyser of its own. */}
         <AudioBusProvider>
           <AuthProvider>{children}</AuthProvider>
+          {/* Audible Docs. Renders NOTHING on a route lib/narratable has no
+              entry for, and never plays without a click — mounted here (inside
+              the bus) only so the narrator's voice drives the same --gt-*
+              channels every other surface reads. */}
+          <NarrationDock />
         </AudioBusProvider>
       </body>
     </html>
