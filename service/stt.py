@@ -92,6 +92,10 @@ class Word:
     start: float
     end: float
     speaker_id: str = "speaker_0"
+    # faster-whisper's per-word probability, when the backend rates words at
+    # all. None = unrated — verify.py's confidence floor treats that honestly
+    # (confidence_source: "unrated") instead of scoring against a guess.
+    confidence: float | None = None
 
 
 @dataclass
@@ -252,7 +256,8 @@ def _assemble(collected, detected, elapsed: float) -> Transcript:
         parts.append(seg.text)
         for w in (getattr(seg, "words", None) or []):
             words.append(Word(text=w.word.strip(), start=round(w.start, 3),
-                              end=round(w.end, 3)))
+                              end=round(w.end, 3),
+                              confidence=getattr(w, "probability", None)))
     duration = float(getattr(detected, "duration", 0.0) or 0.0)
     return Transcript(
         text=" ".join(p.strip() for p in parts).strip(),

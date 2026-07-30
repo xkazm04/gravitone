@@ -16,12 +16,17 @@
 /** Mirror of service/app.py::CORS_EXPOSE_HEADERS. Keep sorted as it is there. */
 export const SERVICE_EXPOSED_HEADERS = [
   "Retry-After",
+  "X-Alignment-Cache",
   "X-Audio-Seconds",
   "X-Cache",
   "X-Character",
   "X-Emotion-Fallback",
   "X-Emotion-Requested",
   "X-Emotion-Used",
+  "X-Fidelity-Deltas",
+  "X-Fidelity-Retries",
+  "X-Fidelity-Score",
+  "X-Fidelity-Unavailable",
   "X-Gravitone-Cache",
   "X-Ignored-Settings",
   "X-Performance-Report",
