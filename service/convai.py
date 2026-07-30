@@ -80,7 +80,7 @@ from typing import AsyncIterator, Callable, Iterable
 import numpy as np
 from fastapi import APIRouter, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 
-from service import dialog, piper, recording, stt
+from service import dialog, engines, piper, recording, stt
 from service.cache import CachedPcm, SynthCache
 from service.config import SETTINGS
 from service.engine import resample_pcm16
@@ -508,49 +508,31 @@ async def conversation(websocket: WebSocket, agent_id: str = Query(...),
 # ---------------------------------------------------------------------------
 # The session
 # ---------------------------------------------------------------------------
-# Languages Pocket TTS can actually speak. Anything else needs a Piper voice
-# (service/piper.py); see _resolve_voice.
-_POCKET_LANGUAGES = frozenset({"en", "fr"})
-
-
-class VoiceUnavailable(RuntimeError):
-    """The agent names a voice this replica cannot speak. Authored for the
-    operator: the message says exactly what to download."""
+# The engine plane owns the resolution rule now (service/engines.py): the four
+# rules, the Pocket TTS language set and the authored refusal all live there, in
+# one place a third engine can be added to. These names stay exactly as they
+# were because they ARE this module's contract with everything that imports it —
+# `test_piper.VoiceResolutionTests` is the router's specification and passes
+# against the moved rule unmodified, and `VoiceUnavailable` is the SAME class
+# object, so every `except VoiceUnavailable` below still catches what
+# `engines.resolve` raises.
+_POCKET_LANGUAGES = engines.POCKET_LANGUAGES
+VoiceUnavailable = engines.VoiceUnavailable
 
 
 def _resolve_voice(agent: dialog.Agent) -> tuple[str, bool]:
     """Which voice speaks for this agent, and whether Piper owns it.
 
-    The rule, in order:
-
-      1. An explicitly named Piper voice wins — the operator was specific.
-      2. Any other explicitly named voice goes to the Pocket TTS pool.
-      3. Otherwise, if the agent's LANGUAGE is one Pocket TTS cannot speak, find
-         a Piper voice for it. This is what lets a Czech agent be configured
-         with nothing but ``"language": "cs"``.
-      4. Otherwise the service default.
-
-    Rule 3 is the one that matters. Without it a Czech agent fell through to an
-    English voice and read Czech words with English phonemes — a conversation
-    that "worked" and was unlistenable, which is worse than one that refuses.
+    A thin re-export of :func:`service.engines.resolve`, kept because this
+    module's callers ask an agent-shaped question ("which mouth for this
+    agent?") while the plane answers a capability-shaped one ("which engine
+    speaks this language?"). The boolean is preserved rather than the engine id
+    for the same reason: dispatch has not moved yet, and a session that started
+    switching on an id would be a behaviour change hiding inside a refactor.
     """
-    named = (agent.voice_id or "").strip()
-    if named:
-        return (named, True) if piper.has_voice(named) else (named, False)
-
-    language = (agent.language or "en").split("-", 1)[0].lower()
-    if language not in _POCKET_LANGUAGES:
-        found = piper.voice_for_language(language)
-        if found:
-            return found, True
-        raise VoiceUnavailable(
-            f"agent '{agent.agent_id}' speaks {language!r}, which Pocket TTS "
-            f"cannot synthesize (it speaks {sorted(_POCKET_LANGUAGES)}), and no "
-            f"Piper voice for {language!r} is installed. Download one into "
-            f"{piper.voices_dir()} — e.g. `python -m piper.download_voices "
-            f"--download-dir {piper.voices_dir()} cs_CZ-jirka-medium` — or give "
-            "the agent an explicit voice_id.")
-    return SETTINGS.default_voice, False
+    engine_id, voice_id = engines.resolve(agent.language, agent.voice_id,
+                                          agent_id=agent.agent_id)
+    return voice_id, engine_id == engines.PIPER
 
 
 def _warm_ears() -> None:
