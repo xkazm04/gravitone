@@ -15,6 +15,7 @@
 
 /** Mirror of service/app.py::CORS_EXPOSE_HEADERS. Keep sorted as it is there. */
 export const SERVICE_EXPOSED_HEADERS = [
+  "ETag",
   "Retry-After",
   "X-Alignment-Cache",
   "X-Audio-Seconds",
@@ -34,6 +35,7 @@ export const SERVICE_EXPOSED_HEADERS = [
   "X-Realtime-Factor",
   "X-Sample-Rate",
   "X-Segments",
+  "X-Speech-Digest",
   "X-Stream",
   "X-Stream-Segments",
   "X-Synth-Seconds",

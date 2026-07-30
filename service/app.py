@@ -51,6 +51,7 @@ import base64
 import json
 
 from service.auth import authorize_headers, optional_scope, require_read_write, require_scope
+from service import buildstore
 from service import errors
 from service import stt, verify
 from service.cache import CachedAudio, SynthCache
@@ -71,6 +72,8 @@ from service.takes import router as takes_router, reviews_router
 from service import convai
 from service.appliance import router as appliance_router
 from service.convai import router as convai_router, ws_router as convai_ws_router
+from service import engines as engines_plane
+from service.engines import router as engines_router
 from service.gym import router as gym_router
 from service.stt import router as stt_router
 
@@ -91,6 +94,13 @@ SYNTH_CACHE = SynthCache(SETTINGS.cache_bytes)
 # either. Alignments are small (a few KB of times per clip), so a sixteenth of
 # the audio budget holds far more of them than the audio cache holds clips.
 ALIGN_CACHE: SynthCache = SynthCache(SETTINGS.cache_bytes // 16)
+
+# Finished ARTIFACTS, on disk, addressed by their public digest. Where
+# SYNTH_CACHE is this process's memory of what it just rendered, this is the
+# durable, shareable half: it survives a restart, it is visible to every replica
+# pointed at the same directory, and its keys are the names clients hold
+# (X-Speech-Digest / a lockfile). See service/buildstore.py.
+BUILD_STORE = buildstore.STORE
 
 logger = logging.getLogger("gravitone")
 
@@ -145,15 +155,15 @@ errors.install_catch_all(app)
 # publishes (X-Cache, X-Realtime-Factor, X-Emotion-Fallback, ...) and the
 # backoff hint on a 429 (Retry-After).
 CORS_EXPOSE_HEADERS = [
-    "Retry-After",
+    "ETag", "Retry-After",
     "X-Alignment-Cache",
     "X-Audio-Seconds", "X-Cache", "X-Character", "X-Emotion-Fallback",
     "X-Emotion-Requested", "X-Emotion-Used", "X-Fidelity-Deltas",
     "X-Fidelity-Retries", "X-Fidelity-Score", "X-Fidelity-Unavailable",
     "X-Gravitone-Cache",
     "X-Ignored-Settings", "X-Performance-Report", "X-Queue-Seconds",
-    "X-Realtime-Factor", "X-Sample-Rate", "X-Segments", "X-Stream",
-    "X-Stream-Segments", "X-Synth-Seconds", "X-Synth-Segments",
+    "X-Realtime-Factor", "X-Sample-Rate", "X-Segments", "X-Speech-Digest",
+    "X-Stream", "X-Stream-Segments", "X-Synth-Seconds", "X-Synth-Segments",
 ]
 # What the API actually accepts. Named explicitly rather than "*": the
 # allow-list IS the policy, and a browser's preflight asks about exactly these.
@@ -928,16 +938,27 @@ class _Rendered:
 
 
 async def _render_tts(voice_id: str, req: TTSRequest, emotion: str | None,
-                      request: Request | None) -> "_Rendered | JSONResponse":
+                      request: Request | None,
+                      resolved: tuple[str, dict] | None = None,
+                      ) -> "_Rendered | JSONResponse":
     """Synthesize (or serve from cache) one drop-in TTS request.
 
     Pure code motion out of ``text_to_speech``: same segmentation, same cache
     identity, same metrics accounting, same truthful timings. Returns the 429
     JSONResponse directly when admission refuses, because backpressure is a
     RESPONSE, not an exception the callers should each re-derive.
+
+    ``resolved`` lets a caller that has ALREADY resolved the emotion address
+    (because it needed the concrete voice id to compute the request's digest
+    before deciding whether to synthesize at all) hand the answer in. Resolving
+    twice would not merely be wasted work: ``_resolve_emotion_address`` records a
+    fallback to disk, so the same request would be counted twice in the emotion
+    demand ledger.
     """
     assert ENGINE is not None
-    voice_id, emotion_headers = await _resolve_emotion_address(voice_id, emotion)
+    if resolved is None:
+        resolved = await _resolve_emotion_address(voice_id, emotion)
+    voice_id, emotion_headers = resolved
 
     overrides = _overrides(req.voice_settings)
     extra_headers: dict[str, str] = {}
@@ -1033,6 +1054,86 @@ async def _render_tts(voice_id: str, req: TTSRequest, emotion: str | None,
                      emotion_headers=emotion_headers)
 
 
+# ---------------------------------------------------------------------------
+# Speech as a build artifact — the public identity of a render
+# ---------------------------------------------------------------------------
+# The identity function itself lives in service/buildstore.py (with the DIGEST
+# LAW it must be maintained under); what belongs HERE is the part only this
+# module knows: which engine config a render happened under, and how this
+# process segments text. Both are folded into the digest, so a replica
+# configured differently cannot hand out the same NAME for different bytes.
+
+def _engine_version() -> str:
+    """Model/engine identity plus the process-wide generation config.
+
+    ``MODEL_VERSION`` covers the weights (bump it when they change — DIGEST
+    LAW); the rest are the ``SETTINGS`` values that reach every generation and
+    genuinely change the audio, exactly the ones ``_cache_key`` already folds in.
+    Read from SETTINGS at call time so a test that rebinds them is honoured.
+    """
+    return (f"{buildstore.MODEL_VERSION}"
+            f"/lang={SETTINGS.language}/quant={int(bool(SETTINGS.quantize))}"
+            f"/max_tokens={SETTINGS.max_tokens}")
+
+
+def _segmentation_version() -> str:
+    """How this process cuts text into synthesis units.
+
+    ``SEGMENTATION_VERSION`` names the ALGORITHM (bump it when ``_chunk_text``
+    or the concat discipline changes); ``chunk_chars`` and the batch cap are the
+    two inputs that decide where the seams actually land on this box. Seams are
+    audible, so they are part of the artifact's identity rather than an
+    implementation detail hidden behind the name.
+    """
+    return (f"{buildstore.SEGMENTATION_VERSION}"
+            f"/chunk={SETTINGS.chunk_chars}/units={_max_batch_units()}")
+
+
+def _speech_digest(voice_id: str, text: str, overrides: dict,
+                   frames_after_eos: int | None, output_format: str) -> str:
+    """``sha256:<hex>`` for a RESOLVED (voice, text, settings, format) request.
+
+    One function, every route: the drop-in route and a ``/v1/build`` line with
+    identical inputs MUST produce the same string, because that identity is the
+    entire product claim — a lockfile written by a build is what an ordinary
+    synthesis call answers to.
+    """
+    return buildstore.speech_digest(
+        voice_id=voice_id,
+        voice_fingerprint=_voice_fingerprint(voice_id),
+        text=text,
+        overrides=overrides,
+        frames_after_eos=frames_after_eos,
+        output_format=output_format,
+        engine_version=_engine_version(),
+        segmentation=_segmentation_version(),
+    )
+
+
+def _digest_headers(digest: str) -> dict[str, str]:
+    """The two ways a client can hold onto a digest.
+
+    ``X-Speech-Digest`` is the product-facing name (it goes in a lockfile);
+    ``ETag`` is the same value in the shape HTTP already knows how to
+    revalidate, so ``If-None-Match`` works with a plain HTTP cache and with
+    ``curl -H`` alike.
+    """
+    return {"X-Speech-Digest": digest, "ETag": f'"{digest}"'}
+
+
+async def _store_artifact(digest: str, body: bytes, fmt: _AudioFormat,
+                          audio: CachedAudio) -> None:
+    """Put a finished artifact in the durable store. Never fails a request.
+
+    Off the event loop (disk + a cross-process lock). A store that is disabled,
+    full or unwritable is a non-event for the caller: the audio it asked for is
+    already in the response, and ``buildstore`` logs the reason.
+    """
+    await _offload(lambda: BUILD_STORE.put(
+        digest, body, content_type=fmt.content_type,
+        audio_seconds=audio.audio_seconds, sample_rate=fmt.sample_rate))
+
+
 @app.post("/v1/text-to-speech/{voice_id}", dependencies=[Depends(require_scope("tts"))])
 async def text_to_speech(
     voice_id: str,
@@ -1082,6 +1183,17 @@ async def text_to_speech(
     scratch without reading or writing the cache — that is how the benchmark
     harness measures synthesis (see ``cache_bypass_requested``).
 
+    Every response carries ``X-Speech-Digest: sha256:…`` (and the same value as
+    an ``ETag``): the PUBLIC name of this piece of speech, computed from the
+    inputs alone — resolved voice + its weights' fingerprint, normalized text,
+    settings, frames_after_eos, engine/model version, output format and
+    segmentation (see service/buildstore.py and its DIGEST LAW). Send it back as
+    ``If-None-Match`` and an unchanged request answers ``304`` without
+    synthesizing anything at all. The artifact is also written to the durable
+    content-addressed store, so the same digest is fetchable from
+    ``GET /v1/audio/{digest}`` after a restart and a ``POST /v1/build`` line with
+    identical inputs reports the SAME digest.
+
     ``?verify=true`` (opt-in, off by default) additionally listens to the
     finished audio with the local ASR and reports what it heard as
     ``X-Fidelity-Score`` + ``X-Fidelity-Deltas``; ``?verify=strict`` may
@@ -1094,7 +1206,23 @@ async def text_to_speech(
     fmt = _parse_format(output_format)  # 400s early on an unsupported format
     mode = _verify_mode(verify_mode)    # 400s early on an unknown verify value
 
-    rendered = await _render_tts(voice_id, req, emotion, request)
+    # Identity BEFORE synthesis: a digest is over the inputs, so it is knowable
+    # without a worker — which is exactly what makes If-None-Match cheap.
+    resolved = await _resolve_emotion_address(voice_id, emotion)
+    digest = _speech_digest(resolved[0], req.text, _overrides(req.voice_settings),
+                            req.frames_after_eos, output_format)
+    digest_headers = _digest_headers(digest)
+    if buildstore.etag_matches(
+            request.headers.get("if-none-match") if request is not None else None,
+            digest):
+        # The caller already holds these exact bytes. Answering 304 here costs
+        # no synthesis at all: nothing was rendered, no admission slot was
+        # taken, and the response carries no body by definition.
+        return Response(status_code=304, headers={**digest_headers,
+                                                  **resolved[1]})
+
+    rendered = await _render_tts(voice_id, req, emotion, request,
+                                 resolved=resolved)
     if isinstance(rendered, JSONResponse):
         return rendered  # backpressure
 
@@ -1108,12 +1236,21 @@ async def text_to_speech(
     extra_headers = dict(rendered.extra_headers)
     extra_headers.update(format_headers)
 
+    # Publish the artifact under its public name — unless this request opted out
+    # of caching (`Cache-Control: no-store` covers the durable copy too) or
+    # `verify=strict` may have served a RE-RENDER: a retry exists because the
+    # first render was wrong, and storing a coin-flip under a stable name is
+    # exactly the lie the DIGEST LAW exists to prevent.
+    if not rendered.bypass and mode != "strict":
+        await _store_artifact(digest, body, fmt, rendered.audio)
+
     return Response(
         content=body, media_type=fmt.content_type,
         headers={
             **rendered.timing_headers(),
             **extra_headers,
             **rendered.emotion_headers,
+            **digest_headers,
             **_ignored_headers(req.voice_settings),
             **verify_headers,
         },
@@ -1574,6 +1711,170 @@ async def text_to_speech_stream(
     )
 
 
+# ---------------------------------------------------------------------------
+# The build plane: /v1/audio/{digest}, /v1/build, /v1/build/plan
+# ---------------------------------------------------------------------------
+
+@app.api_route("/v1/audio/{digest}", methods=["GET", "HEAD"],
+               dependencies=[Depends(require_scope("tts"))])
+async def get_audio(digest: str, request: Request = None):
+    """Fetch an artifact by its digest — the read half of the build plane.
+
+    A digest is a NAME, not a promise that anything was rendered, so an absent
+    one is an ordinary 404 that says so by name (``buildstore.AUDIO_NOT_FOUND``)
+    and tells the caller how to make it exist. A malformed one is a 400: nothing
+    that is not 64 hex characters is allowed anywhere near a filesystem path.
+
+    ``HEAD`` answers the existence question without moving the bytes — that is
+    what a CI job asks 5,000 times before deciding what to render.
+
+    The stored ``Content-Type`` is served back verbatim because the digest is
+    FORMAT-AWARE: ``mp3_24000_128`` and ``wav_24000`` of the same line are
+    different names, so an artifact is never re-encoded on the way out and can
+    never contradict the name it was fetched under.
+    """
+    try:
+        buildstore.parse_digest(digest)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    head_only = request is not None and request.method == "HEAD"
+    entry = await _offload(BUILD_STORE.head if head_only else BUILD_STORE.get,
+                           digest)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=buildstore.AUDIO_NOT_FOUND)
+
+    headers = {
+        **_digest_headers(f"sha256:{entry.digest}"),
+        "X-Audio-Seconds": str(entry.audio_seconds),
+        "Cache-Control": "public, max-age=31536000, immutable",
+    }
+    if entry.sample_rate:
+        headers["X-Sample-Rate"] = str(entry.sample_rate)
+    if head_only:
+        # A HEAD carries the metadata of the GET and none of its bytes — so the
+        # length is stated explicitly rather than derived from an empty body.
+        headers["Content-Length"] = str(await _offload(BUILD_STORE.size_of, digest))
+        return Response(status_code=200, media_type=entry.content_type,
+                        headers=headers)
+    return Response(content=entry.data, media_type=entry.content_type,
+                    headers=headers)
+
+
+class BuildLine(BaseModel):
+    """One line of a manifest: who says what, and in which format."""
+    id: str = Field(..., min_length=1, max_length=200)
+    voice: str = Field(..., min_length=1, max_length=200)
+    text: str = Field(..., min_length=1, max_length=8000)
+    emotion: str | None = None
+    settings: VoiceSettings | None = None
+    format: str | None = None
+    frames_after_eos: int | None = None
+
+
+class BuildRequest(BaseModel):
+    # Capped by a NAMED setting (buildstore.BUILD_MANIFEST_MAX_LINES): every
+    # line is submitted through the same admission window as any other request,
+    # so an unbounded manifest is a way for one caller to hold the pool.
+    lines: list[BuildLine] = Field(
+        ..., min_length=1, max_length=buildstore.BUILD_MANIFEST_MAX_LINES)
+
+
+async def _line_identity(line: BuildLine, index: int) -> tuple[str, str, str, dict]:
+    """(resolved voice, output_format, digest, emotion headers) for one line.
+
+    Fails the whole manifest on an unknown voice/character, naming the line — a
+    build that silently skipped a line would produce a lockfile with a hole in it.
+    """
+    fmt_str = (line.format or "wav_24000")
+    _parse_format(fmt_str)  # 400s on an unsupported format, before any work
+    try:
+        resolved, emotion_headers = await _resolve_emotion_address(line.voice,
+                                                                   line.emotion)
+    except HTTPException as exc:
+        raise HTTPException(status_code=exc.status_code,
+                            detail=f"line {index} ({line.id!r}): {exc.detail}")
+    digest = _speech_digest(resolved, line.text, _overrides(line.settings),
+                            line.frames_after_eos, fmt_str)
+    return resolved, fmt_str, digest, emotion_headers
+
+
+@app.post("/v1/build/plan", dependencies=[Depends(require_scope("tts"))])
+async def build_plan(req: BuildRequest):
+    """Dry run: what WOULD this manifest change? No synthesis, no bytes.
+
+    The CI primitive. Because a digest is computed from the inputs, this answer
+    is exact and costs nothing: a 5,000-line script where two lines were edited
+    reports 4,998 ``fresh`` and 2 ``would_render`` without waking a worker.
+    Run it in a pull request and you know the audio diff before you pay for it.
+    """
+    lines = []
+    for i, line in enumerate(req.lines):
+        _resolved, fmt_str, digest, _emotion = await _line_identity(line, i)
+        stored = await _offload(BUILD_STORE.has, digest)
+        lines.append({"id": line.id, "digest": digest, "format": fmt_str,
+                      "state": "fresh" if stored else "would_render"})
+    return {
+        "lines": lines,
+        "fresh": sum(1 for l in lines if l["state"] == "fresh"),
+        "would_render": sum(1 for l in lines if l["state"] == "would_render"),
+        "identity_version": buildstore.IDENTITY_VERSION,
+    }
+
+
+@app.post("/v1/build", dependencies=[Depends(require_scope("tts"))])
+async def build(req: BuildRequest):
+    """Render a manifest incrementally. Returns digests, never audio bytes.
+
+    Per line: ``fresh`` (the artifact is already in the store under that exact
+    digest — nothing was rendered) or ``rendered`` (it was synthesized now and
+    stored). The response is deliberately byte-free: a build's product is a
+    LOCKFILE, and the audio is fetched by digest from ``/v1/audio/{digest}`` by
+    whoever actually needs it. Two lines with identical inputs share one digest
+    and are rendered once.
+
+    Synthesis goes through the SAME path as a plain ``/v1/text-to-speech`` call
+    (``_render_tts`` → ``_encode_audio``), which is why a build line and an
+    ordinary call with the same inputs report the same digest and produce the
+    same artifact — the two must never be two synthesis paths.
+
+    Admission is untouched and shared: a saturated pool returns the ordinary 429
+    + ``Retry-After``, and the lines already rendered are already stored, so a
+    retried build resumes instead of restarting.
+    """
+    assert ENGINE is not None
+    results = []
+    rendered_now: set[str] = set()
+    for i, line in enumerate(req.lines):
+        resolved, fmt_str, digest, _emotion = await _line_identity(line, i)
+        if digest in rendered_now or await _offload(BUILD_STORE.has, digest):
+            results.append({"id": line.id, "digest": digest, "format": fmt_str,
+                            "state": "fresh"})
+            continue
+        fmt = _parse_format(fmt_str)
+        tts_req = TTSRequest(text=line.text, voice_settings=line.settings,
+                             frames_after_eos=line.frames_after_eos)
+        rendered = await _render_tts(line.voice, tts_req, line.emotion, None,
+                                     resolved=(resolved, {}))
+        if isinstance(rendered, JSONResponse):
+            return rendered  # backpressure — same 429 every other route returns
+        body, _format_headers = await _encode_audio(
+            fmt, rendered.audio.wav_bytes, rendered.audio.sample_rate)
+        await _store_artifact(digest, body, fmt, rendered.audio)
+        rendered_now.add(digest)
+        results.append({
+            "id": line.id, "digest": digest, "format": fmt_str,
+            "state": "rendered", "bytes": len(body),
+            "audio_seconds": rendered.audio.audio_seconds,
+        })
+    return {
+        "lines": results,
+        "fresh": sum(1 for l in results if l["state"] == "fresh"),
+        "rendered": sum(1 for l in results if l["state"] == "rendered"),
+        "identity_version": buildstore.IDENTITY_VERSION,
+    }
+
+
 # Voice + Character management lives in service/voices.py. Read endpoints
 # (list voices/characters/emotions) accept a tts-scoped key so ElevenLabs
 # drop-in clients work; mutations need the "voices" scope.
@@ -1605,12 +1906,23 @@ app.include_router(convai_ws_router)
 app.include_router(gym_router, dependencies=[Depends(require_scope("convai"))])
 # What this artifact IS. Root-only for now — the manifest names every model on disk.
 app.include_router(appliance_router, dependencies=[Depends(require_scope("admin"))])
+# The engine plane (service/engines.py): what each adapter DECLARES it can do,
+# and what conformance actually observed. Read-only, so a tts-scoped key sees it
+# — a drop-in client choosing a language needs to know which engines exist.
+app.include_router(engines_router, dependencies=[Depends(require_scope("tts"))])
 # The conversation session speaks through the same worker pool as every other
 # route, but it cannot import this module to reach it (that is the import cycle
 # — app imports the router). So the pool is handed over instead; the lambda
 # defers the read until a session actually synthesizes, by which time the
 # lifespan has built it.
 convai.set_engine_provider(lambda: ENGINE)
+# Same seam, same reason, for the engine plane: service/engines.py describes the
+# pocket-tts adapter (its voices, its observed sample rate) and needs the LIVE
+# pool to do it, but importing this module would be the cycle. The lambda defers
+# the read until an engine is actually asked about itself, by which time the
+# lifespan has built ENGINE. Without this it falls back to convai's provider —
+# the same object, one indirection further away.
+engines_plane.set_pool_provider(lambda: ENGINE)
 
 
 class SpeakRequest(BaseModel):
