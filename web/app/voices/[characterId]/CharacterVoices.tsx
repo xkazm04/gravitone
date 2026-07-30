@@ -16,7 +16,7 @@ import ApiPanel from "./_variants/ApiPanel";
 export default function CharacterVoices({ characterId }: { characterId: string }) {
   const { character, slots, coverage, total, loading, error, notFound, busySlot, vaultWarning,
           removingVoiceId, addVoice, removeVoice, addCustomEmotion, removeCustomEmotion,
-          refresh } = useCharacter(characterId);
+          deriveVoice, refresh } = useCharacter(characterId);
   const [recording, setRecording] = useState<string | null>(null);
   const [retrying, setRetrying] = useState(false);
   const mounted = useMounted();
@@ -146,6 +146,7 @@ export default function CharacterVoices({ characterId }: { characterId: string }
           busySlot={busySlot} addVoice={addVoiceWithConsent} removeVoice={removeVoice}
           removingVoiceId={removingVoiceId} onRecord={setRecording}
           addCustomEmotion={addCustomEmotion} removeCustomEmotion={removeCustomEmotion}
+          deriveVoice={deriveVoice}
         />
       </div>
 

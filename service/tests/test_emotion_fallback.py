@@ -197,6 +197,26 @@ class ColdStartUnchangedTests(unittest.TestCase):
         self.assertEqual(em.resolve("angry", avail, prosody=prosody),
                          ("a", "angry", False))
 
+    def test_an_install_with_no_derived_voices_is_the_old_function(self) -> None:
+        # The Emotion Algebra rung is opt-in the same way measured mode is: a
+        # plain dict carries no `derived` set, and an empty one is the same as
+        # none. Every existing caller (and every test above) rides this path.
+        avail = {"baseline": "b", "happy": "h"}
+        for derived in (None, (), frozenset(), []):
+            with self.subTest(derived=derived):
+                self.assertEqual(em.resolve("excited", avail, derived=derived),
+                                 ("h", "happy", True))
+                self.assertEqual(em.resolve("happy", avail, derived=derived),
+                                 ("h", "happy", False))
+
+    def test_a_derived_set_naming_absent_slots_decides_nothing(self) -> None:
+        # A stale set (the slot was deleted between the read and the resolve)
+        # must not turn a recorded hit into a fallback.
+        avail = {"baseline": "b", "happy": "h"}
+        self.assertEqual(em.resolve("happy", avail, derived=["angry", "sad"]),
+                         ("h", "happy", False))
+        self.assertEqual(em.derived_slots(avail, ["angry"]), frozenset())
+
 
 class MeasuredFallbackTests(unittest.TestCase):
     """The point of the feature: the chain stops guessing where audio exists."""
@@ -295,6 +315,62 @@ class MeasuredFallbackTests(unittest.TestCase):
         self.assertIsNone(em.nearest_measured("baseline", avail, prosody))
         self.assertEqual(em.resolve("baseline", avail, prosody=prosody),
                          ("s", "sad", True))  # scale-first pick: sad precedes angry
+
+
+class DerivedRungTests(unittest.TestCase):
+    """Emotion Algebra's rung: exact recorded -> exact DERIVED -> measured -> chain.
+
+    A derived slot speaks (it is a real embedding) but it is not a performance,
+    so it resolves as a FALLBACK: `app.py` records demand off that flag, and
+    silencing it the moment a slot was computed would stop the studio ever asking
+    for the take again.
+    """
+
+    def test_a_derived_slot_serves_the_request_and_still_counts_as_a_fallback(self) -> None:
+        avail = {"baseline": "b", "angry": "a-derived"}
+        vid, used, fell = em.resolve("angry", avail, derived={"angry"})
+        self.assertEqual((vid, used), ("a-derived", "angry"))
+        self.assertTrue(fell, "demand must keep accruing for a derived-only slot")
+
+    def test_a_recorded_slot_beside_derived_ones_is_still_a_hit(self) -> None:
+        avail = {"baseline": "b", "angry": "a-derived", "sad": "s-real"}
+        self.assertEqual(em.resolve("sad", avail, derived={"angry"}),
+                         ("s-real", "sad", False))
+
+    def test_the_derived_rung_comes_before_the_measured_walk(self) -> None:
+        # `excited` exists as a derived slot; the measured space would have
+        # chosen `angry`. The native (if computed) slot wins — it is the emotion
+        # that was asked for.
+        avail = {"baseline": "b", "excited": "e-derived", "sad": "s", "angry": "a"}
+        prosody = {"baseline": _MIDDLE, "sad": _QUIET, "angry": _HOT}
+        self.assertEqual(
+            em.resolve("excited", avail, prosody=prosody, derived={"excited"}),
+            ("e-derived", "excited", True))
+
+    def test_a_miss_still_walks_the_chain_when_the_slot_is_absent(self) -> None:
+        avail = {"baseline": "b", "happy": "h"}
+        self.assertEqual(em.resolve("excited", avail, derived={"happy"}),
+                         ("h", "happy", True))
+
+    def test_the_mapping_can_carry_its_own_derived_set(self) -> None:
+        """The protocol `voices.EmotionMap` uses so `app.py` needs no edit.
+
+        Three hot paths call `resolve(seg.emotion, emotion_map(cid), prosody=…)`
+        and cannot pass a new keyword; the mapping carries the set instead. An
+        explicit keyword still wins, and a plain dict still behaves as it always
+        did.
+        """
+        class _Carrier(dict):
+            derived = frozenset({"angry"})
+
+        avail = _Carrier({"baseline": "b", "angry": "a-derived"})
+        self.assertEqual(em.resolve("angry", avail), ("a-derived", "angry", True))
+        # An explicit argument overrides what the mapping claims.
+        self.assertEqual(em.resolve("angry", avail, derived=()),
+                         ("a-derived", "angry", False))
+        # …and the same dict without the attribute is the pre-existing behaviour.
+        self.assertEqual(em.resolve("angry", dict(avail)),
+                         ("a-derived", "angry", False))
 
 
 class ProsodyVectorTests(unittest.TestCase):

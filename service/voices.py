@@ -62,6 +62,12 @@ BUILTIN = [
 # See reject_builtin_collision / _build_characters for how that is handled.
 BUILTIN_IDS = frozenset(vid for vid, _ in BUILTIN)
 
+# The two origins a Voice can have. `recorded` is the default EVERYWHERE — every
+# row written before Emotion Algebra existed, every built-in, every clone — so
+# adding derived voices changed no existing byte in the registry.
+RECORDED = "recorded"
+DERIVED = "derived"
+
 
 class Voice(BaseModel):
     voice_id: str
@@ -82,6 +88,19 @@ class Voice(BaseModel):
     # readers must render nothing at all for that — a fabricated 0 would read as
     # "this voice is bad".
     fidelity: dict | None = None
+    # How this Voice came to exist. "recorded" — the default, and what EVERY
+    # Voice that existed before Emotion Algebra reports — means a human performed
+    # it. "derived" means the studio COMPUTED it from a baseline plus a shared
+    # emotion direction (see service/emotion_basis.py): a real embedding, a real
+    # sound, and not a performance anybody gave. The distinction is pinned into
+    # the model rather than left to the caller because every surface that reads a
+    # Voice (roster, rack, manifest, packs) must be able to refuse to present the
+    # second as the first.
+    origin: str = "recorded"
+    # Provenance for a derived Voice: {"source": "basis"|"donor", "donor":
+    # character_id|None, "emotion": ..., "basis_version": int|None, "alpha": ...}.
+    # None for every recorded Voice — absent, not an empty object.
+    derived_from: dict | None = None
     # Advisory only, and only on the CREATE response: "this take reads closer to
     # `nearest` than to the emotion you filed it under". Never stored on the
     # registry row and never returned by a list/read route, because it is a
@@ -175,6 +194,25 @@ class VoicePatch(BaseModel):
 class CharacterPatch(BaseModel):
     name: str | None = None
     tags: list[str] | None = None
+
+
+class DeriveReq(BaseModel):
+    """Ask the studio to COMPUTE an emotion this Character never recorded.
+
+    Two sources, one verb. With no body (or a null donor) the shared emotion
+    basis is used — the roster-wide average direction, gated on the coherence it
+    was measured at. With ``donor_character_id`` the direction is that ONE
+    speaker's own `(emotion - baseline)` residual, transplanted verbatim: a
+    named performance rather than an average, and correspondingly weaker
+    evidence — which is why the answer records which of the two it was.
+
+    Extras are FORBIDDEN so a client sending `{"alpha": 3}` (a knob this API
+    deliberately does not expose — the step is calibrated, not chosen) gets a 422
+    saying so instead of a 201 that ignored it.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    donor_character_id: str | None = None
 
 
 # ── meta store ────────────────────────────────────────────────────────────────
@@ -624,6 +662,14 @@ def _cloned_voices(meta: dict) -> list[Voice]:
     if not VOICES_DIR.is_dir():
         return out
     for p in sorted(VOICES_DIR.glob("*.safetensors")):
+        # Leading underscore = a STUDIO artefact, not a Voice. The roster is
+        # glob-driven, so `_basis.safetensors` (the shared emotion basis) would
+        # otherwise assemble into a Character called "basis" that nothing can
+        # speak and no route can delete — the same phantom-Character failure the
+        # staged clone write exists to prevent. `_meta.json` was only ever safe
+        # here by virtue of its extension.
+        if p.name.startswith("_"):
+            continue
         m = meta["voices"].get(p.stem, {})
         cid = m.get("character_id", _slug(m.get("name", p.stem)))
         emo = m.get("emotion", BASELINE)
@@ -638,6 +684,14 @@ def _cloned_voices(meta: dict) -> list[Voice]:
             # zeroed object. A dict guard (rather than a bare .get) means a
             # hand-edited or half-written value can't reach the response model.
             fidelity=m["fidelity"] if isinstance(m.get("fidelity"), dict) else None,
+            # Anything that is not literally "derived" is a recording. A
+            # hand-edited or unknown value can NOT quietly become a third state
+            # that surfaces render as neither — the honest failure mode of this
+            # field is to over-report "recorded", never to under-report
+            # "derived", and the row only says "derived" when this service wrote
+            # it there.
+            origin=DERIVED if m.get("origin") == DERIVED else RECORDED,
+            derived_from=m["derived_from"] if isinstance(m.get("derived_from"), dict) else None,
         ))
     return out
 
@@ -806,9 +860,14 @@ def _build_characters() -> list[Character]:
         c.voices.sort(key=lambda v: order.get(v.emotion, 99))
         c.emotions = [v.emotion for v in c.voices]
         c.coverage = len(set(c.emotions))
-        # only slots still missing carry heat — recording one clears it
+        # Only slots still missing A RECORDING carry heat. A DERIVED slot does
+        # not clear it: the appetite was for this speaker performing this
+        # emotion, and computing a stand-in answers the request without
+        # answering the appetite. (resolve() keeps reporting a derived hit as a
+        # fallback for the same reason, so the counter also keeps rising.)
+        recorded = {v.emotion for v in c.voices if v.origin != DERIVED}
         c.demand = {e: n for e, n in demand_for(c.character_id, demand).items()
-                    if e not in c.emotions}
+                    if e not in recorded}
     return sorted(chars.values(), key=lambda c: (c.category != "cloned", c.name.lower()))
 
 
@@ -830,10 +889,47 @@ def get_character_or_404(character_id: str) -> Character:
     return c
 
 
-def emotion_map(character_id: str) -> dict[str, str]:
-    """emotion -> voice_id for one Character (used by /v1/speak)."""
+class EmotionMap(dict):
+    """``{emotion: voice_id}`` that also knows WHICH of those are derived.
+
+    A dict subclass, and the reason is a hard constraint rather than a taste:
+    ``service/app.py`` resolves on three hot paths with
+    ``resolve(seg.emotion, emotion_map(cid), prosody=...)``, and this batch may
+    not edit that module — yet a derived slot has to be distinguishable inside
+    ``resolve`` (it must still count as a fallback so demand keeps accruing; see
+    ``emotions.resolve``). Carrying the set ON the mapping lets the existing call
+    sites stay byte-identical while the information reaches the one function that
+    needs it. ``emotions.derived_slots`` reads it with ``getattr(..., "derived",
+    None)``, so a plain dict — every test, every other caller — behaves exactly
+    as it always did.
+
+    It IS a dict in every other respect: copying, iterating and comparing all
+    work, and a copy that drops the attribute simply degrades to "nothing is
+    known to be derived", which is the pre-existing behaviour.
+    """
+
+    __slots__ = ("derived",)
+
+    def __init__(self, mapping=None, derived=()) -> None:
+        super().__init__(mapping or {})
+        self.derived = frozenset(derived)
+
+
+def emotion_map(character_id: str) -> EmotionMap:
+    """emotion -> voice_id for one Character (used by /v1/speak).
+
+    Derived slots are INCLUDED — a derived Voice is a real embedding the engine
+    can speak with, and hiding it here would mean deriving a slot changed nothing
+    about synthesis. The returned mapping names them separately (see
+    :class:`EmotionMap`) so resolution can treat them as the stand-ins they are.
+    """
     c = find_character(character_id)
-    return {e: v.voice_id for e, v in _by_emotion(c.voices).items()} if c else {}
+    if not c:
+        return EmotionMap()
+    speaking = _by_emotion(c.voices)
+    return EmotionMap(
+        {e: v.voice_id for e, v in speaking.items()},
+        derived=[e for e, v in speaking.items() if v.origin == DERIVED])
 
 
 def prosody_map(character_id: str) -> dict[str, dict]:
@@ -984,11 +1080,19 @@ def character_manifest(character_id: str) -> dict:
     # `fidelity` is published here so a pack's (or an API consumer's) quality is
     # inspectable BEFORE anyone synthesizes with it. Null for every voice cloned
     # before the ledger existed — a consumer reads "not measured", never a zero.
+    # `origin` and `derived_from` ride on every entry so a consumer reading ONE
+    # object still learns whether a performance was performed. `performable`
+    # keeps meaning exactly what it meant — every emotion this Character can
+    # speak natively — and the recorded/derived split below is additive, so no
+    # existing client changed behaviour when derived voices appeared.
     native = {
         e: {"voice_id": v.voice_id, "sample_seconds": v.sample_seconds,
-            "consent": v.consent, "fidelity": v.fidelity}
+            "consent": v.consent, "fidelity": v.fidelity,
+            "origin": v.origin, "derived_from": v.derived_from}
         for e, v in _by_emotion(c.voices).items()
     }
+    recorded = {e: m for e, m in native.items() if m["origin"] != DERIVED}
+    derived = {e: m for e, m in native.items() if m["origin"] == DERIVED}
     # Same deterministic pick resolve() uses, so the manifest can never
     # advertise a fallback the synthesis path wouldn't actually choose.
     fallback = deterministic_fallback(native)
@@ -999,7 +1103,18 @@ def character_manifest(character_id: str) -> dict:
         "emotion_scale": c.scale,          # base + this Character's custom slots
         "custom_emotions": c.custom_emotions,
         "performable": native,
+        # The split. `recorded` is what somebody performed; `derived` is what the
+        # studio computed and can be regenerated or replaced by a real take at
+        # any time. A client directing a script that must be genuinely acted (a
+        # voice-over, an audiobook) reads `recorded`; one that just needs the
+        # range reads `performable`.
+        "recorded": recorded,
+        "derived": derived,
         "missing": [e for e in c.scale if e not in native],
+        # Slots with no RECORDING — the derived ones included. This is the list
+        # the coverage loop works from, and it is why deriving a slot does not
+        # make the studio stop asking for the take.
+        "unrecorded": [e for e in c.scale if e not in recorded],
         "fallback": fallback,
         "coverage": f"{c.coverage}/{c.total}",
         "demand": c.demand,  # unmet requests per missing emotion
@@ -1205,6 +1320,228 @@ def create_voice(
                  name=f"{character.strip()} · {emotion}", category="cloned",
                  created=created, sample_seconds=seconds, consent=True,
                  fidelity=row.get("fidelity"), label_check=label_check)
+
+
+# ── derived voices (Emotion Algebra) ──────────────────────────────────────────
+def _load_tensors(voice_id: str, what: str) -> dict:
+    """One Voice's embedding, or the named HTTP refusal for why not.
+
+    501 for "this server cannot read embeddings at all" (no `safetensors`, the
+    dev-box case) and 422 for "this particular file could not be read" — the two
+    are different problems with different fixes, and collapsing them would tell
+    an operator to reinstall a package when the real answer is that one voice is
+    damaged.
+    """
+    from service.tools.emotion_residuals import TensorsUnavailable, load_embedding
+    try:
+        return load_embedding(VOICES_DIR / f"{voice_id}.safetensors")
+    except TensorsUnavailable as exc:
+        raise HTTPException(501, f"deriving emotions is not available here: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(422, f"{what} embedding could not be read ({exc})")
+
+
+# NOT async, for exactly the reason clone_voice_endpoint is not: this handler
+# reads and writes embedding files (tens of MB) and takes the registry lock.
+@router.post("/v1/characters/{character_id}/emotions/{emotion}/derive",
+             response_model=Voice, status_code=201)
+def derive_emotion(character_id: str, emotion: str,
+                   req: DeriveReq | None = None) -> Voice:
+    """Compute a missing emotion for this Character instead of recording it.
+
+    `baseline + alpha * direction`, written through the EXACT discipline
+    :func:`create_voice` uses — export into a temp dir, load the result BACK to
+    prove it is readable, commit the registry row under the lock with the slot
+    re-checked, and only then move the file into place — so a failure at any step
+    leaves neither a phantom embedding nor a row promising a file that is not
+    there.
+
+    What it refuses, and why each refusal is its own sentence:
+
+      * **501** — this server cannot read/write embeddings at all (no
+        `safetensors`; the whole feature is unavailable, not this request).
+      * **404** — no such Character, or the Character has no such slot.
+      * **409** — the slot is already filled, or this is a built-in Character
+        (which cannot be extended, exactly as `add_custom_emotion` refuses).
+      * **422** — no baseline to derive FROM, no basis has been built, the
+        emotion is below the coherence bar, or the donor cannot supply it.
+
+    **Consent.** The derived row inherits the baseline's consent receipt
+    VERBATIM and stamps `derived_from` beside it. It never mints an attestation
+    of its own: nobody attested to a performance nobody gave, and a derived slot
+    that manufactured its own receipt would be consent laundering with extra
+    steps. If the baseline has no receipt, neither does this.
+    """
+    req = req or DeriveReq()
+    try:
+        emotion = normalize_emotion(emotion)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    if emotion == BASELINE:
+        raise HTTPException(
+            422, "baseline is the origin every other emotion is derived FROM — "
+                 "it has to be recorded")
+    if character_id in BUILTIN_IDS:
+        raise HTTPException(
+            409, f"'{character_id}' is a built-in character and cannot be extended")
+
+    c = get_character_or_404(character_id)
+    if emotion not in c.scale:
+        raise HTTPException(
+            404, f"'{character_id}' has no '{emotion}' slot — add it to the "
+                 "palette first (POST /v1/characters/{id}/emotions)")
+    speaking = _by_emotion(c.voices)
+    if emotion in speaking:
+        raise HTTPException(
+            409, f"'{character_id}' already has a '{emotion}' voice "
+                 f"({speaking[emotion].voice_id}) — delete or re-slot that voice first")
+    base = speaking.get(BASELINE)
+    if base is None:
+        raise HTTPException(
+            422, f"'{character_id}' has no baseline recording to derive from — "
+                 "an emotion is a step away from a baseline, so record that first")
+    if base.origin == DERIVED:
+        raise HTTPException(
+            422, "this character's baseline is itself derived — deriving from a "
+                 "derived voice would compound the approximation")
+
+    from service import emotion_basis
+
+    base_tensors = _load_tensors(base.voice_id, "this character's baseline")
+    donor_id = (req.donor_character_id or "").strip()
+    basis_version: int | None = None
+    confidence: float | None = None
+
+    if donor_id:
+        donor = find_character(donor_id)
+        if donor is None:
+            raise HTTPException(404, f"no donor character '{donor_id}'")
+        donor_slots = _by_emotion(donor.voices)
+        take = donor_slots.get(emotion)
+        if take is None:
+            raise HTTPException(
+                422, f"'{donor_id}' has no '{emotion}' voice to derive from")
+        if take.origin == DERIVED:
+            raise HTTPException(
+                422, f"'{donor_id}' only has a DERIVED '{emotion}' — derive from a "
+                     "recording, or the approximation compounds")
+        donor_base = donor_slots.get(BASELINE)
+        if donor_base is None:
+            raise HTTPException(
+                422, f"'{donor_id}' has no baseline, and the emotion travels as "
+                     f"'{emotion}' MINUS baseline — there is nothing to subtract")
+        vector, alpha, reason = emotion_basis.donor_direction(
+            _load_tensors(donor_base.voice_id, f"{donor_id}'s baseline"),
+            _load_tensors(take.voice_id, f"{donor_id}'s {emotion}"))
+        if vector is None:
+            raise HTTPException(422, reason or "the donor supplies no direction")
+        # A basis, if one exists, is the only measurement of whether this emotion
+        # transfers at all. It does not GATE the donor path (a user naming a donor
+        # is making a specific, inspectable choice), but its coherence is reported
+        # as the confidence, and stays absent — never 0 — when nothing measured it.
+        basis, _reason = emotion_basis.load(VOICES_DIR)
+        if basis is not None and emotion in basis.emotions:
+            basis_version = basis.version
+            confidence = basis.emotions[emotion].coherence
+        source = {"source": "donor", "donor": donor.character_id,
+                  "donor_name": donor.name, "donor_voice_id": take.voice_id}
+    else:
+        basis, reason = emotion_basis.load(VOICES_DIR)
+        if basis is None:
+            raise HTTPException(422, reason or "no emotion basis is available")
+        entry, reason = emotion_basis.direction(basis, emotion)
+        if entry is None:
+            raise HTTPException(422, reason or f"'{emotion}' cannot be derived")
+        vector, alpha = entry.vector, entry.alpha
+        basis_version, confidence = basis.version, entry.coherence
+        source = {"source": "basis", "donor": None,
+                  "contributors": list(entry.contributors)}
+
+    tensors, reason = emotion_basis.derive_tensors(base_tensors, vector, alpha)
+    if tensors is None:
+        raise HTTPException(422, reason or "the derived embedding could not be built")
+
+    # The id is already canonical (it came out of the registry), so unlike the
+    # clone path there is nothing to slug here.
+    voice_id = f"{c.character_id}-{emotion}-{uuid.uuid4().hex[:6]}"
+    try:
+        out_path = voice_file_path(voice_id)
+    except ValueError as exc:  # unreachable: emotion + cid are both validated
+        raise HTTPException(400, str(exc))
+
+    with tempfile.TemporaryDirectory(prefix="gravitone-derive-") as td:
+        staged = Path(td) / f"{voice_id}.safetensors"
+        from service.tools.emotion_residuals import (
+            TensorsUnavailable, load_embedding, save_embedding,
+        )
+        try:
+            save_embedding(staged, tensors)
+            # The load-back. Same reason export_stems round-trips its own output:
+            # an embedding that cannot be read is a voice that fails at synthesis
+            # time, long after the user has left. Staged, so this failure takes
+            # the file with it and registers nothing.
+            back = load_embedding(staged)
+        except TensorsUnavailable as exc:  # pragma: no cover - checked above
+            raise HTTPException(501, f"deriving emotions is not available here: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            raise errors.sanitized_500("derive", exc)
+        if set(back) != set(tensors) or any(
+                np.asarray(back[k]).shape != np.asarray(tensors[k]).shape for k in tensors):
+            raise errors.sanitized_500(
+                "derive", "the derived embedding did not load back with the shape "
+                          "it was written with")
+
+        created = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        base_row = _load_meta()["voices"].get(base.voice_id) or {}
+        row: dict = {
+            "name": c.name, "character_id": c.character_id, "emotion": emotion,
+            "created": created,
+            # NOT a number: nothing was recorded, and a 0 would render in the
+            # rack as a zero-second take rather than as "there is no recording".
+            "sample_seconds": None,
+            "lang": base_row.get("lang", c.lang),
+            "origin": DERIVED,
+            "basis_version": basis_version,
+            "confidence": confidence,
+            "derived_from": {**source, "emotion": emotion,
+                             "from_voice_id": base.voice_id,
+                             "basis_version": basis_version,
+                             "alpha": round(float(alpha), 6),
+                             "at": created},
+        }
+        # The consent receipt, copied WORD FOR WORD off the baseline — never a
+        # fresh one. A missing baseline receipt stays missing here.
+        inherited = base_row.get("consent")
+        if isinstance(inherited, dict):
+            row["consent"] = dict(inherited)
+
+        def _commit(meta: dict) -> None:
+            # Re-checked under the registry lock, exactly as create_voice does:
+            # a concurrent clone of the same slot could have committed while the
+            # tensors were being written.
+            reject_slot_collision(meta, c.character_id, emotion)
+            meta["voices"][voice_id] = row
+            cm = meta["characters"].setdefault(
+                c.character_id, {"name": c.name, "tags": list(c.tags)})
+            if emotion not in EMOTION_SCALE:
+                custom = list(cm.get("custom_emotions") or [])
+                if emotion not in custom:
+                    custom.append(emotion)
+                cm["custom_emotions"] = custom
+
+        mutate_meta(_commit)
+
+        try:
+            shutil.move(str(staged), str(out_path))
+        except OSError as exc:
+            remove_voices([voice_id])
+            raise errors.sanitized_500("derive", exc)
+
+    return Voice(
+        voice_id=voice_id, character_id=c.character_id, emotion=emotion,
+        name=f"{c.name} · {emotion}", category="cloned", lang=row["lang"],
+        created=created, sample_seconds=None, consent="consent" in row,
+        origin=DERIVED, derived_from=row["derived_from"])
 
 
 @router.patch("/v1/voices/{voice_id}", response_model=Voice)

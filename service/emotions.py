@@ -387,24 +387,59 @@ def label_check(prosody_vec: object, declared_emotion: str,
             "distance": round(distance, 4)}
 
 
+def derived_slots(available: Mapping[str, str],
+                  derived: Iterable[str] | None) -> frozenset[str]:
+    """Which of ``available``'s slots are DERIVED rather than recorded.
+
+    Two ways to say it, because one caller cannot pass an argument. Normally
+    ``derived`` is handed in explicitly. But ``service/app.py`` calls
+    ``resolve(seg.emotion, emotion_map(cid), prosody=...)`` on three hot paths,
+    and this batch may not edit that module — so ``voices.emotion_map`` returns
+    an :class:`~service.voices.EmotionMap`, a dict that CARRIES its own
+    ``derived`` set, and ``resolve`` reads it off the mapping when the keyword is
+    absent. A plain ``dict`` has no such attribute, which is precisely why every
+    existing caller and every existing test keeps the old behaviour byte for
+    byte.
+
+    Only emotions actually present in ``available`` count: a set naming a slot
+    that isn't there cannot make a decision about it.
+    """
+    if derived is None:
+        derived = getattr(available, "derived", None)
+    if not derived:
+        return frozenset()
+    return frozenset(e for e in derived if e in available)
+
+
 def resolve(emotion: str, available: dict[str, str], *,
-            prosody: Mapping[str, object] | None = None) -> tuple[str, str, bool]:
+            prosody: Mapping[str, object] | None = None,
+            derived: Iterable[str] | None = None) -> tuple[str, str, bool]:
     """Map a requested emotion to an actual voice_id.
 
     Returns (voice_id, used_emotion, fell_back). ``available`` maps emotion ->
-    voice_id for one Character. On a miss the walk is: MEASURED nearest slot (see
-    :func:`nearest_measured`, only when ``prosody`` is supplied and can carry the
-    decision) → adjacent emotions (in FALLBACK_CHAIN order) → baseline →
-    deterministic scale-first voice. The second element is the TRUE emotion used;
-    ``fell_back`` is True whenever it differs from what was requested.
+    voice_id for one Character. The walk is: exact RECORDED slot → exact DERIVED
+    slot → MEASURED nearest slot (see :func:`nearest_measured`, only when
+    ``prosody`` is supplied and can carry the decision) → adjacent emotions (in
+    FALLBACK_CHAIN order) → baseline → deterministic scale-first voice. The
+    second element is the TRUE emotion used; ``fell_back`` is True whenever it
+    differs from what was requested — **and also when the slot that served it was
+    derived**.
+
+    That last clause is deliberate and is the only place ``fell_back`` is not
+    literally ``used != emotion``. ``app.py`` records demand off this flag, and a
+    derived slot is a computed stand-in for a recording nobody has made: if it
+    counted as a hit, the moment Emotion Algebra filled a slot the appetite data
+    for that slot would go silent and the coverage loop would stop asking for the
+    real take. The per-segment report still names the emotion actually spoken,
+    so nothing downstream mislabels the audio.
 
     ``prosody`` maps emotion -> that slot's stored ``prosody.probe`` dict for the
-    same Character. Omit it (the default) and behaviour is byte-for-byte what it
-    was before measured mode existed — the chain is the cold-start default, and
-    every rung stays deterministic.
+    same Character. Omit both keywords (the default) and behaviour is
+    byte-for-byte what it was before measured mode or derived voices existed.
     """
+    is_derived = derived_slots(available, derived)
     if emotion in available:
-        return available[emotion], emotion, False
+        return available[emotion], emotion, emotion in is_derived
     measured = nearest_measured(emotion, available, prosody)
     if measured is not None:
         return available[measured], measured, True

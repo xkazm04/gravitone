@@ -49,7 +49,48 @@ export type Voice = {
   // Measured signal facts, normalized off the wire by `readFidelity`. Optional
   // on purpose — see the Fidelity docstring: absent renders as nothing.
   fidelity?: Fidelity;
+  /**
+   * How this Voice came to exist. `"recorded"` — the default, and what every
+   * Voice that predates Emotion Algebra reports — means a human performed it.
+   * `"derived"` means the studio COMPUTED it from a baseline plus a shared
+   * emotion direction: a real embedding that makes a real sound, and not a
+   * performance anybody gave.
+   *
+   * **A derived Voice must never be rendered as recorded.** That is the whole
+   * trust contract of the feature, so the field is read here at the fetch
+   * boundary and anything unrecognised is treated as `"recorded"` — the honest
+   * failure mode is to under-claim the algebra, never to over-claim the human.
+   */
+  origin?: "recorded" | "derived";
+  /** Provenance for a derived Voice (donor, basis version, step). Absent for
+   *  recorded ones — absent, not an empty object. */
+  derived_from?: DerivedFrom;
 };
+
+/** Where a derived Voice's emotion came from. */
+export type DerivedFrom = {
+  source: "basis" | "donor";
+  /** The donor Character, or null when the roster-wide basis supplied it. */
+  donor?: string | null;
+  donor_name?: string | null;
+  donor_voice_id?: string | null;
+  contributors?: string[];
+  emotion?: string;
+  from_voice_id?: string;
+  basis_version?: number | null;
+  alpha?: number;
+  at?: string;
+};
+
+/** Who to credit for a derived slot, in the rack's own words. Null when the
+ *  Voice is a recording (there is nobody to credit — they performed it). */
+export function derivedDonorLabel(v: Voice | null | undefined): string | null {
+  if (!v || v.origin !== "derived") return null;
+  const d = v.derived_from;
+  if (d?.source === "donor") return d.donor_name || d.donor || "another character";
+  const n = d?.contributors?.length ?? 0;
+  return n > 0 ? `${n} voice${n === 1 ? "" : "s"}` : "the shared basis";
+}
 
 /** A group of Voices across the emotion scale. */
 export type Character = {
@@ -288,7 +329,16 @@ export function normalizeCharacter(c: Character): Character {
     ...c,
     voices: c.voices.map((v) => {
       const fidelity = readFidelity((v as { fidelity?: unknown }).fidelity);
-      return fidelity ? { ...v, fidelity } : { ...v, fidelity: undefined };
+      // Only the literal string counts as derived. An older service (no field),
+      // a hand-edited registry, a future third value — all read as a recording,
+      // because the UI's job is to refuse to present a computed slot as a
+      // performance, not to invent a state it cannot render.
+      const origin = v.origin === "derived" ? "derived" : "recorded";
+      return {
+        ...v, origin,
+        derived_from: origin === "derived" && v.derived_from ? v.derived_from : undefined,
+        fidelity: fidelity ?? undefined,
+      };
     }),
   };
 }
@@ -427,6 +477,32 @@ export async function addCustomEmotionReq(id: string, name: string): Promise<voi
   });
   if (!r.ok) return throwDetail(r, `could not add "${name}"`);
   invalidateRoster();
+}
+
+/**
+ * Ask the studio to COMPUTE an emotion instead of recording it.
+ *
+ * `donorCharacterId` picks one speaker's own take as the direction; omitting it
+ * uses the roster-wide basis. The service refuses far more often than it
+ * succeeds (no basis built, the emotion does not transfer between speakers, this
+ * server cannot read embeddings at all) and every refusal is a sentence written
+ * to be shown — so the error is thrown with the backend's own detail intact and
+ * the rack renders it verbatim rather than replacing it with "derive failed".
+ */
+export async function deriveVoiceReq(
+  id: string, emotion: string, donorCharacterId?: string | null,
+): Promise<Voice> {
+  const r = await fetch(
+    `/api/characters/${encodeURIComponent(id)}/emotions/${encodeURIComponent(emotion)}/derive`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ donor_character_id: donorCharacterId ?? null }),
+    },
+  );
+  if (!r.ok) return throwDetail(r, `could not derive "${emotion}"`);
+  invalidateRoster();
+  return (await r.json()) as Voice;
 }
 
 export async function removeCustomEmotionReq(id: string, emotion: string): Promise<void> {
@@ -728,6 +804,23 @@ export function useCharacter(characterId: string) {
     await refresh();
   }, [characterId, refresh]);
 
+  /** Compute an empty slot instead of recording it (Emotion Algebra).
+   *
+   *  THROWS on refusal, deliberately: the reasons are per-slot and specific
+   *  ("no basis has been built", "angry does not transfer between speakers well
+   *  enough"), and the rack shows each one against the row it belongs to. The
+   *  hook's shared error banner would strip that placement away. */
+  const deriveVoice = useCallback(async (emotion: string, donor?: string | null) => {
+    setBusySlot(emotion);
+    try {
+      const v = await deriveVoiceReq(characterId, emotion, donor);
+      await refresh();
+      return v;
+    } finally {
+      if (mounted.current) setBusySlot(null);
+    }
+  }, [characterId, mounted, refresh]);
+
   /** Clone a new Voice into an empty emotion slot.
    *  `rethrow` lets callers with their own error UI (GuidedRecorder) get the
    *  failure instead of the hook's shared error banner. `consent` names how
@@ -800,7 +893,7 @@ export function useCharacter(characterId: string) {
 
   return { character, slots, coverage, total: slots.length, loading, error, notFound, busySlot,
            vaultWarning, removingVoiceId, addVoice, removeVoice, addCustomEmotion,
-           removeCustomEmotion, refresh };
+           removeCustomEmotion, deriveVoice, refresh };
 }
 
 // ── preview hook ────────────────────────────────────────────────────────────
