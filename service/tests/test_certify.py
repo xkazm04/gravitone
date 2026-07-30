@@ -78,11 +78,12 @@ class VerdictTests(unittest.TestCase):
         failed = [c["check"] for c in ev["checks"] if not c["pass"]]
         self.assertEqual(failed, ["measures_synthesis"])
 
-    def test_old_result_cannot_mint_a_v2_certificate(self) -> None:
+    def test_old_result_cannot_mint_a_current_certificate(self) -> None:
         old = {"schema_version": 2, "levels": [_level()], "recommended_cap": 1}
         cert = certify.build_certificate(old)
         self.assertEqual(cert["verdict"], "failed")
-        self.assertEqual(cert["version"], "gravitone-cert/2")
+        # Whatever the current version is, a cache-blind result never mints it.
+        self.assertEqual(cert["version"], certify.CERT_VERSION)
 
 
 class CertificateTopologyTests(unittest.TestCase):
@@ -114,18 +115,152 @@ class CertificateTopologyTests(unittest.TestCase):
 
 class CertVersionTests(unittest.TestCase):
     def test_version_bumped_so_old_artifacts_are_distinguishable(self) -> None:
-        # v1 certificates were issued from cache-blind results; a consumer must
-        # be able to tell them apart from a v2 measurement of the model.
-        self.assertEqual(certify.CERT_VERSION, "gravitone-cert/2")
+        # v1 was cache-blind; v2 measured a closed-loop concurrency ramp; v3
+        # can additionally promise an arrival rate at an SLO. A consumer must
+        # be able to tell which measurement basis it is holding.
+        self.assertEqual(certify.CERT_VERSION, "gravitone-cert/3")
         self.assertEqual(certify.MIN_RESULT_SCHEMA, 3)
         # Today's harness must produce results the bar accepts.
         self.assertGreaterEqual(lt.SCHEMA_VERSION, certify.MIN_RESULT_SCHEMA)
+
+    def test_v2_certificates_remain_verifiable(self) -> None:
+        # Extending the issuing bar must not orphan artifacts already in the
+        # wild: a v2 certificate's integrity still checks out, and still fails
+        # on tamper.
+        self.assertIn("gravitone-cert/2", certify.SUPPORTED_CERT_VERSIONS)
+        self.assertIn(certify.CERT_VERSION, certify.SUPPORTED_CERT_VERSIONS)
+        v2 = certify.build_certificate(_result())
+        v2["version"] = "gravitone-cert/2"
+        v2.pop("signature", None)
+        v2["sha256"] = certify.hashlib.sha256(certify._canonical(v2)).hexdigest()
+        self.assertTrue(certify.verify_certificate(v2))
+        v2["capacity"]["recommended_cap"] = 999
+        self.assertFalse(certify.verify_certificate(v2))
+
+    def test_v2_signed_certificate_still_verifies_with_the_secret(self) -> None:
+        secret = "s3cret"
+        v2 = certify.build_certificate(_result())
+        v2["version"] = "gravitone-cert/2"
+        v2.pop("signature", None)
+        v2["sha256"] = certify.hashlib.sha256(certify._canonical(v2)).hexdigest()
+        v2["signature"] = {"alg": "HMAC-SHA256", "value": certify.hmac.new(
+            secret.encode(), certify._canonical(v2),
+            certify.hashlib.sha256).hexdigest()}
+        self.assertTrue(certify.verify_certificate(v2, secret))
+        self.assertFalse(certify.verify_certificate(v2, "wrong"))
 
     def test_certificate_still_hashes_and_verifies(self) -> None:
         cert = certify.build_certificate(_result())
         self.assertTrue(certify.verify_certificate(cert))
         cert["capacity"]["single_stream_rtf"] = 99.0   # tamper
         self.assertFalse(certify.verify_certificate(cert))
+
+
+# ---------------------------------------------------------------------------
+# The fourth check: an SLO capacity contract, or an explicit absence of one
+# ---------------------------------------------------------------------------
+def _slo(**over) -> dict:
+    blk = {"p95_s": 2.0, "violations_max": 0.01, "max_rate_rps": 7.4,
+           "candidate_rate_rps": 7.4, "first_failing_rate_rps": 8.0,
+           "soak_minutes": 30, "soak_passed": True, "think_time_s": 30.0,
+           "concurrent_users": 222, "predicted": False, "note": "ok"}
+    blk.update(over)
+    return blk
+
+
+def _slo_result(**over) -> dict:
+    res = _result()
+    res["slo"] = _slo(**over)
+    res["workload"] = {"arrival": "poisson", "max_in_flight": 64,
+                       "refused_in_flight_total": 0}
+    return res
+
+
+class SloContractTests(unittest.TestCase):
+    def test_a_ramp_only_run_promises_nothing_and_still_certifies(self) -> None:
+        # Every pre-existing (v2-era) closed-loop result: no SLO was declared,
+        # so there is nothing to refuse — but there is also no contract.
+        ev = certify.evaluate(_result())
+        check = next(c for c in ev["checks"] if c["check"] == "sustains_slo")
+        self.assertTrue(check["pass"])
+        self.assertIn("no SLO declared", check["got"])
+        self.assertIsNone(ev["capacity_contract"])
+        self.assertEqual(ev["verdict"], "certified")
+
+    def test_a_measured_contract_is_signed(self) -> None:
+        ev = certify.evaluate(_slo_result())
+        self.assertEqual(ev["verdict"], "certified")
+        contract = ev["capacity_contract"]
+        self.assertEqual(contract["max_rate_rps"], 7.4)
+        self.assertEqual(contract["soak_minutes"], 30)
+        self.assertEqual(contract["concurrent_users"], 222)
+        self.assertEqual(contract["slo"], {"p95_s": 2.0, "violations_max": 0.01})
+        self.assertIn("think_time_s", contract["concurrent_users_basis"])
+
+    def test_a_predicted_rate_is_refused(self) -> None:
+        # Mirrors measures_synthesis: a fitted curve is a hypothesis about a
+        # box, a certificate is a promise about one.
+        ev = certify.evaluate(_slo_result(predicted=True))
+        self.assertEqual(ev["verdict"], "failed")
+        failed = [c["check"] for c in ev["checks"] if not c["pass"]]
+        self.assertEqual(failed, ["sustains_slo"])
+        self.assertIsNone(ev["capacity_contract"])
+        self.assertIn("PREDICTED", ev["slo"]["reasons"][0])
+
+    def test_a_failed_soak_refuses_the_contract(self) -> None:
+        ev = certify.evaluate(_slo_result(soak_passed=False))
+        self.assertEqual(ev["verdict"], "failed")
+        self.assertIsNone(ev["capacity_contract"])
+        self.assertIn("not sustainable", ev["slo"]["reasons"][0])
+
+    def test_no_sustainable_rate_refuses_the_contract(self) -> None:
+        ev = certify.evaluate(_slo_result(max_rate_rps=None,
+                                          note="no offered rate met the SLO"))
+        self.assertEqual(ev["verdict"], "failed")
+        self.assertFalse(ev["slo"]["sustains_slo"])
+
+    def test_a_cache_contaminated_slo_run_fails_the_first_check_too(self) -> None:
+        res = _slo_result()
+        res["levels"] = [_level(cache_hits=9)]
+        res["measurement"] = lt.measurement_block(res["levels"], "bypass")
+        ev = certify.evaluate(res)
+        self.assertEqual(ev["verdict"], "failed")
+        self.assertIn("measures_synthesis",
+                      [c["check"] for c in ev["checks"] if not c["pass"]])
+
+    def test_contract_travels_into_the_signed_certificate(self) -> None:
+        cert = certify.build_certificate(_slo_result())
+        self.assertEqual(cert["version"], "gravitone-cert/3")
+        self.assertEqual(cert["capacity_contract"]["max_rate_rps"], 7.4)
+        self.assertTrue(certify.verify_certificate(cert))
+        cert["capacity_contract"]["max_rate_rps"] = 99.0   # tamper
+        self.assertFalse(certify.verify_certificate(cert))
+
+
+class OpenLoopResultEndToEndTests(unittest.TestCase):
+    """A result built by the open-loop harness certifies without hand-editing."""
+
+    def test_loadtest_open_loop_output_is_certifiable(self) -> None:
+        results = {"lat": [0.5] * 60, "ttfb": [], "rtf": [2.5] * 60,
+                   "audio": [3.0] * 60, "rejected": 0, "errors": 0,
+                   "timeouts": 0, "unsupported": 0, "cache_hits": 0}
+        row = lt.open_loop_row(offered_rate=6.0, duration_s=10.0, scheduled=60,
+                               refused=0, results=results, wall_s=10.0,
+                               slo_p95=2.0, peak_in_flight=4)
+        slo = lt.slo_block(slo_p95=2.0, violations_max=0.01, max_rate=6.0,
+                           first_fail=None, soak_minutes=5, soak_ok=True)
+        result = lt.build_result(
+            [row], knee=None, recommended=lt.open_loop_recommended_cap([row], slo),
+            route="synth", fmt="wav_24000", corpus="workload:typical seed=0",
+            service_config={}, meta=lt.runtime_metadata(), cache_mode="bypass",
+            extra={"slo": slo, "workload": lt.workload_block(
+                rates=[6.0], duration_s=10.0, seed=0, profile="typical",
+                max_in_flight=64, rows=[row])})
+        cert = certify.build_certificate(result)
+        self.assertEqual(cert["verdict"], "certified")
+        self.assertEqual(cert["capacity"]["recommended_cap"], 4)
+        self.assertEqual(cert["capacity_contract"]["max_rate_rps"], 6.0)
+        self.assertEqual(cert["capacity_contract"]["concurrent_users"], 180)
 
 
 if __name__ == "__main__":

@@ -31,8 +31,26 @@ from pathlib import Path
 # happily averaged X-Realtime-Factor values in the millions). They are NOT
 # comparable to v2 and must not be read as capacity claims — hence a new
 # version string rather than a silent behaviour change.
-CERT_VERSION = "gravitone-cert/2"
+#
+# v3 adds the SLO capacity contract: a certificate may now carry a promise
+# about ARRIVAL RATE at a latency SLO ("this box sustains R req/s at p95 <= S
+# for M minutes, ~= N concurrent listeners"), measured open-loop. That is a
+# different measurement basis from v2's closed-loop concurrency ramp — a v2
+# cap and a v3 rate answer different questions and must never be diffed
+# against each other — so, per this file's own precedent, the version string
+# changes rather than the meaning of an existing field.
+CERT_VERSION = "gravitone-cert/3"
+
+# Versions whose integrity this module can still verify. A v2 certificate
+# stays verifiable forever (the hash/HMAC covers the payload, whatever version
+# it declares) — extending the issuing bar must never orphan artifacts already
+# in the wild.
+SUPPORTED_CERT_VERSIONS = ("gravitone-cert/2", "gravitone-cert/3")
 CERT_SECRET = os.environ.get("GRAVITONE_CERT_SECRET", "")
+
+# Seconds between one listener's requests, used to turn req/s into people.
+# Mirrors service.loadtest.DEFAULT_THINK_TIME_S; the run's own value wins.
+DEFAULT_THINK_TIME_S = 30.0
 
 # Load-test result schema that is cache-aware (service.loadtest.SCHEMA_VERSION).
 # Anything older cannot substantiate that its numbers came from the model.
@@ -85,6 +103,73 @@ def measurement_status(result: dict) -> dict:
     }
 
 
+def slo_status(result: dict) -> dict:
+    """Does this run substantiate a capacity PROMISE, and may we sign it?
+
+    Three outcomes, and the middle one is the point of the check:
+      * **not declared** — a closed-loop concurrency ramp (every v2-era run).
+        It makes no rate/SLO claim, so there is nothing to refuse: the
+        certificate simply carries no capacity contract and says so.
+      * **declared and measured** — an open-loop run found a rate that met the
+        SLO (and held it through any soak). This is signable.
+      * **declared but PREDICTED** — the rate came from a fitted/extrapolated
+        envelope, not from arrivals that actually happened. Refused, exactly
+        as a cache-contaminated measurement is refused: a certificate is a
+        promise about a box, and a curve fit is a hypothesis about one.
+    """
+    slo = result.get("slo") or {}
+    declared = slo.get("p95_s") is not None
+    predicted = bool(slo.get("predicted"))
+    rate = slo.get("max_rate_rps")
+    soak_minutes = slo.get("soak_minutes") or 0
+    soak_passed = slo.get("soak_passed")
+    reasons = []
+    if declared:
+        if predicted:
+            reasons.append(
+                "the rate is PREDICTED (fitted/extrapolated), not measured — a "
+                "certificate may only promise arrivals that actually happened")
+        if not isinstance(rate, (int, float)) or rate <= 0:
+            reasons.append(slo.get("note")
+                           or "no offered rate met the declared SLO")
+        elif soak_passed is False:
+            reasons.append(f"the {soak_minutes}-minute soak at {rate} req/s did "
+                           f"not hold: the rate is reachable, not sustainable")
+    think = slo.get("think_time_s") or DEFAULT_THINK_TIME_S
+    return {
+        "declared": declared,
+        "predicted": predicted,
+        "p95_s": slo.get("p95_s"),
+        "violations_max": slo.get("violations_max"),
+        "max_rate_rps": rate if (declared and not reasons) else None,
+        "soak_minutes": soak_minutes,
+        "soak_passed": soak_passed,
+        "think_time_s": think,
+        "concurrent_users": (slo.get("concurrent_users")
+                             if (declared and not reasons) else None),
+        "sustains_slo": declared and not reasons,
+        "reasons": reasons,
+    }
+
+
+def capacity_contract(status: dict) -> dict | None:
+    """The signable capacity promise, or None when the run made none."""
+    if not status["sustains_slo"]:
+        return None
+    return {
+        "slo": {"p95_s": status["p95_s"],
+                "violations_max": status["violations_max"]},
+        "max_rate_rps": status["max_rate_rps"],
+        "soak_minutes": status["soak_minutes"],
+        "concurrent_users": status["concurrent_users"],
+        "concurrent_users_basis": (
+            f"max_rate_rps x think_time_s: a listener requesting speech every "
+            f"{status['think_time_s']}s contributes 1/{status['think_time_s']} "
+            f"req/s. Change the think time and the headcount changes with it."),
+        "measured": "open-loop Poisson arrivals, distinct script per request",
+    }
+
+
 def gather_hardware() -> dict:
     hw = {
         "machine": platform.machine(),
@@ -125,6 +210,7 @@ def evaluate(result: dict) -> dict:
     aud_per_s = at_cap.get("audio_s_per_wall_s") or 0.0
 
     measurement = measurement_status(result)
+    slo = slo_status(result)
 
     checks = [
         # FIRST, because every number below it is meaningless without it: did
@@ -148,10 +234,25 @@ def evaluate(result: dict) -> dict:
          "want": f"<= {THRESHOLDS['errors_at_cap_max']} errors/429s",
          "got": cap_errors,
          "pass": cap_errors <= THRESHOLDS["errors_at_cap_max"]},
+        # The capacity CONTRACT. A run that declared no SLO passes without
+        # claiming anything (the certificate then carries no contract at all);
+        # a run that declared one must have MEASURED a rate that met it.
+        {"check": "sustains_slo",
+         "want": "a measured arrival rate meeting the declared SLO",
+         "got": ("no SLO declared: this certificate covers the concurrency "
+                 "ramp only and promises no request rate"
+                 if not slo["declared"] else
+                 (f"{slo['max_rate_rps']} req/s at p95 <= {slo['p95_s']}s"
+                  f" ({slo['concurrent_users']} concurrent listeners"
+                  f" at a {slo['think_time_s']}s think time)"
+                  if slo["sustains_slo"] else "; ".join(slo["reasons"]))),
+         "pass": (not slo["declared"]) or slo["sustains_slo"]},
     ]
     return {
         "checks": checks,
         "measurement": measurement,
+        "slo": slo,
+        "capacity_contract": capacity_contract(slo),
         "verdict": "certified" if all(c["pass"] for c in checks) else "failed",
         "capacity": {
             "single_stream_rtf": single_rtf,
@@ -260,6 +361,16 @@ def main() -> None:
         print(f"  {'PASS' if c['pass'] else 'FAIL'}  {c['check']}: {c['got']} (want {c['want']})")
     if cap["audio_minutes_per_hour"]:
         print(f"Capacity: ~{cap['audio_minutes_per_hour']} audio-min/hour at cap {cap['recommended_cap']}")
+    contract = cert.get("capacity_contract")
+    if contract:
+        print(f"Contract: sustains {contract['max_rate_rps']} req/s at p95 <= "
+              f"{contract['slo']['p95_s']}s "
+              f"~= {contract['concurrent_users']} concurrent listeners"
+              + (f", held {contract['soak_minutes']} min"
+                 if contract["soak_minutes"] else " (no soak)"))
+        print(f"          {contract['concurrent_users_basis']}")
+    elif cert["slo"]["declared"]:
+        print(f"Contract: REFUSED — {'; '.join(cert['slo']['reasons'])}")
     topo = cert["topology"]
     if not topo["pool_aggregate_available"]:
         print(f"Server counters: {topo['server_metrics_scope']} — "
