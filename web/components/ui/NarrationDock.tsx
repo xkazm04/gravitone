@@ -33,8 +33,9 @@ import { usePathname } from "next/navigation";
 
 import { readDetail } from "@/lib/apiFetch";
 import {
-  clipKey, narratableFor, narrationPlan, taggedSentence,
-  type CharacterHint, type NarratableRoute, type NarrationStep,
+  BAKED_MANIFEST, bakedUrl, clipKey, narratableFor, narrationPlan, parseManifest,
+  routeFromPlan, taggedSentence,
+  type BakeManifest, type CharacterHint, type NarratableRoute, type NarrationStep,
 } from "@/lib/narratable";
 import { cacheAvailable, clearClips, countClips, getClip, putClip } from "@/lib/narrationCache";
 import { useAudioBus } from "./AudioBus";
@@ -206,6 +207,34 @@ async function speakFailure(res: Response): Promise<NarrationError> {
   return new NarrationError(detail ?? `synthesis failed (${res.status})`, "failed");
 }
 
+/**
+ * A clip that was rendered at BUILD time (web/scripts/bake-narration.ts).
+ *
+ * Preferred over synthesis whenever the key is in the manifest, because it is
+ * the same audio: the bake computes `clipKey` from this very module, with the
+ * same emotion tag and the same narrator, so a hit is not an approximation of
+ * the live reading — it IS the live reading, rendered once.
+ *
+ * A miss returns null and the caller synthesizes. A manifest that promises a
+ * clip the server does not serve is treated as a miss too, rather than as an
+ * error: a stale manifest should cost a round trip, not the reading.
+ */
+async function fetchBaked(
+  manifest: BakeManifest | null, key: string, signal: AbortSignal,
+): Promise<Blob | null> {
+  const url = bakedUrl(manifest, key);
+  if (!url) return null;
+  try {
+    const res = await fetch(url, { signal });
+    if (!res.ok) return null;
+    const blob = await res.blob();
+    return blob.size > 0 ? blob : null;
+  } catch (e) {
+    if ((e as { name?: string } | null)?.name === "AbortError") throw e;
+    return null;
+  }
+}
+
 /** Synthesize one tagged sentence. Throws a NarrationError on every failure —
  *  there is no browser-voice fallback here on purpose: a robot voice reading
  *  the marketing copy of a voice company is worse than an honest apology. */
@@ -238,6 +267,18 @@ const ROLE_HUE: Record<string, number> = {
 
 const HIGHLIGHT_ATTR = "data-gt-narrating";
 
+/** Where the bytes now playing came from. Stated rather than hidden: "cached"
+ *  and "baked" and "rendered just now" are three different claims about what
+ *  this listen cost, and a voice company that blurs them is describing its own
+ *  product inaccurately. */
+export type ClipSource = "cache" | "baked" | "live";
+
+const SOURCE_COPY: Record<ClipSource, string> = {
+  cache: "playing — cached",
+  baked: "playing — baked at build time",
+  live: "playing — rendered just now",
+};
+
 /** The one global rule this component owns: what a narrated block looks like.
  *  Scoped entirely to an attribute nothing else writes. */
 const HIGHLIGHT_CSS = `
@@ -258,16 +299,101 @@ function prefersReducedMotion(): boolean {
   }
 }
 
-export default function NarrationDock() {
-  const pathname = usePathname();
-  const route = useMemo(() => narratableFor(pathname), [pathname]);
-  if (!route) return null;
-  // Keyed on the route so switching pages rebuilds the transport from scratch
-  // rather than leaving a cursor pointing into the previous page's plan.
-  return <Dock key={route.route} route={route} />;
+// ── the /v1/narrate consumer ─────────────────────────────────────────────────
+//
+// The registry above narrates THIS site. `?narration=<id>` narrates anything
+// else: a plan minted by POST /v1/narrate — a customer's docs page, a pasted
+// README, a blog post — played by the same transport, with the same cache, the
+// same keyboard rules and the same refusals. That is the whole point of the
+// plan being data: one player, two sources.
+//
+// The id travels in the URL rather than in a prop because the interesting use
+// is a LINK ("here, listen to this"), and a link cannot pass a prop.
+
+const NARRATION_PARAM = "narration";
+const NARRATION_ID = /^[a-z0-9]{1,32}$/i;
+
+type RemoteNarration = {
+  route: NarratableRoute | null;
+  notice: string | null;
+  loading: boolean;
+  requested: boolean;
+};
+
+function useRemoteNarration(): RemoteNarration {
+  const [state, setState] = useState<RemoteNarration>(
+    { route: null, notice: null, loading: false, requested: false });
+
+  useEffect(() => {
+    let id = "";
+    try {
+      id = new URLSearchParams(window.location.search).get(NARRATION_PARAM) ?? "";
+    } catch {
+      return; // exotic URL — the registry dock is unaffected
+    }
+    if (!id) return;
+    if (!NARRATION_ID.test(id)) {
+      setState({ route: null, loading: false, requested: true,
+                 notice: "that narration id is not a valid id" });
+      return;
+    }
+    const ctrl = new AbortController();
+    setState({ route: null, notice: null, loading: true, requested: true });
+    (async () => {
+      try {
+        const res = await fetch(`/api/narrate/${id}`, { signal: ctrl.signal, cache: "no-store" });
+        if (res.status === 404) {
+          // Two different 404s, and the difference matters to whoever is
+          // debugging: no relay route deployed vs. a plan that has aged out.
+          const detail = await readDetail(res);
+          throw new Error(detail
+            ?? "that narration is not on this deployment — plans are evicted oldest-first");
+        }
+        if (!res.ok) throw new Error(await readDetail(res) ?? "that narration could not be loaded");
+        const built = routeFromPlan(await res.json());
+        if (ctrl.signal.aborted) return;
+        if (!built) throw new Error("that narration plan contains nothing readable");
+        setState({ route: built, notice: null, loading: false, requested: true });
+      } catch (e) {
+        if ((e as { name?: string }).name === "AbortError") return;
+        setState({
+          route: null, loading: false, requested: true,
+          notice: (e as Error).message || "that narration could not be loaded",
+        });
+      }
+    })();
+    return () => ctrl.abort();
+  }, []);
+
+  return state;
 }
 
-function Dock({ route }: { route: NarratableRoute }) {
+/** The stand-in reading for a narration that could not be loaded. The dock
+ *  still appears, because the visitor followed a link that promised audio and
+ *  silence is not an answer — it appears saying exactly what went wrong. */
+const EMPTY_ROUTE: NarratableRoute = {
+  route: "narration:unavailable",
+  title: "This narration could not be loaded",
+  blocks: [],
+};
+
+export default function NarrationDock() {
+  const pathname = usePathname();
+  const registry = useMemo(() => narratableFor(pathname), [pathname]);
+  const remote = useRemoteNarration();
+
+  // A requested narration WINS over the page's own registry entry: the link
+  // said "listen to this", not "listen to the page you landed on".
+  const route = remote.route ?? (remote.requested ? EMPTY_ROUTE : registry);
+  if (!route) return null;
+  if (remote.loading && !registry) return null;
+  // Keyed on the route so switching pages — or resolving a remote plan —
+  // rebuilds the transport from scratch rather than leaving a cursor pointing
+  // into the previous plan.
+  return <Dock key={route.route} route={route} notice={remote.notice} />;
+}
+
+function Dock({ route, notice }: { route: NarratableRoute; notice?: string | null }) {
   const plan = useMemo(() => narrationPlan(route), [route]);
   const total = plan.length;
 
@@ -276,8 +402,9 @@ function Dock({ route }: { route: NarratableRoute }) {
   const [roster, setRoster] = useState<Narrator[] | null>(null);
   const [rosterError, setRosterError] = useState<string | null>(null);
   const [chosen, setChosen] = useState<string>(AUTO_NARRATOR);
-  const [fromCache, setFromCache] = useState(false);
+  const [source, setSource] = useState<ClipSource>("live");
   const [cached, setCached] = useState(0);
+  const [manifest, setManifest] = useState<BakeManifest | null>(null);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const urlRef = useRef<string | null>(null);
@@ -356,19 +483,50 @@ function Dock({ route }: { route: NarratableRoute }) {
     void countClips().then(setCached).catch(() => {});
   }, [state.open, state.index]);
 
-  // ── audio for one step: cache first, synth second ──────────────────────────
+  // ── the build-time bake, if this deployment has one ────────────────────────
+  // Fetched once on first expand, alongside the roster. A 404 is the ordinary
+  // case (no bake ran) and must cost nothing: no retry, no error state, no
+  // mention in the UI beyond the status line not saying "baked".
+  useEffect(() => {
+    if (!state.open || manifest) return;
+    const ctrl = new AbortController();
+    (async () => {
+      try {
+        const res = await fetch(BAKED_MANIFEST, { signal: ctrl.signal });
+        if (!res.ok) return;
+        const parsed = parseManifest(await res.json());
+        if (parsed && !ctrl.signal.aborted) setManifest(parsed);
+      } catch {
+        /* no bake here — live synthesis is the normal path, not a degradation */
+      }
+    })();
+    return () => ctrl.abort();
+  }, [state.open, manifest]);
+
+  // ── audio for one step: cache, then bake, then synth ───────────────────────
+  //
+  // Ordered by cost, cheapest first. The IndexedDB cache is free and local; a
+  // baked file is a static asset off the CDN and costs no engine; synthesis
+  // costs a synth slot on the box. Every layer is keyed identically, so moving
+  // between them can never play the wrong audio — only reach the same audio
+  // more or less cheaply.
   const ensureClip = useCallback(
-    async (target: NarrationStep, signal: AbortSignal): Promise<{ blob: Blob; hit: boolean }> => {
+    async (target: NarrationStep, signal: AbortSignal): Promise<{ blob: Blob; from: ClipSource }> => {
       const narrator = pickNarrator(roster ?? [], chosen, target.block.characterHint);
       if (!narrator) throw new NarrationError("no narrator is available on this deployment", "failed");
       const key = clipKey(narrator.character_id, target.block, target.sentence);
       const hit = await getClip(key);
-      if (hit) return { blob: hit.blob, hit: true };
+      if (hit) return { blob: hit.blob, from: "cache" };
+      const baked = await fetchBaked(manifest, key, signal);
+      if (baked) {
+        await putClip(key, baked);
+        return { blob: baked, from: "baked" };
+      }
       const blob = await synthesize(narrator.character_id, taggedSentence(target.block, target.sentence), signal);
       await putClip(key, blob);
-      return { blob, hit: false };
+      return { blob, from: "live" };
     },
-    [roster, chosen],
+    [roster, chosen, manifest],
   );
 
   // ── the loader: the only place that starts audio ───────────────────────────
@@ -386,12 +544,12 @@ function Dock({ route }: { route: NarratableRoute }) {
 
     (async () => {
       try {
-        const { blob, hit } = await ensureClip(target, ctrl.signal);
+        const { blob, from } = await ensureClip(target, ctrl.signal);
         if (cancelled) return;
         const url = URL.createObjectURL(blob);
         if (urlRef.current) URL.revokeObjectURL(urlRef.current);
         urlRef.current = url;
-        setFromCache(hit);
+        setSource(from);
         const el = audioRef.current;
         if (!el) throw new NarrationError("the player element is gone", "failed");
         el.src = url;
@@ -583,17 +741,27 @@ function Dock({ route }: { route: NarratableRoute }) {
   }, []);
 
   // ── copy the dock says out loud ────────────────────────────────────────────
-  const canPlay = !!roster?.length;
+  const canPlay = !!roster?.length && total > 0;
   const status = (() => {
     if (state.phase === "error") return state.error ?? "narration failed";
+    // A remote plan that failed to load is the FIRST thing to say: the visitor
+    // followed a link that promised this specific reading.
+    if (notice) return notice;
     if (rosterError) return rosterError;
+    if (!total) return "there is nothing to read here";
     if (!roster && state.open) return "loading narrators…";
-    // While LOADING, `fromCache` still describes the sentence that just
-    // finished — so it says nothing about this one. Claiming "cued" off a stale
-    // flag would be the dock's one small lie.
+    // While LOADING, `source` still describes the sentence that just finished —
+    // so it says nothing about this one. Claiming "cued" off a stale flag would
+    // be the dock's one small lie.
     if (state.phase === "loading") return "cueing this sentence…";
-    if (state.phase === "playing") return fromCache ? "playing — cached" : "playing — rendered just now";
+    if (state.phase === "playing") return SOURCE_COPY[source];
     if (state.phase === "paused") return "paused";
+    // Stated BEFORE the cache warning, and instead of it: "every listen
+    // re-renders" is simply false on a baked page, and a warning that is false
+    // is worse than no warning.
+    if (manifest) {
+      return `ready — this page was baked with ${manifest.character_name}, so it costs no engine`;
+    }
     if (!cacheAvailable()) return "ready — this browser cannot cache audio, every listen re-renders";
     return cached > 0 ? `ready — ${cached} sentence${cached === 1 ? "" : "s"} cached` : "ready when you are";
   })();

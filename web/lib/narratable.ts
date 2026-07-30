@@ -331,6 +331,134 @@ export function narratableFor(pathname: string | null | undefined): NarratableRo
   return NARRATABLE[clean || "/"] ?? null;
 }
 
+// ── arbitrary narrations (the POST /v1/narrate consumer) ─────────────────────
+//
+// Everything above describes THIS site, derived from its own content modules.
+// The service's `/v1/narrate` produces the same shape for any page — a customer's
+// docs, a blog post, a pasted README — and the dock plays both through one code
+// path. The conversion below is the only seam between them, and it is
+// deliberately suspicious of what it is given: a plan arrives over the network,
+// so a block missing `text`, or carrying an emotion that is not a name, is
+// DROPPED rather than pushed into a synthesis request.
+
+/** One block as `/v1/narrate` emits it (service/narrate.py::build_blocks). */
+export type NarrationPlanBlock = {
+  id?: string;
+  label?: string;
+  text?: string;
+  emotion?: string;
+  character_hint?: string;
+  hash?: string;
+  role?: string;
+};
+
+export type NarrationPlanDoc = {
+  narration_id?: string;
+  title?: string;
+  blocks?: NarrationPlanBlock[];
+};
+
+/** Emotion names the service's scale can carry (service/emotions.py). Anything
+ *  else is refused here rather than at synthesis time, where it would cost a
+ *  round trip to learn. */
+const EMOTION_NAME = /^[a-z][a-z0-9_]{1,23}$/;
+
+/**
+ * A remote narration plan, as the route the dock already knows how to play.
+ *
+ * Returns null when the plan carries nothing playable — which the dock reports
+ * as a named refusal, because "the service answered with an empty reading" and
+ * "the request failed" are different sentences.
+ */
+export function routeFromPlan(plan: NarrationPlanDoc | null | undefined): NarratableRoute | null {
+  const raw = Array.isArray(plan?.blocks) ? plan.blocks : [];
+  const blocks: NarratableBlock[] = [];
+  raw.forEach((b, i) => {
+    const text = speakable(String(b?.text ?? ""));
+    const emotion = String(b?.emotion ?? "").trim();
+    if (text.length < 2 || !EMOTION_NAME.test(emotion)) return;
+    const role: NarratableRole = b?.role === "lead" ? "hero" : "feature";
+    blocks.push({
+      id: String(b?.id ?? `b${i}`).slice(0, 32),
+      role,
+      label: String(b?.label ?? text).slice(0, 90),
+      text,
+      // The service's hint vocabulary is this module's vocabulary; anything
+      // unrecognised reads measured, which is the safer default for prose.
+      characterHint: b?.character_hint === "warm" ? "warm" : "measured",
+      emotionTag: emotion,
+      // No anchor: the blocks describe a document this page is not rendering,
+      // so there is nothing on screen to highlight. The dock's highlight code
+      // already treats a missing anchor as "no highlight".
+      hash: b?.hash ? String(b.hash).slice(0, 32) : hashParts(emotion, text),
+    });
+  });
+  if (!blocks.length) return null;
+  return {
+    route: `narration:${String(plan?.narration_id ?? "").slice(0, 32)}`,
+    title: String(plan?.title ?? "").slice(0, 120) || "A narration, read aloud",
+    blocks,
+  };
+}
+
+// ── build-time baked audio ───────────────────────────────────────────────────
+//
+// `npm run bake:narration` renders the registry once and writes the clips under
+// public/narration/. A baked clip is the SAME bytes the dock would have
+// synthesized — same key, same emotion tag, same narrator — so preferring it is
+// invisible except in the status line and in the engine time it does not spend.
+//
+// The manifest exists so the dock can know what was baked WITHOUT a request per
+// sentence: a 404 for a clip that was never baked is indistinguishable from a
+// deployment problem, and forty of them per page would be indistinguishable
+// from an outage.
+
+export const BAKED_PREFIX = "/narration";
+export const BAKED_MANIFEST = `${BAKED_PREFIX}/manifest.json`;
+
+export type BakeManifest = {
+  version: 1;
+  /** Which narrator the clips were baked with. A listener who picks anyone
+   *  else gets live synthesis, because the keys will not match — which is the
+   *  correct outcome, not a bug: the bake is one voice's reading. */
+  character_id: string;
+  character_name: string;
+  generated: string;
+  /** clipKey → the file's byte length, for the manifest to be worth reading. */
+  clips: Record<string, number>;
+};
+
+/** The static file for one clip key, or null when it was not baked. */
+export function bakedUrl(manifest: BakeManifest | null, key: string): string | null {
+  if (!manifest || !Object.prototype.hasOwnProperty.call(manifest.clips, key)) return null;
+  return `${BAKED_PREFIX}/${key}.wav`;
+}
+
+/** Parse a fetched manifest, or null. Never throws: a malformed manifest must
+ *  cost the bake and nothing else. */
+export function parseManifest(raw: unknown): BakeManifest | null {
+  if (!raw || typeof raw !== "object") return null;
+  const m = raw as Record<string, unknown>;
+  if (m.version !== 1 || typeof m.character_id !== "string") return null;
+  const clips = m.clips;
+  if (!clips || typeof clips !== "object") return null;
+  const out: Record<string, number> = {};
+  for (const [key, value] of Object.entries(clips as Record<string, unknown>)) {
+    // Keys are content hashes this module produced; anything else is not a key
+    // we can ever look up, and letting it through would put an attacker-chosen
+    // string into a URL.
+    if (/^[0-9a-f]{16}$/.test(key) && typeof value === "number") out[key] = value;
+  }
+  if (!Object.keys(out).length) return null;
+  return {
+    version: 1,
+    character_id: m.character_id,
+    character_name: typeof m.character_name === "string" ? m.character_name : m.character_id,
+    generated: typeof m.generated === "string" ? m.generated : "",
+    clips: out,
+  };
+}
+
 /** One flattened playback unit: which block it belongs to, and what to say. */
 export type NarrationStep = {
   blockIndex: number;

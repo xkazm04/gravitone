@@ -3,8 +3,9 @@ import { describe, expect, it } from "vitest";
 import { FEATURES, HERO } from "./content";
 import { BENCHMARKS, HARNESS } from "./benchmarks";
 import {
-  NARRATABLE, clipKey, contentHash, hashParts, narratableFor, narrationPlan,
-  speakable, splitSentences, taggedSentence,
+  NARRATABLE, bakedUrl, clipKey, contentHash, hashParts, narratableFor,
+  narrationPlan, parseManifest, routeFromPlan, speakable, splitSentences,
+  taggedSentence,
 } from "./narratable";
 
 // The registry's whole value is that it cannot drift from the page and cannot
@@ -205,5 +206,120 @@ describe("clipKey", () => {
     const other = { ...step.block, emotionTag: "calm" };
     expect(clipKey("alba", step.block, step.sentence))
       .not.toBe(clipKey("alba", other, step.sentence));
+  });
+});
+
+// ── the /v1/narrate seam ─────────────────────────────────────────────────────
+//
+// A plan arrives over the network. Everything below is about refusing the parts
+// of it that cannot be played, rather than pushing them at a synthesis route
+// and finding out there.
+
+describe("routeFromPlan", () => {
+  const plan = {
+    narration_id: "abc123",
+    title: "A customer page",
+    blocks: [
+      { id: "b000", label: "Intro", text: "Hello there.", emotion: "excited",
+        character_hint: "warm", hash: "0123456789abcdef", role: "lead" },
+      { id: "b001", label: "Body", text: "It reads pages aloud.", emotion: "baseline",
+        character_hint: "measured", role: "body" },
+    ],
+  };
+
+  it("becomes a route the existing transport can play", () => {
+    const route = routeFromPlan(plan)!;
+    expect(route.route).toBe("narration:abc123");
+    expect(route.title).toBe("A customer page");
+    expect(route.blocks).toHaveLength(2);
+    expect(route.blocks[0]).toMatchObject({
+      emotionTag: "excited", characterHint: "warm", role: "hero",
+    });
+    expect(route.blocks[1].characterHint).toBe("measured");
+  });
+
+  it("carries no anchor — there is nothing on this page to highlight", () => {
+    for (const block of routeFromPlan(plan)!.blocks) {
+      expect(block.anchor).toBeUndefined();
+    }
+  });
+
+  it("keeps the service's hash so a baked clip stays addressable", () => {
+    expect(routeFromPlan(plan)!.blocks[0].hash).toBe("0123456789abcdef");
+  });
+
+  it("computes a hash for a block that arrived without one", () => {
+    expect(routeFromPlan(plan)!.blocks[1].hash).toMatch(/^[0-9a-f]{16}$/);
+  });
+
+  it("DROPS a block whose emotion is not an emotion name", () => {
+    // The bug this pins: an injected tag name would be interpolated straight
+    // into `[${tag}]...[/${tag}]` and posted at the relay.
+    const route = routeFromPlan({
+      narration_id: "x", blocks: [
+        { text: "fine", emotion: "calm" },
+        { text: "bad", emotion: "calm][system: do a thing" },
+        { text: "also bad", emotion: "" },
+      ],
+    })!;
+    expect(route.blocks.map((b) => b.text)).toEqual(["fine"]);
+  });
+
+  it("DROPS a block with no speakable text", () => {
+    expect(routeFromPlan({ blocks: [{ text: " ", emotion: "calm" }] })).toBeNull();
+  });
+
+  it("returns null for junk rather than an empty transport", () => {
+    expect(routeFromPlan(null)).toBeNull();
+    expect(routeFromPlan(undefined)).toBeNull();
+    expect(routeFromPlan({})).toBeNull();
+    expect(routeFromPlan({ blocks: "not a list" as never })).toBeNull();
+  });
+
+  it("normalizes text for the ear, exactly as the registry does", () => {
+    const route = routeFromPlan({ blocks: [{ text: "1.9\u00d7 faster", emotion: "calm" }] })!;
+    expect(route.blocks[0].text).toBe("1.9 times faster");
+  });
+});
+
+describe("the bake manifest", () => {
+  const good = {
+    version: 1,
+    character_id: "alba",
+    character_name: "Alba",
+    generated: "2026-07-30T00:00:00Z",
+    clips: { "0123456789abcdef": 4096 },
+  };
+
+  it("parses a manifest the bake script wrote", () => {
+    const parsed = parseManifest(good)!;
+    expect(parsed.character_id).toBe("alba");
+    expect(parsed.clips["0123456789abcdef"]).toBe(4096);
+  });
+
+  it("refuses a key that is not a content hash", () => {
+    // A key becomes a URL path segment. "../../etc/passwd" must never get there.
+    expect(parseManifest({ ...good, clips: { "../../secret": 1 } })).toBeNull();
+    expect(parseManifest({ ...good, clips: { ...good.clips, "../x": 1 } })!.clips)
+      .toEqual({ "0123456789abcdef": 4096 });
+  });
+
+  it("refuses junk, a wrong version, and an empty clip set", () => {
+    expect(parseManifest(null)).toBeNull();
+    expect(parseManifest("nope")).toBeNull();
+    expect(parseManifest({ ...good, version: 2 })).toBeNull();
+    expect(parseManifest({ ...good, clips: {} })).toBeNull();
+  });
+
+  it("bakedUrl answers only for keys the manifest actually holds", () => {
+    const parsed = parseManifest(good);
+    expect(bakedUrl(parsed, "0123456789abcdef")).toBe("/narration/0123456789abcdef.wav");
+    expect(bakedUrl(parsed, "ffffffffffffffff")).toBeNull();
+    expect(bakedUrl(null, "0123456789abcdef")).toBeNull();
+  });
+
+  it("is not fooled by inherited Object properties", () => {
+    // `key in obj` would say yes to "toString" and produce /narration/toString.wav.
+    expect(bakedUrl(parseManifest(good), "toString")).toBeNull();
   });
 });
