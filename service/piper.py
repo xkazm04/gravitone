@@ -35,6 +35,7 @@ import wave
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 from service.config import SETTINGS
 
@@ -110,6 +111,53 @@ def voice_for_language(language: str) -> str | None:
         return None
     want = language.split("-", 1)[0].lower()
     return next((v.voice_id for v in list_voices() if v.language == want), None)
+
+
+def prewarm(languages: "Iterable[str]" = (), voice_ids: "Iterable[str]" = ()) -> dict:
+    """Resolve and LOAD voices before a conversation needs one. Blocking.
+
+    A cold ONNX load is a second or two. Paying it at connect is invisible (the
+    caller is listening to a greeting); paying it on the first sentence after the
+    caller switches language is the one moment the feature is being judged. So a
+    session that declares a second language warms it here, off the event loop,
+    the same way ``convai._warm_ears`` warms the transcriber.
+
+    Reports rather than raises, for the same reason ``_warm_ears`` does: this is
+    an optimization, and its failure mode has to be "the first switched sentence
+    is slow", never "the conversation does not start". ``missing`` is also the
+    honest answer to "can this replica actually speak that?" — the demand signal
+    that says which voice to download.
+
+    At most ``_CACHE_MAX`` voices are warmed: warming more than the LRU holds
+    would evict what was just loaded, so the extras are reported as ``skipped``
+    instead of being loaded and thrown away.
+    """
+    wanted: list[tuple[str, str]] = []
+    missing: list[str] = []
+    for language in languages:
+        tag = (language or "").split("-", 1)[0].lower()
+        if not tag:
+            continue
+        found = voice_for_language(tag)
+        if found is None:
+            missing.append(tag)
+        elif found not in [v for _, v in wanted]:
+            wanted.append((tag, found))
+    for voice_id in voice_ids:
+        if voice_id and voice_id not in [v for _, v in wanted]:
+            wanted.append((_language_of(voice_id), voice_id))
+
+    warmed: dict[str, str] = {}
+    for language, voice_id in wanted[:_CACHE_MAX]:
+        try:
+            _load(voice_id)
+        except PiperUnavailable as exc:
+            logger.warning("piper: could not pre-load '%s' (%s)", voice_id, exc)
+            missing.append(language)
+            continue
+        warmed[language] = voice_id
+    return {"warmed": warmed, "missing": sorted(set(missing)),
+            "skipped": [v for _, v in wanted[_CACHE_MAX:]]}
 
 
 def _load(voice_id: str):

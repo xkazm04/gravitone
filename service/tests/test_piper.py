@@ -158,6 +158,57 @@ class SynthesisTests(_PiperCase):
         self.assertIn("pip install", str(caught.exception))
 
 
+class PrewarmTests(_PiperCase):
+    """Keeping the second voice hot, so a mid-call switch pays no cold load."""
+
+    def test_a_declared_language_is_loaded_before_it_is_needed(self) -> None:
+        self.add_voice("cs_CZ-jirka-medium")
+        report = piper.prewarm(["cs"])
+        self.assertEqual(report["warmed"], {"cs": "cs_CZ-jirka-medium"})
+        self.assertEqual(report["missing"], [])
+        self.assertEqual(len(_FakeVoice.loaded), 1)
+        # ...and the switching sentence then finds it already in the LRU.
+        piper.synthesize_pcm("cs_CZ-jirka-medium", "Ahoj")
+        self.assertEqual(len(_FakeVoice.loaded), 1)
+
+    def test_a_language_with_no_voice_is_reported_not_raised(self) -> None:
+        """An optimization must not be able to fail a conversation at connect."""
+        report = piper.prewarm(["cs", "de"])
+        self.assertEqual(report["warmed"], {})
+        self.assertEqual(report["missing"], ["cs", "de"])
+
+    def test_an_explicit_voice_id_can_be_warmed_too(self) -> None:
+        self.add_voice("cs_CZ-jirka-medium")
+        report = piper.prewarm(voice_ids=["cs_CZ-jirka-medium"])
+        self.assertEqual(report["warmed"], {"cs": "cs_CZ-jirka-medium"})
+
+    def test_a_voice_is_warmed_once_however_it_was_asked_for(self) -> None:
+        self.add_voice("cs_CZ-jirka-medium")
+        piper.prewarm(["cs", "cs-CZ"], voice_ids=["cs_CZ-jirka-medium"])
+        self.assertEqual(len(_FakeVoice.loaded), 1)
+
+    def test_it_never_warms_more_than_the_cache_holds(self) -> None:
+        """Loading a fourth voice would evict the first one we just loaded."""
+        for name in ("cs_CZ-a-medium", "de_DE-b-medium", "es_ES-c-medium",
+                     "pl_PL-d-medium"):
+            self.add_voice(name)
+        report = piper.prewarm(["cs", "de", "es", "pl"])
+        self.assertEqual(len(report["warmed"]), piper._CACHE_MAX)
+        self.assertEqual(report["skipped"], ["pl_PL-d-medium"])
+        self.assertEqual(len(_FakeVoice.loaded), piper._CACHE_MAX)
+
+    def test_warming_nothing_is_valid(self) -> None:
+        self.assertEqual(piper.prewarm()["warmed"], {})
+        self.assertEqual(piper.prewarm([""])["missing"], [])
+
+    def test_a_broken_voice_is_reported_as_missing(self) -> None:
+        self.add_voice("cs_CZ-jirka-medium")
+        sys.modules["piper"] = None   # makes `import piper` raise, like no install
+        report = piper.prewarm(["cs"])
+        self.assertEqual(report["warmed"], {})
+        self.assertEqual(report["missing"], ["cs"])
+
+
 class VoiceResolutionTests(_PiperCase):
     """The rule that decides which engine speaks for an agent."""
 
