@@ -19,6 +19,15 @@ import { readDetail } from "@/lib/apiFetch";
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { migrationSnippet, SNIPPET_LANGS, type SnippetLang } from "@/lib/switchkit";
 import { useCopyFeedback } from "@/lib/useCopyFeedback";
+import AgentBlocks from "./AgentBlocks";
+
+// The fourth tab is not a fourth language. curl / python / javascript migrate a
+// HUMAN's codebase; "agents" hands the same key to a runtime that reads instead
+// of being read to — an MCP server config or a tool-schema array, derived from
+// this key's own manifest. It sits behind the same switcher because it is the
+// same decision (how do I call this deployment?), made by a different caller.
+type Tab = SnippetLang | "agents";
+const TABS: Tab[] = [...SNIPPET_LANGS, "agents"];
 
 type CheckState =
   | { phase: "idle" }
@@ -26,8 +35,8 @@ type CheckState =
   | { phase: "pass"; audioSeconds: string; rtf: string }
   | { phase: "fail"; reason: string };
 
-export default function MigrationKit({ apiKey }: { apiKey: string }) {
-  const [lang, setLang] = useState<SnippetLang>("curl");
+export default function MigrationKit({ apiKey, keyId }: { apiKey: string; keyId: string }) {
+  const [tab, setTab] = useState<Tab>("curl");
   const { copy: copyText, copied, failed, reset: resetCopied } = useCopyFeedback();
   const [check, setCheck] = useState<CheckState>({ phase: "idle" });
 
@@ -36,7 +45,10 @@ export default function MigrationKit({ apiKey }: { apiKey: string }) {
     resetCopied();
   }, [apiKey, resetCopied]);
 
-  const snippet = migrationSnippet(lang, { apiKey });
+  // The agents tab renders its own blocks (and its own copy affordance), so the
+  // snippet below is only meaningful for the three language tabs.
+  const lang: SnippetLang | null = tab === "agents" ? null : tab;
+  const snippet = lang ? migrationSnippet(lang, { apiKey }) : "";
 
   const copy = () => copyText(snippet);
 
@@ -77,14 +89,14 @@ export default function MigrationKit({ apiKey }: { apiKey: string }) {
     <div className="mt-6 rounded-2xl border border-white/10 bg-black/30 p-4">
       <div className="flex items-center justify-between">
         <span className="font-jetbrains text-[11px] uppercase tracking-widest text-white/60">
-          switch from elevenlabs — one line
+          {tab === "agents" ? "give this key to an agent" : "switch from elevenlabs — one line"}
         </span>
         <div className="flex gap-1.5">
-          {SNIPPET_LANGS.map((l) => (
+          {TABS.map((l) => (
             <button
-              key={l} onClick={() => setLang(l)}
+              key={l} onClick={() => setTab(l)}
               className={`font-jetbrains cursor-pointer rounded-full border px-2 py-0.5 text-[10px] transition ${
-                l === lang ? "border-cyan-400/40 bg-cyan-400/10 text-cyan-200" : "border-white/12 text-white/60 hover:text-white"
+                l === tab ? "border-cyan-400/40 bg-cyan-400/10 text-cyan-200" : "border-white/12 text-white/60 hover:text-white"
               }`}
             >
               {l}
@@ -93,6 +105,14 @@ export default function MigrationKit({ apiKey }: { apiKey: string }) {
         </div>
       </div>
 
+      {/* The agents tab is a different artifact, not a different snippet: it is
+          derived from this key's manifest, so it stops at the key's scopes. */}
+      {tab === "agents" ? (
+        <div className="mt-3">
+          <AgentBlocks keyId={keyId} secret={apiKey} />
+        </div>
+      ) : (
+      <>
       <pre className="font-jetbrains mt-3 max-h-44 overflow-auto rounded-xl border border-white/8 bg-black/40 p-3 text-[11px] leading-relaxed text-cyan-100/90">
         {snippet}
       </pre>
@@ -139,6 +159,8 @@ export default function MigrationKit({ apiKey }: { apiKey: string }) {
           the preflight fails before your key is even sent — set TTS_CORS_ORIGINS to your origin, or run this
           server-side (Node, an edge function, your own API), where it works as written.
         </ErrorBanner>
+      )}
+      </>
       )}
     </div>
   );

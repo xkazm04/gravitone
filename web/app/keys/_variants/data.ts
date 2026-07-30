@@ -18,14 +18,13 @@ export type ApiKey = {
 };
 export type ApiKeyWithSecret = ApiKey & { secret: string };
 
-export const SCOPES: { id: string; label: string; hint: string }[] = [
-  { id: "tts", label: "Synthesize", hint: "generate speech" },
-  { id: "voices", label: "Manage voices", hint: "rename / retag / delete" },
-  { id: "clone", label: "Clone", hint: "upload & create voices" },
-  { id: "performance", label: "Performance", hint: "multi-character scripts (/v1/performance) — the premium tier" },
-  { id: "stt", label: "Transcribe", hint: "turn a recording into text (/v1/speech-to-text)" },
-  { id: "convai", label: "Converse", hint: "hold a spoken conversation — listens and speaks (/v1/convai)" },
-];
+// SCOPES now lives in `capabilities.ts` — a PURE module, so the manifest route,
+// the well-known document and the agent-config blocks can import the same list
+// this create bar renders (a "use client" module cannot be imported by a server
+// route, which is why the scope→endpoint mapping had nowhere to live). Re-
+// exported here so every existing importer is unchanged.
+export { SCOPES } from "./capabilities";
+export type { ScopeInfo } from "./capabilities";
 
 export function relTime(iso?: string | null): string {
   if (!iso) return "never";

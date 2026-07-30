@@ -10,9 +10,10 @@
 // so it is labelled destructive and confirmed. Every label names the request it
 // sends.
 
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { Button, Eyebrow } from "@/components/ui/Primitives";
+import AgentBlocks from "./AgentBlocks";
 import SecretReveal from "./SecretReveal";
 import { provenScopes, readAttestation, restate, type Attestation } from "./attestation";
 import type { Posture } from "./probes";
@@ -135,6 +136,10 @@ export default function KeysLedger() {
   // — never during render, which would differ between server and client HTML.
   const [proofs, setProofs] = useState<Record<string, Attestation | null>>({});
   const [reproving, setReproving] = useState<string | null>(null);
+  // Which row has its agent-config panel open. One at a time: the panel is a
+  // full-width row under its key, and two open at once would separate a config
+  // from the key it belongs to.
+  const [agentFor, setAgentFor] = useState<string | null>(null);
 
   useEffect(() => {
     const next: Record<string, Attestation | null> = {};
@@ -257,10 +262,11 @@ export default function KeysLedger() {
             {!loading && keys.length === 0 && !error && <tr><td colSpan={6} className="px-3 py-8 text-center text-sm text-white/60">No keys yet — create one above.</td></tr>}
             {!loading && keys.length === 0 && error && <tr><td colSpan={6} className="px-3 py-8 text-center text-sm text-rose-200/80">Key list unavailable — this table is empty because the request failed, not because you have no keys.</td></tr>}
             {keys.map((k) => (
-              // Revoked keys STAY listed — keeping them auditable is what
-              // revoke is for. Dimmed + struck through + labelled, matching
-              // profile/MyVoices' revoked clone rows.
-              <tr key={k.id} className={`border-b border-white/5 transition hover:bg-white/[0.03] ${k.revoked ? "opacity-50" : ""}`}>
+              <Fragment key={k.id}>
+              {/* Revoked keys STAY listed — keeping them auditable is what
+                  revoke is for. Dimmed + struck through + labelled, matching
+                  profile/MyVoices' revoked clone rows. */}
+              <tr className={`border-b border-white/5 transition hover:bg-white/[0.03] ${k.revoked ? "opacity-50" : ""}`}>
                 <td className="px-3 py-2.5 text-sm font-medium text-white">
                   {k.revoked ? <s>{k.name}</s> : k.name}
                   {k.revoked && <span className="font-jetbrains ml-2 text-[10px] uppercase tracking-widest text-rose-300/80">revoked</span>}
@@ -316,6 +322,18 @@ export default function KeysLedger() {
                     className="font-jetbrains ml-3 text-[11px] text-cyan-300/60 transition hover:text-cyan-200 disabled:cursor-not-allowed disabled:text-white/25">
                     {reproving === k.id ? "re-proving…" : "re-prove"}
                   </button>
+                  {/* The key as a machine reads it. Needs no secret: the
+                      manifest is derived from the key's scopes, and the config
+                      it fills references an env var — which is what the block
+                      should say anyway, since a config file is a place a secret
+                      goes to get committed. */}
+                  <button
+                    onClick={() => setAgentFor((cur) => (cur === k.id ? null : k.id))}
+                    aria-expanded={agentFor === k.id}
+                    title="Regenerate this key's agent install block (MCP server config or tool schema) from its capability manifest. No secret needed."
+                    className="font-jetbrains ml-3 text-[11px] text-cyan-300/60 transition hover:text-cyan-200">
+                    {agentFor === k.id ? "hide agent config" : "agent config"}
+                  </button>
                   {/* Revoke disappears once the key is revoked (it is already
                       dead, and the backend is idempotent about it); rotate
                       stays clickable so the backend's 409 — which states the
@@ -338,6 +356,18 @@ export default function KeysLedger() {
                   </button>
                 </td>
               </tr>
+              {agentFor === k.id && (
+                <tr className="border-b border-white/5 bg-black/20">
+                  <td colSpan={6} className="px-3 py-4">
+                    {/* `secret` is deliberately absent: this key's secret was
+                        shown once and is gone, so the block offers the env-var
+                        reference and points at rotate rather than pretending a
+                        raw value could be filled in. */}
+                    <AgentBlocks keyId={k.id} />
+                  </td>
+                </tr>
+              )}
+              </Fragment>
             ))}
           </tbody>
         </table>

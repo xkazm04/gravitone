@@ -1,0 +1,12 @@
+{
+  "name": "mcp-gravitone",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "stdio MCP server that exposes exactly the tools a Gravitone API key's manifest declares",
+  "bin": { "mcp-gravitone": "./server.mjs" },
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "test": "node --test"
+  }
+}

@@ -117,7 +117,7 @@ export default function SecretReveal({ keyData, onClose }: { keyData: ApiKeyWith
             <ProvingSweep keyId={keyData.id} secret={keyData.secret} scopes={keyData.scopes} />
 
             {/* the key-in-hand moment IS the switching moment */}
-            <MigrationKit apiKey={keyData.secret} />
+            <MigrationKit apiKey={keyData.secret} keyId={keyData.id} />
 
             <div className="mt-6 flex justify-end">
               <Button onClick={onClose} className="cursor-pointer">I&apos;ve saved it</Button>
