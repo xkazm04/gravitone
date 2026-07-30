@@ -17,7 +17,9 @@ from __future__ import annotations
 import contextlib
 import functools
 import io
+import itertools
 import logging
+import math
 import os
 import platform
 import queue
@@ -63,6 +65,68 @@ _WORKER_RESTART_MAX = 3
 # Consecutive scaffolding errors (queue.get / bookkeeping — NOT job failures,
 # which have their own handler) tolerated before a worker gives up its loop.
 _LOOP_ERRORS_MAX = 5
+
+
+# ----------------------------------------------------------------------------
+# The deadline contract (cost model, admission classes, elastic quality)
+# ----------------------------------------------------------------------------
+# Everything below is DEFAULT-OFF in the sense that matters: a caller that names
+# no deadline, no class and no degradation gets exactly the previous behaviour —
+# FIFO order, blind admission, full quality. The knobs only start deciding
+# things when somebody asks them to.
+
+CLASS_BULK = "bulk"                  # the default: long-form, batch renders
+CLASS_INTERACTIVE = "interactive"    # convai turns, hero demo — latency first
+_CLASSES = (CLASS_BULK, CLASS_INTERACTIVE)
+
+# Scheduling horizon per class when the caller named no deadline. The queue key
+# is `t_enqueue + horizon`, computed ONCE at enqueue time, which is what makes
+# aging expressible in a static-priority heap: a bulk job enqueued at T beats an
+# interactive job that arrives after T + (BULK - INTERACTIVE), so interactive
+# work jumps the queue without ever being able to starve bulk work behind it.
+_BULK_AGING_HORIZON_S = float(os.environ.get("TTS_BULK_AGING_HORIZON_S") or 30.0)
+_INTERACTIVE_HORIZON_S = float(os.environ.get("TTS_INTERACTIVE_HORIZON_S") or 2.0)
+
+# Admission permits no BULK job may consume — the interactive floor. Zero by
+# default ON PURPOSE: a non-zero floor changes who gets a 429 on a saturated
+# box, and that is an operator decision, not a silent upgrade.
+_INTERACTIVE_RESERVE = int(os.environ.get("TTS_INTERACTIVE_RESERVE") or 0)
+
+# A promise is only ever made from a WARM window. Below this many completed
+# synths the cost model still ESTIMATES (an estimate is useful), but it labels
+# itself `cold`/`insufficient` and the API layer must not turn it into an
+# X-Gravitone-Deadline header. A cost model that mispredicts turns promises into
+# lies; refusing to promise is the only honest floor.
+_WARM_WINDOW = int(os.environ.get("TTS_COST_WARM_WINDOW") or 20)
+
+# Priors used to turn a request into an amount of AUDIO to produce. The engine
+# records synth seconds and audio seconds, never text length, so the bridge from
+# "this many characters" to "this many seconds of speech" is a constant. ~15
+# characters per second of speech is the measured average for this model's
+# languages; the token cap is the model's own ceiling on how much audio a single
+# generate call can emit.
+_AUDIO_S_PER_CHAR = 1.0 / 15.0
+_AUDIO_S_PER_TOKEN = 0.02
+
+# Real-time factor assumed when there is no window at all (basis=insufficient):
+# 1.0 = "assume it renders at real time". Never used for a promise.
+_COLD_RTF = 1.0
+
+# The measured p95/p50 spread widens the estimate (a promise built on the median
+# is wrong half the time), clamped so one pathological outlier cannot inflate
+# every estimate on the box.
+_MAX_SPREAD = 4.0
+
+# Elastic quality ladder. Each level names the decode knobs it reduces and the
+# fraction of the full-quality cost it is assumed to take. Applied ONLY when the
+# caller opted in (degrade_allowed) AND the predicted wait misses their deadline,
+# and always reported back on the job (Job.quality_level -> X-Quality-Level).
+QUALITY_FULL = "full"
+_QUALITY_LADDER = (
+    # (level, lsd_decode_steps, frames_after_eos, cost fraction)
+    ("reduced", 2, 2, 0.7),
+    ("minimal", 1, 1, 0.5),
+)
 
 
 # ----------------------------------------------------------------------------
@@ -459,6 +523,77 @@ class Metrics:
                 "audio_seconds_total": round(self.audio_seconds_total, 2),
             }
 
+    def cost_model(self) -> dict:
+        """What the engine currently knows about its own speed.
+
+        Derived from the SAME ``_proc`` / ``_audio`` windows ``snapshot`` reads —
+        no new measurement, just the decision-shaped view of it:
+
+        * ``realtime_factor`` — audio seconds produced per compute second;
+        * ``spread`` — the measured p95/p50 ratio of synth time, the amount by
+          which a median-based estimate has to be widened to be a promise;
+        * ``basis`` — ``warm`` (enough samples to promise from), ``cold`` (some
+          samples, estimate only) or ``insufficient`` (no samples at all).
+
+        Nested under one key on ``snapshot`` deliberately: every top-level
+        scalar there is either summed into pool totals or explicitly classified
+        as non-additive by ``replicas.AGG_KEYS`` (see its contract test), and a
+        ratio is neither summable nor averageable across replicas.
+        """
+        with self._lock:
+            proc = sorted(self._proc)
+            audio = list(self._audio)
+        rtf = None
+        total_proc, total_audio = sum(proc), sum(audio)
+        if proc and audio and total_audio > 0 and total_proc > 0:
+            rtf = total_audio / total_proc
+        p50, p95 = self._pct(proc, 50), self._pct(proc, 95)
+        spread = 1.0
+        if p50 and p95 and p50 > 0:
+            spread = min(_MAX_SPREAD, max(1.0, p95 / p50))
+        if rtf and len(proc) >= _WARM_WINDOW:
+            basis = "warm"
+        elif rtf:
+            basis = "cold"
+        else:
+            basis = "insufficient"
+        return {
+            "basis": basis,
+            "realtime_factor": round(rtf, 3) if rtf else None,
+            "spread": round(spread, 3),
+            "samples": len(proc),
+            "warm_at": _WARM_WINDOW,
+            "audio_s_per_char": _AUDIO_S_PER_CHAR,
+        }
+
+    def cost_estimate(self, text_len: int, max_tokens: Optional[int] = None) -> dict:
+        """Seconds of synthesis this request is expected to cost.
+
+        ``text_len`` (characters) becomes expected audio seconds via the
+        ``_AUDIO_S_PER_CHAR`` prior, capped by what ``max_tokens`` allows the
+        model to emit at all; audio seconds become compute seconds through the
+        measured real-time factor; and a WARM estimate is widened by the
+        measured p95/p50 spread so the number is a number the engine can keep
+        rather than the median it would miss half the time.
+
+        Always returns a number — an estimate is useful even when it cannot be
+        promised — and always says which it is via ``basis``. ``promise`` is
+        True only for a warm window: that flag, not the estimate, is what the
+        API layer gates ``X-Gravitone-Deadline`` on.
+        """
+        model = self.cost_model()
+        est_audio_s = max(0, int(text_len or 0)) * _AUDIO_S_PER_CHAR
+        if max_tokens and max_tokens > 0:
+            est_audio_s = min(est_audio_s, max_tokens * _AUDIO_S_PER_TOKEN)
+        rtf = model["realtime_factor"] or _COLD_RTF
+        est = est_audio_s / rtf
+        if model["basis"] == "warm":
+            est *= model["spread"]   # only a measured spread may widen a promise
+        return dict(model,
+                    est_synth_s=round(est, 3),
+                    est_audio_s=round(est_audio_s, 3),
+                    promise=model["basis"] == "warm")
+
     def snapshot(self) -> dict:
         base = self.counters()
         with self._lock:
@@ -476,6 +611,9 @@ class Metrics:
             "synth_p50_s": self._pct(proc, 50),
             "realtime_factor": rtf,  # audio_seconds / compute_seconds
             "window_size": len(lat),
+            # The decision layer's view of the same windows (nested — see
+            # cost_model's docstring for why it is not top-level scalars).
+            "cost_model": self.cost_model(),
         })
         return base
 
@@ -519,6 +657,34 @@ class Job:
     overrides: dict = field(default_factory=dict)
     future: Future = field(default_factory=Future)
     t_enqueue: float = field(default_factory=time.perf_counter)
+    # --- the deadline contract -------------------------------------------
+    # Seconds from admission by which the caller wants this finished. None is
+    # the DEFAULT and means exactly what it meant before deadlines existed:
+    # schedule me by arrival. A job with every one of these fields left alone is
+    # FIFO-equivalent to the pre-deadline engine, which test_deadline_engine
+    # pins field by field.
+    deadline_s: Optional[float] = None
+    # Which admission pool this job belongs to (CLASS_BULK / CLASS_INTERACTIVE).
+    job_class: str = CLASS_BULK
+    # Whether the CALLER allowed a cheaper render to make the deadline. Never
+    # inferred: a caller who did not ask for degradation never gets it.
+    degrade_allowed: bool = False
+    # What the cost model expected this job to cost (seconds of synthesis).
+    # Feeds the predicted wait every later admission decision is made from.
+    est_synth_s: float = 0.0
+    # The latency the engine PROMISED at admission (X-Gravitone-Deadline), or
+    # None when it refused to promise — which is what a cold/insufficient window
+    # means. None is not "no delay expected", it is "we will not put a number on
+    # this yet", and the API layer must send no header rather than a guess.
+    promised_s: Optional[float] = None
+    # The quality level actually used. QUALITY_FULL unless elastic quality fired,
+    # in which case the API layer reports it as X-Quality-Level — degradation
+    # that a caller cannot see is worse than a 429.
+    quality_level: str = QUALITY_FULL
+    # Called exactly once, by whoever WINS claim(), to tell the engine this job
+    # has left the queue's cost accounting. Wired by submit; None everywhere else
+    # (a Job built by hand in a test owes the engine nothing).
+    settle_hook: Optional[object] = field(default=None, repr=False)
     # Set by the API layer when the caller has given up (504 timeout or client
     # disconnect). Setting it releases the admission permit AT THAT MOMENT (see
     # _AbandonFlag / TtsEngine._release_abandoned) and leaves the job in the
@@ -548,7 +714,72 @@ class Job:
             if self._claimed:
                 return False
             self._claimed = True
-            return True
+        # Outside the lock, and best-effort: the claim is the single choke point
+        # every exit path (run, abandon, drain) passes through exactly once, so
+        # it is the only correct place to stop counting this job's estimated
+        # cost against the queue. A bookkeeping failure must never turn a valid
+        # claim into a lost job.
+        hook = self.settle_hook
+        if hook is not None:
+            try:
+                hook()
+            except Exception:  # noqa: BLE001 - accounting, not correctness
+                logger.exception("job settle hook failed")
+        return True
+
+
+class _DeadlineQueue:
+    """A ``queue.PriorityQueue`` keyed ``(priority, seq)`` with a Job-level API.
+
+    A wrapper rather than a subclass because the things the engine puts on the
+    queue — ``Job`` and the ``None`` shutdown sentinel — are not orderable
+    against each other. Ordering lives entirely in the entry tuple; the payload
+    is never compared, so two jobs with an identical priority fall back to
+    ``seq`` (arrival order) and no comparison ever reaches a ``Job``.
+
+    The claim/tombstone protocol is order-agnostic — a worker claims whatever it
+    dequeues and a tombstone is discarded wherever it surfaces — so this is a
+    container swap, not a redesign. With every job at the same horizon (the
+    default), ``t_enqueue + horizon`` is monotonic in arrival, which makes the
+    heap order EXACTLY the old FIFO order. That equivalence is the pinned
+    contract, not a happy accident.
+
+    ``put(None)`` gets ``+inf``: the shutdown sentinel sat at the tail of the
+    FIFO and must keep sitting at the tail, or a worker would take it while real
+    jobs are still queued.
+    """
+
+    def __init__(self) -> None:
+        self._q: "queue.PriorityQueue[tuple[float, int, Optional[Job]]]" = \
+            queue.PriorityQueue()
+        self._seq = itertools.count()
+        self._seq_lock = threading.Lock()
+
+    def _next_seq(self) -> int:
+        # itertools.count() is atomic in CPython, but the lock costs nothing on
+        # this path and does not depend on that being true.
+        with self._seq_lock:
+            return next(self._seq)
+
+    def put(self, item: "Optional[Job]", priority: Optional[float] = None) -> None:
+        if priority is None:
+            priority = math.inf if item is None else item.t_enqueue
+        self._q.put((priority, self._next_seq(), item))
+
+    def get(self, block: bool = True, timeout: Optional[float] = None):
+        return self._q.get(block, timeout)[2]
+
+    def get_nowait(self):
+        return self._q.get_nowait()[2]
+
+    def task_done(self) -> None:
+        self._q.task_done()
+
+    def qsize(self) -> int:
+        return self._q.qsize()
+
+    def empty(self) -> bool:
+        return self._q.empty()
 
 
 @dataclass
@@ -781,7 +1012,32 @@ class _Worker(threading.Thread):
 # Engine
 # ----------------------------------------------------------------------------
 class AdmissionRejected(Exception):
-    """Raised when the queue is full — maps to HTTP 429."""
+    """Raised when the queue is full — maps to HTTP 429.
+
+    Carries the TRUTH about the refusal, not just the fact of it: how long the
+    caller would have waited had it been admitted (``predicted_wait_s``) and
+    when it is worth coming back (``retry_after_s``). A 429 that says "try
+    again" teaches the client nothing; a 429 that says "the box is 40 seconds
+    deep, come back in 40" lets it decide.
+
+    Both default to None so an ``AdmissionRejected(msg)`` raised anywhere else
+    (test doubles included) stays valid — every reader must use ``payload()``
+    or getattr defaults.
+    """
+
+    def __init__(self, message: str, predicted_wait_s: Optional[float] = None,
+                 retry_after_s: Optional[float] = None,
+                 reason: str = "queue_full"):
+        super().__init__(message)
+        self.predicted_wait_s = predicted_wait_s
+        self.retry_after_s = retry_after_s
+        self.reason = reason
+
+    def payload(self) -> dict:
+        """The refusal, JSON-shaped, for the 429 body."""
+        return {"reason": self.reason,
+                "predicted_wait_s": self.predicted_wait_s,
+                "retry_after_s": self.retry_after_s}
 
 
 class ShuttingDown(Exception):
@@ -803,7 +1059,12 @@ class TtsEngine:
         # any model) starts. Records what actually took effect for /metrics.
         self.tuning = _apply_cpu_tuning()
         self.metrics = Metrics()
-        self._queue: "queue.Queue[Optional[Job]]" = queue.Queue()
+        self._queue = _DeadlineQueue()
+        # Sum of est_synth_s over jobs that are queued but not yet claimed —
+        # the numerator of every predicted wait. Maintained at exactly two
+        # points: submit adds, Job.claim's settle hook subtracts.
+        self._pending_lock = threading.Lock()
+        self._pending_est_s = 0.0
         # Admission slots = workers (in-flight) + queue_max (waiting).
         self._max_inflight = SETTINGS.workers + SETTINGS.queue_max
         self._admit = threading.Semaphore(self._max_inflight)
@@ -1014,29 +1275,153 @@ class TtsEngine:
         """
         return self._admit._value
 
+    def voice_lru_keys(self) -> list[str]:
+        """Voice ids currently resident in some worker's LRU (read-only).
+
+        Fabric's router uses this for affinity: routing to a replica that
+        already holds the voice skips get_state_for_audio_prompt, the largest
+        avoidable cost on a cold voice. Snapshot of a live OrderedDict, so
+        treat it as advisory.
+        """
+        keys: set[str] = set()
+        for w in self._workers:
+            keys.update(list(w._voice_cache.keys()))
+        return sorted(keys)
+
+    # -- the deadline contract --------------------------------------------
+    def _settle_job(self, job: "Job") -> None:
+        """A job left the queue (claimed to run, abandoned or drained): stop
+        counting its estimated cost against everyone still waiting."""
+        with self._pending_lock:
+            self._pending_est_s = max(0.0, self._pending_est_s - job.est_synth_s)
+
+    def pending_cost_s(self) -> float:
+        """Estimated synthesis seconds sitting in the queue right now."""
+        with self._pending_lock:
+            return round(self._pending_est_s, 3)
+
+    def predicted_wait_s(self, est_synth_s: float = 0.0) -> float:
+        """How long a job costing ``est_synth_s`` would take to come back.
+
+        Queued work ahead of it, spread over the workers that are actually
+        alive, plus its own render. ``live_workers`` and not ``worker_count``:
+        promising against capacity that died is exactly the lie this whole
+        contract exists to stop telling.
+        """
+        workers = max(1, self.live_workers or self.worker_count)
+        return round(self.pending_cost_s() / workers + max(0.0, est_synth_s), 3)
+
+    @staticmethod
+    def _priority(job: "Job") -> float:
+        """The queue key: the wall-clock instant this job wants to be done by.
+
+        An explicit ``deadline_s`` is that instant directly. Otherwise the job
+        gets its class's horizon, which is what makes interactive work jump the
+        queue AND makes that jump bounded: bulk work enqueued more than
+        (BULK - INTERACTIVE) seconds ago already has the earlier key, so it
+        cannot be starved by an endless stream of interactive arrivals.
+        """
+        if job.deadline_s is not None:
+            return job.t_enqueue + max(0.0, float(job.deadline_s))
+        horizon = (_INTERACTIVE_HORIZON_S if job.job_class == CLASS_INTERACTIVE
+                   else _BULK_AGING_HORIZON_S)
+        return job.t_enqueue + horizon
+
+    @staticmethod
+    def _degrade(job: "Job", predicted_wait_s: float) -> None:
+        """Fit ``job`` into its deadline by rendering it more cheaply.
+
+        Walks the quality ladder until the (assumed) cheaper render lands inside
+        the deadline, applies the level's decode knobs through the existing
+        ``Job.overrides`` seam and STAMPS the level on the job. Never lowers a
+        knob the caller already pinned lower, and never runs at all unless the
+        caller allowed it — a cheaper render nobody asked for and nobody is told
+        about is silent quality loss, which is worse than a refusal.
+        """
+        deadline = float(job.deadline_s)
+        full_cost = job.est_synth_s
+        for level, steps, frames, fraction in _QUALITY_LADDER:
+            job.quality_level = level
+            job.est_synth_s = round(full_cost * fraction, 3)
+            want_steps = job.overrides.get("lsd_decode_steps")
+            if want_steps is None or want_steps > steps:
+                job.overrides["lsd_decode_steps"] = steps
+            if job.frames_after_eos is None or job.frames_after_eos > frames:
+                job.frames_after_eos = frames
+            if predicted_wait_s + job.est_synth_s <= deadline:
+                return   # this level fits; go no cheaper than we must
+
     def submit(self, voice_id: str, text: str, overrides: Optional[dict] = None,
                max_tokens: Optional[int] = None,
-               frames_after_eos: Optional[int] = None) -> Job:
+               frames_after_eos: Optional[int] = None,
+               deadline_s: Optional[float] = None,
+               job_class: str = CLASS_BULK,
+               degrade_allowed: bool = False) -> Job:
         """Admit a job or raise AdmissionRejected (429). Non-blocking admission.
 
         Once graceful shutdown has begun, refuses new work with ShuttingDown
-        (503) so a draining process doesn't admit jobs it will only fail."""
+        (503) so a draining process doesn't admit jobs it will only fail.
+
+        ``deadline_s`` (seconds from now), ``job_class`` and ``degrade_allowed``
+        are the deadline contract. Leaving all three alone is the pre-deadline
+        engine, byte for byte: bulk class, arrival-ordered, full quality, no
+        reserved floor (the floor defaults to 0 permits).
+
+        A refusal now carries ``predicted_wait_s`` and ``retry_after_s`` — what
+        the caller would have waited, and when to come back.
+        """
         if self._stopping:
             raise ShuttingDown("server shutting down")
+        if job_class not in _CLASSES:
+            raise ValueError(f"unknown admission class {job_class!r} "
+                             f"(expected one of {_CLASSES})")
         self.metrics.on_received()
+        max_tokens = max_tokens or SETTINGS.max_tokens
+        cost = self.metrics.cost_estimate(len(text or ""), max_tokens)
+        est_synth_s = cost["est_synth_s"]
+        predicted = self.predicted_wait_s(est_synth_s)
         if not self._admit.acquire(blocking=False):
             self.metrics.on_rejected()
             raise AdmissionRejected(
-                f"queue full (max in-flight {self._max_inflight})"
+                f"queue full (max in-flight {self._max_inflight})",
+                predicted_wait_s=predicted,
+                retry_after_s=self._retry_after(predicted),
+            )
+        # The interactive floor: bulk work may not consume the last
+        # _INTERACTIVE_RESERVE permits. Checked AFTER the acquire so the number
+        # we read is the number that would remain — a bulk job that would dip
+        # the pool below the floor hands its permit straight back.
+        if (job_class != CLASS_INTERACTIVE and _INTERACTIVE_RESERVE > 0
+                and self.available_permits() < _INTERACTIVE_RESERVE):
+            self._admit.release()
+            self.metrics.on_rejected()
+            raise AdmissionRejected(
+                f"bulk admission is holding {_INTERACTIVE_RESERVE} permit(s) "
+                f"back for interactive work",
+                predicted_wait_s=predicted,
+                retry_after_s=self._retry_after(predicted),
+                reason="interactive_reserve",
             )
         job = Job(
-            voice_id=voice_id, text=text, overrides=overrides or {},
-            max_tokens=max_tokens or SETTINGS.max_tokens,
+            voice_id=voice_id, text=text, overrides=dict(overrides or {}),
+            max_tokens=max_tokens,
             frames_after_eos=frames_after_eos,
+            deadline_s=deadline_s, job_class=job_class,
+            degrade_allowed=degrade_allowed, est_synth_s=est_synth_s,
         )
+        # Elastic quality: a slightly cheaper render that lands on time beats a
+        # perfect one that misses (or 429s). Opt-in, and always reported.
+        if (deadline_s is not None and degrade_allowed
+                and predicted + est_synth_s > float(deadline_s)):
+            self._degrade(job, predicted)
+        # Promise ONLY from a warm window (Metrics.cost_estimate decides): an
+        # estimate off a two-sample window is a number, not a contract.
+        if cost["promise"]:
+            job.promised_s = round(predicted + job.est_synth_s, 3)
         # Wired BEFORE the job is reachable by anyone else, so there is no
         # window in which abandoning it would silently keep the permit.
         job.abandoned._on_abandon = functools.partial(self._release_abandoned, job)
+        job.settle_hook = functools.partial(self._settle_job, job)
         # Re-check _stopping while enqueuing so this can't race the shutdown
         # drain: if stop() won the flag, release the permit and refuse cleanly
         # instead of putting a job no worker will ever dequeue.
@@ -1044,9 +1429,19 @@ class TtsEngine:
             if self._stopping:
                 self._admit.release()
                 raise ShuttingDown("server shutting down")
+            with self._pending_lock:
+                self._pending_est_s += job.est_synth_s
             self.metrics.on_enqueue()
-            self._queue.put(job)
+            self._queue.put(job, self._priority(job))
         return job
+
+    @staticmethod
+    def _retry_after(predicted_wait_s: float) -> float:
+        """A backoff hint the caller can act on: the wait we just predicted,
+        floored at one second (a 429 that says "retry in 0s" is a hot loop) and
+        rounded up, because coming back slightly late costs nothing and coming
+        back early costs another 429."""
+        return float(max(1, math.ceil(predicted_wait_s)))
 
     def config(self) -> dict:
         return {
@@ -1057,6 +1452,14 @@ class TtsEngine:
             "language": SETTINGS.language,
             "quantize": SETTINGS.quantize,
             "ffmpeg_threads": SETTINGS.ffmpeg_threads,
+            # The deadline contract's knobs, so an operator can see which
+            # scheduling policy this replica is actually running.
+            "scheduling": {
+                "interactive_reserve": _INTERACTIVE_RESERVE,
+                "bulk_aging_horizon_s": _BULK_AGING_HORIZON_S,
+                "interactive_horizon_s": _INTERACTIVE_HORIZON_S,
+                "cost_warm_window": _WARM_WINDOW,
+            },
             # What the CPU tuning ACTUALLY achieved (not what was requested):
             # set_flush_denormal can refuse, interop threads can be too late,
             # and inference_mode demotes itself on incompatibility. The A/B

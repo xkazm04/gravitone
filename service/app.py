@@ -68,6 +68,7 @@ from service.ingest_api import (
     router as ingest_router, start_background as ingest_start_background,
 )
 from service.packs import router as packs_router
+from service.direction import router as direction_router
 from service.takes import router as takes_router, reviews_router
 from service import convai
 from service.appliance import router as appliance_router
@@ -160,8 +161,9 @@ CORS_EXPOSE_HEADERS = [
     "X-Audio-Seconds", "X-Cache", "X-Character", "X-Emotion-Fallback",
     "X-Emotion-Requested", "X-Emotion-Used", "X-Fidelity-Deltas",
     "X-Fidelity-Retries", "X-Fidelity-Score", "X-Fidelity-Unavailable",
-    "X-Gravitone-Cache",
-    "X-Ignored-Settings", "X-Performance-Report", "X-Queue-Seconds",
+    "X-Gravitone-Cache", "X-Gravitone-Deadline",
+    "X-Ignored-Settings", "X-Performance-Report", "X-Quality-Level",
+    "X-Queue-Seconds",
     "X-Realtime-Factor", "X-Sample-Rate", "X-Segments", "X-Speech-Digest",
     "X-Stream", "X-Stream-Segments", "X-Synth-Seconds", "X-Synth-Segments",
 ]
@@ -293,6 +295,11 @@ class TTSRequest(BaseModel):
     model_id: str | None = "pocket_tts"
     voice_settings: VoiceSettings | None = None
     frames_after_eos: int | None = None
+    # The deadline contract. Absent = the previous behaviour exactly: bulk
+    # class, arrival order, full quality. degrade_allowed is opt-in because a
+    # cheaper render nobody asked for is silent quality loss.
+    deadline_s: float | None = Field(None, gt=0, le=3600)
+    degrade_allowed: bool = False
 
 
 async def _await_result(job):
@@ -339,15 +346,39 @@ async def _await_result(job):
 
 
 async def _submit_and_wait(voice_id: str, text: str, overrides: dict,
-                           frames_after_eos: int | None = None):
+                           frames_after_eos: int | None = None,
+                           deadline_s: float | None = None,
+                           job_class: str | None = None,
+                           degrade_allowed: bool = False,
+                           promise: dict | None = None):
     """Submit one synthesis job and await its result (shared by the TTS,
-    speak and performance endpoints). Raises the endpoint-shaped errors."""
+    speak and performance endpoints). Raises the endpoint-shaped errors.
+
+    ``promise`` is an out-parameter: the caller passes a dict and gets back the
+    engine's numeric promise and the quality level actually used, which become
+    X-Gravitone-Deadline / X-Quality-Level. Returning it would change this
+    function's return type at ~6 call sites for a header two of them want.
+    """
     assert ENGINE is not None
+    # Only pass the contract kwargs when the caller actually used them: engine
+    # doubles in the test suite predate them, and a request that named no
+    # deadline must reach submit() as the exact call it always made.
+    extra: dict = {}
+    if deadline_s is not None:
+        extra["deadline_s"] = deadline_s
+    if job_class is not None:
+        extra["job_class"] = job_class
+    if degrade_allowed:
+        extra["degrade_allowed"] = degrade_allowed
     try:
         job = ENGINE.submit(voice_id=voice_id, text=text, overrides=overrides,
-                            frames_after_eos=frames_after_eos)
+                            frames_after_eos=frames_after_eos, **extra)
     except AdmissionRejected as exc:
-        raise _Backpressure(str(exc))
+        raise _Backpressure(str(exc), exc)
+    if promise is not None:
+        # None promised_s = a cold window: send NO header rather than a guess.
+        promise["deadline"] = getattr(job, "promised_s", None)
+        promise["quality"] = getattr(job, "quality_level", "full")
     return await _await_result(job)
 
 
@@ -453,7 +484,15 @@ async def _offload(fn, *args):
 
 
 class _Backpressure(Exception):
-    """Queue full — translated to the 429 + Retry-After response."""
+    """Queue full — translated to the 429 + Retry-After response.
+
+    Carries the engine's AdmissionRejected when there is one, so the 429 can
+    report the predicted wait instead of an unconditional "Retry-After: 1".
+    """
+
+    def __init__(self, message: str, rejection: AdmissionRejected | None = None):
+        super().__init__(message)
+        self.rejection = rejection
 
 
 def _backpressure_response(exc: _Backpressure) -> JSONResponse:
@@ -463,9 +502,16 @@ def _backpressure_response(exc: _Backpressure) -> JSONResponse:
     # percentiles — work on the event loop that no rejected caller reads. The
     # queue depth, in-flight count and rejection tally are what make a 429
     # actionable, and they are O(1).
-    return JSONResponse(status_code=429,
-                        content={"detail": str(exc), "queue": ENGINE.metrics.counters()},
-                        headers={"Retry-After": "1"})
+    rejection = getattr(exc, "rejection", None)
+    admission = rejection.payload() if rejection is not None else {}
+    retry_after = admission.get("retry_after_s") or 1
+    return JSONResponse(
+        status_code=429,
+        content={"detail": str(exc), "queue": ENGINE.metrics.counters(),
+                 # The truth about the refusal: how long this caller would have
+                 # waited, and when it is worth coming back.
+                 "admission": admission},
+        headers={"Retry-After": str(int(retry_after))})
 
 
 def _require_known_voice(voice_id: str) -> None:
@@ -977,8 +1023,20 @@ async def _render_tts(voice_id: str, req: TTSRequest, emotion: str | None,
             # including the timing headers (X-Synth-Seconds stays the job's own
             # synthesis time, which for one job IS the request's synthesis
             # wall-clock minus the queue wait already in X-Queue-Seconds).
-            result = await _submit_and_wait(voice_id, req.text, overrides,
-                                            frames_after_eos=req.frames_after_eos)
+            promise: dict = {}
+            result = await _submit_and_wait(
+                voice_id, req.text, overrides,
+                frames_after_eos=req.frames_after_eos,
+                deadline_s=req.deadline_s,
+                degrade_allowed=req.degrade_allowed,
+                promise=promise)
+            # Visible, never silent: a caller who allowed degradation is TOLD
+            # which level ran, and a promise is only ever sent when the engine
+            # was willing to make one (warm window).
+            if promise.get("deadline") is not None:
+                extra_headers["X-Gravitone-Deadline"] = str(promise["deadline"])
+            if promise.get("quality") not in (None, "full"):
+                extra_headers["X-Quality-Level"] = str(promise["quality"])
             timing["synth"] = result.synth_seconds
             timing["queue"] = result.queue_seconds
             return CachedAudio(wav_bytes=result.wav_bytes,
@@ -992,7 +1050,7 @@ async def _render_tts(voice_id: str, req: TTSRequest, emotion: str | None,
         except AdmissionRejected as exc:
             # Admission is decided for the whole batch; _submit_batch already
             # abandoned the siblings that did get in.
-            raise _Backpressure(str(exc))
+            raise _Backpressure(str(exc), exc)
         results = await _gather_results(jobs)
         wav_bytes = await _offload(concat_wavs, [r.wav_bytes for r in results])
         # Wall-clock for the WHOLE request, not the sum of per-segment synth
@@ -1602,7 +1660,7 @@ async def text_to_speech_stream(
                                    for text in chunks[:window]],
                                   frames_after_eos=req.frames_after_eos)
     except AdmissionRejected as exc:
-        return _backpressure_response(_Backpressure(str(exc)))
+        return _backpressure_response(_Backpressure(str(exc), exc))
 
     pending = deque(chunks[window:])
     total = len(chunks)
@@ -1891,6 +1949,8 @@ app.include_router(packs_router, dependencies=[Depends(require_scope("voices"))]
 app.include_router(takes_router, dependencies=[Depends(require_scope("tts"))])
 # Review sets (client approval links) — same surface, same scope.
 app.include_router(reviews_router, dependencies=[Depends(require_scope("tts"))])
+# Direction corpus (what re-performances change) - same surface, same scope.
+app.include_router(direction_router, dependencies=[Depends(require_scope("tts"))])
 # Local transcription (service/stt.py) — its own scope: hearing a recording is
 # a different capability from speaking one, and a drop-in TTS client has no
 # business transcribing.
@@ -1998,7 +2058,7 @@ async def speak(
             [(voice_id, seg.text, overrides)
              for (seg, voice_id, used, fell_back) in resolved])
     except AdmissionRejected as exc:
-        return _backpressure_response(_Backpressure(str(exc)))
+        return _backpressure_response(_Backpressure(str(exc), exc))
 
     wavs: list[bytes] = []
     report: list[dict] = []
@@ -2114,7 +2174,7 @@ async def performance(req: PerformanceRequest,
         results = await _submit_and_gather_in_waves(
             [(t[3], t[2].text, t[6]) for t in tasks])
     except AdmissionRejected as exc:
-        return _backpressure_response(_Backpressure(str(exc)))
+        return _backpressure_response(_Backpressure(str(exc), exc))
 
     wavs: list[bytes] = []
     report: list[dict] = []

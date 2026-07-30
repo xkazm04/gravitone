@@ -67,6 +67,7 @@ import base64
 import binascii
 import dataclasses
 import hmac
+import inspect
 import io
 import json
 import logging
@@ -559,6 +560,32 @@ def wav_to_pcm(wav_bytes: bytes, dst_rate: int) -> bytes:
     if rate != dst_rate:
         samples = resample_pcm16(samples, rate, dst_rate)
     return samples.tobytes()
+
+
+_ADMISSION_KWARGS_CACHE: dict = {}
+
+
+def _interactive_kwargs(engine) -> dict:
+    """A convai turn is INTERACTIVE work, and says so.
+
+    A live phone call sitting behind a 4000-token audiobook segment is tens of
+    seconds of dead air; the engine can only avoid that if the caller names its
+    class. Feature-detected (and cached per engine type) rather than passed
+    blindly, because the test doubles that stand in for the engine here predate
+    admission classes and a TypeError would break a turn that works fine
+    without the tag.
+    """
+    key = type(engine)
+    kwargs = _ADMISSION_KWARGS_CACHE.get(key)
+    if kwargs is None:
+        try:
+            params = inspect.signature(engine.submit).parameters
+            kwargs = ({"job_class": "interactive"} if "job_class" in params
+                      else {})
+        except (TypeError, ValueError):
+            kwargs = {}
+        _ADMISSION_KWARGS_CACHE[key] = kwargs
+    return kwargs
 
 
 class _Session:
@@ -1377,7 +1404,8 @@ class _Session:
         engine = _engine_provider()
         if engine is None:
             raise RuntimeError("the synthesis engine is not running")
-        job = engine.submit(voice_id=voice, text=str(text), overrides={})
+        job = engine.submit(voice_id=voice, text=str(text), overrides={},
+                            **_interactive_kwargs(engine))
         result = await asyncio.wait_for(asyncio.wrap_future(job.future),
                                         timeout=SETTINGS.request_timeout_s)
         return await asyncio.get_event_loop().run_in_executor(
