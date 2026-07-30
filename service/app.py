@@ -59,7 +59,7 @@ from service.engine import (
     AdmissionRejected, ShuttingDown, TtsEngine, concat_wavs,
     resample_pcm16, resample_wav_bytes, wav_bytes_to_mp3,
 )
-from service.voices import BUILTIN, emotion_map, router as voices_router
+from service.voices import BUILTIN, emotion_map, prosody_map, router as voices_router
 from service.keys import router as keys_router
 from service.ingest_api import (
     router as ingest_router, start_background as ingest_start_background,
@@ -580,7 +580,7 @@ async def _resolve_emotion_address(voice_id: str, emotion: str | None) -> tuple[
     emap = emotion_map(character_id)
     if not emap:
         raise HTTPException(status_code=404, detail=f"unknown character '{character_id}'")
-    resolved_id, used, fell_back = resolve(requested, emap)
+    resolved_id, used, fell_back = resolve(requested, emap, prosody=prosody_map(character_id))
     if fell_back:
         await _offload(_record_fallbacks, [(character_id, requested)])
     return resolved_id, {
@@ -1286,6 +1286,7 @@ async def speak(
     emap = emotion_map(req.character_id)
     if not emap:
         raise HTTPException(status_code=404, detail=f"unknown character '{req.character_id}'")
+    pmap = prosody_map(req.character_id)  # one registry read, not one per segment
 
     segments = parse_segments(req.text)
     overrides = _overrides(req.voice_settings)
@@ -1302,7 +1303,7 @@ async def speak(
     resolved: list[tuple] = []
     fallbacks: list[tuple[str, str]] = []
     for seg in segments:
-        voice_id, used, fell_back = resolve(seg.emotion, emap)
+        voice_id, used, fell_back = resolve(seg.emotion, emap, prosody=pmap)
         if fell_back:
             fallbacks.append((req.character_id, seg.emotion))
         resolved.append((seg, voice_id, used, fell_back))
@@ -1396,6 +1397,7 @@ async def performance(req: PerformanceRequest,
 
     # Fail fast: validate every character before synthesizing anything.
     emaps: dict[str, dict[str, str]] = {}
+    pmaps: dict[str, dict[str, dict]] = {}
     for i, line in enumerate(req.lines):
         if line.character_id not in emaps:
             emap = emotion_map(line.character_id)
@@ -1403,6 +1405,7 @@ async def performance(req: PerformanceRequest,
                 raise HTTPException(status_code=404,
                                     detail=f"unknown character '{line.character_id}' (line {i})")
             emaps[line.character_id] = emap
+            pmaps[line.character_id] = prosody_map(line.character_id)
 
     # Flatten every line into its emotion segments, resolving voices first, then
     # submit in waves bounded by real parallelism and gather in order — an
@@ -1416,7 +1419,8 @@ async def performance(req: PerformanceRequest,
         emap = emaps[line.character_id]
         overrides = _overrides(line.voice_settings)
         for seg in parse_segments(line.text):
-            voice_id, used, fell_back = resolve(seg.emotion, emap)
+            voice_id, used, fell_back = resolve(seg.emotion, emap,
+                                                prosody=pmaps[line.character_id])
             if fell_back:
                 fallbacks.append((line.character_id, seg.emotion))
             tasks.append((i, line.character_id, seg, voice_id, used, fell_back, overrides))
