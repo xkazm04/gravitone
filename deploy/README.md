@@ -105,14 +105,86 @@ Whisper size likewise: `--build-arg BAKE_STT_MODEL=base`.
 > review (Piper is MIT; the Whisper/CTranslate2 and sherpa-onnx model releases
 > need confirming). The manifest says so in band as `license_review`.
 
+## 5. Measure → plan → deploy (the deployment compiler)
+
+"What should I set for my box?" is not a question anyone should answer from a
+README. Measure the box once, and it writes its own topology:
+
+```bash
+bash benchmark_arm.sh                     # ramp concurrency, find the knee
+python -m service.certify                 # → certification.json (+ verdict)
+python -m service.plan certification.json # → deployment-plan.json
+```
+
+`deployment-plan.json` carries `replicas`, `torch_threads`, `queue_max`,
+per-replica `resources`, an `autoscaling` mode with the reason it was chosen,
+the three `roles`, and `provenance` (certificate sha256 + hardware fingerprint)
+so any artifact can be traced back to the measurement it came from.
+
+**It refuses more than it emits.** A failing certificate, a cache-contaminated
+run, a v1 certificate, or a v3 whose rate was *predicted* rather than measured
+all exit `2` with a named reason and write nothing — a wrong plan is worse than
+a conservative default, and `service.certify` already refuses to sign a curve
+fit for the same reason. `--verify` additionally checks the certificate's
+hash/HMAC before planning.
+
+Render the same plan into whatever runs it:
+
+```bash
+python -m service.plan certification.json --emit helm-values  # → gravitone-values.yaml
+python -m service.plan certification.json --emit compose      # → docker-compose.yml
+```
+
+On a box (bootstrap path), drop the plan where the unit looks for it:
+
+```bash
+sudo install -D -m644 deployment-plan.json /etc/gravitone/deployment-plan.json
+sudo -E bash deploy/bootstrap.sh        # or PLAN=/path/to/plan.json sudo -E bash ...
+```
+
+`bootstrap.sh` then takes `TTS_TORCH_THREADS`/`TTS_QUEUE_MAX` from the plan and,
+when `replicas > 1`, runs `python -m service.replicas --replicas N` inside the
+container — the supervisor that does SO_REUSEPORT port sharing, per-replica
+thread pinning and restart-on-death. **With no plan present nothing changes**:
+one container, `TTS_TORCH_THREADS=min(4, cores)`, `TTS_QUEUE_MAX=32`, exactly as
+before. A plan is an upgrade to a measured box, never a prerequisite, and the
+`PLAN=` override exists so a first boot never has to probe.
+
+### Which autoscaling metric, and why it is not always queue depth
+
+The plan picks `autoscaling.mode` from the *measured topology*, not preference:
+
+| Topology | Mode | Why |
+|---|---|---|
+| 1 replica | `off` | a single-replica box scales by resizing, not by count |
+| SO_REUSEPORT (shared port) | `cpu` | aggregated `/metrics` is a `single_replica_sample` with `totals: null` — KEDA on `metrics.queued` would size the fleet from one arbitrary replica |
+| sequential ports / k8s pods | `keda` | every replica is individually addressable, so queue depth (the pre-429 signal) is a real pool figure |
+
+### Roles
+
+The plan places three roles rather than one do-everything pod: `synth`
+(stateless, scales freely), `converse` (needs STT+VAD+TTS co-resident and holds
+a latency budget) and `ingest` — which is `affine: true` **as a field**, so the
+404 footgun documented below is a machine-readable placement constraint instead
+of a paragraph somebody may not read. Below 4 replicas the roles are colocated
+and the plan says so (`roles.colocated`).
+
+Role-scoped images are the Dockerfile's existing build args, not a new build:
+each role carries `image_build_args` (`MODELS_STAGE`, `BAKE_STT_MODEL`,
+`BAKE_PIPER_VOICES`). Note the image's capability gate imports all four
+capability modules, so roles differ in baked **weights** (image size), not in
+installed code.
+
 ## What the bootstrap sets up
 
 - `TTS_API_KEY` enforced on every endpoint (see `service/auth.py`) — the
   printed root key, or scoped keys minted via `/v1/keys`.
 - Tuning from the measured scaling law: `TTS_WORKERS=1`,
   `TTS_TORCH_THREADS=min(4, cores)`, bf16 via the image's oneDNN/ACL torch.
-  For multi-replica fleets (full utilization of big boxes) see the
-  production-fleet follow-up in `docs/harness/`.
+  These are the no-plan defaults; with a `deployment-plan.json` present the
+  thread budget, queue depth and replica count come from the measurement
+  instead (section 5) — that is how a big box stops being deliberately
+  underused.
 - `docker volume gravitone-voices` — persisted voices; the service survives
   reboots via systemd `Restart=always`.
 - `docker volume gravitone-ingest` — ingest job workdirs + `state.json`.

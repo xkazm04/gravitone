@@ -36,8 +36,26 @@ if [ -d "$APP_DIR/.git" ]; then git -C "$APP_DIR" pull -q; else git clone -q "$R
 # shellcheck source=deploy/gravitone-unit.sh
 . "$APP_DIR/deploy/gravitone-unit.sh"
 
+# --- plan: the topology this box measured for itself -------------------------
+# A deployment plan (python -m service.plan certification.json) turns the
+# certificate's numbers into this install's replica count, thread budget and
+# queue depth. It is strictly optional: with no plan the defaults below are the
+# single-container ones this script has always used. PLAN=<file> overrides.
+PLAN_FILE="$(gravitone_plan_path)"
+REPLICAS=1
+if [ -n "$PLAN_FILE" ]; then
+  REPLICAS="$(gravitone_plan_field "$PLAN_FILE" replicas 1)"
+  echo "-- deployment plan: $PLAN_FILE (replicas=$REPLICAS)"
+else
+  echo "-- no deployment plan found; using single-container defaults."
+  echo "   Measure this box and compile one:"
+  echo "     bash benchmark_arm.sh && python -m service.certify"
+  echo "     python -m service.plan certification.json"
+  echo "     sudo install -D -m644 deployment-plan.json /etc/gravitone/deployment-plan.json"
+fi
+
 # --- config: root API key + tuning from the measured scaling law -------------
-gravitone_write_env_file "$ENV_FILE"
+gravitone_write_env_file "$ENV_FILE" "$PLAN_FILE"
 
 # --- image ------------------------------------------------------------------
 # The SEALED image bakes every weight at build time (Dockerfile `bake` stage),
@@ -48,7 +66,7 @@ gravitone_write_env_file "$ENV_FILE"
 docker build -q ${BUILD_ARGS:-} -t gravitone "$APP_DIR"
 
 # --- systemd service ----------------------------------------------------------
-gravitone_write_unit gravitone "$ENV_FILE" 8080
+gravitone_write_unit gravitone "$ENV_FILE" 8080 "$REPLICAS"
 gravitone_start
 
 # --- report -----------------------------------------------------------------
