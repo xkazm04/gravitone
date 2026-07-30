@@ -28,61 +28,37 @@ systemctl enable --now docker
 # --- code -------------------------------------------------------------------
 if [ -d "$APP_DIR/.git" ]; then git -C "$APP_DIR" pull -q; else git clone -q "$REPO" "$APP_DIR"; fi
 
+# The env file, the systemd unit and the health wait live in ONE place, shared
+# with scripts/airgap-install.sh — two hand-maintained copies of a unit whose
+# stop grace period must exceed TTS_DRAIN_TIMEOUT_S is a divergence waiting to
+# happen. Sourced after the clone above, which is what puts it on disk (this
+# script is normally piped from curl and has no siblings of its own).
+# shellcheck source=deploy/gravitone-unit.sh
+. "$APP_DIR/deploy/gravitone-unit.sh"
+
 # --- config: root API key + tuning from the measured scaling law -------------
-if [ ! -f "$ENV_FILE" ]; then
-  KEY="${TTS_API_KEY:-gvt_root_$(head -c24 /dev/urandom | od -An -tx1 | tr -d ' \n')}"
-  CORES="$(nproc)"
-  THREADS=$(( CORES > 4 ? 4 : CORES ))
-  {
-    echo "TTS_API_KEY=$KEY"
-    echo "TTS_WORKERS=1"                # scale by replica, not in-process workers
-    echo "TTS_TORCH_THREADS=$THREADS"
-    echo "OMP_NUM_THREADS=$THREADS"
-    echo "TTS_QUEUE_MAX=32"
-  } > "$ENV_FILE"
-  chmod 600 "$ENV_FILE"
-fi
+gravitone_write_env_file "$ENV_FILE"
 
 # --- image ------------------------------------------------------------------
-docker build -q -t gravitone "$APP_DIR"
+# The SEALED image bakes every weight at build time (Dockerfile `bake` stage),
+# which is slower to build and needs no egress afterwards. For a fast build on
+# a connected box that may download weights on first use, add:
+#   BUILD_ARGS="--build-arg MODELS_STAGE=nobake --build-arg HF_HUB_OFFLINE=0"
+# GET /v1/appliance always says which one this box got.
+docker build -q ${BUILD_ARGS:-} -t gravitone "$APP_DIR"
 
 # --- systemd service ----------------------------------------------------------
-# Named volume: docker populates it from the image's /app/voices on first use,
-# so built-in voices ship and cloned voices survive image rebuilds.
-cat > /etc/systemd/system/gravitone.service <<'UNIT'
-[Unit]
-Description=Gravitone TTS (Private ElevenLabs)
-After=docker.service
-Requires=docker.service
-
-[Service]
-Restart=always
-RestartSec=5
-ExecStartPre=-/usr/bin/docker rm -f gravitone
-ExecStart=/usr/bin/docker run --name gravitone --env-file /etc/gravitone.env \
-  -p 8080:8080 -v gravitone-voices:/app/voices \
-  -v gravitone-ingest:/app/ingest_jobs gravitone
-# -t 30 must exceed TTS_DRAIN_TIMEOUT_S (20s): docker's 10s default SIGKILLs
-# the service mid-drain, so in-flight generations die and a commit can be cut
-# between registering a voice and recording it in the job state.
-ExecStop=/usr/bin/docker stop -t 30 gravitone
-TimeoutStopSec=40
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-systemctl daemon-reload
-systemctl enable --now gravitone
+gravitone_write_unit gravitone "$ENV_FILE" 8080
+gravitone_start
 
 # --- report -----------------------------------------------------------------
-echo "waiting for the model to load (first boot pulls weights, 1-3 min) ..."
-for _ in $(seq 1 120); do
-  curl -sf localhost:8080/health >/dev/null 2>&1 && break
-  sleep 5
-done
+echo "waiting for the service to come up (a sealed image loads from disk; an"
+echo "unsealed one pulls weights on first boot, 1-3 min) ..."
+gravitone_wait_healthy 8080 120 || echo "!! /health never answered — check: journalctl -u gravitone"
 
 IP="$(curl -sf -m 3 http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || hostname -I | awk '{print $1}')"
-KEY="$(grep ^TTS_API_KEY= "$ENV_FILE" | cut -d= -f2-)"
+KEY="$(gravitone_existing_key "$ENV_FILE")"
+gravitone_report_seal 8080 "$KEY"
 cat <<DONE
 
 ============================================================

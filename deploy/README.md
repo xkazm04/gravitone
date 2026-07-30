@@ -55,6 +55,56 @@ Works on Graviton, Axion, Ampere, or an Arm devboard. Installs docker,
 builds the Arm-tuned image, and registers a systemd service (`gravitone`)
 with a named volume so cloned voices survive rebuilds.
 
+## 4. Air-gapped (USB stick, no registry, no internet)
+
+The image bakes every model weight at build time (Dockerfile `bake` stage), so
+a disconnected box needs no egress at all — not even on first boot.
+
+```bash
+# on a connected Arm64 build box
+docker build -t gravitone:1.0 .
+scripts/airgap-install.sh save gravitone:1.0 gravitone-1.0.tar
+#   -> gravitone-1.0.tar + .sha256 + gravitone-1.0.manifest.json
+
+# carry all three across, then on the air-gapped box (root, Arm64):
+./airgap-install.sh install gravitone-1.0.tar
+```
+
+`airgap-install.sh` and `bootstrap.sh` register the SAME systemd unit — both
+source `deploy/gravitone-unit.sh`, which is the only place that unit exists.
+Copy `gravitone-unit.sh` onto the stick beside the tarball (the installer looks
+for it next to itself, in `./deploy/`, and in `/opt/gravitone/deploy/`).
+
+**Sealed vs slim.** The default build is sealed. For a fast build on a
+connected box:
+
+```bash
+docker build --build-arg MODELS_STAGE=nobake --build-arg HF_HUB_OFFLINE=0 -t gravitone:slim .
+BUILD_ARGS="--build-arg MODELS_STAGE=nobake --build-arg HF_HUB_OFFLINE=0" ./bootstrap.sh
+```
+
+A slim image downloads weights on first use exactly as the old image did. You
+never have to guess which one a box got:
+
+```bash
+curl -s -H "xi-api-key: $KEY" localhost:8080/v1/appliance | python3 -m json.tool
+```
+
+`GET /v1/appliance` (service/appliance.py) reports `seal: sealed|unsealed`, every
+baked model file with its sha256 and upstream provenance, the locales and
+capabilities that follow, and — when unsealed — the NAME of each missing
+component with the command that fetches it. Set `TTS_APPLIANCE_SECRET` (or
+reuse `TTS_PACK_SECRET`) and the manifest is HMAC-signed, so the document that
+shipped with the tarball can be diffed against the running box.
+
+Which Piper locales are baked in is a build-time decision (image size grows with
+each voice): `--build-arg BAKE_PIPER_VOICES="cs_CZ-jirka-medium pl_PL-darkman-medium"`.
+Whisper size likewise: `--build-arg BAKE_STT_MODEL=base`.
+
+> Model licences for redistribution INSIDE an image are still an open legal
+> review (Piper is MIT; the Whisper/CTranslate2 and sherpa-onnx model releases
+> need confirming). The manifest says so in band as `license_review`.
+
 ## What the bootstrap sets up
 
 - `TTS_API_KEY` enforced on every endpoint (see `service/auth.py`) — the
