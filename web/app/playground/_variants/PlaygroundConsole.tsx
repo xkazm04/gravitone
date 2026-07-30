@@ -38,6 +38,7 @@ import { useAudioPlayer } from "./useAudioPlayer";
 import EmotionPicker from "./EmotionPicker";
 import TakeCode from "./TakeCode";
 import LiveStage from "../_live/LiveStage";
+import ScoreEditor from "./ScoreEditor";
 // Punch-in: the take log's editing drill-down. Deliberately a separate module —
 // the take card stays exactly what it was until the user asks for the timeline.
 import PunchIn, { type CommitPayload } from "./PunchIn";
@@ -1280,6 +1281,14 @@ export default function PlaygroundConsole() {
                 {script.length >= MAX_SCRIPT_LINES ? `line limit reached (${MAX_SCRIPT_LINES})` : "+ add line"}
               </button>
             </div>
+          )}
+
+          {mode === "solo" && (
+            <details className="border-t border-white/8 px-5 py-3">
+              <summary className="font-jetbrains cursor-pointer text-[11px] uppercase tracking-widest text-white/60">score — direct emotion by dragging spans</summary>
+              <ScoreEditor value={text} onChange={setText} characterId={charId} expr={expr}
+                available={character?.emotions ?? []} scale={scale} className="mt-3" />
+            </details>
           )}
 
           {/* emotion chips + wheel */}
