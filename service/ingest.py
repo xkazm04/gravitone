@@ -1546,9 +1546,18 @@ def label_and_stem(work_dir: Path, target: str, min_stem: float = MIN_STEM_SECON
             # looking: "dropped" = its audio is not in any stem, "flagged" = it
             # is, and it looked unlike the rest. Absent = nothing measured about
             # it, which must render as nothing at all.
-            "segments": [{"emotion": l["emotion"], "confidence": l["confidence"], "cue": l["cue"],
+            #
+            # `i` and `ok` ride here for the Casting Board: every consumer of
+            # this list (recipes, the corpus, the segment endpoints) had to
+            # re-derive the index by POSITION and re-derive usability from
+            # `failure` + a stat() of the wav. Publishing both makes the join
+            # the pipeline already knows explicit rather than reconstructed.
+            # Position stays the contract (`i` equals it here, and the readers
+            # still verify the join against each segment's labelled duration).
+            "segments": [{"i": l["i"], "emotion": l["emotion"],
+                          "confidence": l["confidence"], "cue": l["cue"],
                           "dur": l["dur"], "text": l["text"], "model": l["model"],
-                          "failure": l.get("failure"),
+                          "failure": l.get("failure"), "ok": bool(l.get("ok")),
                           "outlier": _outlier_by_index.get(l["i"]),
                           "escalation": l.get("escalation")} for l in labelled]}
 

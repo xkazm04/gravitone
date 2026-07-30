@@ -5,6 +5,8 @@
   GET  /v1/ingest/{job}/speaker-preview/{id}→ per-speaker sample wav
   POST /v1/ingest/{job}/speaker             { speaker_id }  [start label+stem for that speaker]
   GET  /v1/ingest/{job}/preview/{emotion}   → stem wav (the SPEAKER's own audio)
+  GET  /v1/ingest/{job}/segment/{i}         → ONE labelled segment's wav
+  POST /v1/ingest/{job}/stems               { assignments, reset? } → re-spliced stems
   POST /v1/ingest/{job}/audition            { emotion, text, recipe? } → wav (a CLONE)
   POST /v1/ingest/{job}/commit              { character, emotions[], character_id?,
                                               recipes?, corpus? } → voices
@@ -51,6 +53,20 @@ written. Candidate stems come from `recipes`: 2-3 deterministic splices per
 emotion computed from the segment labels the scan already produced, so a user can
 compare "all of it" against "the longest takes" against "the cleanest signal"
 before anything irreversible happens. `commit` re-splices to the chosen recipe.
+
+The Casting Board (`/segment/{i}` + `/stems`): a stem used to be an opaque
+aggregate — one number on screen for a splice of segments nobody could hear or
+change. `/segment/{i}` serves one labelled segment's own wav (the sibling of
+`speaker-preview`), and `/stems` re-runs `concat_wavs` over a caller-supplied
+`{emotion: [segment indices]}` map, rewriting `stem_{emotion}.wav` IN THE
+WORKDIR and reporting the new seconds/eligibility. It writes nothing to the
+roster, it cannot reach a filename (emotions are normalized, indices are ints
+validated against this scan's own segments), and `reset` restores the splice
+the pipeline proposed. Editing an emotion WITHDRAWS its candidate recipes —
+they were alternative readings of the proposed selection and "everything" no
+longer means what they were built from — so an audition of an edited emotion
+hears exactly the stem now on disk. Cross-recording pooling is NOT here: the
+corpus (below) is the seam that would carry it.
 """
 from __future__ import annotations
 
@@ -756,10 +772,24 @@ def _label(job_id: str, target: str) -> None:
         except Exception as exc:  # noqa: BLE001 - never fail a scan over recipes
             logger.warning("ingest job %s: recipes skipped: %s", job_id, exc)
             why = "candidate stems could not be built for this scan"
+        # What each stem is spliced FROM, published with the ledger. The studio
+        # needs it before anything is re-cast (a row expands into its segments
+        # read-only first), and it must be the pipeline's own answer: the
+        # baseline's segments are not "the neutral ones" — plan_baseline may have
+        # topped it up — so a client deriving this from the labels would draw a
+        # stem the backend never built.
+        casting: dict | None = None
+        try:
+            _rows, proposed, why_cast = _board(Path(job["work_dir"]), res)
+            casting = {"assignments": proposed, "edited": [], "unavailable": why_cast}
+        except Exception as exc:  # noqa: BLE001 - never fail a scan over the board
+            logger.warning("ingest job %s: casting board unavailable: %s", job_id, exc)
+            casting = {"assignments": {}, "edited": [],
+                       "unavailable": "the segments of this scan could not be listed"}
         _update(job, result={"duration": job.get("duration", 0),
                              "speakers": [s["id"] for s in job.get("speakers", [])],
                              "mode": job["mode"], **res},
-                recipe_plan=plan,
+                recipe_plan=plan, casting=casting,
                 recipes={"applied": {}, "skipped": [], "unavailable": why},
                 status="done")
     except ingest.Cancelled:
@@ -1045,6 +1075,10 @@ def start_scan(file: UploadFile = File(...), mode: str = Form("auto"),
         # Audition Room state: `recipes` is public (choices + named outcomes),
         # `recipe_plan` is the server-side index map behind them.
         "recipes": None, "recipe_plan": {},
+        # Casting Board state. None until the user re-casts something: absent
+        # means "the stems are exactly what the pipeline proposed", which is a
+        # different fact from an assignment map that happens to match it.
+        "casting": None,
         # Corpus state. `requested` is what the caller asked for at upload time
         # (the commit may still change its mind); everything else is filled in
         # after a successful commit and always NAMES the outcome, including
@@ -1066,6 +1100,13 @@ _PUBLIC_KEYS = ("id", "status", "step", "steps", "partial", "speakers",
                 # (the segment indices behind each recipe) is deliberately NOT
                 # here: a client names a recipe, it never selects audio.
                 "recipes",
+                # The Casting Board's state: which segments each stem is
+                # currently spliced from and which emotions the user has
+                # re-cast. Published (unlike `recipe_plan`) because it IS the
+                # caller's own selection echoed back — a reload, or a second
+                # tab, must not show a ledger whose numbers no longer match the
+                # audio on disk.
+                "casting",
                 # Whether this job's audio was kept, and — always — why not.
                 "corpus",
                 # What analyze learned about THIS recording. A key the job dict
@@ -1219,6 +1260,310 @@ def preview(job_id: str, emotion: str):
     return FileResponse(str(stem), media_type="audio/wav")
 
 
+# ── the casting board ─────────────────────────────────────────────────────────
+# Serializes re-splices. Two /stems calls for the same job would otherwise write
+# the same stem file from two threads (the studio debounces, but a debounce is a
+# UI convenience, not a concurrency argument). Global rather than per-job: a
+# splice is milliseconds of local wav work, so one lock costs nothing and there
+# is no per-job lock lifecycle to leak.
+_STEM_LOCK = threading.Lock()
+# A hand-curated stem is a handful of takes, not a programme. The cap is a
+# boundary check on a client-supplied list, in the same spirit as MAX_UPLOAD_BYTES.
+MAX_ASSIGNED_SEGMENTS = 200
+
+
+def _segment_refusal(index: int, result: dict) -> str:
+    """WHY a segment index cannot feed a stem, in the pipeline's own terms.
+
+    "bad index" is four different facts, and a user staring at a greyed row
+    deserves the one that applies to it: out of range, extraction failed,
+    classification failed, or measured as not the target speaker.
+    """
+    segs = result.get("segments") or []
+    if not isinstance(index, int) or index < 0 or index >= len(segs):
+        return f"segment {index} is not part of this scan"
+    s = segs[index] if isinstance(segs[index], dict) else {}
+    failure = s.get("failure")
+    if failure == "extract":
+        return (f"segment {index} has no audio - that span of the recording "
+                "could not be decoded")
+    if failure:
+        return f"segment {index} has no audio - it could not be prepared ({failure})"
+    if s.get("outlier") == "dropped":
+        return (f"segment {index} was measured as not the target speaker, so it "
+                "is not available to any stem")
+    return f"segment {index} has no audio on this scan"
+
+
+def _board(work_dir: Path, result: dict) -> tuple[list[dict], dict[str, list[int]], str | None]:
+    """(usable segment rows, the splice the PIPELINE proposed, reason-unavailable).
+
+    The proposed map is re-derived from the same inputs `label_and_stem` used
+    rather than remembered, so "reset to proposed" restores what the ledger
+    actually reported instead of a second, drifting record of it — including the
+    baseline's borrow ORDER, which is not recording order (plan_baseline appends
+    the topped-up segments after the genuinely-neutral ones, and splicing them
+    back in index order would produce a different stem than the one on screen).
+    """
+    stems = result.get("stems")
+    if not isinstance(stems, list) or not stems:
+        return [], {}, "this scan produced no stems"
+    rows, reason = segment_rows(work_dir, result)
+    if reason:
+        return [], {}, reason
+    min_stem = float(result.get("min_stem") or ingest.MIN_STEM_SECONDS)
+    by_emotion: dict[str, list[dict]] = {}
+    for r in rows:
+        by_emotion.setdefault(r["emotion"], []).append(r)
+    proposed: dict[str, list[int]] = {}
+    for stem in stems:
+        emo = stem.get("emotion")
+        if not emo:
+            continue
+        if emo == ingest.BASELINE:
+            proposed[emo] = [l["i"] for l in ingest.plan_baseline(by_emotion, min_stem).labs]
+        else:
+            proposed[emo] = [r["i"] for r in sorted(by_emotion.get(emo, []),
+                                                    key=lambda r: r["i"])]
+    return rows, proposed, None
+
+
+def _mixed_note(emotion: str, indices: list[int], label_of: dict[int, str]) -> str | None:
+    """The sentence a HAND-ASSEMBLED stem needs: which of its segments are
+    labelled as something else. None when the selection is all one emotion.
+
+    This replaces the pipeline's own note for an edited emotion rather than
+    living beside it: `plan_baseline`'s note describes a borrow the user has just
+    overruled, and leaving it on screen would state a fact about a stem that no
+    longer exists.
+    """
+    foreign: dict[str, int] = {}
+    for i in indices:
+        lab = label_of.get(i)
+        if lab and lab != emotion:
+            foreign[lab] = foreign.get(lab, 0) + 1
+    if not foreign:
+        return None
+    what = ", ".join(f"{n} x {e}" for e, n in sorted(foreign.items()))
+    return (f"you assembled this stem: {what} segment(s) in it are labelled as "
+            f"another emotion, so this voice is not purely {emotion}.")
+
+
+def _withdraw_recipes(job: dict, work_dir: Path, stem: dict, emotion: str) -> bool:
+    """Drop an edited emotion's candidate takes, and their wavs.
+
+    A recipe is an alternative reading of the PROPOSED selection ("the longest of
+    these segments"). Once the user has chosen the segments themselves, every
+    alternative describes a set that is no longer on screen — and `full`, the
+    default, would name a splice that is not the one in `stem_{emotion}.wav`.
+    Withdrawing them means an audition of this emotion hears exactly the stem the
+    board just built, and a stale client choice is refused by name at commit
+    ("that recipe was not offered for this emotion") instead of quietly cloning
+    something else.
+    """
+    had = bool(stem.pop("recipes", None))
+    plan = job.get("recipe_plan") or {}
+    for rid in list((plan.get(emotion) or {})):
+        if rid == RECIPE_FULL:
+            continue
+        with contextlib.suppress(OSError):
+            (work_dir / f"stem_{emotion}__{rid}.wav").unlink(missing_ok=True)
+    had = bool(plan.pop(emotion, None)) or had
+    job["recipe_plan"] = plan
+    return had
+
+
+class StemsReq(BaseModel):
+    # {emotion: [segment indices]} — the emotions being re-cast. Emotions NOT
+    # named keep whatever selection they already have, so a move is one request
+    # naming both sides and everything else is left alone.
+    assignments: dict[str, list[int]] | None = None
+    # Restore the splice the pipeline proposed. An empty body means the same
+    # thing: there is no other sensible reading of "re-splice nothing".
+    reset: bool = False
+
+
+@router.post(INGEST + "/{job_id}/stems")
+def restem(job_id: str, req: StemsReq):
+    """Re-splice this job's stems from a caller-chosen segment selection.
+
+    The stem was the one part of this flow the user had no authority over: a
+    mislabelled laugh, a cough, or 0.4s under the clone minimum was a dead end
+    shown as a grey badge. This rewrites `stem_{emotion}.wav` from the segments
+    the user picked and answers with the measured seconds and the eligibility
+    that follows from them - so a short stem can be WATCHED crossing the line
+    rather than re-uploaded and hoped about.
+
+    What it deliberately does not do: touch the roster, touch the corpus, admit
+    against the job budget (this is local wav arithmetic, not a model load), or
+    accept anything that reaches a filename. Refusals are named, one per fact.
+    """
+    job = _get_job(job_id)
+    if not job:
+        return job_expired()
+    status = job.get("status")
+    if status in ("committing", "committed"):
+        raise HTTPException(
+            409, "this scan has already been committed - its stems can no longer "
+                 "be re-spliced")
+    if status != "done":
+        raise HTTPException(409, "re-splicing needs a finished scan")
+
+    wd = Path(job["work_dir"])
+    result = job.get("result") or {}
+    rows, proposed, why = _board(wd, result)
+    if why:
+        raise HTTPException(409, f"these stems cannot be re-spliced - {why}")
+    wav_of = {r["i"]: Path(r["wav"]) for r in rows}
+    label_of = {r["i"]: r["emotion"] for r in rows}
+    min_stem = float(result.get("min_stem") or ingest.MIN_STEM_SECONDS)
+    stem_of = {s.get("emotion"): s for s in result.get("stems") or []}
+
+    reset = bool(req.reset) or not req.assignments
+    current: dict[str, list[int]] = dict((job.get("casting") or {}).get("assignments")
+                                         or proposed)
+    # An emotion the job remembers but this scan no longer proposes cannot be
+    # spliced from here; proposed is the authority on what stems exist.
+    current = {e: list(v) for e, v in current.items() if e in proposed}
+    for emo in proposed:
+        current.setdefault(emo, list(proposed[emo]))
+
+    if reset:
+        effective = {e: list(v) for e, v in proposed.items()}
+    else:
+        effective = {e: list(v) for e, v in current.items()}
+        for raw_emo, idxs in (req.assignments or {}).items():
+            try:
+                emo = normalize_emotion(raw_emo)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc))
+            if emo not in proposed:
+                raise HTTPException(
+                    400, f"'{emo}' is not one of this scan's stems, so segments "
+                         "cannot be cast into it")
+            if not idxs:
+                raise HTTPException(
+                    400, f"leave at least one segment in {emo} - to drop the "
+                         "emotion entirely, descope it instead")
+            if len(idxs) > MAX_ASSIGNED_SEGMENTS:
+                raise HTTPException(
+                    400, f"too many segments for one stem (max {MAX_ASSIGNED_SEGMENTS})")
+            picked: list[int] = []
+            for i in idxs:
+                if i not in wav_of:
+                    raise HTTPException(400, _segment_refusal(i, result))
+                if i in picked:
+                    raise HTTPException(400, f"segment {i} is listed twice in {emo}")
+                picked.append(i)
+            effective[emo] = picked
+
+    # Only what actually CHANGED is re-spliced: the same assignments twice write
+    # nothing the second time and answer identically (the endpoint is a debounce
+    # target, so idempotence is not a nicety here).
+    changed = [e for e in effective if effective[e] != current.get(e)]
+    edited = sorted(e for e in effective if effective[e] != proposed.get(e))
+
+    with _STEM_LOCK:
+        for emo in changed:
+            try:
+                sp = ingest.concat_wavs([wav_of[i] for i in effective[emo]],
+                                        wd / f"stem_{emo}.wav")
+            except Exception as exc:  # noqa: BLE001 - never leak splice internals
+                raise errors.sanitized_500("re-splicing this stem", exc)
+            stem = stem_of.get(emo)
+            if stem is None:
+                continue
+            stem["seconds"], stem["segments"] = sp.seconds, sp.segments
+            # Re-measured on the WRITTEN file, exactly as label_and_stem and
+            # commit do — the badge and the clone must agree.
+            stem["eligible"] = sp.seconds >= min_stem
+            # A hand-assembled stem's identity score described the previous
+            # splice. Absent is the honest state; a stale number is not.
+            stem.pop("identity", None)
+        if reset and changed:
+            # Back to the pipeline's own splice, so its own candidate takes are
+            # true again. Cleared first: build_recipes only ADDS offers, and a
+            # stem that no longer qualifies for a choice must not keep one.
+            for stem in result.get("stems") or []:
+                stem.pop("recipes", None)
+            job["recipe_plan"] = {}
+            try:
+                plan, _why = build_recipes(wd, result)
+                job["recipe_plan"] = plan
+            except Exception as exc:  # noqa: BLE001 - takes are advisory, always
+                logger.warning("ingest job %s: recipes not rebuilt after reset: %s",
+                               job_id, exc)
+        else:
+            for emo in changed:
+                stem = stem_of.get(emo)
+                if stem is not None:
+                    _withdraw_recipes(job, wd, stem, emo)
+
+    with _LOCK:
+        if job.get("cancel"):
+            raise HTTPException(409, "this scan was cancelled")
+        casting = dict(job.get("casting") or {})
+        # The pipeline's own per-stem notes, snapshotted ONCE so a reset can put
+        # them back. plan_baseline's "topped up with 2x calm" is a statement
+        # about the proposed splice; it is restored, never recomputed.
+        if "proposed_notes" not in casting:
+            casting["proposed_notes"] = {s.get("emotion"): s.get("note")
+                                         for s in result.get("stems") or []}
+        for emo, stem in stem_of.items():
+            if emo in edited:
+                stem["note"] = _mixed_note(emo, effective[emo], label_of)
+            else:
+                stem["note"] = casting["proposed_notes"].get(emo)
+        casting["assignments"] = effective
+        casting["edited"] = edited
+        job["casting"] = casting
+        job["result"] = result
+        _persist(job)
+
+    return {
+        "min_stem": min_stem,
+        "reset": reset,
+        "edited": edited,
+        "changed": sorted(changed),
+        "stems": [{"emotion": emo,
+                   "seconds": stem.get("seconds"),
+                   "segments": stem.get("segments"),
+                   "eligible": bool(stem.get("eligible")),
+                   "note": stem.get("note"),
+                   "assigned": effective.get(emo, []),
+                   "proposed": proposed.get(emo, []),
+                   "edited": emo in edited,
+                   # Whether an A/B of alternative takes still exists for this
+                   # row. False after an edit, and the studio must stop offering
+                   # one rather than let it 404 at commit.
+                   "takes": bool(stem.get("recipes"))}
+                  for emo, stem in stem_of.items() if emo in proposed],
+    }
+
+
+@router.get(INGEST + "/{job_id}/segment/{index}")
+def segment(job_id: str, index: int):
+    """One labelled segment's own audio. The sibling of `speaker-preview`.
+
+    The scan has always written these (`seg_%03d.wav`) and always thrown them
+    away behind a single per-stem number. Serving them is what makes the "mixed"
+    note, an outlier badge and a 3.6s stem explicable instead of assertions the
+    user has to take on faith — including for segments the pipeline REJECTED,
+    which are precisely the ones somebody wants to hear.
+    """
+    job = _get_job(job_id)
+    if not job:
+        return job_expired()
+    result = job.get("result") or {}
+    segs = result.get("segments") or []
+    if index < 0 or index >= len(segs):
+        raise HTTPException(404, "that segment is not part of this scan")
+    p = Path(job["work_dir"]) / f"seg_{index:03d}.wav"
+    if not p.is_file():
+        raise HTTPException(404, _segment_refusal(index, result))
+    return FileResponse(str(p), media_type="audio/wav")
+
+
 class CommitReq(BaseModel):
     character: str
     emotions: list[str]
@@ -1365,7 +1710,7 @@ def start_rederive(req: RederiveReq) -> dict:
         "note": None, "limits": None, "detection": None,
         "work_dir": str(work_dir), "created": time.time(),
         "clip_sha256": None, "cancel": False, "committed": None,
-        "recipes": None, "recipe_plan": {},
+        "recipes": None, "recipe_plan": {}, "casting": None,
         # A rebuild reads the corpus and never writes to it.
         "corpus": {"requested": False, "captured": False,
                    "reason": "a re-derivation reads the corpus, it never adds "

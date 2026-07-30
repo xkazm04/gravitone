@@ -1,7 +1,7 @@
 "use client";
 
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
-import { Fragment, useEffect, useReducer, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useReducer, useRef, useState } from "react";
 import Link from "next/link";
 import AppFrame from "@/components/ui/AppFrame";
 import { Button, Eyebrow } from "@/components/ui/Primitives";
@@ -17,11 +17,14 @@ import { CONSENT_STATEMENT } from "@/lib/consent";
 import WaveformLab from "./_loaders/WaveformLab";
 import { DetectionFinding, SovereignLimits, segmentFailureNote, type LoaderData } from "./_loaders/shared";
 import AuditionPanel from "./_review/AuditionPanel";
+import SegmentBoard from "./_review/SegmentBoard";
 import {
   reducer, initialState, POLLING_PHASES,
-  type Character, type Job, type ModeInfo, type Stem,
+  type CastResult, type Character, type Job, type ModeInfo, type Stem,
 } from "./_state/machine";
 import { candidates, commitRecipes, recipeById } from "./_state/audition";
+import { isEdited } from "./_state/casting";
+import { useCasting } from "./_state/useCasting";
 import {
   ACCEPT_ATTR, LIMITS_HINT, checkBytes, checkDuration,
 } from "./_state/uploadLimits";
@@ -64,7 +67,8 @@ export default function NewCharacterPage() {
   // The whole create-flow state graph in one reducer.
   const [state, dispatch] = useReducer(reducer, initialState);
   const { phase, jobId, job, result, selected, error,
-    mode, charName, extendCid, committedCid, created, auditions } = state;
+    mode, charName, extendCid, committedCid, created, auditions,
+    assignments, dirty } = state;
 
   // Ephemeral input/UI state — not part of the flow's state graph.
   const [consented, setConsented] = useState(false); // Voice Vault attestation
@@ -93,6 +97,22 @@ export default function NewCharacterPage() {
   // is the normal state: the fast path is still keep/descope then commit.
   const [auditionFor, setAuditionFor] = useState<string | null>(null);
   const { takes, request: requestTake } = useAudition(jobId);
+  // Which ledger row has its Casting Board open. Independent of the Audition
+  // Room: one answers "what is in this stem", the other "what does it sound
+  // like as a voice", and a user can want both about the same emotion.
+  const [boardFor, setBoardFor] = useState<string | null>(null);
+  const casting = useCasting(
+    jobId,
+    useCallback((cast: CastResult) => dispatch({ type: "CAST_SYNCED", cast }), []),
+  );
+
+  /** Cast segments into stems: the checkbox answers immediately, the re-splice
+   *  behind it is debounced, and the LENGTH only ever moves when the service
+   *  answers with what it measured. */
+  function castSegments(next: Record<string, number[]>) {
+    dispatch({ type: "CAST_SEGMENTS", assignments: next });
+    casting.cast(next);
+  }
 
   // 429 from the ingest admission gate. Recoverable, so it never becomes the
   // rose `error` — a full queue is "try again in a moment", not "it failed".
@@ -573,7 +593,9 @@ export default function NewCharacterPage() {
                   {result.min_stem}s of audio, the minimum this backend clones from.
                   Play <span className="text-white/80">stem</span> to hear the speaker&apos;s own
                   recording, or <span className="text-cyan-200">as a voice</span> to hear the
-                  clone itself — before anything is created.
+                  clone itself — before anything is created. Open the{" "}
+                  <span className="text-white/80">segment count</span> to hear what a stem is
+                  spliced from, and to exclude or move a segment.
                 </p>
               </div>
               <span className="font-jetbrains text-[12px] text-white/60">{selected.size} selected</span>
@@ -604,6 +626,12 @@ export default function NewCharacterPage() {
                     const chosen = recipeById(st, auditions[st.emotion]);
                     const quick = takes[takeKey(st.emotion, auditions[st.emotion] ?? "full", "")];
                     const open = auditionFor === st.emotion;
+                    // The segment layer only exists once the backend published
+                    // it; absent = the row simply does not expand.
+                    const board = boardFor === st.emotion;
+                    const castable = Boolean(result.segments?.length
+                      && assignments[st.emotion]?.length);
+                    const cast = isEdited(dirty, st.emotion);
                     return (
                       <Fragment key={st.emotion}>
                       <tr className={`border-b border-white/5 transition hover:bg-white/[0.03] ${on ? "" : "opacity-55"}`}>
@@ -617,6 +645,9 @@ export default function NewCharacterPage() {
                             <span className="h-2 w-2 rounded-full" style={{ background: `hsl(${m.hue} 85% 62%)` }} />{m.label}
                             {!st.eligible && <span className="font-jetbrains rounded bg-amber-400/10 px-1.5 py-0.5 text-[10px] text-amber-200">short</span>}
                             {st.note && <span className="font-jetbrains rounded bg-amber-400/10 px-1.5 py-0.5 text-[10px] text-amber-200">mixed</span>}
+                            {/* A stem the USER assembled is never presented as
+                                the pipeline's proposal. */}
+                            {cast && <span className="font-jetbrains rounded bg-cyan-400/10 px-1.5 py-0.5 text-[10px] text-cyan-200">cast</span>}
                           </span>
                           {st.note && <span className="mt-1 block max-w-[26rem] text-[11px] leading-snug text-amber-200/70">{st.note}</span>}
                           {/* What the EAR chose, stated where the emotion is
@@ -636,7 +667,19 @@ export default function NewCharacterPage() {
                           )}
                         </td>
                         <td className="font-jetbrains px-3 py-2 text-[12px] text-white/70">{st.seconds}s</td>
-                        <td className="font-jetbrains px-3 py-2 text-[12px] text-white/60">{st.segments}</td>
+                        <td className="font-jetbrains px-3 py-2 text-[12px] text-white/60">
+                          {castable ? (
+                            <button onClick={() => setBoardFor(board ? null : st.emotion)}
+                              aria-expanded={board}
+                              aria-label={`${board ? "Hide" : "Show"} the ${st.segments} segments in the ${m.label} stem`}
+                              title="what this stem is spliced from — play, exclude or move each segment"
+                              className="cursor-pointer underline decoration-dotted underline-offset-4 transition hover:text-white">
+                              {st.segments} {board ? "▾" : "▸"}
+                            </button>
+                          ) : (
+                            st.segments
+                          )}
+                        </td>
                         <td className="px-3 py-2 text-[12px] italic text-white/50">{st.cues[0] ? `“${st.cues[0]}”` : "—"}</td>
                         <td className="px-3 py-2">
                           <div className="flex flex-wrap items-center gap-1.5">
@@ -682,6 +725,26 @@ export default function NewCharacterPage() {
                           </button>
                         </td>
                       </tr>
+                      {board && (
+                        <tr className="border-b border-white/5">
+                          <td colSpan={7} className="px-3 pb-4 pt-1">
+                            <SegmentBoard
+                              jobId={jobId!}
+                              stem={st}
+                              result={result}
+                              minStem={result.min_stem}
+                              assignments={assignments}
+                              edited={cast}
+                              busy={casting.busy}
+                              error={casting.error}
+                              onCast={castSegments}
+                              onReset={casting.reset}
+                              onDismissError={casting.dismiss}
+                              onClose={() => setBoardFor(null)}
+                            />
+                          </td>
+                        </tr>
+                      )}
                       {open && (
                         <tr className="border-b border-white/5">
                           <td colSpan={7} className="px-3 pb-4 pt-1">
