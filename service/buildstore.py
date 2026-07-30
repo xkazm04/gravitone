@@ -30,8 +30,20 @@ mode a build system cannot survive. ``service/tests/test_buildstore.py`` pins a
 golden fixture manifest to exact digest strings, so a silent identity change
 fails loudly there rather than quietly in someone's repository.
 
-Scope, stated plainly: no billing, no entitlements, no lockfile emission and no
-zip delivery here — a digest is a name and this is where the named bytes live.
+Two more things joined them once the build plane grew teeth, and they are the
+same idea one level up:
+
+3. **The identity of a BUILD** — ``build_id``, a digest over the (line id →
+   digest) map. Deterministic, so re-posting an unchanged manifest names the
+   same build rather than minting a new one, and the record that backs
+   ``GET /v1/build/{build_id}.zip`` is content-addressed exactly like the audio.
+
+4. **The lockfile** — ``lockfile()`` renders the ``gravitone.lock`` document:
+   sorted keys, no timestamps, no host names, nothing that moves when nothing
+   changed. A lockfile whose diff is noisy is a lockfile nobody keeps in git.
+
+Scope, stated plainly: no billing and no entitlements — a digest is a name and
+this is where the named bytes live.
 """
 from __future__ import annotations
 
@@ -41,6 +53,7 @@ import logging
 import os
 import re
 import time
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -89,6 +102,61 @@ BAD_DIGEST = (
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
+# --- The lockfile / build-record plane --------------------------------------
+# Two documents leave this service and land in somebody's git repository, so
+# both are VERSIONED and both are rendered with sorted keys and no timestamps:
+# a document that changes when nothing changed is a document that gets deleted
+# from the repo after the third noisy diff.
+LOCKFILE_SCHEMA_VERSION = "gravitone.lock/1"
+BUILD_RECORD_SCHEMA_VERSION = "gravitone.build/1"
+
+# How many build records the store keeps. A record is a few kilobytes of JSON
+# naming digests it does not own, so this is a bound on clutter, not on disk;
+# the artifacts have their own (byte) budget and their own LRU.
+BUILD_RECORDS_MAX = 500
+
+# The largest zip this service will assemble. Checked BEFORE a byte is streamed
+# (from the stored sizes, which are free), because a refusal a client can read
+# is worth more than a truncated download it cannot distinguish from success.
+_ZIP_BYTES_ENV = "GRAVITONE_BUILD_ZIP_MAX_BYTES"
+BUILD_ZIP_MAX_BYTES_DEFAULT = 256 * 1024 * 1024
+
+# A fixed DOS timestamp for every zip member: the archive of an unchanged build
+# is then byte-identical on every machine and every day. Zip cannot store a year
+# before 1980, so this is the epoch the format allows, not an invented one.
+ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
+
+BUILD_NOT_FOUND = (
+    "no build is stored under this build id on this replica. A build id names "
+    "the lines of a manifest, and the record is written by POST /v1/build — "
+    "re-post the manifest and fetch the zip under the build_id it returns."
+)
+
+BAD_BUILD_ID = (
+    "not a build id: expected 64 hex characters (the value of build_id in a "
+    "POST /v1/build response), optionally with the 'sha256:' prefix"
+)
+
+DUPLICATE_LINE_ID = (
+    "a lockfile is keyed by line id, so a manifest with two lines sharing one "
+    "id cannot be locked: it would silently drop one of them. Duplicate ids: "
+)
+
+BUILD_PRUNED = (
+    "this build's audio is no longer stored: the artifacts below were evicted "
+    "by the store's LRU budget (GRAVITONE_BUILD_STORE_BYTES) or never rendered "
+    "on this replica. Re-run POST /v1/build with the same manifest to restore "
+    "them under the same names. Missing digests: "
+)
+
+ZIP_TOO_LARGE = (
+    "this build's artifacts exceed the zip budget "
+    "(GRAVITONE_BUILD_ZIP_MAX_BYTES); fetch the lines individually with "
+    "GET /v1/audio/{digest} instead. Bytes requested/allowed: "
+)
+
+_UNSAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
+
 
 def store_dir() -> Path:
     """The configured store root (read per call so tests can repoint it)."""
@@ -105,6 +173,18 @@ def store_max_bytes() -> int:
         logger.warning("%s=%r is not an integer; using the default budget",
                        _STORE_BYTES_ENV, raw)
         return STORE_MAX_BYTES_DEFAULT
+
+
+def zip_max_bytes() -> int:
+    raw = os.environ.get(_ZIP_BYTES_ENV)
+    if not raw:
+        return BUILD_ZIP_MAX_BYTES_DEFAULT
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning("%s=%r is not an integer; using the default zip budget",
+                       _ZIP_BYTES_ENV, raw)
+        return BUILD_ZIP_MAX_BYTES_DEFAULT
 
 
 # --- Identity ---------------------------------------------------------------
@@ -199,6 +279,191 @@ def etag_matches(if_none_match: str | None, digest: str) -> bool:
         if token == bare:
             return True
     return False
+
+
+# --- Build identity, the lockfile, and the zip ------------------------------
+
+def build_id(lines: list[dict]) -> str:
+    """The name of a BUILD: 64 hex characters over its (id, digest, format) map.
+
+    Deterministic and order-insensitive (the lines are sorted first), so
+    re-posting a manifest that did not change names the same build instead of
+    minting a new record every time CI runs. Two manifests that differ in a
+    single line's text differ in that line's digest and therefore in this id —
+    which is what makes ``GET /v1/build/{build_id}.zip`` a stable URL for a
+    stable set of audio, and a changing URL for changing audio.
+    """
+    payload = {
+        "v": BUILD_RECORD_SCHEMA_VERSION,
+        "lines": sorted(
+            [str(ln["id"]), str(ln["digest"]), str(ln.get("format") or "")]
+            for ln in lines),
+    }
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def parse_build_id(value: str) -> str:
+    """Normalize a caller-supplied build id, or raise ``ValueError``.
+
+    Same discipline as ``parse_digest`` and for the same reason: a build id
+    becomes a filename, so nothing that is not 64 hex characters is ever
+    allowed to become one.
+    """
+    raw = (value or "").strip().lower()
+    if raw.startswith("sha256:"):
+        raw = raw[len("sha256:"):]
+    if not _HEX64.match(raw):
+        raise ValueError(BAD_BUILD_ID)
+    return raw
+
+
+def duplicate_line_ids(lines: list[dict]) -> list[str]:
+    """The ids that appear more than once, sorted. Empty when the manifest is ok."""
+    seen: dict[str, int] = {}
+    for line in lines:
+        key = str(line["id"])
+        seen[key] = seen.get(key, 0) + 1
+    return sorted(k for k, n in seen.items() if n > 1)
+
+
+def lockfile(lines: list[dict], *, identity_version: str | None = None) -> dict:
+    """Render ``gravitone.lock``.
+
+    Schema (``schema_version`` = ``gravitone.lock/1``)::
+
+        {
+          "schema_version":   "gravitone.lock/1",
+          "identity_version": "gravitone-speech-identity/1",
+          "lines": {
+            "<line id>": {
+              "digest":         "sha256:<64 hex>",
+              "engine_version": "pocket_tts/1/lang=english/quant=0/max_tokens=50",
+              "voice":          "<resolved voice id>",
+              "format":         "wav_24000"
+            }
+          }
+        }
+
+    Deliberately absent: any timestamp, host, build id or counter. Everything in
+    here is a function of the INPUTS, so the file changes when and only when the
+    audio would — which is the only property that makes it worth committing.
+    ``json.dumps(..., sort_keys=True, indent=2)`` renders it; the ordering is
+    total, so two machines building the same script write identical bytes.
+
+    Raises ``ValueError`` (named, ``DUPLICATE_LINE_ID``) when two lines share an
+    id: the document is keyed by id, so it cannot represent that manifest.
+    """
+    dupes = duplicate_line_ids(lines)
+    if dupes:
+        raise ValueError(DUPLICATE_LINE_ID + ", ".join(dupes))
+    return {
+        "schema_version": LOCKFILE_SCHEMA_VERSION,
+        "identity_version": identity_version or IDENTITY_VERSION,
+        "lines": {
+            str(line["id"]): {
+                "digest": str(line["digest"]),
+                "engine_version": str(line.get("engine_version") or ""),
+                "voice": str(line.get("voice") or ""),
+                "format": str(line.get("format") or ""),
+            }
+            for line in sorted(lines, key=lambda ln: str(ln["id"]))
+        },
+    }
+
+
+def lockfile_bytes(doc: dict) -> bytes:
+    """The lockfile as it should be written to disk: sorted, indented, newline."""
+    return (json.dumps(doc, sort_keys=True, indent=2, ensure_ascii=True)
+            + "\n").encode("utf-8")
+
+
+def zip_member_names(lines: list[dict]) -> list[str]:
+    """One archive path per line, in manifest order — safe, stable, unique.
+
+    A line id is whatever the caller's script called it, which means it can hold
+    slashes, dots and worse. Those are replaced rather than escaped, and a
+    collision (or an id that sanitizes to nothing) falls back to a numbered
+    suffix, so an archive can never contain two members with one name or a
+    member that writes outside the extraction directory.
+    """
+    names: list[str] = []
+    taken: set[str] = set()
+    for index, line in enumerate(lines):
+        stem = _UNSAFE_NAME.sub("_", str(line["id"])).strip("._-")[:80]
+        if not stem:
+            stem = f"line-{index}"
+        ext = (str(line.get("format") or "wav").split("_", 1)[0]
+               or "bin").lower()
+        ext = _UNSAFE_NAME.sub("", ext) or "bin"
+        name = f"audio/{stem}.{ext}"
+        if name in taken:
+            suffix = 2
+            while f"audio/{stem}-{suffix}.{ext}" in taken:
+                suffix += 1
+            name = f"audio/{stem}-{suffix}.{ext}"
+        taken.add(name)
+        names.append(name)
+    return names
+
+
+class _ZipSink:
+    """A write-only, non-seekable file object that hands its bytes back.
+
+    ``zipfile`` writes to this; the generator below drains it after every
+    member. That is what makes the zip STREAMED: exactly one artifact is in
+    memory at a time, never the whole archive.
+    """
+
+    def __init__(self) -> None:
+        self._buf = bytearray()
+        self._pos = 0
+
+    def write(self, data) -> int:
+        self._buf += data
+        self._pos += len(data)
+        return len(data)
+
+    def flush(self) -> None:  # pragma: no cover - required by the file protocol
+        pass
+
+    def tell(self) -> int:
+        return self._pos
+
+    def seekable(self) -> bool:
+        return False
+
+    def drain(self) -> bytes:
+        out = bytes(self._buf)
+        del self._buf[:]
+        return out
+
+
+def stream_zip(members):
+    """Yield the bytes of a zip over ``(name, data)`` pairs, one member at a time.
+
+    ``ZIP_STORED``: the payload is already-encoded audio (mp3 does not deflate,
+    and wav's few percent are not worth spending a core on a request path that
+    is bounded by the manifest cap). With a fixed ``ZIP_EPOCH`` per member, the
+    archive of an unchanged build is byte-identical every time it is fetched.
+
+    ``members`` is consumed lazily, so the caller can read each artifact off
+    disk only when it is about to be written.
+    """
+    sink = _ZipSink()
+    with zipfile.ZipFile(sink, "w", zipfile.ZIP_STORED) as archive:
+        for name, data in members:
+            info = zipfile.ZipInfo(filename=name, date_time=ZIP_EPOCH)
+            info.compress_type = zipfile.ZIP_STORED
+            info.external_attr = 0o644 << 16
+            archive.writestr(info, data)
+            chunk = sink.drain()
+            if chunk:
+                yield chunk
+    tail = sink.drain()
+    if tail:
+        yield tail
 
 
 # --- The store --------------------------------------------------------------
@@ -398,6 +663,82 @@ class BuildStore:
             removed += 1
         return removed
 
+    # -- build records ----------------------------------------------------
+    # A record is the manifest's SKELETON: line id -> digest -> format, and
+    # nothing else. It owns no bytes (the artifacts are content-addressed and
+    # shared with every other build that names them), which is why it is capped
+    # by COUNT and why a pruned artifact makes the zip a named 410 rather than
+    # making the record wrong.
+
+    @property
+    def records_dir(self) -> Path:
+        return self.root / "builds"
+
+    def _record_path(self, build: str) -> Path:
+        return self.records_dir / f"{parse_build_id(build)}.json"
+
+    def put_record(self, record: dict) -> bool:
+        """Persist a build record. Returns whether it is now stored.
+
+        Blocking; same failure posture as ``put`` — a build whose record could
+        not be written still returned every digest it rendered, so the only
+        thing lost is the zip convenience route, and that is logged, not raised.
+        """
+        if not self.enabled:
+            return False
+        try:
+            path = self._record_path(str(record.get("build_id") or ""))
+        except ValueError:
+            return False
+        try:
+            with file_lock(self.root / ".store.lock"):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write_text(path, json.dumps(record, sort_keys=True))
+                self._prune_records_locked()
+        except (OSError, TimeoutError) as exc:
+            logger.warning("build record write failed for %s: %s", path.name, exc)
+            return False
+        return True
+
+    def get_record(self, build: str) -> dict | None:
+        try:
+            path = self._record_path(build)
+        except ValueError:
+            return None
+        try:
+            record = json.loads(path.read_text("utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(record, dict):
+            return None
+        try:
+            os.utime(path, None)  # records prune least-recently-USED too
+        except OSError:
+            pass
+        return record
+
+    def records(self) -> list[tuple[float, Path]]:
+        out: list[tuple[float, Path]] = []
+        if not self.records_dir.is_dir():
+            return out
+        for path in self.records_dir.glob("*.json"):
+            try:
+                out.append((path.stat().st_mtime, path))
+            except OSError:
+                continue
+        return out
+
+    def _prune_records_locked(self) -> int:
+        items = sorted(self.records())
+        removed = 0
+        for _mtime, path in items[:max(0, len(items) - BUILD_RECORDS_MAX)]:
+            try:
+                path.unlink()
+            except OSError:
+                continue
+            removed += 1
+        return removed
+
     def stats(self) -> dict:
         items = self.entries()
         return {
@@ -406,6 +747,7 @@ class BuildStore:
             "entries": len(items),
             "bytes": sum(size for _m, size, _p in items),
             "max_bytes": self.max_bytes,
+            "builds": len(self.records()),
         }
 
 

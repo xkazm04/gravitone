@@ -2,6 +2,7 @@
 // emotion Voices mid-sentence. A missing emotion is substituted with the
 // nearest recorded one, and only then baseline (service/emotions.py::resolve).
 
+import { hueFor } from "@/lib/glyphs/generate";
 import type { OutputFormat } from "@/lib/audioFormats";
 
 export type Segment = {
@@ -16,6 +17,21 @@ export type Segment = {
   characterId?: string;
   line?: number;
 };
+
+/**
+ * The tint a Character is drawn in.
+ *
+ * A scene is only readable as a scene if each speaker keeps ONE colour across
+ * every surface that shows it, so the hue is a pure function of the Character's
+ * id — the same rule `emotionMeta` uses for custom emotions, and the same hash,
+ * so two Characters are as unlikely to collide as two custom slots are. (The
+ * console's line dot still derives its own hue from the id's LENGTH, which
+ * collides for every pair of equal-length ids; it can adopt this without any
+ * data change.)
+ */
+export function characterHue(characterId: string): number {
+  return hueFor(characterId);
+}
 
 /** One directed line of a multi-character performance script. */
 export type PerfLine = { character_id: string; text: string };

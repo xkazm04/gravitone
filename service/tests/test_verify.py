@@ -22,7 +22,8 @@ import json
 import unittest
 from dataclasses import dataclass
 
-from service.tests import fake_engine  # installs shims — must precede app import
+from service.tests import fake_engine
+from service import ratelimit  # installs shims — must precede app import
 
 import service.app as appmod
 import service.stt as stt
@@ -252,6 +253,8 @@ class _RouteBase(unittest.TestCase):
     HEARD = "Hello world."
 
     def setUp(self) -> None:
+
+        ratelimit.reset_all()  # demo per-IP budgets are process-global; a heavy suite must not 429 itself
         self._orig_engine = appmod.ENGINE
         self._orig_transcribe = stt.transcribe_pcm
         self._orig_available = stt.available
@@ -358,6 +361,8 @@ class StrictRetryTests(_RouteBase):
     """verify=strict re-renders ONCE, bounded by ordinary admission."""
 
     def setUp(self) -> None:
+
+        ratelimit.reset_all()  # demo per-IP budgets are process-global; a heavy suite must not 429 itself
         super().setUp()
         self.heard_sequence = ["Hello.", "Hello world."]
 

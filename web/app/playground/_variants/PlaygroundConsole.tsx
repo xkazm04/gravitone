@@ -39,6 +39,7 @@ import EmotionPicker from "./EmotionPicker";
 import TakeCode from "./TakeCode";
 import LiveStage from "../_live/LiveStage";
 import ScoreEditor from "./ScoreEditor";
+import ScriptScore from "./ScriptScore";
 // Punch-in: the take log's editing drill-down. Deliberately a separate module —
 // the take card stays exactly what it was until the user asks for the timeline.
 import PunchIn, { type CommitPayload } from "./PunchIn";
@@ -251,6 +252,9 @@ export default function PlaygroundConsole() {
   const [composerErr, setComposerErr] = useState<string | null>(null);
   const [composerNotice, setComposerNotice] = useState<string | null>(null);
   const reconciled = useRef(false);
+  // Publish-time consent for PUBLIC re-perform, applied to takes published
+  // from here on. Default OFF — see the toggle in the takes-log header.
+  const [allowReperform, setAllowReperform] = useState(false);
   // Why publishing a take failed. The button's "✗ failed" says THAT it failed;
   // the backend's own detail (request id included) says what to do about it,
   // and share()'s catch used to throw it away.
@@ -696,7 +700,7 @@ export default function PlaygroundConsole() {
   function uploadOnce(t: Take): Promise<string> {
     const existing = inflightUploads.current.get(t.id);
     if (existing) return existing;
-    const p = uploadTake(t).finally(() => { inflightUploads.current.delete(t.id); });
+    const p = uploadTake(t, { allowReperform }).finally(() => { inflightUploads.current.delete(t.id); });
     inflightUploads.current.set(t.id, p);
     return p;
   }
@@ -1291,6 +1295,17 @@ export default function PlaygroundConsole() {
             </details>
           )}
 
+          {mode === "script" && script.length > 0 && (
+            <details className="border-t border-white/8 px-5 py-3">
+              <summary className="font-jetbrains cursor-pointer text-[11px] uppercase tracking-widest text-white/60">score — the scene as stacked lanes</summary>
+              <ScriptScore lines={script} activeLineId={script[activeLine]?.id} scale={scale} className="mt-3"
+                onChangeLine={(id, next) => updateLine(script.findIndex((l) => l.id === id), { text: next })}
+                characterName={charName}
+                availableFor={(id) => characters.find((c) => c.character_id === id)?.emotions ?? []}
+                onFocusLine={(_id, i) => { setActiveLine(i); lineRefs.current[i]?.focus(); }} />
+            </details>
+          )}
+
           {/* emotion chips + wheel */}
           <div className="border-t border-white/8 px-5 py-4">
             <div className="mb-2 flex items-center justify-between">
@@ -1403,6 +1418,16 @@ export default function PlaygroundConsole() {
                 </button>
               </>
             )}
+            {/* Publish-time consent for public re-perform. OFF by default and
+                deliberately so: a fork puts NEW WORDS in this Character's
+                voice and spends the box's CPU for a stranger. */}
+            <label className="flex cursor-pointer items-center gap-2 normal-case tracking-normal text-white/55"
+              title="Let visitors edit the text on the share page and re-render it in this Character's voice (rate-limited, and their fork cannot be forked again)">
+              <input type="checkbox" checked={allowReperform}
+                onChange={(e) => setAllowReperform(e.target.checked)}
+                className="h-3 w-3 accent-cyan-300" />
+              allow re-perform <span className="text-white/35">(visitors can re-render new words in this voice)</span>
+            </label>
             <span>{takes.length}</span>
           </div>
         </div>

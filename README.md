@@ -476,6 +476,68 @@ statement is the single source of truth (`web/lib/consent.ts`), so the record
 always reflects what was actually agreed — and `GET /v1/voices` reports whether
 a voice carries a receipt.
 
+### Audible docs — `POST /v1/narrate` and the one-line embed
+
+Turn any page into a narration **plan**: an ordered list of blocks, each with
+the emotion it should be read with and the Character role it wants. It renders
+nothing — every block is synthesized lazily through the ordinary
+`/v1/speak` / `/v1/text-to-speech` routes, so admission, caching and the emotion
+fallback report all behave exactly as they do everywhere else.
+
+```bash
+# A markdown or HTML body needs no configuration at all.
+curl -s -X POST localhost:8080/v1/narrate -H "xi-api-key: $KEY" \
+  -H 'content-type: application/json' \
+  -d '{"markdown":"# Getting started\n\nInstall it with pip.","character_id":"alba"}'
+# -> {"narration_id":"...","blocks":[{"text":"...","emotion":"excited",
+#     "character_hint":"warm","tagged_text":"[excited]...[/excited]",
+#     "addressing":{"speak":{"route":"/v1/speak", ...}}}], ...}
+
+curl -s localhost:8080/v1/narrate/<narration_id> -H "xi-api-key: $KEY"
+```
+
+**Remote URLs are off by default.** `{"url": "..."}` is refused unless an
+operator opts in per host:
+
+| variable | default | meaning |
+|---|---|---|
+| `NARRATE_ALLOW_HOSTS` | *(empty)* | comma-separated hosts the service may fetch. A leading dot is a suffix rule (`.example.com` allows `docs.example.com`, **not** `example.com`). Empty = markdown/HTML bodies only. |
+| `NARRATE_MAX_BYTES` | `1048576` | page size cap |
+| `NARRATE_TIMEOUT_S` | `8` | fetch deadline |
+
+Even on an allowlisted host the fetch refuses private, loopback, link-local
+(`169.254.169.254` — the cloud metadata endpoint), CGNAT and reserved
+addresses, re-checks **every redirect hop**, and caps redirects at 3. Every
+refusal is a named sentence ending in *"paste the text instead"*, which is the
+honest degrade when extraction or fetching cannot work.
+
+**The site's own dock.** `web/components/ui/NarrationDock.tsx` narrates the
+landing and `/benchmarks` from a registry derived from the same modules those
+pages render from — and plays an arbitrary plan with `?narration=<id>`.
+Nothing ever plays without a click; `?narrate=1` only *arms* the dock.
+
+**Baked audio.** `npm run bake:narration` (in `web/`) renders the registry once
+against a local service and writes `public/narration/<clipKey>.wav` plus a
+manifest the dock prefers over synthesis — so a page reading costs static files
+rather than ~40 synth slots per visitor. It is incremental, prunes clips the
+copy no longer contains, and degrades to a **named no-op** (exit 0) when the
+service is unreachable or unkeyed. `--strict` makes a release pipeline fail
+instead; `--character=<id>` pins the narrator.
+
+**The embed.** `web/public/narrate.js` puts the same dock on any site:
+
+```html
+<script src="https://your-gravitone/narrate.js"
+        data-host="https://your-gravitone"
+        data-voice="alba"></script>
+```
+
+It is dependency-free, under 15 KB, lives in a shadow root, contains **no
+secrets** (it asks the reader for their own key and keeps it in `sessionStorage`
+for that tab only), talks to `data-host` and nowhere else, and never autoplays.
+It reads the reader's selection when there is one, otherwise the page's
+`<article>`/`<main>`.
+
 ## The full studio — two products, one repo
 
 Gravitone is **two products** that together form the studio, living side by

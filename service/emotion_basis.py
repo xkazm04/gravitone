@@ -51,6 +51,22 @@ BASIS_VERSION = 1
 BASIS_TENSORS = "_basis.safetensors"
 BASIS_JSON = "_basis.json"
 
+# The measured half of the file, written by `service/tools/derive_ab.py` long
+# after the directions were built. Versioned SEPARATELY from the basis because
+# the two answer different questions and move at different speeds: the basis
+# says "these residuals agree", the transfer block says "and the derived voice
+# actually lands where the real one does". A transfer block this service cannot
+# read is treated as ABSENT (see :func:`load`) -- unmeasured, never failed.
+TRANSFER_VERSION = 1
+TRANSFER_KEY = "transfer"
+
+# The product bar for measured transfer quality. `quality` is 1.0 when a derived
+# render sits AS CLOSE to the real slot's stored prosody as the real voice's own
+# render of the same line does, and falls off by one "noticeable step" of excess
+# distance (see derive_ab.quality). 0.5 therefore reads: a derived voice may be
+# at most one noticeable step further away than the recording it stands in for.
+MIN_TRANSFER_QUALITY = 0.5
+
 # The same bar the measurement gate calls `go`. Named separately because THIS is
 # the one the product enforces: an emotion below it is refused at derive time
 # with its own number in the message.
@@ -73,12 +89,34 @@ class EmotionBasis:
 
 
 @dataclass(frozen=True)
+class TransferQuality:
+    """What the blind A/B harness MEASURED for one emotion's direction.
+
+    `quality` is a number about derived voices, not about the residuals: it
+    compares a derived render against the real recording it stands in for,
+    through the prosody probe. `speakers` says how thin the evidence is, and
+    `in_sample` says how many of those speakers also CONTRIBUTED to the
+    direction being tested -- an in-sample speaker flatters the result, so the
+    count travels with it rather than being quietly ignored.
+    """
+    emotion: str
+    quality: float
+    speakers: int
+    in_sample: int = 0
+    measured: str = ""
+
+
+@dataclass(frozen=True)
 class Basis:
     """A loaded `_basis` pair. `emotions` is keyed by emotion name."""
     version: int
     created: str
     layout: tuple[tuple[str, tuple[int, ...]], ...]
     emotions: dict[str, EmotionBasis] = field(default_factory=dict)
+    # Measured transfer quality per emotion, EMPTY until derive_ab has run.
+    # Absence is not failure: an emotion nobody measured still derives, and the
+    # derived Voice records that its quality is unmeasured (voices.derive_emotion).
+    transfer: dict[str, TransferQuality] = field(default_factory=dict)
 
     @property
     def dim(self) -> int:
@@ -216,7 +254,13 @@ def build(voices_dir: Path | str, *, min_coherence: float = MIN_COHERENCE,
 
 def write(voices_dir: Path | str, *, layout, emotions: dict[str, EmotionBasis],
           created: str | None = None) -> None:
-    """Persist a basis. Tensors first, manifest second -- see :func:`load`."""
+    """Persist a basis. Tensors first, manifest second -- see :func:`load`.
+
+    Any previously measured transfer block is DROPPED here, deliberately: the
+    numbers derive_ab wrote describe the directions it tested, and this call
+    replaces those directions. Carrying them over would attach a measurement to
+    a vector nobody measured.
+    """
     voices_dir = Path(voices_dir)
     voices_dir.mkdir(parents=True, exist_ok=True)
     tensors_path, json_path = paths(voices_dir)
@@ -270,6 +314,7 @@ def load(voices_dir: Path | str) -> tuple[Basis | None, str | None]:
 
     layout = tuple((str(k), tuple(int(d) for d in shape))
                    for k, shape in (raw.get("layout") or []))
+    transfer = _read_transfer(raw)
     emotions: dict[str, EmotionBasis] = {}
     for emotion, meta in (raw.get("emotions") or {}).items():
         vector = tensors.get(emotion)
@@ -287,7 +332,119 @@ def load(voices_dir: Path | str) -> tuple[Basis | None, str | None]:
     if not emotions:
         return None, "the emotion basis contains no usable directions -- rebuild it"
     return Basis(version=BASIS_VERSION, created=str(raw.get("created") or ""),
-                 layout=layout, emotions=emotions), None
+                 layout=layout, emotions=emotions,
+                 transfer={e: q for e, q in transfer.items() if e in emotions}), None
+
+
+# -- measured transfer quality (written by service/tools/derive_ab.py) ---------
+def _read_transfer(raw: dict) -> dict[str, TransferQuality]:
+    """Parse the manifest's transfer block. Anything doubtful reads as ABSENT.
+
+    A block written by a future TRANSFER_VERSION, a malformed entry, a quality
+    outside 0..1 -- none of them may become a number the derive gate acts on,
+    and none of them may take the basis down either. They simply do not appear,
+    and the emotion derives as unmeasured.
+    """
+    block = raw.get(TRANSFER_KEY)
+    if not isinstance(block, dict) or block.get("version") != TRANSFER_VERSION:
+        return {}
+    measured = str(block.get("measured") or "")
+    out: dict[str, TransferQuality] = {}
+    for emotion, entry in (block.get("emotions") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        try:
+            quality = float(entry["quality"])
+            speakers = int(entry["speakers"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (0.0 <= quality <= 1.0) or speakers <= 0:
+            continue
+        try:
+            in_sample = int(entry.get("in_sample") or 0)
+        except (TypeError, ValueError):
+            in_sample = 0
+        out[str(emotion)] = TransferQuality(
+            emotion=str(emotion), quality=quality, speakers=speakers,
+            in_sample=in_sample, measured=str(entry.get("measured") or measured))
+    return out
+
+
+def write_transfer(voices_dir: Path | str, results: dict[str, dict], *,
+                   measured: str | None = None) -> str | None:
+    """Merge measured per-emotion quality into `_basis.json`. Returns a reason.
+
+    ``None`` means written. A SENTENCE means nothing was written and why -- the
+    harness prints it and exits, because a quality number for a basis that is
+    not there (or is not the one that was measured) would license voices nobody
+    tested.
+
+    Merged, never replaced: measuring `angry` today must not erase last week's
+    `whisper`. Rebuilding the basis DOES erase all of it (see :func:`write`) --
+    new directions are not the ones that were measured.
+    """
+    voices_dir = Path(voices_dir)
+    _tensors_path, json_path = paths(voices_dir)
+    if not json_path.is_file():
+        return ("no emotion basis has been built for this install -- there is "
+                "nothing to record transfer quality against")
+    try:
+        raw = json.loads(json_path.read_text("utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        return f"the emotion basis manifest is unreadable ({exc})"
+    if not isinstance(raw, dict) or raw.get("version") != BASIS_VERSION:
+        return ("the emotion basis was built by a different version -- rebuild "
+                "it before measuring transfer quality")
+
+    stamp = measured or datetime.now(timezone.utc).isoformat(
+        timespec="seconds").replace("+00:00", "Z")
+    block = raw.get(TRANSFER_KEY)
+    kept: dict = {}
+    if isinstance(block, dict) and block.get("version") == TRANSFER_VERSION:
+        existing = block.get("emotions")
+        if isinstance(existing, dict):
+            kept = dict(existing)
+    for emotion, entry in results.items():
+        if emotion not in (raw.get("emotions") or {}):
+            # A direction that is not in this file cannot have been measured
+            # against it. Skipped rather than invented.
+            continue
+        kept[str(emotion)] = {**entry, "measured": stamp}
+    raw[TRANSFER_KEY] = {"version": TRANSFER_VERSION, "measured": stamp,
+                         "emotions": {e: kept[e] for e in sorted(kept)}}
+    from service.atomicio import atomic_write_text
+
+    # Atomic: this is a read-modify-write of a file the derive endpoint reads on
+    # every request, and a torn manifest would take the whole feature offline.
+    atomic_write_text(json_path, json.dumps(raw, indent=2))
+    return None
+
+
+def transfer_gate(basis: Basis, emotion: str, *,
+                  min_quality: float = MIN_TRANSFER_QUALITY,
+                  ) -> tuple[TransferQuality | None, str | None]:
+    """``(measurement, refusal)`` -- the quality bar, enforced.
+
+    Three outcomes, and the middle one is the whole point:
+
+      * measured and good -> ``(entry, None)``: derive, and record the number.
+      * measured and BAD  -> ``(entry, sentence)``: refuse, naming both numbers
+        and what to do about it.
+      * never measured    -> ``(None, None)``: derive anyway. Absence of a
+        measurement is not evidence of a bad voice, and a bar that refused
+        everything until someone ran the harness would make the harness a
+        deployment prerequisite for a feature that works without it.
+    """
+    entry = basis.transfer.get(emotion)
+    if entry is None:
+        return None, None
+    if entry.quality < min_quality:
+        return entry, (
+            f"'{emotion}' was measured deriving worse than the recordings it "
+            f"stands in for (transfer quality {entry.quality:.2f} across "
+            f"{entry.speakers} speaker(s), needs {min_quality:.2f}) -- record "
+            f"this emotion, or improve the basis and re-run the A/B harness")
+    return entry, None
 
 
 def direction(basis: Basis, emotion: str, *,

@@ -454,5 +454,309 @@ class OneIdentityTests(_RouteCase):
         self.assertEqual(inert.headers["x-speech-digest"], plain)
 
 
+class BuildIdentityTests(unittest.TestCase):
+    """A build has a name too, and it is a function of its lines."""
+
+    LINES = [{"id": "b", "digest": "sha256:" + "1" * 64, "format": "wav_24000"},
+             {"id": "a", "digest": "sha256:" + "2" * 64, "format": "mp3_24000_128"}]
+
+    def test_build_id_is_stable_and_order_insensitive(self) -> None:
+        first = buildstore.build_id(self.LINES)
+        self.assertEqual(first, buildstore.build_id(list(reversed(self.LINES))))
+        self.assertEqual(len(first), 64)
+        self.assertEqual(buildstore.parse_build_id(first), first)
+
+    def test_any_line_change_renames_the_build(self) -> None:
+        base = buildstore.build_id(self.LINES)
+        for mutation in ({"id": "c"}, {"digest": "sha256:" + "3" * 64},
+                         {"format": "wav_48000"}):
+            with self.subTest(mutation=mutation):
+                moved = [dict(self.LINES[0], **mutation), self.LINES[1]]
+                self.assertNotEqual(buildstore.build_id(moved), base)
+
+    def test_build_ids_are_rejected_before_they_become_paths(self) -> None:
+        for bad in ("", "..", "../../etc/passwd", "a" * 63, "zz" * 32):
+            with self.subTest(value=bad):
+                with self.assertRaises(ValueError):
+                    buildstore.parse_build_id(bad)
+
+
+class LockfileTests(unittest.TestCase):
+    """gravitone.lock: versioned, sorted, and free of anything that moves."""
+
+    LINES = [
+        {"id": "scene-2", "digest": "sha256:" + "b" * 64, "voice": "alba",
+         "format": "wav_24000", "engine_version": "pocket_tts/1"},
+        {"id": "scene-1", "digest": "sha256:" + "a" * 64, "voice": "sarah",
+         "format": "mp3_24000_128", "engine_version": "pocket_tts/1"},
+    ]
+
+    def test_schema_shape_is_versioned_and_complete(self) -> None:
+        doc = buildstore.lockfile(self.LINES)
+        self.assertEqual(doc["schema_version"], buildstore.LOCKFILE_SCHEMA_VERSION)
+        self.assertEqual(doc["identity_version"], buildstore.IDENTITY_VERSION)
+        self.assertEqual(set(doc["lines"]), {"scene-1", "scene-2"})
+        self.assertEqual(set(doc["lines"]["scene-1"]),
+                         {"digest", "engine_version", "voice", "format"})
+        self.assertEqual(doc["lines"]["scene-1"]["voice"], "sarah")
+
+    def test_rendered_bytes_are_sorted_and_reproducible(self) -> None:
+        forward = buildstore.lockfile_bytes(buildstore.lockfile(self.LINES))
+        backward = buildstore.lockfile_bytes(
+            buildstore.lockfile(list(reversed(self.LINES))))
+        self.assertEqual(forward, backward, "a lockfile diff must be about audio")
+        text = forward.decode()
+        self.assertLess(text.index("scene-1"), text.index("scene-2"))
+        self.assertTrue(text.endswith("\n"))
+
+    def test_nothing_in_the_document_moves_on_its_own(self) -> None:
+        # No clock, no host, no counter: the whole file is a function of inputs.
+        blob = buildstore.lockfile_bytes(buildstore.lockfile(self.LINES)).decode()
+        for moving in ("generated", "timestamp", "_at", "host", "build_id"):
+            with self.subTest(field=moving):
+                self.assertNotIn(moving, blob)
+
+    def test_duplicate_ids_are_a_named_refusal(self) -> None:
+        dupes = [dict(self.LINES[0]), dict(self.LINES[0])]
+        with self.assertRaises(ValueError) as caught:
+            buildstore.lockfile(dupes)
+        self.assertIn(buildstore.DUPLICATE_LINE_ID, str(caught.exception))
+        self.assertIn("scene-2", str(caught.exception))
+
+
+class ZipAssemblyTests(unittest.TestCase):
+    def test_member_names_are_safe_unique_and_extension_correct(self) -> None:
+        names = buildstore.zip_member_names([
+            {"id": "../../etc/passwd", "format": "wav_24000"},
+            {"id": "scene 1", "format": "mp3_24000_128"},
+            {"id": "scene/1", "format": "mp3_24000_128"},
+            {"id": "...", "format": None},
+        ])
+        self.assertEqual(len(set(names)), 4)
+        for name in names:
+            with self.subTest(name=name):
+                self.assertTrue(name.startswith("audio/"))
+                self.assertNotIn("..", name)
+                self.assertEqual(name.count("/"), 1)
+        self.assertTrue(names[1].endswith(".mp3"))
+        self.assertTrue(names[3].endswith(".wav"), "no format means the default")
+        # "scene 1" and "scene/1" both sanitize to scene_1.mp3 -> disambiguated.
+        self.assertEqual(names[1], "audio/scene_1.mp3")
+        self.assertEqual(names[2], "audio/scene_1-2.mp3")
+
+    def test_stream_zip_yields_a_readable_deterministic_archive(self) -> None:
+        import io
+        import zipfile as zf
+
+        members = [("gravitone.lock", b"{}\n"), ("audio/a.wav", b"RIFFxxxx")]
+        first = b"".join(buildstore.stream_zip(iter(members)))
+        second = b"".join(buildstore.stream_zip(iter(members)))
+        self.assertEqual(first, second, "an unchanged build zips to the same bytes")
+        with zf.ZipFile(io.BytesIO(first)) as archive:
+            self.assertIsNone(archive.testzip())
+            self.assertEqual(archive.namelist(), ["gravitone.lock", "audio/a.wav"])
+            self.assertEqual(archive.read("audio/a.wav"), b"RIFFxxxx")
+
+    def test_members_are_streamed_not_collected(self) -> None:
+        seen = []
+
+        def _lazy():
+            for i in range(3):
+                seen.append(i)
+                yield f"audio/{i}.wav", b"x" * 8
+                # By the time member i is yielded, only i+1 have been produced.
+                self.assertEqual(len(seen), i + 1)
+
+        list(buildstore.stream_zip(_lazy()))
+        self.assertEqual(seen, [0, 1, 2])
+
+
+class BuildRecordStoreTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.store = buildstore.BuildStore(root=self.root, max_bytes=4096)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _record(self, n: int) -> dict:
+        return {"build_id": f"{n:064x}", "lines": [{"id": "l1", "digest": "d"}]}
+
+    def test_round_trip(self) -> None:
+        self.assertTrue(self.store.put_record(self._record(1)))
+        got = self.store.get_record(f"{1:064x}")
+        self.assertEqual(got["lines"][0]["id"], "l1")
+        self.assertIsNone(self.store.get_record(f"{2:064x}"))
+
+    def test_a_record_is_not_an_artifact(self) -> None:
+        self.store.put_record(self._record(3))
+        self.assertEqual(self.store.entries(), [], "records own no audio bytes")
+        self.assertEqual(self.store.stats()["builds"], 1)
+
+    def test_malformed_ids_never_become_paths(self) -> None:
+        self.assertFalse(self.store.put_record({"build_id": "../../evil"}))
+        self.assertIsNone(self.store.get_record("../../evil"))
+
+    def test_records_are_capped_by_count(self) -> None:
+        prior = buildstore.BUILD_RECORDS_MAX
+        buildstore.BUILD_RECORDS_MAX = 3
+        try:
+            for n in range(6):
+                self.store.put_record(self._record(n))
+                time.sleep(0.01)
+            self.assertLessEqual(len(self.store.records()), 3)
+            self.assertIsNotNone(self.store.get_record(f"{5:064x}"))
+            self.assertIsNone(self.store.get_record(f"{0:064x}"))
+        finally:
+            buildstore.BUILD_RECORDS_MAX = prior
+
+    def test_a_disabled_store_records_nothing(self) -> None:
+        store = buildstore.BuildStore(root=self.root, max_bytes=0)
+        self.assertFalse(store.put_record(self._record(4)))
+
+
+class LockRouteTests(_RouteCase):
+    _MANIFEST = {"lines": [
+        {"id": "l2", "voice": "alba", "text": "Second line."},
+        {"id": "l1", "voice": "alba", "text": "Hello world."},
+    ]}
+
+    def test_lock_names_every_line_without_synthesizing(self) -> None:
+        r = self.client.post("/v1/build/lock", json=self._MANIFEST)
+        self.assertEqual(r.status_code, 200)
+        doc = r.json()
+        self.assertEqual(doc["schema_version"], buildstore.LOCKFILE_SCHEMA_VERSION)
+        self.assertEqual(list(doc["lines"]), ["l1", "l2"], "sorted for clean diffs")
+        self.assertEqual(doc["lines"]["l1"]["voice"], "alba")
+        self.assertTrue(doc["lines"]["l1"]["digest"].startswith("sha256:"))
+        self.assertIn("pocket_tts", doc["lines"]["l1"]["engine_version"])
+        self.assertEqual(len(self.engine.jobs), 0, "a lockfile is not a render")
+
+    def test_the_locked_digest_is_the_digest_the_build_produces(self) -> None:
+        doc = self.client.post("/v1/build/lock", json=self._MANIFEST).json()
+        built = self.client.post("/v1/build", json=self._MANIFEST).json()
+        by_id = {l["id"]: l["digest"] for l in built["lines"]}
+        for line_id, entry in doc["lines"].items():
+            with self.subTest(line=line_id):
+                self.assertEqual(entry["digest"], by_id[line_id])
+
+    def test_duplicate_line_ids_are_refused_by_name(self) -> None:
+        r = self.client.post("/v1/build/lock", json={"lines": [
+            {"id": "same", "voice": "alba", "text": "One."},
+            {"id": "same", "voice": "alba", "text": "Two."}]})
+        self.assertEqual(r.status_code, 422)
+        self.assertIn("same", r.json()["detail"])
+        self.assertIn(buildstore.DUPLICATE_LINE_ID, r.json()["detail"])
+
+    def test_an_unknown_voice_fails_the_lock_naming_the_line(self) -> None:
+        r = self.client.post("/v1/build/lock", json={"lines": [
+            {"id": "bad", "voice": "no-such-voice-xyz", "text": "Nope."}]})
+        self.assertEqual(r.status_code, 404)
+        self.assertIn("bad", r.json()["detail"])
+
+
+class BuildZipTests(_RouteCase):
+    _MANIFEST = {"lines": [
+        {"id": "l1", "voice": "alba", "text": "Hello world."},
+        {"id": "l2", "voice": "alba", "text": "Second line.", "format": "wav_48000"},
+    ]}
+
+    def _archive(self, content: bytes):
+        import io
+        import zipfile as zf
+        return zf.ZipFile(io.BytesIO(content))
+
+    def test_a_build_is_fetchable_as_one_zip(self) -> None:
+        built = self.client.post("/v1/build", json=self._MANIFEST).json()
+        build_id = built["build_id"]
+        self.assertEqual(len(build_id), 64)
+        jobs = len(self.engine.jobs)
+
+        r = self.client.get(f"/v1/build/{build_id}.zip")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers["content-type"], "application/zip")
+        self.assertIn(build_id[:12], r.headers["content-disposition"])
+        self.assertEqual(len(self.engine.jobs), jobs,
+                         "a zip is a read of the store, never a re-render")
+
+        with self._archive(r.content) as archive:
+            self.assertIsNone(archive.testzip())
+            self.assertEqual(archive.namelist(),
+                             ["gravitone.lock", "audio/l1.wav", "audio/l2.wav"])
+            lock = json.loads(archive.read("gravitone.lock"))
+            self.assertEqual(lock["schema_version"],
+                             buildstore.LOCKFILE_SCHEMA_VERSION)
+            digest = lock["lines"]["l1"]["digest"]
+            served = self.client.get(f"/v1/audio/{digest}")
+            self.assertEqual(archive.read("audio/l1.wav"), served.content)
+
+    def test_the_build_id_is_stable_across_identical_builds(self) -> None:
+        first = self.client.post("/v1/build", json=self._MANIFEST).json()
+        second = self.client.post("/v1/build", json=self._MANIFEST).json()
+        self.assertEqual(first["build_id"], second["build_id"])
+        plan = self.client.post("/v1/build/plan", json=self._MANIFEST).json()
+        self.assertEqual(plan["build_id"], first["build_id"],
+                         "a dry run names the build it would produce")
+
+    def test_an_edit_renames_the_build(self) -> None:
+        first = self.client.post("/v1/build", json=self._MANIFEST).json()
+        edited = {"lines": [self._MANIFEST["lines"][0],
+                            {"id": "l2", "voice": "alba", "text": "Edited."}]}
+        second = self.client.post("/v1/build", json=edited).json()
+        self.assertNotEqual(first["build_id"], second["build_id"])
+        # ...and the old build is still fetchable under its own name.
+        self.assertEqual(
+            self.client.get(f"/v1/build/{first['build_id']}.zip").status_code, 200)
+
+    def test_unknown_build_is_a_named_404(self) -> None:
+        r = self.client.get("/v1/build/" + "c" * 64 + ".zip")
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["detail"], buildstore.BUILD_NOT_FOUND)
+
+    def test_malformed_build_id_is_a_400_and_never_a_path(self) -> None:
+        r = self.client.get("/v1/build/not-a-build-id.zip")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("64 hex", r.json()["detail"])
+
+    def test_a_pruned_artifact_is_a_named_410_before_any_bytes(self) -> None:
+        built = self.client.post("/v1/build", json=self._MANIFEST).json()
+        gone = built["lines"][0]["digest"]
+        bare = buildstore.parse_digest(gone)
+        root = appmod.BUILD_STORE.root
+        (root / bare[:2] / f"{bare}.bin").unlink()
+
+        r = self.client.get(f"/v1/build/{built['build_id']}.zip")
+        self.assertEqual(r.status_code, 410)
+        self.assertIn(buildstore.BUILD_PRUNED, r.json()["detail"])
+        self.assertIn(gone, r.json()["detail"])
+
+    def test_a_build_over_the_zip_budget_is_a_named_413(self) -> None:
+        built = self.client.post("/v1/build", json=self._MANIFEST).json()
+        prior = os.environ.get("GRAVITONE_BUILD_ZIP_MAX_BYTES")
+        os.environ["GRAVITONE_BUILD_ZIP_MAX_BYTES"] = "16"
+        try:
+            r = self.client.get(f"/v1/build/{built['build_id']}.zip")
+        finally:
+            if prior is None:
+                os.environ.pop("GRAVITONE_BUILD_ZIP_MAX_BYTES", None)
+            else:
+                os.environ["GRAVITONE_BUILD_ZIP_MAX_BYTES"] = prior
+        self.assertEqual(r.status_code, 413)
+        self.assertIn("GRAVITONE_BUILD_ZIP_MAX_BYTES", r.json()["detail"])
+
+    def test_duplicate_ids_build_but_ship_no_lock_member(self) -> None:
+        built = self.client.post("/v1/build", json={"lines": [
+            {"id": "same", "voice": "alba", "text": "One."},
+            {"id": "same", "voice": "alba", "text": "Two."}]}).json()
+        r = self.client.get(f"/v1/build/{built['build_id']}.zip")
+        self.assertEqual(r.status_code, 200)
+        with self._archive(r.content) as archive:
+            names = archive.namelist()
+        self.assertNotIn("gravitone.lock", names,
+                         "a lock that dropped a line is worse than no lock")
+        self.assertEqual(len(set(names)), 2)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

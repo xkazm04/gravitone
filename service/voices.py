@@ -68,6 +68,13 @@ BUILTIN_IDS = frozenset(vid for vid, _ in BUILTIN)
 RECORDED = "recorded"
 DERIVED = "derived"
 
+# What a derived Voice says about its measured quality when nothing measured it
+# (no A/B harness run, or a donor transplant, which the harness does not test).
+# `quality: None` — never a fabricated 0 — plus a word for WHY it is null, so a
+# reader can tell "not tested" apart from "tested and bad", which is the whole
+# difference the transfer gate exists to keep.
+UNMEASURED_TRANSFER = {"quality": None, "state": "unmeasured"}
+
 
 class Voice(BaseModel):
     voice_id: str
@@ -1445,6 +1452,10 @@ def derive_emotion(character_id: str, emotion: str,
             confidence = basis.emotions[emotion].coherence
         source = {"source": "donor", "donor": donor.character_id,
                   "donor_name": donor.name, "donor_voice_id": take.voice_id}
+        # The A/B harness measures BASIS directions; a donor transplant is a
+        # different mechanism nobody measured, so it records "unmeasured" rather
+        # than borrowing a number that was not about it.
+        transfer = UNMEASURED_TRANSFER
     else:
         basis, reason = emotion_basis.load(VOICES_DIR)
         if basis is None:
@@ -1452,6 +1463,20 @@ def derive_emotion(character_id: str, emotion: str,
         entry, reason = emotion_basis.direction(basis, emotion)
         if entry is None:
             raise HTTPException(422, reason or f"'{emotion}' cannot be derived")
+        # The QUALITY bar, on top of the coherence bar above. Coherence says the
+        # residuals agree; transfer quality says a derived voice built from them
+        # actually lands where the recording it stands in for lands (measured by
+        # service/tools/derive_ab.py). An emotion measured BELOW the bar is
+        # refused here — the whole point of measuring it. An emotion nobody has
+        # measured is allowed and says so on the row: absence of a measurement
+        # is not evidence of a bad voice.
+        measured, refusal = emotion_basis.transfer_gate(basis, emotion)
+        if refusal is not None:
+            raise HTTPException(422, refusal)
+        transfer = UNMEASURED_TRANSFER if measured is None else {
+            "quality": measured.quality, "speakers": measured.speakers,
+            "in_sample": measured.in_sample,
+            "version": emotion_basis.TRANSFER_VERSION}
         vector, alpha = entry.vector, entry.alpha
         basis_version, confidence = basis.version, entry.coherence
         source = {"source": "basis", "donor": None,
@@ -1507,6 +1532,11 @@ def derive_emotion(character_id: str, emotion: str,
                              "from_voice_id": base.voice_id,
                              "basis_version": basis_version,
                              "alpha": round(float(alpha), 6),
+                             # Rides INSIDE derived_from so it reaches every
+                             # surface that already reads provenance — the
+                             # roster, the manifest, and a .gravichar pack —
+                             # without a new field on the Voice model.
+                             "transfer": dict(transfer),
                              "at": created},
         }
         # The consent receipt, copied WORD FOR WORD off the baseline — never a

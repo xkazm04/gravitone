@@ -7,6 +7,8 @@ import { notFound } from "next/navigation";
 import { Wordmark } from "@/components/ui/Primitives";
 import { loadLineage, loadTake } from "@/lib/takes";
 import Lineage from "./Lineage";
+import RePerform, { ReperformProvenance } from "./RePerform";
+import TakeScore from "./TakeScore";
 import OpenInRack from "./OpenInRack";
 import TakeCard from "./TakeCard";
 
@@ -50,8 +52,11 @@ export default async function TakePage({ params }: { params: Promise<{ id: strin
         <div className="pt-8">
           <TakeCard take={take} />
         </div>
+        <TakeScore take={take} />
 
         {lineage && <Lineage lineage={lineage} />}
+        <ReperformProvenance take={take} />
+        <RePerform take={take} />
         <OpenInRack take={take} />
 
         {/* try-it-yourself CTA — every share is a landing page */}

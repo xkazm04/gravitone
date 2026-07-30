@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 
+import { NARRATABLE, clipKey, narrationPlan } from "@/lib/narratable";
 import NarrationDock, {
   AUTO_NARRATOR, INITIAL_DOCK, pickNarrator, reduceDock,
   type DockEvent, type DockState,
@@ -217,5 +218,192 @@ describe("<NarrationDock />", () => {
     openDock();
     await waitFor(() =>
       expect((screen.getByRole("combobox") as HTMLSelectElement).value).toBe("marius"));
+  });
+});
+
+// ── the build-time bake ──────────────────────────────────────────────────────
+//
+// A baked clip must be preferred over synthesis and must be the SAME audio.
+// The test asserts the second half of that by construction: the key the dock
+// asks for is `clipKey`, computed here from the same registry the bake walks.
+
+// jsdom has no object-URL support, and the existing suite never needed it
+// (nothing in it ever reaches playback). These tests do.
+function stubObjectUrls() {
+  const url = URL as unknown as Record<string, unknown>;
+  beforeEach(() => {
+    url.createObjectURL = vi.fn(() => "blob:narration");
+    url.revokeObjectURL = vi.fn();
+  });
+  // Deliberately NOT torn down: React's unmount cleanup revokes the object URL
+  // during Testing Library's own afterEach, which runs after this one — a
+  // delete here would make every play test fail in teardown.
+}
+
+function wav(): Blob {
+  return new Blob([new Uint8Array([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0])], { type: "audio/wav" });
+}
+
+/** Serve the roster, a manifest, baked clips and /api/speak — recording which
+ *  of them was actually used. */
+function serveBaked(clips: Record<string, number>) {
+  const seen: string[] = [];
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+    const url = String(typeof input === "object" && "url" in input ? input.url : input);
+    seen.push(url);
+    if (url.includes("/api/characters")) {
+      return new Response(JSON.stringify([ALBA]), {
+        status: 200, headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (url.includes("/narration/manifest.json")) {
+      return new Response(JSON.stringify({
+        version: 1, character_id: "alba", character_name: "Alba",
+        generated: "2026-07-30T00:00:00Z", clips,
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    if (/\/narration\/[0-9a-f]{16}\.wav$/.test(url)) return new Response(wav(), { status: 200 });
+    if (url.includes("/api/speak")) return new Response(wav(), { status: 200 });
+    throw new Error(`unexpected request to ${url}`);
+  });
+  return seen;
+}
+
+const firstKey = () => {
+  const step = narrationPlan(NARRATABLE["/"])[0];
+  return clipKey("alba", step.block, step.sentence);
+};
+
+describe("<NarrationDock /> and the baked bundle", () => {
+  stubObjectUrls();
+
+  it("says a baked page costs no engine, before anything is played", async () => {
+    serveBaked({ [firstKey()]: 4096 });
+    render(<NarrationDock />);
+    openDock();
+    await waitFor(() =>
+      expect(screen.getByRole("status")).toHaveTextContent(/baked with Alba/i));
+  });
+
+  it("plays the BAKED file instead of calling the synthesis relay", async () => {
+    const key = firstKey();
+    const seen = serveBaked({ [key]: 4096 });
+    render(<NarrationDock />);
+    openDock();
+    await screen.findByRole("option", { name: "Alba" });
+    fireEvent.click(screen.getByRole("button", { name: /play the narration/i }));
+    await waitFor(() =>
+      expect(screen.getByRole("status")).toHaveTextContent(/baked at build time/i));
+    expect(seen.some((u) => u.endsWith(`/narration/${key}.wav`))).toBe(true);
+    expect(seen.some((u) => u.includes("/api/speak"))).toBe(false);
+  });
+
+  it("falls through to live synthesis for a sentence that was never baked", async () => {
+    const seen = serveBaked({ ffffffffffffffff: 1 });
+    render(<NarrationDock />);
+    openDock();
+    await screen.findByRole("option", { name: "Alba" });
+    fireEvent.click(screen.getByRole("button", { name: /play the narration/i }));
+    await waitFor(() =>
+      expect(screen.getByRole("status")).toHaveTextContent(/rendered just now/i));
+    expect(seen.some((u) => u.includes("/api/speak"))).toBe(true);
+  });
+
+  it("a deployment with no bake is the ordinary case, not an error", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(typeof input === "object" && "url" in input ? input.url : input);
+      if (url.includes("/api/characters")) {
+        return new Response(JSON.stringify([ALBA]), {
+          status: 200, headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url.includes("/narration/manifest.json")) return new Response("", { status: 404 });
+      throw new Error(`unexpected request to ${url}`);
+    });
+    render(<NarrationDock />);
+    openDock();
+    await screen.findByRole("option", { name: "Alba" });
+    expect(screen.getByRole("status")).not.toHaveTextContent(/baked/i);
+    expect(screen.getByRole("status")).not.toHaveTextContent(/error|failed/i);
+  });
+});
+
+// ── ?narration=<id>: the /v1/narrate consumer ────────────────────────────────
+
+function setSearch(query: string) {
+  window.history.replaceState({}, "", `/${query}`);
+}
+
+const PLAN = {
+  narration_id: "n1a2b3c4",
+  title: "Someone else's docs",
+  blocks: [{
+    id: "b000", label: "Intro", text: "This page came from the narrate endpoint.",
+    emotion: "calm", character_hint: "measured", role: "lead",
+  }],
+};
+
+function serveNarration(responder: (url: string) => Response) {
+  return vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+    const url = String(typeof input === "object" && "url" in input ? input.url : input);
+    if (url.includes("/api/characters")) {
+      return new Response(JSON.stringify([ALBA]), {
+        status: 200, headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (url.includes("/narration/manifest.json")) return new Response("", { status: 404 });
+    return responder(url);
+  });
+}
+
+describe("<NarrationDock /> playing an arbitrary narration id", () => {
+  stubObjectUrls();
+  afterEach(() => setSearch(""));
+
+  it("plays a plan fetched by id, on a route the registry does not cover", async () => {
+    mockPath = "/playground"; // no registry entry at all
+    setSearch("?narration=n1a2b3c4");
+    serveNarration((url) => url.includes("/api/narrate/n1a2b3c4")
+      ? new Response(JSON.stringify(PLAN), {
+          status: 200, headers: { "Content-Type": "application/json" } })
+      : new Response("", { status: 404 }));
+    render(<NarrationDock />);
+    await waitFor(() => expect(pill()).toBeInTheDocument());
+    openDock();
+    expect(await screen.findByText("Someone else's docs")).toBeInTheDocument();
+    expect(screen.getByText(/came from the narrate endpoint/i)).toBeInTheDocument();
+  });
+
+  it("NAMES a plan that has aged out rather than falling silently back", async () => {
+    setSearch("?narration=n1a2b3c4");
+    serveNarration(() => new Response(
+      JSON.stringify({ detail: "narration not found - plans are evicted oldest-first" }),
+      { status: 404, headers: { "Content-Type": "application/json" } }));
+    render(<NarrationDock />);
+    await waitFor(() => expect(pill()).toBeInTheDocument());
+    openDock();
+    await waitFor(() =>
+      expect(screen.getByRole("status")).toHaveTextContent(/evicted oldest-first/i));
+  });
+
+  it("refuses an id that is not an id without making a request", async () => {
+    setSearch("?narration=../../etc/passwd");
+    const spy = serveNarration(() => new Response("", { status: 500 }));
+    render(<NarrationDock />);
+    await waitFor(() => expect(pill()).toBeInTheDocument());
+    openDock();
+    await waitFor(() =>
+      expect(screen.getByRole("status")).toHaveTextContent(/not a valid id/i));
+    expect(spy.mock.calls.every(([i]) =>
+      !String(i).includes("/api/narrate"))).toBe(true);
+  });
+
+  it("still does not play anything on its own", async () => {
+    setSearch("?narration=n1a2b3c4");
+    serveNarration(() => new Response(JSON.stringify(PLAN), {
+      status: 200, headers: { "Content-Type": "application/json" } }));
+    render(<NarrationDock />);
+    await waitFor(() => expect(pill()).toBeInTheDocument());
+    expect(HTMLMediaElement.prototype.play).not.toHaveBeenCalled();
   });
 });
