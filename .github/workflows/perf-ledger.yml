@@ -32,9 +32,12 @@ name: perf-ledger
 on:
   pull_request:
     paths:
-      - "service/**"
-      - "requirements.txt"
-      - "benchmark_arm*.sh"
+      # The repo root is arm/; the application lives one level down in
+      # gravitone/. Path filters are always workspace-relative, so they carry
+      # the prefix. Every `run:` step below gets it via defaults.working-directory.
+      - "gravitone/service/**"
+      - "gravitone/requirements.txt"
+      - "gravitone/benchmark_arm*.sh"
       - ".github/workflows/perf-ledger.yml"
   # The cloud matrix costs money and takes ~40 min per box, so it is NEVER
   # per-PR: weekly, or on demand.
@@ -68,6 +71,11 @@ jobs:
     # alternative (hosted runners are shared silicon and noisier).
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
+
+    defaults:
+      run:
+        # Repo root is arm/; every command here expects the application root.
+        working-directory: gravitone
 
     env:
       # Fixed for the LIFE of the gate: a diff across fast-math modes is a
@@ -223,11 +231,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: perf-pr-${{ github.event.pull_request.number }}
+          # `path:` is workspace-relative and is NOT covered by
+          # defaults.working-directory, so it needs the prefix spelled out.
           path: |
-            service/loadtest_result.json
-            certification.json
-            perf-diff.json
-            logs/server.log
+            gravitone/service/loadtest_result.json
+            gravitone/certification.json
+            gravitone/perf-diff.json
+            gravitone/logs/server.log
           if-no-files-found: warn
 
       - name: Stop the service
@@ -243,6 +253,10 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest      # a driver, not a benchmark: x86 is fine here
     timeout-minutes: 90
+
+    defaults:
+      run:
+        working-directory: gravitone
 
     strategy:
       # NEVER parallel: `find_instance` in aws/run_benchmark.sh looks the box up
@@ -358,8 +372,9 @@ jobs:
             The certificate carries its own sha256 (and HMAC when the secret is
             set). `python -m service.certify --append-ledger` verified every
             existing row against its artifact before appending this one.
+          # Workspace-relative, like every non-`run` step input.
           add-paths: |
-            docs/certifications/**
+            gravitone/docs/certifications/**
 
       - name: Upload the raw run
         if: always()
@@ -367,9 +382,9 @@ jobs:
         with:
           name: perf-cloud-${{ matrix.type }}
           path: |
-            bench-${{ matrix.type }}.log
-            certification-${{ matrix.type }}.json
-            service/loadtest_result.json
+            gravitone/bench-${{ matrix.type }}.log
+            gravitone/certification-${{ matrix.type }}.json
+            gravitone/service/loadtest_result.json
           if-no-files-found: warn
 
       # ALWAYS. An instance left running because a step failed is a bill that

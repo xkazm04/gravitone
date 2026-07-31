@@ -34,10 +34,14 @@ on:
   workflow_dispatch:
   pull_request:
     paths:
-      - "Dockerfile"
-      - "requirements.txt"
-      - "service/**"
-      - "scripts/airgap-install.sh"
+      # Repo root is arm/; the application root is gravitone/. Path filters are
+      # workspace-relative; the `run:` steps get the prefix from
+      # defaults.working-directory below (which also makes `docker build .`
+      # use gravitone/ as its build context).
+      - "gravitone/Dockerfile"
+      - "gravitone/requirements.txt"
+      - "gravitone/service/**"
+      - "gravitone/scripts/airgap-install.sh"
       - ".github/workflows/sealed.yml"
 
 permissions:
@@ -51,6 +55,11 @@ jobs:
     # Graviton box both work; the label is the first thing to fix on a real run.
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 120
+
+    defaults:
+      run:
+        # Repo root is arm/; `docker build ... .` must see the application root.
+        working-directory: gravitone
 
     steps:
       - uses: actions/checkout@v4
@@ -250,9 +259,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: appliance-manifest
+          # Workspace-relative; upload-artifact ignores defaults.working-directory.
           path: |
-            appliance.json
-            gravitone-ci.manifest.json
+            gravitone/appliance.json
+            gravitone/gravitone-ci.manifest.json
           if-no-files-found: warn
 
       - name: Logs on failure

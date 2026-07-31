@@ -1,0 +1,26 @@
+.venv/
+__pycache__/
+*.pyc
+logs/
+results/
+recordings/
+samples/
+voices/*.safetensors
+*.wav
+*.mp3
+service/loadtest_result.json
+.research-cache/
+.env
+api_keys.json
+emotion_demand.json
+# Anchored: these are the runtime take/review stores at this directory's root.
+# Unanchored they also swallow web/app/api/takes and web/app/api/reviews, which
+# are tracked source.
+/takes/
+/reviews/
+.worktrees/
+ingest_jobs/
+recordings/
+piper_voices/
+diarization_models/
+build_store/

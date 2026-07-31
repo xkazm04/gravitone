@@ -1,0 +1,346 @@
+{
+  "$schema": "https://vibeman.dev/schemas/context-map.json",
+  "projectId": "ff2330f6-0dce-491b-8b6f-a2f5214272af",
+  "projectName": "Gravitone",
+  "projectPath": "C:/Users/mkdol/dolla/arm",
+  "version": "2.0.0",
+  "groups": [
+    {
+      "name": "TTS Service Core",
+      "domain": "feature",
+      "type": null,
+      "color": "#3B82F6",
+      "icon": null,
+      "contexts": [
+        {
+          "name": "Voice & Emotion Library",
+          "description": "Catalog of available voices and emotion presets; parses emotion-tagged text segments and resolves them to voice/temperature settings for expressive synthesis.",
+          "businessFeature": "Voice & Emotion Library",
+          "category": "lib",
+          "filePaths": [
+            "gravitone/service/voices.py",
+            "gravitone/service/emotions.py"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/v1/voices"
+          ]
+        },
+        {
+          "name": "Voice Cloning & Ingest Pipeline",
+          "description": "Turn a short reference clip into a reusable voice embedding: audio cleanup to 24kHz mono, speaker separation, emotion previews, export to safetensors served like any built-in voice.",
+          "businessFeature": "Voice Cloning & Ingest Pipeline",
+          "category": "api",
+          "filePaths": [
+            "gravitone/service/ingest.py",
+            "gravitone/service/ingest_api.py",
+            "gravitone/service/export_stems.py",
+            "gravitone/clone_test.sh"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/ingest"
+          ]
+        },
+        {
+          "name": "Concurrency Engine & Metrics",
+          "description": "Bounded pool of independent Pocket TTS model instances with admission queue, HTTP 429 backpressure, and live metrics (in-flight, queue depth, latency percentiles, real-time factor); wav concat and mp3 encoding.",
+          "businessFeature": "Concurrency Engine & Metrics",
+          "category": "lib",
+          "filePaths": [
+            "gravitone/service/engine.py",
+            "gravitone/service/replicas.py"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Speech Synthesis API",
+          "description": "ElevenLabs-compatible HTTP endpoint: POST /v1/text-to-speech/{voice_id} returns wav/mp3/pcm audio with timing headers, plus /health and /metrics; optional xi-api-key auth and API-key management router.",
+          "businessFeature": "Speech Synthesis API",
+          "category": "api",
+          "filePaths": [
+            "gravitone/service/app.py",
+            "gravitone/service/config.py",
+            "gravitone/service/keys.py"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/v1/text-to-speech/{voice_id}",
+            "/v1/voices",
+            "/health",
+            "/metrics"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Performance & Deployment",
+      "domain": "infrastructure",
+      "type": null,
+      "color": "#10B981",
+      "icon": null,
+      "contexts": [
+        {
+          "name": "Packaging & Deployment",
+          "description": "Containerized deployment of the CPU-only Arm-native service: Dockerfile, Python dependency pinning, and the hackathon-facing runbook.",
+          "businessFeature": "Packaging & Deployment",
+          "category": "config",
+          "filePaths": [
+            "gravitone/Dockerfile",
+            "gravitone/requirements.txt",
+            "gravitone/README.md"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Load Testing & Benchmarks",
+          "description": "Ramp parallel requests against the service and report the degradation knee, throughput ceiling, latency percentiles, CPU/RAM — reproducible across Arm variants (Graviton, dev box).",
+          "businessFeature": "Load Testing & Benchmarks",
+          "category": "test",
+          "filePaths": [
+            "gravitone/service/loadtest.py",
+            "gravitone/benchmark_arm.sh",
+            "gravitone/benchmark_t4g.sh",
+            "gravitone/aws/run_benchmark.sh",
+            "gravitone/service/tests/test_loadtest.py"
+          ],
+          "target": null,
+          "apiRoutes": []
+        }
+      ]
+    },
+    {
+      "name": "Web Studio",
+      "domain": "feature",
+      "type": null,
+      "color": "#EC4899",
+      "icon": null,
+      "contexts": [
+        {
+          "name": "Auth & Profile",
+          "description": "Firebase-backed sign-in, session state via useAuth provider, user menu, and profile page.",
+          "businessFeature": "Auth & Profile",
+          "category": "ui",
+          "filePaths": [
+            "gravitone-web/app/profile/page.tsx",
+            "gravitone-web/lib/useAuth.tsx",
+            "gravitone-web/lib/firebase.ts",
+            "gravitone-web/components/ui/UserMenu.tsx"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "API Key Management",
+          "description": "Create, reveal once, and revoke API keys for programmatic access; ledger-style UI with secret reveal flow backed by keys API routes.",
+          "businessFeature": "API Key Management",
+          "category": "ui",
+          "filePaths": [
+            "gravitone-web/app/keys/page.tsx",
+            "gravitone-web/app/keys/_variants/KeysLedger.tsx",
+            "gravitone-web/app/keys/_variants/SecretReveal.tsx",
+            "gravitone-web/app/keys/_variants/data.ts",
+            "gravitone-web/app/api/keys/route.ts",
+            "gravitone-web/app/api/keys/[id]/route.ts"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/api/keys"
+          ]
+        },
+        {
+          "name": "Voice Creation Studio",
+          "description": "Upload/record a reference clip and create a new cloned voice: waveform lab UI plus ingest job API routes (scan, speaker pick, per-emotion preview, commit).",
+          "businessFeature": "Voice Creation Studio",
+          "category": "ui",
+          "filePaths": [
+            "gravitone-web/app/voices/new/page.tsx",
+            "gravitone-web/app/voices/new/_loaders/WaveformLab.tsx",
+            "gravitone-web/app/voices/new/_loaders/shared.tsx",
+            "gravitone-web/app/api/ingest/scan/route.ts",
+            "gravitone-web/app/api/ingest/[job]/route.ts",
+            "gravitone-web/app/api/ingest/[job]/commit/route.ts",
+            "gravitone-web/app/api/ingest/[job]/speaker/route.ts",
+            "gravitone-web/app/api/ingest/[job]/speaker-preview/[sid]/route.ts",
+            "gravitone-web/app/api/ingest/[job]/preview/[emotion]/route.ts"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/api/ingest/*"
+          ]
+        },
+        {
+          "name": "Character & Voice Management",
+          "description": "Browse and manage characters and their cloned voices: character table with tags, per-character emotion rack with audio previews, CRUD via characters/voices API routes.",
+          "businessFeature": "Character & Voice Management",
+          "category": "ui",
+          "filePaths": [
+            "gravitone-web/app/voices/page.tsx",
+            "gravitone-web/app/voices/_variants/CharacterTable.tsx",
+            "gravitone-web/app/voices/_variants/TagEditor.tsx",
+            "gravitone-web/app/voices/_variants/data.ts",
+            "gravitone-web/app/voices/[characterId]/page.tsx",
+            "gravitone-web/app/voices/[characterId]/CharacterVoices.tsx",
+            "gravitone-web/app/voices/[characterId]/_variants/EmotionRack.tsx",
+            "gravitone-web/app/api/characters/route.ts",
+            "gravitone-web/app/api/characters/[id]/route.ts",
+            "gravitone-web/app/api/voices/route.ts",
+            "gravitone-web/app/api/voices/[id]/route.ts",
+            "gravitone-web/app/voices/_data/characters.ts"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/api/characters",
+            "/api/voices"
+          ]
+        },
+        {
+          "name": "TTS Playground",
+          "description": "Interactive console to type text, pick a voice and emotion, and hear synthesized speech; streams audio through server-side proxy routes that hide the backend and avoid CORS.",
+          "businessFeature": "TTS Playground",
+          "category": "ui",
+          "filePaths": [
+            "gravitone-web/app/playground/page.tsx",
+            "gravitone-web/app/playground/_variants/PlaygroundConsole.tsx",
+            "gravitone-web/app/playground/_variants/EmotionPicker.tsx",
+            "gravitone-web/app/playground/_variants/engine.ts",
+            "gravitone-web/app/playground/_variants/useAudioPlayer.ts",
+            "gravitone-web/app/playground/_variants/shared.ts",
+            "gravitone-web/app/api/tts/route.ts",
+            "gravitone-web/app/api/speak/route.ts"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/api/tts",
+            "/api/speak"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Design System & Brand",
+      "domain": "shared",
+      "type": null,
+      "color": "#F59E0B",
+      "icon": null,
+      "contexts": [
+        {
+          "name": "App Shell & Landing",
+          "description": "Marketing landing page and root layout: hero, copy content, global styles, and Next.js configuration.",
+          "businessFeature": "App Shell & Landing",
+          "category": "ui",
+          "filePaths": [
+            "gravitone-web/app/page.tsx",
+            "gravitone-web/app/layout.tsx",
+            "gravitone-web/app/globals.css",
+            "gravitone-web/lib/content.ts",
+            "gravitone-web/next.config.mjs",
+            "gravitone-web/package.json"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Emotion Glyph Art",
+          "description": "Animated glyph artwork per emotion (happy, sad, angry, calm, excited, confused, whisper) rendered as EmotionGlyph/EmotionArt components; emotion metadata shared with the playground.",
+          "businessFeature": "Emotion Glyph Art",
+          "category": "lib",
+          "filePaths": [
+            "gravitone-web/lib/glyphs/index.ts",
+            "gravitone-web/lib/glyphs/baseline.ts",
+            "gravitone-web/lib/glyphs/happy.ts",
+            "gravitone-web/lib/glyphs/sad.ts",
+            "gravitone-web/lib/glyphs/angry.ts",
+            "gravitone-web/lib/glyphs/calm.ts",
+            "gravitone-web/lib/glyphs/excited.ts",
+            "gravitone-web/lib/glyphs/confused.ts",
+            "gravitone-web/lib/glyphs/whisper.ts",
+            "gravitone-web/components/ui/EmotionGlyph.tsx",
+            "gravitone-web/components/ui/EmotionArt.tsx",
+            "gravitone-web/lib/emotions.ts"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "UI Design System",
+          "description": "Shared visual language for the studio: app frame with navigation, primitives, design tokens, prototype tab switcher, and the StudioDark theme variant.",
+          "businessFeature": "UI Design System",
+          "category": "ui",
+          "filePaths": [
+            "gravitone-web/components/ui/AppFrame.tsx",
+            "gravitone-web/components/ui/Primitives.tsx",
+            "gravitone-web/components/ui/tokens.ts",
+            "gravitone-web/components/ui/PrototypeTabs.tsx",
+            "gravitone-web/components/variants/StudioDark.tsx",
+            "gravitone-web/components/ui/MobileNav.tsx",
+            "gravitone-web/components/ui/Equalizer.tsx"
+          ],
+          "target": null,
+          "apiRoutes": []
+        }
+      ]
+    }
+  ],
+  "ungrouped": [],
+  "relationships": [
+    {
+      "source": "TTS Service Core",
+      "target": "Web Studio",
+      "type": "calls"
+    },
+    {
+      "source": "Web Studio",
+      "target": "Design System & Brand",
+      "type": "uses"
+    },
+    {
+      "source": "TTS Service Core",
+      "target": "Performance & Deployment",
+      "type": "calls"
+    }
+  ],
+  "index": [
+    "TTS Service Core › Voice & Emotion Library [lib] — 2 files",
+    "TTS Service Core › Voice Cloning & Ingest Pipeline [api] — 4 files",
+    "TTS Service Core › Concurrency Engine & Metrics [lib] — 2 files",
+    "TTS Service Core › Speech Synthesis API [api] — 3 files",
+    "Performance & Deployment › Packaging & Deployment [config] — 3 files",
+    "Performance & Deployment › Load Testing & Benchmarks [test] — 5 files",
+    "Web Studio › Auth & Profile [ui] — 4 files",
+    "Web Studio › API Key Management [ui] — 6 files",
+    "Web Studio › Voice Creation Studio [ui] — 9 files",
+    "Web Studio › Character & Voice Management [ui] — 12 files",
+    "Web Studio › TTS Playground [ui] — 8 files",
+    "Design System & Brand › App Shell & Landing [ui] — 6 files",
+    "Design System & Brand › Emotion Glyph Art [lib] — 12 files",
+    "Design System & Brand › UI Design System [ui] — 7 files"
+  ],
+  "summary": {
+    "totalGroups": 4,
+    "totalContexts": 14,
+    "totalFiles": 78,
+    "categories": {
+      "lib": 3,
+      "api": 2,
+      "config": 1,
+      "test": 1,
+      "ui": 7
+    },
+    "domains": {
+      "feature": 2,
+      "infrastructure": 1,
+      "shared": 1
+    }
+  },
+  "audit": {
+    "ok": true,
+    "tier": "medium",
+    "warnings": 0
+  },
+  "instructions": "Context map for Gravitone. Each group is a business domain (domain field); each context is a feature with its files (filePaths) + a technical category. Read this to learn which files belong to which feature BEFORE editing. When you change a context's files, update them here (or run Vibeman's refresh) to keep this fresh.",
+  "generatedAt": "2026-07-10T19:08:54.482Z",
+  "revision": "e1ec006db415"
+}
