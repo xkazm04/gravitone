@@ -11,6 +11,7 @@ import { useVoicePreview, relTime, pickAudio, deleteVoiceQuestion, signalOf,
 import { checkEmotion } from "@/lib/slugs";
 import EmotionArt from "@/components/ui/EmotionArt";
 import SignalChip from "@/app/voices/_variants/SignalChip";
+import EmotionAudition from "./EmotionAudition";
 
 // ── donors ────────────────────────────────────────────────────────────────────
 // Emotion Algebra can take its direction from ONE named speaker's take. The
@@ -556,6 +557,12 @@ export default function EmotionRack({
           </tbody>
         </table>
       </div>
+
+      {/* The rack above is per-slot bookkeeping: one row, one voice, one
+          preview at a time. The audition is the opposite reading of the same
+          data — the WHOLE scale on one held-still line, so the range and the
+          speaker's identity can be judged together. */}
+      <EmotionAudition name={name} slots={slots} />
 
       {/* custom emotion palette — the scale is a platform primitive, not a constant */}
       <div className="glass-panel mt-4 rounded-xl p-4">

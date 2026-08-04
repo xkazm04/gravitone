@@ -285,8 +285,13 @@ export function isAbort(e: unknown): boolean {
 
 // ── header decoding (unchanged arithmetic, moved) ───────────────────────────
 
-/** Parse a Retry-After header (delta-seconds form) into a number, default 1. */
-function parseRetryAfter(header: string | null): number {
+/** Parse a Retry-After header (delta-seconds form) into a number, default 1.
+ *
+ *  Exported because the emotion audition (app/voices/[characterId]) speaks to
+ *  the backend through /api/tts rather than through this seam, and it must read
+ *  backpressure the SAME way — two parsers for one header is two different
+ *  ideas of how long to wait. */
+export function parseRetryAfter(header: string | null): number {
   const n = Number(header);
   return Number.isFinite(n) && n > 0 ? Math.ceil(n) : 1;
 }

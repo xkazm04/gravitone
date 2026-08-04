@@ -174,7 +174,7 @@
         },
         {
           "name": "Character & Voice Management",
-          "description": "Browse and manage characters and their cloned voices: character table with tags, per-character emotion rack with audio previews, CRUD via characters/voices API routes.",
+          "description": "Browse and manage characters and their cloned voices: character table with tags, per-character emotion rack with audio previews, an audition matrix that renders every recorded emotion on one identical line, CRUD via characters/voices API routes.",
           "businessFeature": "Character & Voice Management",
           "category": "ui",
           "filePaths": [
@@ -187,6 +187,8 @@
             "gravitone-web/app/voices/[characterId]/_variants/EmotionRack.tsx",
             "gravitone-web/app/voices/[characterId]/_variants/CastExport.tsx",
             "gravitone-web/app/voices/_data/cast.ts",
+            "gravitone-web/app/voices/[characterId]/_variants/EmotionAudition.tsx",
+            "gravitone-web/app/voices/[characterId]/_variants/audition.ts",
             "gravitone-web/app/api/characters/route.ts",
             "gravitone-web/app/api/characters/[id]/route.ts",
             "gravitone-web/app/api/voices/route.ts",
@@ -217,13 +219,14 @@
         },
         {
           "name": "TTS Playground",
-          "description": "Interactive console to type text, pick a voice and emotion, and hear synthesized speech; streams audio through server-side proxy routes that hide the backend and avoid CORS.",
+          "description": "Interactive console to type text, pick a voice and emotion, and hear synthesized speech; includes an emotion A/B that renders one line under two emotions side by side. Streams audio through server-side proxy routes that hide the backend and avoid CORS.",
           "businessFeature": "TTS Playground",
           "category": "ui",
           "filePaths": [
             "gravitone-web/app/playground/page.tsx",
             "gravitone-web/app/playground/_variants/PlaygroundConsole.tsx",
             "gravitone-web/app/playground/_variants/EmotionPicker.tsx",
+            "gravitone-web/app/playground/_variants/EmotionAB.tsx",
             "gravitone-web/app/playground/_variants/engine.ts",
             "gravitone-web/app/playground/_variants/useAudioPlayer.ts",
             "gravitone-web/app/playground/_variants/shared.ts",
@@ -331,9 +334,9 @@
     "Web Studio › Auth & Profile [ui] — 4 files",
     "Web Studio › API Key Management [ui] — 6 files",
     "Web Studio › Voice Creation Studio [ui] — 9 files",
-    "Web Studio › Character & Voice Management [ui] — 14 files",
+    "Web Studio › Character & Voice Management [ui] — 16 files",
     "Web Studio › Ops Transparency [ui] — 4 files",
-    "Web Studio › TTS Playground [ui] — 8 files",
+    "Web Studio › TTS Playground [ui] — 9 files",
     "Design System & Brand › App Shell & Landing [ui] — 6 files",
     "Design System & Brand › Emotion Glyph Art [lib] — 12 files",
     "Design System & Brand › UI Design System [ui] — 7 files"
@@ -341,7 +344,7 @@
   "summary": {
     "totalGroups": 4,
     "totalContexts": 15,
-    "totalFiles": 85,
+    "totalFiles": 93,
     "categories": {
       "lib": 3,
       "api": 2,
