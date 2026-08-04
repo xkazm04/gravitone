@@ -11,6 +11,7 @@ import { useCharacter, defectDirection } from "@/app/voices/_data/characters";
 import EmotionRack from "./_variants/EmotionRack";
 import GuidedRecorder from "./_variants/GuidedRecorder";
 import ApiPanel from "./_variants/ApiPanel";
+import CorpusPanel from "./_variants/CorpusPanel";
 
 // Rack won the voice-overview round — rendered directly, no switcher.
 export default function CharacterVoices({ characterId }: { characterId: string }) {
@@ -166,6 +167,17 @@ export default function CharacterVoices({ characterId }: { characterId: string }
         onClose={() => setRecording(null)}
         onSwitch={setRecording}
       />
+
+      {/* What audio of this person the box kept, and the two things a user must
+          be able to do about it (delete one recording; rebuild the voices from
+          all of them). Only cloned characters can have a corpus — capture
+          happens at an ingest commit — so a built-in character is not offered a
+          retention panel that could only ever be empty. A cloned character
+          with nothing kept DOES get it: "nothing is kept for this character" is
+          the answer to a question users are entitled to ask. */}
+      {character.category === "cloned" && (
+        <CorpusPanel characterId={character.character_id} onRebuilt={refresh} />
+      )}
 
       <ApiPanel characterId={character.character_id} filledEmotions={character.emotions} />
     </div>

@@ -23,6 +23,7 @@ import {
   type CastResult, type Character, type Job, type ModeInfo, type Stem,
 } from "./_state/machine";
 import { candidates, commitRecipes, recipeById } from "./_state/audition";
+import { corpusNotice } from "./_state/corpus";
 import { isEdited } from "./_state/casting";
 import { useCasting } from "./_state/useCasting";
 import {
@@ -72,6 +73,14 @@ export default function NewCharacterPage() {
 
   // Ephemeral input/UI state — not part of the flow's state graph.
   const [consented, setConsented] = useState(false); // Voice Vault attestation
+  // The retention opt-in, and it lives at the CONSENT moment rather than at
+  // upload on purpose. The service takes `corpus` at both points (scan's Form
+  // field and the commit body, the commit winning — ingest_api.py:1038/1583);
+  // asking at upload would demand a retention decision before the user has seen
+  // what the recording even contains, and the commit would override it anyway.
+  // So the scan sends nothing (service default: off) and every commit sends an
+  // EXPLICIT true/false — the job's outcome then names what this checkbox said.
+  const [keepCorpus, setKeepCorpus] = useState(false);
   const [file, setFile] = useState<File | null>(null);
   const [dragging, setDragging] = useState(false);
   // auto = cloud quality when the backend has API keys, else local.
@@ -317,7 +326,7 @@ export default function NewCharacterPage() {
       // `recipes` is present ONLY when an audition actually changed something —
       // the fast path sends exactly the body it always sent.
       const recipes = commitRecipes(auditions, selected, result?.stems ?? []);
-      const r = await fetch(`/api/ingest/${jobId}/commit`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ character, emotions: [...selected], character_id, attested: consented, statement: CONSENT_STATEMENT, ...(recipes ? { recipes } : {}) }) });
+      const r = await fetch(`/api/ingest/${jobId}/commit`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ character, emotions: [...selected], character_id, attested: consented, statement: CONSENT_STATEMENT, corpus: keepCorpus, ...(recipes ? { recipes } : {}) }) });
       // Refused before any cloning started: the ledger is intact, so go back to
       // it with NO error — the amber notice carries the whole truth.
       if (r.status === 429) {
@@ -344,12 +353,15 @@ export default function NewCharacterPage() {
   }
 
   function startOver() {
-    setFile(null); setBusyNotice(null);
+    setFile(null); setBusyNotice(null); setKeepCorpus(false);
     dispatch({ type: "RESET", kind: "start-over" });
   }
 
   function scanAnother() {
-    setFile(null); setBusyNotice(null);
+    // The retention opt-in is re-taken per recording, never inherited: it is a
+    // decision about THIS audio, and carrying it forward would keep a second
+    // recording on the box on the strength of a tick about the first.
+    setFile(null); setBusyNotice(null); setKeepCorpus(false);
     dispatch({ type: "RESET", kind: "scan-another" });
   }
 
@@ -820,6 +832,28 @@ export default function NewCharacterPage() {
                   </span>
                 </span>
               </label>
+              {/* Retention, opt-IN, and asked here because this is the consent
+                  moment. Off means the recording is used to clone and then
+                  discarded with the rest of the scan workdir; on means this box
+                  keeps the audio and its labels for the character, under the
+                  attestation above. Everything the checkbox promises is
+                  inspectable and deletable from the character page, which is the
+                  only thing that makes keeping it defensible. */}
+              <label className="mt-3 flex cursor-pointer items-start gap-2 border-t border-white/8 pt-3 text-[13px] text-white/70">
+                <input type="checkbox" checked={keepCorpus} onChange={(e) => setKeepCorpus(e.target.checked)}
+                  className="mt-0.5 accent-emerald-300" />
+                <span>
+                  Keep this recording for the character on this machine.{" "}
+                  <span className="font-jetbrains text-[11px] leading-relaxed text-white/45">
+                    The audio, its segment labels and the attestation above are stored
+                    on this Gravitone box — never uploaded anywhere — so the voices can
+                    be rebuilt from it later, and improved as more recordings arrive.
+                    You can list and delete it, one recording at a time, from the
+                    character page. Leave it off and nothing of the recording survives
+                    the clone.
+                  </span>
+                </span>
+              </label>
             </div>
           </div>
         )}
@@ -891,6 +925,39 @@ export default function NewCharacterPage() {
               {vaultWarn && (
                 <p className="font-jetbrains mt-3 rounded-lg border border-amber-400/25 bg-amber-400/5 px-3 py-2 text-[11px] text-amber-200/85">
                   Voices cloned, but the consent receipt couldn’t be saved to your vault. Reload “My Voices” — if they’re missing, re-open the character to re-record ownership.
+                </p>
+              )}
+              {/* What this box did with the RECORDING, as the service reported
+                  it — always stated, including the "nothing was kept" case,
+                  which is quiet rather than absent: on a page about someone's
+                  voice, "we kept nothing" is worth one line, and silence is the
+                  one thing indistinguishable from a capture that failed. */}
+              {(() => {
+                const notice = corpusNotice(job?.corpus);
+                if (!notice) return null;
+                if (notice.tone === "quiet") {
+                  return (
+                    <p className="font-jetbrains mt-3 text-[11px] text-white/40">{notice.text}</p>
+                  );
+                }
+                if (notice.tone === "warning") {
+                  return <ErrorBanner severity="warning" className="mt-3">{notice.text}</ErrorBanner>;
+                }
+                return (
+                  <p className="font-jetbrains mt-3 rounded-lg border border-emerald-400/20 bg-emerald-400/5 px-3 py-2 text-[11px] leading-relaxed text-emerald-200/85">
+                    🔒 {notice.text}
+                  </p>
+                );
+              })()}
+              {/* Eviction is a deletion the user did not ask for, so it is named
+                  with the service's own reason for each clip it took. */}
+              {(job?.corpus?.pruned?.length ?? 0) > 0 && (
+                <p className="font-jetbrains mt-2 rounded-lg border border-amber-400/25 bg-amber-400/5 px-3 py-2 text-[11px] leading-relaxed text-amber-200/85">
+                  {job!.corpus!.pruned!.map((p) => (
+                    <span key={p.clip_sha256} className="block">
+                      an older recording was removed to make room — {p.why}.
+                    </span>
+                  ))}
                 </p>
               )}
               <div className="mt-4 flex flex-wrap gap-2">

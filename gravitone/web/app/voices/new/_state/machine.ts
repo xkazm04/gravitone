@@ -88,6 +88,39 @@ export type Job = {
   // from, and which emotions the user has re-cast. Served on every poll so a
   // reload never shows a ledger whose numbers disagree with the audio.
   casting?: { assignments: Record<string, number[]>; edited: string[] } | null;
+  // Whether this recording's audio was KEPT on the box for the character, and —
+  // always — why not. Optional here only because an older service would not
+  // send it; when it is present the complete screen states it.
+  corpus?: CorpusOutcome | null;
+};
+
+/**
+ * What this box did with the recording's audio once the clone succeeded — the
+ * job's `corpus` key (service/ingest_api.py, `_PUBLIC_KEYS`).
+ *
+ * It is served on EVERY job and it always names the outcome, including "not
+ * requested" — a silent absence would be indistinguishable from a capture that
+ * failed, which on a retention surface is the one confusion that matters. So
+ * `requested` and `captured` are required here and `reason` is the sentence to
+ * print whenever `captured` is false.
+ */
+export type CorpusOutcome = {
+  requested: boolean;
+  captured: boolean;
+  reason?: string | null;
+  /** The recording was already in the corpus (content-addressed by clip hash). */
+  already?: boolean;
+  clip_sha256?: string | null;
+  rev?: number;
+  /** Segments whose AUDIO was copied, out of the labels recorded. */
+  segments?: number;
+  segments_recorded?: number;
+  stems?: number;
+  bytes?: number;
+  /** Clips evicted to stay under the byte cap, each with the service's own why. */
+  pruned?: { clip_sha256: string; bytes?: number | null; why: string }[];
+  /** Set on a re-derivation job: it READS the corpus at this revision. */
+  corpus_rev?: number;
 };
 
 export type RecipeOutcome = {

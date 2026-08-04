@@ -78,6 +78,21 @@ describe("SCAN_STARTED", () => {
 });
 
 describe("JOB_POLLED", () => {
+  it("carries the retention outcome through to the screen that states it", () => {
+    // The service names this on EVERY job, including "not requested" — a key
+    // the reducer dropped would be indistinguishable from a capture that failed.
+    const committed = run(scanned,
+      { type: "COMMIT_STARTED", character: "Sarah", cid: "sarah", total: 1 },
+      { type: "JOB_POLLED", job: job({
+        status: "committed", committed: [{ voice_id: "v1", emotion: "angry" }],
+        corpus: { requested: true, captured: true, segments: 9, stems: 2, bytes: 4096 },
+      }) });
+    expect(committed.phase).toBe("complete");
+    expect(committed.job?.corpus).toEqual({
+      requested: true, captured: true, segments: 9, stems: 2, bytes: 4096,
+    });
+  });
+
   it("follows the server through the analyze leg", () => {
     expect(reducer(scanned, { type: "JOB_POLLED", job: job({ status: "running" }) }).phase)
       .toBe("processing");
