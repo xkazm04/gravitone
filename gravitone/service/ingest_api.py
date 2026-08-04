@@ -25,12 +25,16 @@ Status flow: running → awaiting_speaker → running → done. `partial` stream
 intermediate data (word count, speakers, per-emotion tally) for a data-rich loader.
 
 Durability: every job owns a subdir under INGEST_WORK_DIR holding its files and a
-`state.json` mirror of the job dict. All JOBS mutations + persistence happen under a
-single lock. On import we rehydrate finished/awaiting jobs (marking any job caught
-mid-flight by the restart as errored) and start a background GC thread that expires
-IDLE jobs (and orphan workdirs) on a timer — a job that is actively working only
-ages out on the far longer wedged threshold, so GC never deletes a workdir under
-a running thread.
+`state.json` mirror of the job dict. All JOBS mutations happen under a single
+in-process lock, and every `state.json` write goes through `atomicio` — the
+cross-process mutex plus a per-process temp name — because INGEST_WORK_DIR is
+shared by all N replica processes. At startup we CLAIM and rehydrate the jobs
+no live replica owns (marking any job caught mid-flight by the restart as
+errored) and start a background thread that beats this process's liveness and
+expires IDLE jobs (and orphan workdirs) on a timer — a job that is actively
+working only ages out on the far longer wedged threshold, so GC never deletes a
+workdir under a running thread, and never deletes another replica's at all.
+See "ownership across replicas" below.
 
 Abandonment: `job["cancel"]` is the single teardown flag, and EVERY phase honours
 it — analyze polls it before each paid call, labelling before each segment,
@@ -74,6 +78,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
 import shutil
 import subprocess
 import threading
@@ -87,7 +92,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
-from service import errors, export_stems, ingest, voices
+from service import atomicio, errors, export_stems, ingest, ratelimit, voices
 from service.config import SETTINGS
 from service.emotions import normalize_emotion
 from service.errors import job_expired
@@ -133,7 +138,12 @@ SCAN_MODES = ("auto", "cloud", "sovereign")
 
 # ── durable job store ─────────────────────────────────────────────────────────
 JOBS: dict[str, dict] = {}
-_LOCK = threading.RLock()          # guards every JOBS mutation + state persistence
+# Guards every JOBS mutation. It is NOT the whole story: this service ships as N
+# single-worker processes (service/replicas.py), so an RLock serializes this
+# process against itself and nothing against the other replicas that write the
+# same `state.json` files. Cross-PROCESS exclusion is `atomicio.file_lock`,
+# taken by `_persist` and by `_claim` — see "ownership across replicas" below.
+_LOCK = threading.RLock()
 WORK_ROOT = Path(SETTINGS.ingest_work_dir)
 _TTL = 60 * 30                     # idle jobs (and their workdirs) expire after 30 min
 _GC_INTERVAL = 60 * 5             # background GC sweep cadence
@@ -150,11 +160,160 @@ ACTIVE_STATUSES = ("running", "committing")
 _RUNNING_TTL = 60 * 120
 # Bounded concurrency: nothing used to stop N uploads spawning N unbounded
 # fan-outs of ffmpeg + paid cloud calls. See Settings.ingest_max_jobs.
+#
+# This number is the POOL's budget, not one process's. It used to be counted per
+# process, so a box running TTS_REPLICAS=4 admitted 4x what the operator
+# configured while the 429 quoted the single number — the same lie
+# `service/ratelimit.py` fixed for the per-IP budgets. See `admission_shape`.
 MAX_ACTIVE_JOBS = SETTINGS.ingest_max_jobs
 # How long a refused caller is told to wait. Coarse on purpose: the work that
 # holds a slot is a whole scan or commit (minutes), so any precise-looking
 # number would be a guess dressed as an ETA. See `_admit`.
 ADMISSION_RETRY_AFTER_S = 5
+
+
+# ── ownership across replicas ─────────────────────────────────────────────────
+# One box, many processes, ONE truth per job.
+#
+# `WORK_ROOT` is shared by every replica. Before this, `_rehydrate` loaded EVERY
+# `state.json` under it into EVERY process, so N processes each held a mutable
+# copy of the same job, each ran its own phase threads against the same workdir,
+# and `_gc_once` reaped directories a sibling replica was still writing into.
+# `os.replace` prevents a torn file; it does not prevent two owners.
+#
+# So a job is OWNED. The owner record lives in the job's own directory
+# (`owner.json`) and is written under `atomicio.file_lock` — the O_CREAT|O_EXCL
+# cross-process mutex — so the claim itself cannot race: exactly one process
+# wins, the losers do not load the job at all (the deployment is already
+# replica-affine for ingest; see deploy/README.md).
+#
+# Liveness is a per-PROCESS heartbeat file, not a pid check: `os.kill(pid, 0)`
+# is not portable to the Windows dev box, and a recycled pid would let a fresh
+# process inherit a dead one's jobs. A process refreshes its beat every
+# `_BEAT_INTERVAL` from the GC thread and deletes it on a clean shutdown, so an
+# owner is "gone" when its beat is missing or older than `_OWNER_STALE_S`. Only
+# then may its jobs be claimed or its workdirs reaped.
+OWNER = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+_OWNERS_DIRNAME = ".owners"
+_BEAT_INTERVAL = 15.0
+_OWNER_STALE_S = 60.0
+# A beat file whose process never came back is swept on this much longer clock,
+# so the directory cannot grow without bound across restarts.
+_BEAT_TTL_S = 60 * 60
+# Claiming is a fast, uncontended lock (one O_EXCL create). A long wait here
+# would stall startup for every job on disk, and failing to claim is SAFE —
+# the job stays owned by whoever has it.
+_CLAIM_TIMEOUT_S = 2.0
+# Names under WORK_ROOT that are infrastructure, not jobs.
+_RESERVED_DIRS = (_OWNERS_DIRNAME,)
+
+
+def _owners_dir() -> Path:
+    return WORK_ROOT / _OWNERS_DIRNAME
+
+
+def _beat_path(owner: str = OWNER) -> Path:
+    return _owners_dir() / f"{owner}.alive"
+
+
+def _beat() -> None:
+    """Say this process is still here. Best effort: a box whose work root is
+    momentarily unwritable must not crash the sweeper — it will simply look
+    dead, and looking dead only ever costs ownership, never correctness."""
+    try:
+        _owners_dir().mkdir(parents=True, exist_ok=True)
+        _beat_path().write_text(str(time.time()), "utf-8")
+    except OSError as exc:
+        logger.warning("ingest: owner heartbeat failed: %s", exc)
+
+
+def _release_owner() -> None:
+    """Drop this process's beat. A cleanly-stopped replica is gone IMMEDIATELY
+    rather than after `_OWNER_STALE_S`, which is what makes a restart adopt its
+    predecessor's jobs at once instead of leaving them stranded."""
+    with contextlib.suppress(OSError):
+        _beat_path().unlink(missing_ok=True)
+
+
+def _owner_alive(owner: str) -> bool:
+    """Is `owner` a process that is still running? Unknown owners are DEAD:
+    an owner record with no beat behind it is exactly what a crash leaves."""
+    if not owner:
+        return False
+    if owner == OWNER:
+        return True
+    try:
+        age = time.time() - _beat_path(owner).stat().st_mtime
+    except OSError:
+        return False
+    return age <= _OWNER_STALE_S
+
+
+def _owner_of(job_dir: Path) -> str | None:
+    try:
+        rec = json.loads((job_dir / "owner.json").read_text("utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return rec.get("owner") if isinstance(rec, dict) else None
+
+
+def _write_owner(job_dir: Path) -> None:
+    """Stamp this process onto a job directory it already owns by construction
+    (it just created it under a fresh uuid — no other process can name it)."""
+    with contextlib.suppress(OSError):
+        atomicio.atomic_write_text(
+            job_dir / "owner.json",
+            json.dumps({"owner": OWNER, "pid": os.getpid(),
+                        "claimed_at": time.time()}))
+
+
+def _claim(job_dir: Path) -> bool:
+    """Take ownership of a job directory, or report that somebody live has it.
+
+    The read-check-write is done under the cross-process mutex, so two replicas
+    rehydrating the same root at the same instant cannot both win. Fails CLOSED:
+    a lock we could not take means we do not claim, because two owners is the
+    bug this exists to prevent and one stranded job is not.
+    """
+    try:
+        with atomicio.file_lock(job_dir / ".owner.lock", timeout=_CLAIM_TIMEOUT_S):
+            current = _owner_of(job_dir)
+            if current and _owner_alive(current) and current != OWNER:
+                return False
+            atomicio.atomic_write_text(
+                job_dir / "owner.json",
+                json.dumps({"owner": OWNER, "pid": os.getpid(),
+                            "claimed_at": time.time()}))
+            return True
+    except (OSError, TimeoutError) as exc:
+        logger.warning("ingest: could not claim %s (%s); leaving it alone",
+                       job_dir.name, exc)
+        return False
+
+
+def admission_shape(total: int, replicas: int | None = None) -> tuple[int, int, int]:
+    """(per-replica slots, what the POOL really allows, replica count).
+
+    The alternative was a file-backed cross-process count. It was rejected: a
+    concurrency slot has to be RELEASED, so a replica killed mid-scan leaks a
+    slot until some reaper decides it is stale — a whole second liveness
+    protocol, on the admission path, to save an integer division. Dividing the
+    configured budget by the replica count needs no release path at all, and
+    the only thing it owes the caller is honesty about the arithmetic, which
+    `_admit` pays (the `describe()` precedent from service/ratelimit.py).
+
+    Trade-off, stated: the share is floored at 1, so a pool budget SMALLER than
+    the replica count (2 jobs, 4 replicas) admits one per replica — 4, not 2.
+    The 429 says 4 in that deployment rather than quoting a 2 nobody enforces.
+    """
+    n = max(1, int(replicas if replicas is not None else ratelimit.replica_count()))
+    total = int(total)
+    if total <= 0:
+        # A budget of zero is an operator saying "not on this box". Flooring it
+        # at one per replica would hand it back the surface it switched off.
+        return 0, 0, n
+    return max(1, total // n), max(1, total // n) * n, n
+
 
 # ── auditions ─────────────────────────────────────────────────────────────────
 # How many auditions may be synthesizing at once, ACROSS jobs. Deliberately its
@@ -183,11 +342,16 @@ def _audition_slot() -> Iterator[None]:
     `MAX_ACTIVE_JOBS`. Released in a `finally`, so a failed synthesis cannot
     strand the budget the way a leaked counter would."""
     global _active_auditions
+    per, pool, replicas = admission_shape(MAX_ACTIVE_AUDITIONS)
     with _audition_lock:
-        if _active_auditions >= MAX_ACTIVE_AUDITIONS:
+        if _active_auditions >= per:
             raise HTTPException(
                 429, f"{_active_auditions} audition(s) are already being "
-                     "synthesized on the CPU engine — try again in a moment",
+                     "synthesized on the CPU engine"
+                     + (f" by this replica (the box runs {replicas} of them and "
+                        f"synthesizes at most {pool} auditions at once)"
+                        if replicas > 1 else "")
+                     + " — try again in a moment",
                 headers={"Retry-After": str(AUDITION_RETRY_AFTER_S)})
         _active_auditions += 1
     try:
@@ -511,6 +675,18 @@ def _spend_for(job_id: str) -> ingest.Spend:
 
 # ── state persistence (all callers hold _LOCK) ────────────────────────────────
 def _persist(job: dict) -> None:
+    """Mirror the job dict to `state.json`, safely against the OTHER replicas.
+
+    Two things were wrong with the old write. The temp file had a FIXED name
+    (`state.json.tmp`), so two processes writing the same job interleaved into
+    one temp and `os.replace` could promote a mixed file — the exact hazard
+    `atomicio._atomic_write`'s per-process temp name exists to remove. And the
+    read-modify-write was guarded only by `_LOCK`, which serializes nothing
+    between replicas; the cross-process mutex is `atomicio.file_lock`.
+
+    Persisting is a MIRROR, so a failure here is logged and swallowed — losing
+    the mirror costs a rehydrate, while raising would cost the caller's phase.
+    """
     wd = Path(job["work_dir"])
     # Do NOT mkdir: a teardown (DELETE or GC) may have just rmtree'd this
     # workdir, and recreating it here resurrects an orphan directory that no
@@ -522,10 +698,9 @@ def _persist(job: dict) -> None:
     # so a job that is visibly progressing is never reaped mid-phase.
     job["touched"] = time.time()
     try:
-        tmp = wd / "state.json.tmp"
-        tmp.write_text(json.dumps(job), "utf-8")
-        tmp.replace(wd / "state.json")
-    except OSError as exc:
+        with atomicio.file_lock(wd / ".state.lock"):
+            atomicio.atomic_write_text(wd / "state.json", json.dumps(job))
+    except (OSError, TimeoutError) as exc:
         # Losing the on-disk mirror means a restart can't rehydrate this job —
         # worth a log line rather than a bare pass.
         logger.warning("ingest job %s: state persist failed: %s",
@@ -570,13 +745,25 @@ def _partial(job: dict, d: dict) -> None:
 
 # ── rehydrate + GC ────────────────────────────────────────────────────────────
 def _rehydrate() -> None:
-    """Reload jobs from disk on startup. Jobs caught mid-flight (running) by the
-    restart become errored; awaiting/finished jobs stay usable until they expire."""
+    """Reload the jobs THIS process owns from disk on startup.
+
+    Ownership is the whole point of the claim (see "ownership across
+    replicas"): a job directory whose owner is still beating belongs to that
+    replica, and loading it here would give one job two owners, two sets of
+    phase threads and two GC verdicts. A job we cannot claim is skipped
+    entirely — not loaded read-only — because every read path in this module
+    (`_get_job`, `get_job`, the preview routes) is also a mutation path's
+    neighbour, and "visible but not writable" is a distinction this store has
+    no way to enforce.
+
+    Jobs caught mid-flight (running) by the restart become errored; awaiting/
+    finished jobs stay usable until they expire.
+    """
     if not WORK_ROOT.is_dir():
         return
     for d in sorted(WORK_ROOT.iterdir()):
         sf = d / "state.json"
-        if not d.is_dir() or not sf.is_file():
+        if not d.is_dir() or d.name in _RESERVED_DIRS or not sf.is_file():
             continue
         try:
             job = json.loads(sf.read_text("utf-8"))
@@ -584,11 +771,15 @@ def _rehydrate() -> None:
             continue
         if not isinstance(job, dict) or "id" not in job:
             continue
+        if not _claim(d):
+            logger.info("ingest job %s belongs to a live replica; not rehydrated",
+                        job.get("id"))
+            continue
         job["cancel"] = False
         if job.get("status") in ("running", "committing"):
             job["status"] = "error"
             job["error"] = "interrupted by restart"
-            _persist(job)  # tmp+replace, same as every other writer
+            _persist(job)  # locked + atomic, same as every other writer
         JOBS[job["id"]] = job
 
 
@@ -621,13 +812,23 @@ def _admit() -> None:
     caller is told when to come back. A scan is minutes long, so the hint is
     deliberately coarse — it says "not instantly", not a real ETA, which is
     the honest amount of information available here.
+
+    The COUNT is this process's, because a job's phase threads live in the
+    process that OWNS it — so the configured budget is divided across the
+    replicas and the refusal states the pool-wide number (`admission_shape`).
+    A 429 quoting `MAX_ACTIVE_JOBS` on a 4-replica box named a limit the box
+    never applied.
     """
+    per, pool, replicas = admission_shape(MAX_ACTIVE_JOBS)
     with _LOCK:
         active = _active_count()
-    if active >= MAX_ACTIVE_JOBS:
+    if active >= per:
         raise HTTPException(
-            429, f"{active} recordings are already being processed — "
-                 "try again in a moment",
+            429, f"{active} recording(s) are already being processed"
+                 + (f" by this replica (the box runs {replicas} of them and "
+                    f"processes at most {pool} recordings at once)"
+                    if replicas > 1 else "")
+                 + " — try again in a moment",
             headers={"Retry-After": str(ADMISSION_RETRY_AFTER_S)})
 
 
@@ -656,28 +857,59 @@ def _gc_once() -> None:
         if leaked:
             logger.warning("swept %d leaked audition scratch artefact(s) in %s: %s",
                            len(leaked), wd, leaked)
-    # orphan workdirs with no live job (e.g. left by a crash) age out too
+    # Orphan workdirs with no live job (e.g. left by a crash) age out too — but
+    # ONLY if no live replica owns them. This sweep used to delete a sibling
+    # process's job directory out from under its running phase thread purely
+    # because this process had never heard of the job (deploy/README.md
+    # documented that as unfixed). A directory owned by a beating process is
+    # somebody's; a directory owned by nobody, or by an owner whose beat
+    # stopped, is ours to reap.
     if WORK_ROOT.is_dir():
         for d in WORK_ROOT.iterdir():
-            if not d.is_dir() or str(d) in live:
+            if not d.is_dir() or str(d) in live or d.name in _RESERVED_DIRS:
+                continue
+            owner = _owner_of(d)
+            if owner and owner != OWNER and _owner_alive(owner):
                 continue
             try:
                 if now - d.stat().st_mtime > _TTL:
                     shutil.rmtree(d, ignore_errors=True)
             except OSError:
                 pass
+    # Heartbeat files of processes that never came back.
+    if _owners_dir().is_dir():
+        for b in _owners_dir().iterdir():
+            try:
+                if b.name != _beat_path().name and now - b.stat().st_mtime > _BEAT_TTL_S:
+                    b.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
-def _gc_loop() -> None:
+def _gc_loop(stop: threading.Event | None = None) -> None:
+    """Beat, sweep, repeat.
+
+    Two clocks, deliberately: the OWNERSHIP heartbeat has to be much faster
+    than the sweep (a replica that only says "still here" every five minutes
+    would have to be presumed dead for five minutes before anyone could adopt
+    its jobs), while a full sweep every fifteen seconds would be pointless
+    stat() traffic on a small Arm box.
+    """
+    waiter = stop or threading.Event()
+    last_sweep: float | None = None
     while True:
         try:
-            # Sweep FIRST: the most valuable sweep is the one right after a
-            # restart (orphan workdirs left by the previous process), and
-            # sleeping first stranded those for a full interval.
-            _gc_once()
+            _beat()
+            if last_sweep is None or time.monotonic() - last_sweep >= _GC_INTERVAL:
+                last_sweep = time.monotonic()
+                # Sweep FIRST: the most valuable sweep is the one right after a
+                # restart (orphan workdirs left by the previous process), and
+                # sleeping first stranded those for a full interval.
+                _gc_once()
         except Exception as exc:  # noqa: BLE001 - the loop must never die
             logger.warning("ingest GC sweep failed: %s", exc)
-        time.sleep(_GC_INTERVAL)
+        if waiter.wait(_BEAT_INTERVAL):
+            return
 
 
 # ── background phases ─────────────────────────────────────────────────────────
@@ -914,9 +1146,12 @@ def _do_commit(job_id: str, character: str, emotions: list[str], character_id: s
         return
     if recipes:
         # BEFORE the clone: the stems must be what the user chose by the time the
-        # exporter reads them.
+        # exporter reads them. Under _STEM_LOCK, because this WRITES the stem
+        # files — it is a re-splice by another name, and it must not interleave
+        # with one from the casting board.
         try:
-            _apply_recipes(job, emotions, recipes)
+            with _STEM_LOCK:
+                _apply_recipes(job, emotions, recipes)
         except Exception as exc:  # noqa: BLE001 - a commit must not die over this
             logger.warning("ingest job %s: recipe application failed: %s", job_id, exc)
     total = len(emotions)
@@ -1055,6 +1290,7 @@ def start_scan(file: UploadFile = File(...), mode: str = Form("auto"),
     job_id = uuid.uuid4().hex[:12]
     work_dir = WORK_ROOT / job_id
     work_dir.mkdir(parents=True, exist_ok=True)
+    _write_owner(work_dir)   # this process runs its phases; no sibling may adopt it
     safe_name = Path(file.filename or "upload").name
     src = work_dir / f"src-{safe_name}"
     src.write_bytes(data)
@@ -1266,6 +1502,14 @@ def preview(job_id: str, emotion: str):
 # UI convenience, not a concurrency argument). Global rather than per-job: a
 # splice is milliseconds of local wav work, so one lock costs nothing and there
 # is no per-job lock lifecycle to leak.
+#
+# It also serializes a re-splice against the COMMIT FLIP, which is the race the
+# 409 in `restem` only looked like it closed: the status was read unlocked, and
+# `commit` flipped it to "committing" and handed `stem_{emotion}.wav` to the
+# export child while a /stems call that had already passed its check was
+# rewriting that same file. LOCK ORDER, everywhere: `_STEM_LOCK` then `_LOCK`.
+# `commit` takes `_STEM_LOCK` around the flip, `restem` re-checks the status
+# under `_LOCK` INSIDE `_STEM_LOCK`, so one of the two always refuses.
 _STEM_LOCK = threading.Lock()
 # A hand-curated stem is a handful of takes, not a programme. The cap is a
 # boundary check on a client-supplied list, in the same spirit as MAX_UPLOAD_BYTES.
@@ -1373,6 +1617,27 @@ def _withdraw_recipes(job: dict, work_dir: Path, stem: dict, emotion: str) -> bo
     return had
 
 
+def _refuse_unless_splicable(job: dict) -> None:
+    """409 unless this job's stems may still be rewritten.
+
+    Read under `_LOCK` and called TWICE by `restem` — once before the work, and
+    again inside `_STEM_LOCK` right before the first byte is written. The second
+    call is the one that matters: between the cheap check and the splice sits a
+    whole `_board()` re-derivation, and a commit that flips the status in that
+    window has already given `stem_{emotion}.wav` to the export child.
+    """
+    with _LOCK:
+        status = job.get("status")
+        if job.get("cancel"):
+            raise HTTPException(409, "this scan was cancelled")
+    if status in ("committing", "committed"):
+        raise HTTPException(
+            409, "this scan has already been committed - its stems can no longer "
+                 "be re-spliced")
+    if status != "done":
+        raise HTTPException(409, "re-splicing needs a finished scan")
+
+
 class StemsReq(BaseModel):
     # {emotion: [segment indices]} — the emotions being re-cast. Emotions NOT
     # named keep whatever selection they already have, so a move is one request
@@ -1401,13 +1666,7 @@ def restem(job_id: str, req: StemsReq):
     job = _get_job(job_id)
     if not job:
         return job_expired()
-    status = job.get("status")
-    if status in ("committing", "committed"):
-        raise HTTPException(
-            409, "this scan has already been committed - its stems can no longer "
-                 "be re-spliced")
-    if status != "done":
-        raise HTTPException(409, "re-splicing needs a finished scan")
+    _refuse_unless_splicable(job)
 
     wd = Path(job["work_dir"])
     result = job.get("result") or {}
@@ -1464,6 +1723,10 @@ def restem(job_id: str, req: StemsReq):
     edited = sorted(e for e in effective if effective[e] != proposed.get(e))
 
     with _STEM_LOCK:
+        # THE re-check. `commit` cannot flip the status while this is held, so
+        # a commit either got here first (and this call refuses) or waits until
+        # the stems on disk are the ones this call reports.
+        _refuse_unless_splicable(job)
         for emo in changed:
             try:
                 sp = ingest.concat_wavs([wav_of[i] for i in effective[emo]],
@@ -1499,26 +1762,29 @@ def restem(job_id: str, req: StemsReq):
                 if stem is not None:
                     _withdraw_recipes(job, wd, stem, emo)
 
-    with _LOCK:
-        if job.get("cancel"):
-            raise HTTPException(409, "this scan was cancelled")
-        casting = dict(job.get("casting") or {})
-        # The pipeline's own per-stem notes, snapshotted ONCE so a reset can put
-        # them back. plan_baseline's "topped up with 2x calm" is a statement
-        # about the proposed splice; it is restored, never recomputed.
-        if "proposed_notes" not in casting:
-            casting["proposed_notes"] = {s.get("emotion"): s.get("note")
-                                         for s in result.get("stems") or []}
-        for emo, stem in stem_of.items():
-            if emo in edited:
-                stem["note"] = _mixed_note(emo, effective[emo], label_of)
-            else:
-                stem["note"] = casting["proposed_notes"].get(emo)
-        casting["assignments"] = effective
-        casting["edited"] = edited
-        job["casting"] = casting
-        job["result"] = result
-        _persist(job)
+        # Still inside _STEM_LOCK: the ledger this call answers with is written
+        # before a waiting commit may flip the status, so the numbers published
+        # here always describe the audio that commit will clone.
+        with _LOCK:
+            if job.get("cancel"):
+                raise HTTPException(409, "this scan was cancelled")
+            casting = dict(job.get("casting") or {})
+            # The pipeline's own per-stem notes, snapshotted ONCE so a reset can
+            # put them back. plan_baseline's "topped up with 2x calm" is a
+            # statement about the proposed splice; restored, never recomputed.
+            if "proposed_notes" not in casting:
+                casting["proposed_notes"] = {s.get("emotion"): s.get("note")
+                                             for s in result.get("stems") or []}
+            for emo, stem in stem_of.items():
+                if emo in edited:
+                    stem["note"] = _mixed_note(emo, effective[emo], label_of)
+                else:
+                    stem["note"] = casting["proposed_notes"].get(emo)
+            casting["assignments"] = effective
+            casting["edited"] = edited
+            job["casting"] = casting
+            job["result"] = result
+            _persist(job)
 
     return {
         "min_stem": min_stem,
@@ -1613,7 +1879,10 @@ def commit(job_id: str, req: CommitReq):
             raise HTTPException(400, "unknown recipe")
         chosen[emo] = rid
     _admit()  # cloning loads the TTS model in a child process — the heaviest phase
-    with _LOCK:
+    # _STEM_LOCK first (see the lock-order note on the casting board): the flip
+    # to "committing" is what makes `restem` refuse, so it must not land while a
+    # re-splice is midway through rewriting the very stems this commit clones.
+    with _STEM_LOCK, _LOCK:
         job = JOBS.get(job_id)
         if not job:
             return job_expired()
@@ -1700,6 +1969,7 @@ def start_rederive(req: RederiveReq) -> dict:
     job_id = uuid.uuid4().hex[:12]
     work_dir = WORK_ROOT / job_id
     work_dir.mkdir(parents=True, exist_ok=True)
+    _write_owner(work_dir)
     job = {
         "id": job_id, "status": "committing", "step": None, "mode": "rederive",
         "steps": [{**s, "state": "pending"} for s in STEPS_BY_MODE["rederive"]],
@@ -1798,5 +2068,9 @@ def start_background() -> None:
         if _started:
             return
         _started = True
+    # Beat BEFORE claiming anything: a sibling replica starting in the same
+    # second must be able to see that we are alive, or two processes could each
+    # decide the other is dead and both claim the same job.
+    _beat()
     _rehydrate()
     threading.Thread(target=_gc_loop, daemon=True, name="ingest-gc").start()

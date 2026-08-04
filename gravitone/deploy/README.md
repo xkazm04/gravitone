@@ -220,6 +220,15 @@ multi-replica fleet behind `SO_REUSEPORT` (or a k8s Service) will round-robin
 the follow-up `GET /v1/ingest/{job}` to a replica that has never heard of the
 job and answer 404 `{"status": "expired"}`.
 
+What is no longer true is that the replicas *fight* over that shared directory.
+A job is OWNED by exactly one process: the owner record in the job's directory
+is written under `atomicio.file_lock`, ownership is claimed once at rehydrate,
+and a process advertises liveness through a heartbeat under
+`INGEST_WORK_DIR/.owners`. A replica therefore rehydrates only its own jobs,
+and its GC never reaps a directory a beating sibling owns — only its own, or
+one whose owner stopped beating. Admission is divided across the pool the same
+way (`ingest_api.admission_shape`), and the 429 states the pool-wide number.
+
 So: run the **voice-creation flow against a single replica** (sticky sessions,
 a dedicated ingest pod, or `replicaCount: 1` while cloning). Synthesis
 (`/v1/text-to-speech`, `/v1/speak`, `/v1/performance`) has no such constraint —
