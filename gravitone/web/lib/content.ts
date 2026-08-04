@@ -52,6 +52,74 @@ export const FEATURES = [
   },
 ];
 
+// ── the three positions ───────────────────────────────────────────────────────
+//
+// Why someone picks this studio over a hosted voice library. EVERY line below
+// has to be true of the product as it ships today — these are the claims a
+// visitor will hold us to, so each one names a surface that exists:
+//
+//   audition   — the ingest review ledger's "as a voice" button synthesizes each
+//                proposed emotion BEFORE commit (app/voices/new/page.tsx
+//                ::hearAsVoice), and the Audition Room compares alternative
+//                splices of the same emotion.
+//   own it     — MIT (LICENSE), self-hosted, CPU-only; the compat surface is
+//                real (service/app.py: /v1/text-to-speech/{voice_id},
+//                xi-api-key, output_format).
+//   characters — Characters group Voices by emotion with tags and a rack; a
+//                request for a missing emotion falls back to baseline and says
+//                so in the response headers; guided capture is a ~30s read per
+//                emotion (lib/emotionScripts.ts).
+//
+// NO comparison numbers, no benchmark claims, and no characterisation of anyone
+// else's product live here. "Works with your existing ElevenLabs client" is a
+// fact about our API surface; anything about their pricing or quality is not
+// ours to state on this page. Measured performance has its own page
+// (/benchmarks) where the method is shown.
+export const PILLARS = [
+  {
+    key: "audition",
+    eyebrow: "hear it before you own it",
+    title: "Audition the clone, not a promise.",
+    body:
+      "A scan proposes one Voice per emotion it found — and every one of them can be "
+      + "heard as a cloned voice before a single embedding is written. Keep what sounds "
+      + "right, descope what doesn't.",
+    points: [
+      "Play the source stem or the clone of it, side by side, at review time.",
+      "Compare alternative takes of the same emotion and pick with your ear.",
+      "Each emotion is its own embedding — the same voice, consistently, on every call.",
+    ],
+  },
+  {
+    key: "own",
+    eyebrow: "no credit meter",
+    title: "Your box, your voices, your bill.",
+    body:
+      "Gravitone is MIT-licensed and self-hosted. It runs on ordinary Arm CPUs, so the "
+      + "cost of a line of speech is the cost of the machine you already pay for — there "
+      + "is no per-character meter to watch.",
+    points: [
+      "Works with your existing ElevenLabs client: swap the base URL, keep xi-api-key.",
+      "Same request shape, same output_format grammar, wav / mp3 / pcm.",
+      "Nothing leaves the box in sovereign mode — the recording is processed locally.",
+    ],
+  },
+  {
+    key: "characters",
+    eyebrow: "built for characters",
+    title: "A cast, not a flat voice list.",
+    body:
+      "Writers and game teams think in characters, so that is the unit here: one "
+      + "Character owns a rack of emotion Voices, carries its own tags, and is addressed "
+      + "by name and mood — sarah:excited.",
+    points: [
+      "Clone a Character from one short recording, then extend it from the same page.",
+      "Fill any missing emotion with a guided 30-second read — the script is written for you.",
+      "An emotion a Character lacks falls back to its baseline, reported in the response headers.",
+    ],
+  },
+];
+
 export const VOICES = [
   { name: "Alba", tag: "warm · en", hue: 190 },
   { name: "Marius", tag: "narration · en", hue: 265 },

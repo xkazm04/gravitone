@@ -192,6 +192,7 @@ export default function NewCharacterPage() {
   // disables.
   const atUpload = phase === "upload";
   const atComplete = phase === "complete";
+  const [rosterLoaded, setRosterLoaded] = useState(false);
   useEffect(() => {
     if (!atUpload && !atComplete) return;
     const ctrl = new AbortController();
@@ -200,6 +201,7 @@ export default function NewCharacterPage() {
         if (!mounted.current) return;
         setCharacters(cs.filter((c) => c.category === "cloned"));
         setRosterFailed(false);
+        setRosterLoaded(true);
       })
       .catch(() => {
         // An abort is this effect being replaced, not a failure.
@@ -208,6 +210,37 @@ export default function NewCharacterPage() {
       });
     return () => ctrl.abort();
   }, [atUpload, atComplete, mounted]);
+
+  // ── the clone loop's inbound leg ────────────────────────────────────────────
+  // /voices/new?extend={character_id} — arrived from a character's own page.
+  // The param only ARMS the flow; it is applied once the roster has actually
+  // answered, because "extend" is only real for a character that exists and is
+  // cloneable. A param naming something the roster does not have is SAID (the
+  // flow silently falling back to "New character" would create a second
+  // character with the same name), and a roster that could not be read says
+  // that instead — the two are different facts and never share a message.
+  const [fromCid, setFromCid] = useState<string | null>(null);
+  const [fromUnknown, setFromUnknown] = useState<string | null>(null);
+  const preselected = useRef(false);
+  useEffect(() => {
+    const want = new URLSearchParams(window.location.search).get("extend");
+    if (want) setFromCid(want);
+  }, []);
+  useEffect(() => {
+    if (preselected.current || !fromCid || !rosterLoaded) return;
+    preselected.current = true;
+    if (characters.some((c) => c.character_id === fromCid)) {
+      dispatch({ type: "SET_MODE", mode: "extend" });
+      dispatch({ type: "SET_EXTEND_CID", cid: fromCid });
+    } else {
+      setFromUnknown(fromCid);
+    }
+  }, [fromCid, rosterLoaded, characters]);
+  // The character this flow will return to, by name — only once it is genuinely
+  // armed, so the completion screen never promises a destination it invented.
+  const returningTo = fromCid && !fromUnknown
+    ? characters.find((c) => c.character_id === fromCid)?.name ?? null
+    : null;
 
   // Mode descriptions are backend constants — fetch once. A failure is SAID
   // (the panel can't invent the limits), never swallowed into silence.
@@ -559,7 +592,29 @@ export default function NewCharacterPage() {
                 with a character) rather than by "a commit happened once" —
                 which RESET used to leave behind for a brand-new flow to read. */}
             {mode === "extend" && extendCid && (
-              <p className="font-jetbrains mt-3 text-[12px] text-cyan-300/80">Extending an existing character with more emotions.</p>
+              <p className="font-jetbrains mt-3 text-[12px] text-cyan-300/80">
+                {returningTo
+                  ? `Extending ${returningTo} — the voices you commit attach to it, and you land back on its page.`
+                  : "Extending an existing character with more emotions."}
+              </p>
+            )}
+            {/* The inbound link named a character this roster does not have.
+                Rose: the thing the link asked for did not happen. Nothing is
+                pre-armed, so say which character and what the flow will do
+                instead — a silent fallback to "New character" would quietly
+                create a duplicate. */}
+            {fromUnknown && (
+              <ErrorBanner>
+                “{fromUnknown}” is not one of your cloned characters, so nothing was
+                pre-selected — this scan will create a NEW character unless you pick one
+                to extend below.
+              </ErrorBanner>
+            )}
+            {fromCid && rosterFailed && !rosterLoaded && (
+              <ErrorBanner severity="warning">
+                Your characters could not be loaded, so the character you came from could not
+                be pre-selected. Reload to retry — nothing about your recording is affected.
+              </ErrorBanner>
             )}
 
             {/* privacy mode */}
@@ -1186,7 +1241,20 @@ export default function NewCharacterPage() {
               })()}
 
               <div className="mt-6 flex flex-wrap gap-3">
-                {committedCid && <Link href={`/voices/${committedCid}`} className="rounded-full bg-cyan-300 px-5 py-2.5 text-sm font-semibold text-slate-950 transition hover:brightness-110">Open character →</Link>}
+                {/* The loop closes here. When the flow was opened FROM a
+                    character, the primary action names that character by the
+                    name it was committed under — not "Open character", which
+                    reads as somewhere new. Deliberately a click and not an
+                    automatic redirect: this screen carries the skipped-take and
+                    consent-receipt warnings above, and a redirect would throw
+                    them away before they were read. */}
+                {committedCid && (
+                  <Link href={`/voices/${committedCid}`} className="rounded-full bg-cyan-300 px-5 py-2.5 text-sm font-semibold text-slate-950 transition hover:brightness-110">
+                    {fromCid === committedCid && state.pendingCommit?.character
+                      ? `Back to ${state.pendingCommit.character} →`
+                      : "Open character →"}
+                  </Link>
+                )}
                 <button onClick={scanAnother} className="font-jetbrains cursor-pointer rounded-full border border-white/15 px-5 py-2.5 text-sm text-white/85 transition hover:bg-white/5">Scan another recording (extend palette)</button>
                 <Link href="/voices" className="font-jetbrains rounded-full px-5 py-2.5 text-sm text-white/60 transition hover:text-white">Back to roster</Link>
               </div>

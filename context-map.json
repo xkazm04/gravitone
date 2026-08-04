@@ -184,6 +184,8 @@
             "gravitone-web/app/voices/[characterId]/page.tsx",
             "gravitone-web/app/voices/[characterId]/CharacterVoices.tsx",
             "gravitone-web/app/voices/[characterId]/_variants/EmotionRack.tsx",
+            "gravitone-web/app/voices/[characterId]/_variants/CastExport.tsx",
+            "gravitone-web/app/voices/_data/cast.ts",
             "gravitone-web/app/api/characters/route.ts",
             "gravitone-web/app/api/characters/[id]/route.ts",
             "gravitone-web/app/api/voices/route.ts",
@@ -312,7 +314,7 @@
     "Web Studio › Auth & Profile [ui] — 4 files",
     "Web Studio › API Key Management [ui] — 6 files",
     "Web Studio › Voice Creation Studio [ui] — 9 files",
-    "Web Studio › Character & Voice Management [ui] — 12 files",
+    "Web Studio › Character & Voice Management [ui] — 14 files",
     "Web Studio › TTS Playground [ui] — 8 files",
     "Design System & Brand › App Shell & Landing [ui] — 6 files",
     "Design System & Brand › Emotion Glyph Art [lib] — 12 files",
@@ -321,7 +323,7 @@
   "summary": {
     "totalGroups": 4,
     "totalContexts": 14,
-    "totalFiles": 78,
+    "totalFiles": 80,
     "categories": {
       "lib": 3,
       "api": 2,
