@@ -11,6 +11,7 @@ import { useCharacter, defectDirection } from "@/app/voices/_data/characters";
 import EmotionRack from "./_variants/EmotionRack";
 import GuidedRecorder from "./_variants/GuidedRecorder";
 import ApiPanel from "./_variants/ApiPanel";
+import CastExport from "./_variants/CastExport";
 
 // Rack won the voice-overview round — rendered directly, no switcher.
 export default function CharacterVoices({ characterId }: { characterId: string }) {
@@ -182,6 +183,7 @@ export default function CharacterVoices({ characterId }: { characterId: string }
       />
 
       <ApiPanel characterId={character.character_id} filledEmotions={character.emotions} />
+      <CastExport character={character} />
     </div>
   );
 }
