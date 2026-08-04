@@ -65,8 +65,10 @@ from service.engine import (
 )
 from service.voices import BUILTIN, emotion_map, prosody_map, router as voices_router
 from service.keys import router as keys_router
+from service import ingest_api
 from service.ingest_api import (
     router as ingest_router, start_background as ingest_start_background,
+    stop_background as ingest_stop_background,
 )
 from service.packs import router as packs_router
 from service.direction import router as direction_router
@@ -124,6 +126,18 @@ async def lifespan(app: FastAPI):
     # the request timeout), let in-flight generations finish, join workers.
     # The budget is configurable so it can be kept under the orchestrator's
     # stop grace (see Settings.drain_timeout_s).
+    #
+    # INGEST DRAINS TOO, and first. It used not to drain at all: the lifespan
+    # stopped ENGINE while ingest's phase threads were daemons nobody joined,
+    # so a SIGTERM mid-commit killed a clone with rows already registered and
+    # its rollback still ahead of it. Ingest's phases do not use ENGINE (they
+    # spawn their own one-load export child), so draining them first costs the
+    # engine nothing and gives a commit its grace while the box is still up.
+    # A phase that outruns the grace is reconciled from its journal at the next
+    # startup (ingest_api._reconcile) — the grace is the optimization, that is
+    # the guarantee.
+    await asyncio.get_event_loop().run_in_executor(
+        None, ingest_stop_background, ingest_api.DRAIN_GRACE_S)
     await asyncio.get_event_loop().run_in_executor(
         None, ENGINE.stop, SETTINGS.drain_timeout_s)
 

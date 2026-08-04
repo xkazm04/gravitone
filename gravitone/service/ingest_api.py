@@ -147,6 +147,16 @@ _LOCK = threading.RLock()
 WORK_ROOT = Path(SETTINGS.ingest_work_dir)
 _TTL = 60 * 30                     # idle jobs (and their workdirs) expire after 30 min
 _GC_INTERVAL = 60 * 5             # background GC sweep cadence
+# Set by `stop_background`; every background thread this module owns watches it.
+# A daemon thread is not a drain: SIGTERM used to kill a commit mid-clone with
+# rows already registered and `_rollback` still ten lines away.
+_STOP = threading.Event()
+# Phase threads (analyze/label/commit/rederive) currently in flight, so the
+# drain has something to join. Guarded by _LOCK; pruned as it grows.
+_PHASES: "list[threading.Thread]" = []
+# The real class, captured at import: suites that patch `threading.Thread` hand
+# `_spawn` a stand-in, and a drain must join threads, not a mock's is_alive().
+_REAL_THREAD = threading.Thread
 
 # Statuses that mean "a thread is doing work for this job right now". They are
 # what the admission gate counts and what GC refuses to reap on the idle TTL.
@@ -205,7 +215,7 @@ _BEAT_TTL_S = 60 * 60
 # the job stays owned by whoever has it.
 _CLAIM_TIMEOUT_S = 2.0
 # Names under WORK_ROOT that are infrastructure, not jobs.
-_RESERVED_DIRS = (_OWNERS_DIRNAME,)
+_RESERVED_DIRS = (_OWNERS_DIRNAME, ".receipts")
 
 
 def _owners_dir() -> Path:
@@ -743,6 +753,183 @@ def _partial(job: dict, d: dict) -> None:
         _persist(job)
 
 
+# ── the commit journal ────────────────────────────────────────────────────────
+# What a clone INTENDED and what it has actually REGISTERED, on disk, updated as
+# it goes. `ingest.commit` registers each Voice through `voices.mutate_meta` the
+# moment it is exported, so a process killed mid-clone leaves live rows behind
+# and takes its in-memory `registered` list with it — `_rollback` never ran, and
+# the next boot only relabelled the job. The journal is what survives, so the
+# next boot can tell a HALF character (roll it back) from a whole one whose
+# status flip was the only thing lost (mark it committed).
+#
+# Only the owning process writes it, so no cross-process mutex is needed — but
+# it is written atomically, because a torn journal is a rollback that cannot
+# name what it must undo.
+_JOURNAL_NAME = "commit.json"
+
+
+def _write_journal(work_dir: Path, doc: dict) -> None:
+    if not work_dir.is_dir():
+        return    # torn down under us; there is nothing left to reconcile
+    try:
+        atomicio.atomic_write_text(work_dir / _JOURNAL_NAME, json.dumps(doc))
+    except OSError as exc:
+        logger.warning("ingest: commit journal not written in %s: %s",
+                       work_dir.name, exc)
+
+
+def _read_journal(work_dir: Path) -> dict | None:
+    try:
+        doc = json.loads((work_dir / _JOURNAL_NAME).read_text("utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def _clear_journal(work_dir: Path) -> None:
+    with contextlib.suppress(OSError):
+        (work_dir / _JOURNAL_NAME).unlink(missing_ok=True)
+
+
+def _journal_ids(journal: dict) -> list[str]:
+    return [r.get("voice_id") for r in journal.get("registered") or []
+            if isinstance(r, dict) and r.get("voice_id")]
+
+
+def _reconcile(job: dict, work_dir: Path) -> None:
+    """Decide what a job caught mid-flight by a restart actually left behind.
+
+    Three outcomes, and the middle one is the whole point:
+
+      * no journal (an analyze/label phase, or a commit that died before it
+        registered anything) — nothing was created; the job is errored, as it
+        always was;
+      * a commit whose journal covers every emotion it intended, or that had
+        written its `done` marker — the CLONE finished and only the status flip
+        was lost, so the job becomes `committed` with the voices it made;
+      * anything else — a PARTIAL character. Those voices are exactly the ones
+        `_rollback` would have removed, so they are removed now and the job
+        says so. This is the guarantee: no half-Character survives a restart
+        unnoticed.
+
+    A re-derivation is never rolled back, for the reason `_do_rederive`
+    documents: it REPLACED voices the user already had, and removing the
+    rebuilt one leaves the character with nothing for that emotion. It is
+    reported instead, in the job and in its durable receipt.
+    """
+    journal = _read_journal(work_dir)
+    if not journal:
+        job["status"] = "error"
+        job["error"] = "interrupted by restart"
+        return
+
+    made = [r for r in journal.get("registered") or [] if isinstance(r, dict)]
+    if journal.get("kind") == "rederive":
+        job["status"] = "error"
+        job["error"] = ("interrupted by restart" if not made else
+                        f"interrupted by restart after rebuilding {len(made)} "
+                        "voice(s) — they were KEPT, because a rebuilt voice "
+                        "replaced one that no longer exists")
+        job["committed"] = made or None
+        _record_rederive(job, "interrupted", made)
+        _clear_journal(work_dir)
+        return
+
+    intended = [e for e in journal.get("intended") or []]
+    done_emotions = {r.get("emotion") for r in made}
+    complete = (journal.get("state") == "done"
+                or (bool(intended) and set(intended) <= done_emotions))
+    if complete:
+        job["status"] = "committed"
+        job["committed"] = made
+        job["error"] = None
+        job["partial"] = {"emotions_done": len(made),
+                          "emotions_total": len(intended) or len(made),
+                          "current": None}
+        logger.warning("ingest job %s: the clone had finished when the process "
+                       "stopped; marking it committed (%d voice(s))",
+                       job.get("id"), len(made))
+        _clear_journal(work_dir)
+        return
+
+    ids = _journal_ids(journal)
+    job["status"] = "error"
+    if not ids:
+        job["error"] = "interrupted by restart"
+    else:
+        _rollback(str(job.get("id")), made, "was interrupted by a restart")
+        job["error"] = (f"interrupted by a restart mid-clone — the {len(ids)} "
+                        "voice(s) it had already created were removed")
+    _clear_journal(work_dir)
+
+
+# ── durable receipts ──────────────────────────────────────────────────────────
+# What a job LEFT BEHIND, outliving the job itself.
+#
+# A cancelled re-derivation keeps every voice it had already rebuilt (see
+# `_do_rederive`), but `cancel_job` popped the job and rmtree'd its workdir, so
+# the list of replaced voices survived only in a server log while the API
+# answered a bare {"status": "cancelled"}. The user was told nothing about a
+# change that had already happened to their character. Receipts live OUTSIDE
+# any job directory for exactly that reason, and `GET /v1/ingest/{job}` falls
+# back to them, so the poller that was watching the job reads the outcome from
+# the URL it already has.
+_RECEIPTS_DIRNAME = ".receipts"
+_RECEIPT_TTL_S = 60 * 60 * 24
+_TERMINAL_OUTCOMES = ("completed", "cancelled", "failed", "interrupted")
+
+
+def _receipts_dir() -> Path:
+    return WORK_ROOT / _RECEIPTS_DIRNAME
+
+
+def _receipt_path(job_id: str) -> Path:
+    return _receipts_dir() / f"{job_id}.json"
+
+
+def _read_receipt(job_id: str) -> dict | None:
+    if not job_id or "/" in job_id or "\\" in job_id or job_id.startswith("."):
+        return None
+    try:
+        doc = json.loads(_receipt_path(job_id).read_text("utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def _record_rederive(job: dict, outcome: str, made: list[dict]) -> None:
+    """Write (or refine) the durable receipt for a re-derivation.
+
+    Called as each voice is registered AND at every terminal path, including
+    the cancelled one — where the job dict is already gone from JOBS and the
+    workdir is already deleted. A terminal outcome is never downgraded back to
+    "running" by a straggling progress write.
+    """
+    voices_made = [{"voice_id": v.get("voice_id"), "emotion": v.get("emotion"),
+                    "replaced": v.get("replaced")}
+                   for v in made if isinstance(v, dict)]
+    prior = _read_receipt(str(job.get("id") or "")) or {}
+    prior_out = ((prior.get("rederive") or {}).get("outcome") or "")
+    if outcome == "running" and prior_out in _TERMINAL_OUTCOMES:
+        outcome = prior_out
+    doc = {k: job.get(k) for k in _PUBLIC_KEYS if k != "rederive"}
+    doc["rederive"] = {
+        "outcome": outcome,
+        "character_id": job.get("character_id"),
+        "voices": voices_made,
+        # The one fact a cancelled rebuild owes its user: these are LIVE.
+        "kept": True,
+        "at": time.time(),
+    }
+    try:
+        _receipts_dir().mkdir(parents=True, exist_ok=True)
+        atomicio.atomic_write_text(_receipt_path(str(job.get("id"))),
+                                   json.dumps(doc))
+    except OSError as exc:
+        logger.warning("ingest job %s: rederive receipt not written: %s",
+                       job.get("id"), exc)
+
+
 # ── rehydrate + GC ────────────────────────────────────────────────────────────
 def _rehydrate() -> None:
     """Reload the jobs THIS process owns from disk on startup.
@@ -777,8 +964,9 @@ def _rehydrate() -> None:
             continue
         job["cancel"] = False
         if job.get("status") in ("running", "committing"):
-            job["status"] = "error"
-            job["error"] = "interrupted by restart"
+            # Not just a relabel: whatever this job registered before the
+            # process stopped is undone, or finished, from its journal.
+            _reconcile(job, d)
             _persist(job)  # locked + atomic, same as every other writer
         JOBS[job["id"]] = job
 
@@ -876,6 +1064,15 @@ def _gc_once() -> None:
                     shutil.rmtree(d, ignore_errors=True)
             except OSError:
                 pass
+    # Receipts outlive their jobs, but not forever: they are a day's worth of
+    # "what happened to the rebuild I cancelled", not an audit log.
+    if _receipts_dir().is_dir():
+        for r in _receipts_dir().iterdir():
+            try:
+                if now - r.stat().st_mtime > _RECEIPT_TTL_S:
+                    r.unlink(missing_ok=True)
+            except OSError:
+                pass
     # Heartbeat files of processes that never came back.
     if _owners_dir().is_dir():
         for b in _owners_dir().iterdir():
@@ -913,6 +1110,23 @@ def _gc_loop(stop: threading.Event | None = None) -> None:
 
 
 # ── background phases ─────────────────────────────────────────────────────────
+def _spawn(target: Callable, args: tuple, name: str) -> threading.Thread:
+    """Start a phase thread AND remember it, so shutdown can wait for it.
+
+    Still a daemon: a wedged ffmpeg must not hold the process open past the
+    orchestrator's stop grace. The difference is that `stop_background` now
+    gets a bounded chance to let it finish first, and says in the log what it
+    could not wait out.
+    """
+    t = threading.Thread(target=target, args=args, daemon=True, name=name)
+    with _LOCK:
+        _PHASES[:] = [p for p in _PHASES if p.is_alive()]
+        if isinstance(t, _REAL_THREAD):
+            _PHASES.append(t)
+    t.start()
+    return t
+
+
 def _canceller(job: dict) -> Callable[[], bool]:
     """The one cancellation predicate handed to the pipeline. Reads the flag
     under _LOCK — cancel_job/GC set it on this same dict after popping the job
@@ -1161,6 +1375,21 @@ def _do_commit(job_id: str, character: str, emotions: list[str], character_id: s
     # exception path there is no return value to inspect, and the voices
     # already written are precisely what has to be undone.
     registered: list[dict] = []
+    # ...and its durable twin, for the exception this process does not get to
+    # handle: SIGTERM. See "the commit journal".
+    wd = Path(job["work_dir"])
+    journal = {"kind": "commit", "state": "running", "job_id": job_id,
+               "character": character, "character_id": character_id,
+               "intended": list(emotions), "registered": [],
+               "started": time.time()}
+    _write_journal(wd, journal)
+
+    def _note(v: dict) -> None:
+        registered.append(v)
+        journal["registered"] = [
+            {"voice_id": r.get("voice_id"), "emotion": r.get("emotion")}
+            for r in registered if isinstance(r, dict)]
+        _write_journal(wd, journal)
 
     failure: BaseException | None = None
     try:
@@ -1168,13 +1397,17 @@ def _do_commit(job_id: str, character: str, emotions: list[str], character_id: s
             Path(job["work_dir"]), character, emotions, character_id,
             consent=statement, clip_sha256=job.get("clip_sha256"),
             progress=lambda done, cur: _commit_progress(job, done, total, cur),
-            should_cancel=cancelled, on_voice=registered.append)
+            should_cancel=cancelled, on_voice=_note)
     except Exception as exc:  # noqa: BLE001
         created, failure = registered, exc
 
     with _LOCK:
         was_cancelled = bool(job.get("cancel"))
         if not was_cancelled and failure is None:
+            # The `done` marker goes down BEFORE the status flip: a crash in
+            # between must be read as "the clone finished", which it did.
+            journal["state"] = "done"
+            _write_journal(wd, journal)
             job["committed"] = created
             job["partial"] = {"emotions_done": total, "emotions_total": total,
                               "current": None}
@@ -1186,9 +1419,14 @@ def _do_commit(job_id: str, character: str, emotions: list[str], character_id: s
         # commit), then undo. `_update` no-ops if the job was also cancelled.
         _fail(job, "voice cloning", failure)
         _rollback(job_id, registered, "failed")
+        _clear_journal(wd)
     elif was_cancelled:
         _rollback(job_id, created, "cancelled")
-    elif corpus:
+        _clear_journal(wd)
+    else:
+        # Handled in full; nothing is left for a restart to reconcile.
+        _clear_journal(wd)
+    if failure is None and not was_cancelled and corpus:
         # ONLY on the clean path: a rolled-back commit's voices no longer exist,
         # and keeping the audio that made them would be retention with nothing
         # to justify it.
@@ -1219,6 +1457,25 @@ def _do_rederive(job_id: str, character_id: str, emotions: list[str] | None) -> 
         return
     registered: list[dict] = []
     started = {"clone": False}
+    wd = Path(job["work_dir"])
+    # The journal says "a rebuild was in flight here" so a restart reports it
+    # rather than rolling it back; the RECEIPT is what the user can still read
+    # after the job (and its workdir) are gone.
+    journal = {"kind": "rederive", "state": "running", "job_id": job_id,
+               "character_id": character_id, "intended": list(emotions or []),
+               "registered": [], "started": time.time()}
+    _write_journal(wd, journal)
+    _record_rederive(job, "running", registered)
+
+    def _note(v: dict) -> None:
+        registered.append(v)
+        journal["registered"] = [
+            {"voice_id": r.get("voice_id"), "emotion": r.get("emotion")}
+            for r in registered if isinstance(r, dict)]
+        _write_journal(wd, journal)
+        # Written per voice, on purpose: a cancel can land at any point, and
+        # the receipt must already name what is live when it does.
+        _record_rederive(job, "running", registered)
 
     def _progress(done: int, current: str | None) -> None:
         if not started["clone"]:
@@ -1239,7 +1496,7 @@ def _do_rederive(job_id: str, character_id: str, emotions: list[str] | None) -> 
         res = ingest.rederive(
             character_id, Path(job["work_dir"]), emotions,
             progress=_progress, should_cancel=_canceller(job),
-            on_voice=registered.append)
+            on_voice=_note)
     except ingest.Cancelled:
         logger.info("ingest job %s: rederive abandoned (cancelled)", job_id)
     except Exception as exc:  # noqa: BLE001
@@ -1257,12 +1514,20 @@ def _do_rederive(job_id: str, character_id: str, emotions: list[str] | None) -> 
             job["status"] = "committed"
             _persist(job)
 
+    _clear_journal(wd)
     if failure is not None or was_cancelled:
         done = [v.get("voice_id") for v in registered if isinstance(v, dict)]
         logger.warning(
             "ingest job %s: rederive %s after rebuilding %d voice(s) — they are "
             "KEPT (see _do_rederive): %s", job_id,
             "failed" if failure is not None else "was cancelled", len(done), done)
+    # The receipt is written on EVERY terminal path, cancelled included. The
+    # cancelled one is the reason it exists: `cancel_job` has already popped
+    # the job and deleted its workdir, and the replaced voices are live.
+    _record_rederive(job, "failed" if failure is not None
+                     else "cancelled" if was_cancelled else "completed",
+                     registered if (failure is not None or was_cancelled)
+                     else (res.get("created") or registered))
     if failure is not None:
         _fail(job, "voice re-derivation", failure)
 
@@ -1325,7 +1590,7 @@ def start_scan(file: UploadFile = File(...), mode: str = Form("auto"),
     with _LOCK:
         JOBS[job_id] = job
         _persist(job)
-    threading.Thread(target=_analyze, args=(job_id, src), daemon=True).start()
+    _spawn(_analyze, (job_id, src), f"ingest-analyze-{job_id}")
     return {"job_id": job_id, "mode": resolved}
 
 
@@ -1345,6 +1610,10 @@ _PUBLIC_KEYS = ("id", "status", "step", "steps", "partial", "speakers",
                 "casting",
                 # Whether this job's audio was kept, and — always — why not.
                 "corpus",
+                # A re-derivation's outcome: which voices it replaced, and that
+                # they are KEPT. Present on the job while it runs and on the
+                # durable receipt after it is gone (see "durable receipts").
+                "rederive",
                 # What analyze learned about THIS recording. A key the job dict
                 # holds but this tuple omits is computed and then thrown away —
                 # that is exactly what happened to these three.
@@ -1372,9 +1641,16 @@ def modes() -> dict:
 def get_job(job_id: str):
     with _LOCK:
         job = JOBS.get(job_id)
-        if not job:
-            return job_expired()
-        return {k: job.get(k) for k in _PUBLIC_KEYS}
+        if job:
+            return {k: job.get(k) for k in _PUBLIC_KEYS}
+    # The job is gone — but a re-derivation that was cancelled or interrupted
+    # CHANGED the user's character before it stopped, and that outcome outlives
+    # the job (see "durable receipts"). A 404 here used to be the only answer,
+    # so the one fact worth keeping was the one fact the API never told.
+    receipt = _read_receipt(job_id)
+    if receipt:
+        return receipt
+    return job_expired()
 
 
 @router.get(INGEST + "/{job_id}/speaker-preview/{sid}")
@@ -1404,7 +1680,7 @@ def choose_speaker(job_id: str, req: SpeakerReq) -> dict:
         job["status"] = "running"
         job["partial"] = {}
         _persist(job)
-    threading.Thread(target=_label, args=(job_id, req.speaker_id), daemon=True).start()
+    _spawn(_label, (job_id, req.speaker_id), f"ingest-label-{job_id}")
     return {"status": "running"}
 
 
@@ -1903,11 +2179,9 @@ def commit(job_id: str, req: CommitReq):
                          else "corpus capture was not requested"}
         job["partial"] = {"emotions_done": 0, "emotions_total": len(emotions), "current": None}
         _persist(job)
-    threading.Thread(
-        target=_do_commit,
-        args=(job_id, req.character.strip(), emotions, req.character_id, statement,
-              chosen, want_corpus),
-        daemon=True).start()
+    _spawn(_do_commit,
+           (job_id, req.character.strip(), emotions, req.character_id, statement,
+            chosen, want_corpus), f"ingest-commit-{job_id}")
     return {"status": "committing"}
 
 
@@ -1989,8 +2263,7 @@ def start_rederive(req: RederiveReq) -> dict:
     with _LOCK:
         JOBS[job_id] = job
         _persist(job)
-    threading.Thread(target=_do_rederive, args=(job_id, cid, emotions),
-                     daemon=True).start()
+    _spawn(_do_rederive, (job_id, cid, emotions), f"ingest-rederive-{job_id}")
     return {"job_id": job_id, "mode": "rederive",
             "selection": sel["report"], "corpus_rev": sel["corpus_rev"]}
 
@@ -2034,7 +2307,13 @@ def delete_corpus_clip(character_id: str, clip_sha: str) -> dict:
 @router.delete(INGEST + "/{job_id}")
 def cancel_job(job_id: str):
     """Cancel a job (between emotions during commit, between phases otherwise),
-    mark it 'cancelled' and tear down its workdir."""
+    mark it 'cancelled' and tear down its workdir.
+
+    A cancelled RE-DERIVATION keeps the voices it had already rebuilt, so the
+    teardown leaves a receipt behind and the response says so — the answer used
+    to be a bare {"status": "cancelled"} for an operation that had already
+    replaced part of the user's character.
+    """
     with _LOCK:
         job = JOBS.get(job_id)
         if not job:
@@ -2042,14 +2321,30 @@ def cancel_job(job_id: str):
         job["cancel"] = True
         job["status"] = "cancelled"
         work_dir = job["work_dir"]
+        is_rederive = job.get("mode") == "rederive"
         JOBS.pop(job_id, None)
         _SPEND.pop(job_id, None)
+    rebuilt: list[dict] = []
+    if is_rederive:
+        # The phase thread is still running and will finalize this receipt;
+        # writing it here means the outcome exists even if the thread never
+        # got far enough to write one (cancelled before it started).
+        prior = _read_receipt(job_id) or {}
+        rebuilt = list((prior.get("rederive") or {}).get("voices") or [])
+        _record_rederive(job, "cancelled", rebuilt)
     shutil.rmtree(work_dir, ignore_errors=True)
+    if is_rederive:
+        return {"status": "cancelled", "rebuilt": rebuilt, "kept": True}
     return {"status": "cancelled"}
 
 
-# ── startup: rehydrate persisted jobs + launch the GC timer ───────────────────
+# ── startup / shutdown ────────────────────────────────────────────────────────
 _started = False
+_gc_thread: threading.Thread | None = None
+# What a phase gets to finish once shutdown has begun. Kept well under the
+# engine's own drain budget by the caller (Settings.drain_timeout_s), because
+# the orchestrator's stop grace has to cover BOTH.
+DRAIN_GRACE_S = 10.0
 
 
 def start_background() -> None:
@@ -2063,14 +2358,63 @@ def start_background() -> None:
     workdirs. Tests in particular shared that live thread with the production
     module globals they patch. Idempotent.
     """
-    global _started
+    global _started, _gc_thread
     with _LOCK:
         if _started:
             return
         _started = True
+    _STOP.clear()
     # Beat BEFORE claiming anything: a sibling replica starting in the same
     # second must be able to see that we are alive, or two processes could each
     # decide the other is dead and both claim the same job.
     _beat()
     _rehydrate()
-    threading.Thread(target=_gc_loop, daemon=True, name="ingest-gc").start()
+    _gc_thread = threading.Thread(target=_gc_loop, args=(_STOP,), daemon=True,
+                                  name="ingest-gc")
+    _gc_thread.start()
+
+
+def stop_background(grace: float = DRAIN_GRACE_S) -> dict:
+    """Drain ingest. The other half of `start_background`, and it did not exist.
+
+    The lifespan drained ENGINE and nothing else, so SIGTERM landed on daemon
+    threads that were never joined: a commit mid-clone had rows already
+    registered through `voices.mutate_meta` and its `_rollback` still ahead of
+    it, and the next boot relabelled the job "interrupted by restart" without
+    undoing anything. The partial Character survived, unnoticed.
+
+    So: stop the sweeper (it WAKES on the event — a five-minute sleep is not a
+    shutdown), give the phases in flight a bounded grace to reach their own
+    terminal handling, release this process's ownership so a restart adopts its
+    jobs at once rather than after `_OWNER_STALE_S`, and REPORT what could not
+    be waited out. Whatever a phase could not finish is reconciled at the next
+    startup from its journal (`_reconcile`), which is the guarantee this pairs
+    with: the grace is an optimization, not the safety net.
+    """
+    global _started, _gc_thread
+    _STOP.set()
+    deadline = time.monotonic() + max(0.0, grace)
+    gc = _gc_thread
+    if gc is not None and gc.is_alive():
+        gc.join(timeout=max(0.1, deadline - time.monotonic()))
+    with _LOCK:
+        phases = [p for p in _PHASES if p.is_alive()]
+    unfinished: list[str] = []
+    for t in phases:
+        t.join(timeout=max(0.0, deadline - time.monotonic()))
+        if t.is_alive():
+            unfinished.append(str(getattr(t, "name", t)))
+    if unfinished:
+        logger.warning(
+            "ingest drain: %d phase(s) did not finish within %.0fs and were "
+            "left to the restart's reconciliation: %s",
+            len(unfinished), grace, ", ".join(unfinished))
+    else:
+        logger.info("ingest drain: %d phase(s) finished", len(phases))
+    _release_owner()
+    with _LOCK:
+        _started = False
+        _PHASES[:] = [p for p in _PHASES if p.is_alive()]
+    _gc_thread = None
+    return {"phases": len(phases), "unfinished": unfinished,
+            "gc_stopped": gc is None or not gc.is_alive()}
