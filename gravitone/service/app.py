@@ -348,6 +348,79 @@ async def _await_result(job):
         raise errors.sanitized_500("synthesis", exc)
 
 
+# The smallest deadline this layer will ever hand the engine. A request whose
+# horizon has already elapsed (a later wave, a later stream segment) must still
+# say "I am out of time" rather than silently reverting to NO deadline, which is
+# what passing None would mean — and the engine's own class floor
+# (engine._deadline_floor_s) is what stops that number buying unfair priority.
+_SPENT_DEADLINE_S = 0.001
+
+
+def _contract_kwargs(deadline_s: float | None, degrade_allowed: bool = False,
+                     job_class: str | None = None,
+                     elapsed_s: float = 0.0) -> dict:
+    """Engine kwargs for the deadline contract — the ONE place they are built.
+
+    Only passes what the caller actually used: engine doubles in the test suite
+    predate these parameters, and a request that named no deadline must reach
+    ``submit()`` as the exact call it always made (this is what keeps "no
+    deadline named" byte-identical to the pre-deadline service).
+
+    ``elapsed_s`` is how much of the caller's horizon this request has ALREADY
+    spent before this particular submission — the later waves of /v1/speak and
+    the later segments of the streaming route. ``deadline_s`` is defined as
+    "seconds from admission", so re-sending the caller's original number on a
+    submission made ten seconds later would silently extend their deadline by
+    ten seconds. What is handed over is the REMAINING horizon.
+    """
+    extra: dict = {}
+    if deadline_s is not None:
+        extra["deadline_s"] = max(_SPENT_DEADLINE_S,
+                                  float(deadline_s) - max(0.0, elapsed_s))
+    if job_class is not None:
+        extra["job_class"] = job_class
+    if degrade_allowed:
+        extra["degrade_allowed"] = degrade_allowed
+    return extra
+
+
+def _batch_promise(jobs: list) -> dict:
+    """The promise/quality a MULTI-JOB request may report, from its jobs.
+
+    The units of one request run concurrently, so the request is done when its
+    LAST unit is: the promise is the largest per-unit promise, and it is
+    withheld entirely (None) if any unit was not promised — a partial promise
+    covering some of the audio is not a promise about the response.
+
+    Quality is reported as the WORST level any unit ran at, because that is the
+    level the caller can hear.
+    """
+    promises = [getattr(j, "promised_s", None) for j in jobs]
+    levels = [getattr(j, "quality_level", "full") for j in jobs]
+    order = ["full", "reduced", "minimal"]
+    worst = max(levels, key=lambda lv: order.index(lv) if lv in order else 0,
+                default="full")
+    return {"deadline": (max(promises) if promises and all(p is not None
+                                                           for p in promises)
+                         else None),
+            "quality": worst}
+
+
+def _promise_headers(promise: dict) -> dict[str, str]:
+    """X-Gravitone-Deadline / X-Quality-Level for a promise dict, or {}.
+
+    Visible, never silent: a caller who allowed degradation is TOLD which level
+    ran, and a promise is only ever sent when the engine was willing to make one
+    (a warm window, and a calibrated basis — see engine.TtsEngine.submit).
+    """
+    headers: dict[str, str] = {}
+    if promise.get("deadline") is not None:
+        headers["X-Gravitone-Deadline"] = str(promise["deadline"])
+    if promise.get("quality") not in (None, "full"):
+        headers["X-Quality-Level"] = str(promise["quality"])
+    return headers
+
+
 async def _submit_and_wait(voice_id: str, text: str, overrides: dict,
                            frames_after_eos: int | None = None,
                            deadline_s: float | None = None,
@@ -363,16 +436,7 @@ async def _submit_and_wait(voice_id: str, text: str, overrides: dict,
     function's return type at ~6 call sites for a header two of them want.
     """
     assert ENGINE is not None
-    # Only pass the contract kwargs when the caller actually used them: engine
-    # doubles in the test suite predate them, and a request that named no
-    # deadline must reach submit() as the exact call it always made.
-    extra: dict = {}
-    if deadline_s is not None:
-        extra["deadline_s"] = deadline_s
-    if job_class is not None:
-        extra["job_class"] = job_class
-    if degrade_allowed:
-        extra["degrade_allowed"] = degrade_allowed
+    extra = _contract_kwargs(deadline_s, degrade_allowed, job_class=job_class)
     try:
         job = ENGINE.submit(voice_id=voice_id, text=text, overrides=overrides,
                             frames_after_eos=frames_after_eos, **extra)
@@ -398,7 +462,10 @@ def _abandon_all(jobs) -> None:
 
 
 def _submit_batch(specs: list[tuple[str, str, dict]],
-                  frames_after_eos: int | None = None) -> list:
+                  frames_after_eos: int | None = None,
+                  deadline_s: float | None = None,
+                  degrade_allowed: bool = False,
+                  elapsed_s: float = 0.0) -> list:
     """Submit a whole batch up front (concurrency, not N× serial latency).
 
     Admission is decided here, so a mid-list rejection means the request fails
@@ -407,20 +474,38 @@ def _submit_batch(specs: list[tuple[str, str, dict]],
 
     ``frames_after_eos`` applies to every job in the batch (the drop-in route
     carries one per request; /v1/speak and /v1/performance don't expose it).
+
+    THE MULTI-UNIT DEADLINE SEMANTIC: every unit inherits the WHOLE request's
+    horizon — the same ``deadline_s``, not a 1/N slice of it. A multi-unit
+    request is one response, and that response is complete only when its LAST
+    unit is; the units are submitted at the same instant and run concurrently
+    (the batch is capped at ``_max_batch_units()``, this process's real
+    parallelism), so each unit's own horizon IS the request's horizon. Slicing
+    the deadline N ways would be arithmetically tidier and operationally wrong:
+    it would make each unit look far more urgent than the request really is,
+    escalating a segmented request past an identical unsegmented one purely
+    because its text was longer. ``elapsed_s`` covers the one case where the
+    horizon really has shrunk — a batch submitted LATER than the request's
+    admission (a second wave, a later stream window) — see ``_contract_kwargs``.
     """
+    extra = _contract_kwargs(deadline_s, degrade_allowed, elapsed_s=elapsed_s)
     jobs = []
     try:
         for voice_id, text, overrides in specs:
             jobs.append(ENGINE.submit(voice_id=voice_id, text=text,
                                       overrides=overrides,
-                                      frames_after_eos=frames_after_eos))
+                                      frames_after_eos=frames_after_eos,
+                                      **extra))
     except AdmissionRejected:
         _abandon_all(jobs)
         raise
     return jobs
 
 
-async def _submit_and_gather_in_waves(specs: list[tuple[str, str, dict]]) -> list:
+async def _submit_and_gather_in_waves(specs: list[tuple[str, str, dict]],
+                                      deadline_s: float | None = None,
+                                      degrade_allowed: bool = False,
+                                      promise: dict | None = None) -> list:
     """Submit a multi-segment script as WAVES, returning results in spec order.
 
     ``/v1/speak`` and ``/v1/performance`` flatten their input into one job per
@@ -449,12 +534,30 @@ async def _submit_and_gather_in_waves(specs: list[tuple[str, str, dict]]) -> lis
     that wave's siblings. Waves that already completed are not undone — they are
     finished audio, not a burning worker slot — which is the same trade the
     streaming route's rolling window makes.
+
+    The deadline contract rides along: every segment of a wave inherits the
+    request's horizon (see ``_submit_batch``), but a wave submitted after
+    earlier waves have already run gets the REMAINING horizon, because waves are
+    sequential in time and ``deadline_s`` means "seconds from admission". A
+    request whose horizon is spent by wave three still names a (spent) deadline
+    rather than reverting to none — that is the truth, and the engine records
+    the miss instead of pretending the request became deadline-free.
+
+    ``promise`` is the same out-parameter ``_submit_and_wait`` takes: the
+    promise and quality level of ALL jobs across ALL waves (``_batch_promise``).
     """
     cap = max(1, _max_batch_units())
     results: list = []
+    submitted: list = []
+    t_start = time.monotonic()
     for i in range(0, len(specs), cap):
-        jobs = _submit_batch(specs[i:i + cap])
+        jobs = _submit_batch(specs[i:i + cap], deadline_s=deadline_s,
+                             degrade_allowed=degrade_allowed,
+                             elapsed_s=time.monotonic() - t_start)
+        submitted.extend(jobs)
         results.extend(await _gather_results(jobs))
+    if promise is not None:
+        promise.update(_batch_promise(submitted))
     return results
 
 
@@ -1033,13 +1136,7 @@ async def _render_tts(voice_id: str, req: TTSRequest, emotion: str | None,
                 deadline_s=req.deadline_s,
                 degrade_allowed=req.degrade_allowed,
                 promise=promise)
-            # Visible, never silent: a caller who allowed degradation is TOLD
-            # which level ran, and a promise is only ever sent when the engine
-            # was willing to make one (warm window).
-            if promise.get("deadline") is not None:
-                extra_headers["X-Gravitone-Deadline"] = str(promise["deadline"])
-            if promise.get("quality") not in (None, "full"):
-                extra_headers["X-Quality-Level"] = str(promise["quality"])
+            extra_headers.update(_promise_headers(promise))
             timing["synth"] = result.synth_seconds
             timing["queue"] = result.queue_seconds
             return CachedAudio(wav_bytes=result.wav_bytes,
@@ -1048,12 +1145,20 @@ async def _render_tts(voice_id: str, req: TTSRequest, emotion: str | None,
 
         t_start = time.perf_counter()
         try:
+            # Same contract as the single-unit branch above: the caller's
+            # deadline reaches the engine whichever branch their text length
+            # happens to take (it used to reach it from the single-unit branch
+            # ONLY, so a deadline was honoured or ignored by text length).
+            # Every unit inherits the request's horizon — see _submit_batch.
             jobs = _submit_batch([(voice_id, unit, overrides) for unit in units],
-                                 frames_after_eos=req.frames_after_eos)
+                                 frames_after_eos=req.frames_after_eos,
+                                 deadline_s=req.deadline_s,
+                                 degrade_allowed=req.degrade_allowed)
         except AdmissionRejected as exc:
             # Admission is decided for the whole batch; _submit_batch already
             # abandoned the siblings that did get in.
             raise _Backpressure(str(exc), exc)
+        extra_headers.update(_promise_headers(_batch_promise(jobs)))
         results = await _gather_results(jobs)
         wav_bytes = await _offload(concat_wavs, [r.wav_bytes for r in results])
         # Wall-clock for the WHOLE request, not the sum of per-segment synth
@@ -1647,6 +1752,14 @@ async def text_to_speech_stream(
     (the first window can't be admitted) rather than truncating mid-stream. The
     whole response is bounded by ONE deadline (``stream_deadline_s``); when it
     expires the stream ends and every un-consumed segment is abandoned.
+
+    The CALLER's ``deadline_s``/``degrade_allowed`` (a different thing from
+    ``stream_deadline_s``, which is the server's own truncation bound) reach the
+    engine here exactly as they do on the non-streaming route: the first window
+    inherits the request's whole horizon, later segments get what is left of it.
+    ``X-Gravitone-Deadline`` is emitted only when the entire script fit in the
+    first window — otherwise segments are still unadmitted when the headers go
+    out and any number would be a guess.
     """
     assert ENGINE is not None
     fmt = _parse_format(output_format)  # 400s early on an unsupported format
@@ -1667,10 +1780,18 @@ async def text_to_speech_stream(
     # commit to a streaming response, keeping backpressure semantics identical
     # to the non-stream route. Workers pick the window up concurrently; the
     # rest is submitted as segments are consumed.
+    # The caller's deadline reaches the engine here too. The horizon is the
+    # REQUEST's, not the segment's: every segment of the first window inherits
+    # it whole (they run concurrently), and each later segment is submitted with
+    # whatever is LEFT of it (``elapsed_s`` below) — a segment submitted eight
+    # seconds into a ten-second horizon has two seconds, not ten.
+    t_admitted = time.monotonic()
     try:
         submitted = _submit_batch([(voice_id, text, overrides)
                                    for text in chunks[:window]],
-                                  frames_after_eos=req.frames_after_eos)
+                                  frames_after_eos=req.frames_after_eos,
+                                  deadline_s=req.deadline_s,
+                                  degrade_allowed=req.degrade_allowed)
     except AdmissionRejected as exc:
         return _backpressure_response(_Backpressure(str(exc), exc))
 
@@ -1692,7 +1813,10 @@ async def text_to_speech_stream(
                         submitted.append(ENGINE.submit(
                             voice_id=voice_id, text=pending[0],
                             overrides=overrides,
-                            frames_after_eos=req.frames_after_eos))
+                            frames_after_eos=req.frames_after_eos,
+                            **_contract_kwargs(
+                                req.deadline_s, req.degrade_allowed,
+                                elapsed_s=time.monotonic() - t_admitted)))
                     except AdmissionRejected:
                         break
                     except ShuttingDown:
@@ -1774,6 +1898,11 @@ async def text_to_speech_stream(
     }
     if fmt.kind == "pcm":
         stream_headers["X-Sample-Rate"] = str(fmt.sample_rate)
+    # A promise may only ever cover the WHOLE response. If the script did not
+    # fit in the first window there are segments not yet admitted, so no honest
+    # number exists at header time and none is sent.
+    if not pending:
+        stream_headers.update(_promise_headers(_batch_promise(submitted)))
 
     return StreamingResponse(
         _audio_stream(), media_type=fmt.content_type,
@@ -1848,6 +1977,16 @@ class BuildRequest(BaseModel):
     # so an unbounded manifest is a way for one caller to hold the pool.
     lines: list[BuildLine] = Field(
         ..., min_length=1, max_length=buildstore.BUILD_MANIFEST_MAX_LINES)
+    # PER-LINE horizon, not a budget for the whole manifest: a build renders its
+    # lines one after another (each line's bytes must be stored before the next
+    # is identified), so "this build must finish in 5s" is not a thing the
+    # scheduler can act on, while "schedule each of my lines against a 5s
+    # horizon" is exactly what the queue key consumes.
+    deadline_s: float | None = Field(None, gt=0, le=3600)
+    # Accepted so it can be REFUSED loudly rather than ignored silently — see
+    # build()'s 400. A build artifact is content-addressed and elastic quality
+    # would change the bytes without changing the digest.
+    degrade_allowed: bool = False
 
 
 async def _line_identity(line: BuildLine, index: int) -> tuple[str, str, str, dict]:
@@ -1941,8 +2080,24 @@ async def build(req: BuildRequest):
     Admission is untouched and shared: a saturated pool returns the ordinary 429
     + ``Retry-After``, and the lines already rendered are already stored, so a
     retried build resumes instead of restarting.
+
+    ``deadline_s`` reaches the engine for every line it renders (a PER-LINE
+    horizon — see BuildRequest). ``degrade_allowed`` is REFUSED with a 400
+    rather than honoured: a build artifact is named by a digest computed from
+    its inputs, so a cheaper render would put different bytes under the same
+    name — the one failure the DIGEST LAW (service/buildstore.py) exists to
+    prevent. Elastic quality belongs on the routes that hand back audio, where
+    ``X-Quality-Level`` tells the caller what they got.
     """
     assert ENGINE is not None
+    if req.degrade_allowed:
+        raise HTTPException(
+            status_code=400,
+            detail="degrade_allowed is not available on /v1/build: a build "
+                   "artifact is named by a digest over its inputs, and a "
+                   "cheaper render would store different bytes under that same "
+                   "name. Use deadline_s alone here, or the /v1/text-to-speech "
+                   "routes if you want elastic quality.")
     results = []
     lock_lines = []
     engine_version = _engine_version()
@@ -1957,7 +2112,8 @@ async def build(req: BuildRequest):
             continue
         fmt = _parse_format(fmt_str)
         tts_req = TTSRequest(text=line.text, voice_settings=line.settings,
-                             frames_after_eos=line.frames_after_eos)
+                             frames_after_eos=line.frames_after_eos,
+                             deadline_s=req.deadline_s)
         rendered = await _render_tts(line.voice, tts_req, line.emotion, None,
                                      resolved=(resolved, {}))
         if isinstance(rendered, JSONResponse):
@@ -2143,6 +2299,11 @@ class SpeakRequest(BaseModel):
     character_id: str
     text: str = Field(..., min_length=1, max_length=8000)
     voice_settings: VoiceSettings | None = None
+    # The deadline contract, same field names and same meaning as TTSRequest:
+    # the horizon is the REQUEST's, and every segment of it inherits that
+    # horizon (see _submit_batch). Absent = the previous behaviour exactly.
+    deadline_s: float | None = Field(None, gt=0, le=3600)
+    degrade_allowed: bool = False
 
 
 @app.post("/v1/speak", dependencies=[Depends(require_scope("tts"))])
@@ -2207,10 +2368,13 @@ async def speak(
         await _offload(_record_fallbacks, fallbacks)
 
     t_start = time.perf_counter()
+    promise: dict = {}
     try:
         results = await _submit_and_gather_in_waves(
             [(voice_id, seg.text, overrides)
-             for (seg, voice_id, used, fell_back) in resolved])
+             for (seg, voice_id, used, fell_back) in resolved],
+            deadline_s=req.deadline_s, degrade_allowed=req.degrade_allowed,
+            promise=promise)
     except AdmissionRejected as exc:
         return _backpressure_response(_Backpressure(str(exc), exc))
 
@@ -2245,6 +2409,7 @@ async def speak(
                                   if synth_seconds else "n/a"),
             "X-Segments": base64.b64encode(json.dumps(report).encode()).decode(),
             **({"X-Synth-Segments": str(len(results))} if len(results) > 1 else {}),
+            **_promise_headers(promise),
             **format_headers,
             **_ignored_headers(req.voice_settings),
         },
@@ -2279,6 +2444,12 @@ class PerformanceLine(BaseModel):
 
 class PerformanceRequest(BaseModel):
     lines: list[PerformanceLine] = Field(..., min_length=1, max_length=64)
+    # The deadline contract for the WHOLE performance (see SpeakRequest): one
+    # horizon for the response, inherited by every line's every segment. A
+    # per-line deadline would be a different feature — a performance is one
+    # piece of audio, and the caller waits for all of it.
+    deadline_s: float | None = Field(None, gt=0, le=3600)
+    degrade_allowed: bool = False
 
 
 @app.post("/v1/performance", dependencies=[Depends(require_scope("performance"))])
@@ -2343,9 +2514,12 @@ async def performance(req: PerformanceRequest,
         await _offload(_record_fallbacks, fallbacks)
 
     t_start = time.perf_counter()
+    promise: dict = {}
     try:
         results = await _submit_and_gather_in_waves(
-            [(t[3], t[2].text, t[6]) for t in tasks])
+            [(t[3], t[2].text, t[6]) for t in tasks],
+            deadline_s=req.deadline_s, degrade_allowed=req.degrade_allowed,
+            promise=promise)
     except AdmissionRejected as exc:
         return _backpressure_response(_Backpressure(str(exc), exc))
 
@@ -2376,6 +2550,7 @@ async def performance(req: PerformanceRequest,
                                   if synth_seconds else "n/a"),
             "X-Performance-Report": base64.b64encode(json.dumps(report).encode()).decode(),
             **({"X-Synth-Segments": str(len(results))} if len(results) > 1 else {}),
+            **_promise_headers(promise),
             **format_headers,
             **({"X-Ignored-Settings": ",".join(ignored)} if ignored else {}),
         },

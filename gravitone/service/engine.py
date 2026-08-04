@@ -87,6 +87,29 @@ _CLASSES = (CLASS_BULK, CLASS_INTERACTIVE)
 _BULK_AGING_HORIZON_S = float(os.environ.get("TTS_BULK_AGING_HORIZON_S") or 30.0)
 _INTERACTIVE_HORIZON_S = float(os.environ.get("TTS_INTERACTIVE_HORIZON_S") or 2.0)
 
+# Floor on how tight an EXPLICIT deadline may make a job's QUEUE KEY.
+#
+# ``deadline_s`` arrives from a request body (``app.TTSRequest`` and friends),
+# which makes it an unauthenticated priority knob: ``{"deadline_s": 0.001}``
+# mints a key ahead of every interactive turn (t+2s) and ahead of every bulk job
+# younger than the aging horizon — a starvation weapon costing one JSON field,
+# and it bypasses the very bound ``_BULK_AGING_HORIZON_S`` exists to give. So
+# the EFFECTIVE horizon of an explicit deadline is floored PER CLASS:
+#
+#   * a BULK caller may schedule itself sooner than the 30s bulk horizon, but
+#     never sooner than ``_INTERACTIVE_HORIZON_S`` — i.e. it can at best TIE the
+#     interactive class it does not belong to, never outrank it;
+#   * an INTERACTIVE caller may tighten inside its own class, down to this
+#     floor but not to zero (a zero key is a permanent front-of-queue claim).
+#
+# The floor applies to the queue key ONLY. ``job.deadline_s`` keeps the caller's
+# real number, because the degrade decision, the promise and the deadline-hit
+# measurement must all be made against what the caller actually asked for —
+# clamping the target would quietly turn "you asked for 1s" into "you asked for
+# 2s" in the very metrics that exist to tell us whether we keep our word.
+_INTERACTIVE_DEADLINE_FLOOR_S = float(
+    os.environ.get("TTS_INTERACTIVE_DEADLINE_FLOOR_S") or 0.25)
+
 # Admission permits no BULK job may consume — the interactive floor. Zero by
 # default ON PURPOSE: a non-zero floor changes who gets a 429 on a saturated
 # box, and that is an operator decision, not a silent upgrade.
@@ -1312,17 +1335,34 @@ class TtsEngine:
         return round(self.pending_cost_s() / workers + max(0.0, est_synth_s), 3)
 
     @staticmethod
+    def _deadline_floor_s(job_class: str) -> float:
+        """The tightest queue-key horizon an explicit deadline may buy, by class.
+
+        THIS is the mechanism that stops ``deadline_s`` being a free priority
+        escalation from an unauthenticated request body — see
+        ``_INTERACTIVE_DEADLINE_FLOOR_S`` for the full argument. Bulk floors at
+        the interactive horizon (tie at best, never outrank); interactive floors
+        at a small non-zero value (tighten within the class, never to zero).
+        """
+        return (_INTERACTIVE_DEADLINE_FLOOR_S if job_class == CLASS_INTERACTIVE
+                else _INTERACTIVE_HORIZON_S)
+
+    @staticmethod
     def _priority(job: "Job") -> float:
         """The queue key: the wall-clock instant this job wants to be done by.
 
-        An explicit ``deadline_s`` is that instant directly. Otherwise the job
-        gets its class's horizon, which is what makes interactive work jump the
-        queue AND makes that jump bounded: bulk work enqueued more than
-        (BULK - INTERACTIVE) seconds ago already has the earlier key, so it
-        cannot be starved by an endless stream of interactive arrivals.
+        An explicit ``deadline_s`` is that instant directly — FLOORED at its
+        class's minimum horizon (``_deadline_floor_s``) so that a caller cannot
+        buy its way past the interactive class, or past the aging bound, by
+        naming an absurdly tight deadline. Otherwise the job gets its class's
+        horizon, which is what makes interactive work jump the queue AND makes
+        that jump bounded: bulk work enqueued more than (BULK - INTERACTIVE)
+        seconds ago already has the earlier key, so it cannot be starved by an
+        endless stream of interactive arrivals.
         """
         if job.deadline_s is not None:
-            return job.t_enqueue + max(0.0, float(job.deadline_s))
+            floor = TtsEngine._deadline_floor_s(job.job_class)
+            return job.t_enqueue + max(floor, float(job.deadline_s))
         horizon = (_INTERACTIVE_HORIZON_S if job.job_class == CLASS_INTERACTIVE
                    else _BULK_AGING_HORIZON_S)
         return job.t_enqueue + horizon
@@ -1458,6 +1498,7 @@ class TtsEngine:
                 "interactive_reserve": _INTERACTIVE_RESERVE,
                 "bulk_aging_horizon_s": _BULK_AGING_HORIZON_S,
                 "interactive_horizon_s": _INTERACTIVE_HORIZON_S,
+                "interactive_deadline_floor_s": _INTERACTIVE_DEADLINE_FLOOR_S,
                 "cost_warm_window": _WARM_WINDOW,
             },
             # What the CPU tuning ACTUALLY achieved (not what was requested):

@@ -9,12 +9,15 @@ mocks synthesis at the engine boundary — no model, just timed fake audio.
 from __future__ import annotations
 
 import io
+import itertools
+import queue
 import sys
 import threading
 import time
+import traceback
 import types
 import wave
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +110,7 @@ _install_shims()
 # (not re-implemented) on purpose: the fake must abandon jobs the same way the
 # real engine does, or an HTTP-level test proves nothing about production.
 from service.engine import (  # noqa: E402
-    AdmissionRejected, SynthResult, _AbandonFlag,
+    AdmissionRejected, SynthResult, TtsEngine, _AbandonFlag,
 )
 
 
@@ -173,12 +176,25 @@ class _FakeMetrics:
 
 class _FakeJob:
     __slots__ = ("future", "text", "voice_id", "abandoned",
-                 "_claimed", "_claim_lock")
+                 "_claimed", "_claim_lock",
+                 # The deadline contract, carried with the SAME names the real
+                 # engine's Job uses — TtsEngine._priority is applied to these
+                 # objects directly (see FakeEngine._key), so the fake orders
+                 # its queue by the production rule instead of a copy of it.
+                 "deadline_s", "job_class", "t_enqueue", "degrade_allowed",
+                 "quality_level", "promised_s", "predicted_wait_s", "_work")
 
     def __init__(self, future: Future, text: str, voice_id: str) -> None:
         self.future = future
         self.text = text
         self.voice_id = voice_id
+        self.deadline_s = None
+        self.job_class = "bulk"
+        self.degrade_allowed = False
+        self.t_enqueue = time.perf_counter()
+        self.quality_level = "full"
+        self.promised_s = None
+        self.predicted_wait_s = 0.0
         # The real engine's Job carries this flag; the API layer sets it on a
         # 504/disconnect (app.py `_await_result`, `_abandon_all`) and setting it
         # releases the admission slot IMMEDIATELY via the engine hook.
@@ -207,13 +223,27 @@ class FakeEngine:
     is released when the job finishes — so ``capacity`` is backpressure, not a
     lifetime quota.
 
+    THE DEADLINE CONTRACT IS MODELLED, NOT JUST RECORDED. The pool is a
+    PRIORITY queue keyed by ``engine.TtsEngine._priority`` — the production
+    function, applied to the fake's jobs — so a tighter deadline really is
+    served first here, and elastic quality really does shorten the render:
+    ``submit`` walks the same ladder the engine walks and, like the engine,
+    runs at FULL quality when no rung fits. That is what makes an HTTP-level
+    test of "the caller's deadline reached the engine" an observation rather
+    than a plumbing assertion: remove the wiring on a route and the ordering
+    and the quality level both change back.
+
+    ``paused=True`` holds every worker at the gate so a test can queue several
+    jobs and then ``resume()`` to observe the order they are served in.
+
     Call ``close()`` when done (the test's tearDown) to shut the worker pool.
     """
 
     def __init__(self, workers: int = 2, delay: float = 0.15,
                  capacity: int = 1000, delays: dict[str, float] | None = None,
                  error: str | None = None,
-                 errors: dict[str, str] | None = None):
+                 errors: dict[str, str] | None = None,
+                 paused: bool = False):
         self.metrics = _FakeMetrics(self)
         self.workers = workers
         self.delay = delay
@@ -222,7 +252,6 @@ class FakeEngine:
         self.error = error  # if set, the worker future raises RuntimeError(error)
         self.errors = errors or {}  # per-segment: {text: message} raises for that text only
         self.jobs: list[_FakeJob] = []  # every job ever submitted, in order
-        self._pool = ThreadPoolExecutor(max_workers=workers)
         self._lock = threading.Lock()
         self._admitted = 0
         self._cur = 0
@@ -230,6 +259,52 @@ class FakeEngine:
         self.submit_order: list[str] = []
         # Texts that a worker ACTUALLY ran (abandoned jobs never appear here).
         self.executed: list[str] = []
+        # Texts whose deadline no ladder rung could meet: the engine's honest
+        # answer is to run them at full quality and record the miss, and a test
+        # needs to see that this route asked at all.
+        self.unfittable: list[str] = []
+        # The priority pool. A PriorityQueue of (key, seq, job) exactly like
+        # engine._DeadlineQueue — the payload is never compared.
+        self._q: "queue.PriorityQueue[tuple[float, int, _FakeJob | None]]" = \
+            queue.PriorityQueue()
+        self._seq = itertools.count()
+        self._gate = threading.Event()
+        if not paused:
+            self._gate.set()
+        self._threads = [threading.Thread(target=self._serve, daemon=True,
+                                          name=f"fake-tts-{i}")
+                         for i in range(workers)]
+        for t in self._threads:
+            t.start()
+
+    # -- the priority pool ---------------------------------------------------
+    @staticmethod
+    def _key(job: "_FakeJob") -> float:
+        """The production queue key, computed by the production function.
+
+        ``TtsEngine._priority`` reads exactly ``t_enqueue``/``deadline_s``/
+        ``job_class``, all of which ``_FakeJob`` carries, so the fake inherits
+        the real class floors and the real aging term instead of a stale copy.
+        """
+        return TtsEngine._priority(job)
+
+    def resume(self) -> None:
+        """Let the paused workers start dequeuing."""
+        self._gate.set()
+
+    def _serve(self) -> None:
+        self._gate.wait(30)
+        while True:
+            job = self._q.get()[2]
+            if job is None:  # close() sentinel
+                return
+            try:
+                job._work()
+            except BaseException:  # noqa: BLE001 - a worker must not die
+                # The real worker survives a failing job (engine._serve_once
+                # handles it and carries on); a fake whose thread died here
+                # would silently stop serving every LATER job in the test.
+                traceback.print_exc()
 
     def _abandon(self, job: _FakeJob) -> None:
         """Mirror of ``TtsEngine._release_abandoned``: the caller gave up, so
@@ -243,20 +318,32 @@ class FakeEngine:
             self._admitted -= 1
 
     def submit(self, voice_id: str, text: str, overrides=None,
-               max_tokens=None, frames_after_eos=None) -> _FakeJob:
+               max_tokens=None, frames_after_eos=None,
+               deadline_s=None, job_class: str = "bulk",
+               degrade_allowed: bool = False) -> _FakeJob:
         # Mirrors TtsEngine.submit: `received` is bumped for every request that
         # reaches the engine, admitted or rejected.
         self.metrics.on_received()
+        delay = self.delays.get(text, self.delay)
         with self._lock:
             if self._admitted >= self.capacity:
                 raise AdmissionRejected(
                     f"queue full (max in-flight {self.capacity})")
             self._admitted += 1
             self.submit_order.append(text)
+            # What this job would wait for: the work admitted AHEAD of it,
+            # spread over the pool. The real engine derives this from measured
+            # cost (predicted_wait_s); the fake's cost is its delay.
+            predicted = ((self._admitted - 1) * delay) / max(1, self.workers)
         future: Future = Future()
-        delay = self.delays.get(text, self.delay)
         job = _FakeJob(future, text, voice_id)
+        job.deadline_s = deadline_s
+        job.job_class = job_class
+        job.degrade_allowed = degrade_allowed
+        job.predicted_wait_s = round(predicted, 6)
         job.abandoned._on_abandon = lambda: self._abandon(job)
+        if deadline_s is not None:
+            delay = self._apply_deadline(job, delay)
 
         def _work() -> None:
             if not job.claim():
@@ -279,13 +366,19 @@ class FakeEngine:
                 if text in self.errors:
                     raise RuntimeError(self.errors[text])
                 marker = (len(self.submit_order) + hash(text)) & 0x7FFF
-                future.set_result(SynthResult(
-                    wav_bytes=make_wav(marker),
-                    sample_rate=24000, audio_seconds=1.0,
-                    synth_seconds=delay, queue_seconds=0.0,
-                ))
+                if not future.cancelled():
+                    # Cancelled from the OUTSIDE: asyncio.wrap_future cancels
+                    # the underlying concurrent future when the awaiting task
+                    # is cancelled (a client disconnect), and resolving a
+                    # cancelled future raises InvalidStateError.
+                    future.set_result(SynthResult(
+                        wav_bytes=make_wav(marker),
+                        sample_rate=24000, audio_seconds=1.0,
+                        synth_seconds=delay, queue_seconds=0.0,
+                    ))
             except Exception as exc:  # pragma: no cover - defensive
-                future.set_exception(exc)
+                if not future.cancelled():
+                    future.set_exception(exc)
             finally:
                 with self._lock:
                     self._cur -= 1
@@ -297,14 +390,43 @@ class FakeEngine:
                     # this fake asserted a contract the real engine doesn't have.
                     self._admitted -= 1
 
-        self._pool.submit(_work)
+        job._work = _work
+        self._q.put((self._key(job), next(self._seq), job))
         self.jobs.append(job)
         return job
 
+    def _apply_deadline(self, job: "_FakeJob", delay: float) -> float:
+        """The elastic-quality decision, modelled the way the engine makes it.
+
+        Walks the same ladder fractions, takes the FIRST rung that fits, and —
+        like ``TtsEngine._degrade`` — leaves the job at FULL quality when NO
+        rung fits (recording it in ``unfittable``): the honest outcome for an
+        unmeetable deadline is full quality plus a recorded miss, not the
+        cheapest audio AND a missed deadline. Returns the delay to render with.
+        """
+        deadline = float(job.deadline_s)
+        if job.predicted_wait_s + delay <= deadline:
+            job.promised_s = round(job.predicted_wait_s + delay, 3)
+            return delay                      # fits at full quality
+        if job.degrade_allowed:
+            for level, fraction in (("reduced", 0.7), ("minimal", 0.5)):
+                if job.predicted_wait_s + delay * fraction <= deadline:
+                    job.quality_level = level
+                    delay = delay * fraction
+                    job.promised_s = round(job.predicted_wait_s + delay, 3)
+                    return delay
+        self.unfittable.append(job.text)
+        job.promised_s = round(job.predicted_wait_s + delay, 3)
+        return delay
+
     def close(self) -> None:
         """Shut the worker pool. Tests must call this in tearDown — otherwise
-        every FakeEngine leaks a ThreadPoolExecutor for the run's lifetime."""
-        self._pool.shutdown(wait=False)
+        every FakeEngine leaks its worker threads for the run's lifetime."""
+        self._gate.set()
+        for _ in self._threads:
+            # +inf: the sentinel must sit at the TAIL, exactly as it does in
+            # engine._DeadlineQueue, or a worker would stop while real jobs wait.
+            self._q.put((float("inf"), next(self._seq), None))
 
     def config(self) -> dict:
         return {"workers": self.workers}
