@@ -415,21 +415,25 @@ and the exact `service.replicas` command to run it.
 ### ElevenLabs compatibility matrix (drop-in switch kit)
 
 Migrating an existing ElevenLabs integration is a **base-URL change** — same
-paths, same auth header, same body shape. What maps where:
+paths, same auth header, same body shape. **Step-by-step guide:
+[docs/SWITCH_FROM_ELEVENLABS.md](docs/SWITCH_FROM_ELEVENLABS.md).** What maps where:
 
 | ElevenLabs surface | Gravitone | Notes |
 |---|---|---|
 | `POST /v1/text-to-speech/{voice_id}` | ✅ same path | body `{text, model_id, voice_settings}` |
 | `xi-api-key` header | ✅ same header | root key or a `/v1/keys`-issued scoped key; `Authorization: Bearer` also accepted |
-| `output_format=` query param | ✅ `wav_24000`, `mp3_24000_128`, `pcm_24000` | |
+| `output_format=` query param | ✅ `wav_24000`, `mp3_44100_128`, `pcm_16000`, … | full grammar in the guide; an unsupported one is a **400** listing what is supported, never a silent substitution |
 | `voice_settings.stability` | ✅ mapped | → noise clamp |
-| `voice_settings.similarity_boost`, `style` | ⚪ accepted, ignored | no equivalent knob in pocket-tts |
-| `GET /v1/voices` | ✅ same path | readable with a tts-scoped key, like ElevenLabs |
+| `voice_settings.similarity_boost`, `style`, `use_speaker_boost`, `speed` | ⚪ accepted, ignored | no equivalent knob in pocket-tts; **named on `X-Ignored-Settings`** |
+| `seed`, `language_code`, `previous_text`/`next_text`, `previous_request_ids`/`next_request_ids`, `pronunciation_dictionary_locators`, `apply_text_normalization`, `apply_language_text_normalization`, `use_pvc_as_ivc` | ⚪ accepted, ignored | typed and declared, so a stock SDK body is **never a 422**; each one sent is named on `X-Ignored-Settings` |
+| `GET /v1/voices` | ✅ same path | `{"voices": […]}` with `voice_id`, `name`, `category`, `labels`; readable with a tts-scoped key, like ElevenLabs |
 | Voice cloning | ✅ `POST /v1/voices` (multipart) | 16 s sample → reusable voice |
 | Emotion addressing | ✅➕ Gravitone extension | `/v1/text-to-speech/{character}:{emotion}` (or `?emotion=`), baseline fallback reported in `X-Emotion-*` headers |
 | Multi-character scripts | ✅➕ `POST /v1/performance` | one call, many Characters, inline `[emotion]` metatags; needs the `performance` key scope |
 | Character capability manifest | ✅➕ `GET /v1/characters/{id}/manifest` | which emotions a Character performs natively vs falls back |
-| Streaming endpoint (`/stream`) | ✅ `POST /v1/text-to-speech/{voice_id}/stream` | sentence-chunked: first sentence streams while the rest renders. `pcm_*`/`wav_*` stream; `mp3_*` → **501** (transcode needs the whole clip). No per-synthesis timing headers (see "Scaling on Arm" for the throughput story) |
+| Streaming endpoint (`/stream`) | ✅ `POST /v1/text-to-speech/{voice_id}/stream` | sentence-chunked: first sentence streams while the rest renders. `pcm_*`/`wav_*` stream progressively; `mp3_*` (the EL SDK's default) returns the complete clip in **one body**, labelled `X-Stream: full-body` + `X-Stream-Fallback` — mp3 has no incremental transcode. No per-synthesis timing headers on the genuinely-streaming formats |
+| `/stream/with-timestamps` | ✅ alias of `/with-timestamps` | one full payload, not a frame sequence (the alignment is computed by listening to the finished clip); needs a local transcriber or it **501**s by name |
+| `GET /v1/user`, `GET /v1/user/subscription` | ❌ **not implemented** | deliberate: there is no credit meter to read. Quota-checking code is the one thing you delete on the way over |
 | Usage accounting | ✅ `X-Audio-Seconds` header + `audio_seconds_total` in `/metrics` | feeds the studio's "you'd have paid $X at ElevenLabs" ticker |
 
 ### Characters, not voices — the emotion-addressable API

@@ -96,15 +96,58 @@ class StreamingTests(unittest.TestCase):
         # exactly one header (44 bytes) + 3 * 480 sample bytes
         self.assertEqual(len(body), 44 + 3 * 480)
 
-    def test_mp3_stream_returns_501(self) -> None:
+    def test_mp3_stream_falls_back_to_a_labelled_full_body(self) -> None:
+        """mp3 on /stream serves the whole clip and SAYS it is not a stream.
+
+        It used to 501. That refusal was correct about mp3 (there is no
+        incremental transcode) and wrong about the product: mp3_44100_128 is
+        the ElevenLabs SDK's DEFAULT for this endpoint, so every unmodified
+        `client.text_to_speech.stream(...)` failed on a base-URL swap. Now it
+        succeeds as one full body, and the honesty moves into a header instead
+        of a status code.
+        """
+        import service.engine as enginemod
+        import types as _t
+
         appmod.ENGINE = fake_engine.FakeEngine()
-        resp = self.client.post(
-            "/v1/text-to-speech/alba/stream",
-            params={"output_format": "mp3_24000_128"},
-            json={"text": "Anything."},
-        )
-        self.assertEqual(resp.status_code, 501)
-        self.assertIn("mp3", resp.json()["detail"].lower())
+
+        def fake_run(cmd, input=None, stdout=None, stderr=None, **kw):
+            return _t.SimpleNamespace(returncode=0, stdout=b"MP3DATA", stderr=b"")
+
+        orig = enginemod.subprocess.run
+        enginemod.subprocess.run = fake_run
+        try:
+            resp = self.client.post(
+                "/v1/text-to-speech/alba/stream",
+                params={"output_format": "mp3_24000_128"},
+                json={"text": "Anything."},
+            )
+        finally:
+            enginemod.subprocess.run = orig
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.headers["content-type"], "audio/mpeg")
+        self.assertEqual(resp.content, b"MP3DATA")
+        # The degradation is stated, not silent.
+        self.assertEqual(resp.headers["x-stream"], "full-body")
+        self.assertIn("pcm_24000", resp.headers["x-stream-fallback"])
+        # It went through the drop-in route's path, so it carries that route's
+        # timing headers — which the real streaming path cannot emit at all.
+        self.assertIn("x-synth-seconds", resp.headers)
+
+    def test_pcm_and_wav_still_really_stream(self) -> None:
+        """The fallback is mp3-ONLY: the streaming formats keep streaming."""
+        for fmt in ("pcm_24000", "wav_24000"):
+            with self.subTest(output_format=fmt):
+                appmod.ENGINE = fake_engine.FakeEngine()
+                with self.client.stream(
+                    "POST", "/v1/text-to-speech/alba/stream",
+                    params={"output_format": fmt},
+                    json={"text": "Anything."},
+                ) as resp:
+                    self.assertEqual(resp.headers["x-stream"], "true")
+                    self.assertNotIn("x-stream-fallback", resp.headers)
+                    resp.read()
 
     def test_midstream_failure_truncates_logs_and_abandons(self) -> None:
         # Segment 2 of 3 fails after segment 1 has already been yielded: the
