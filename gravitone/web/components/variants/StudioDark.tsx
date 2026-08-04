@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { motion } from "framer-motion";
-import { BRAND, HERO, STATS, FEATURES, VOICES, SAMPLE_TEXT, API_DOCS_URL } from "@/lib/content";
+import { BRAND, HERO, STATS, FEATURES, PILLARS, VOICES, SAMPLE_TEXT, API_DOCS_URL } from "@/lib/content";
 import { useAuth } from "@/lib/useAuth";
 import UserMenu from "@/components/ui/UserMenu";
 import MobileNav from "@/components/ui/MobileNav";
@@ -102,6 +102,38 @@ export default function StudioDark() {
 
           {/* hero panel = live mic demo: record ~16s, hear your cloned voice */}
           <HeroMicDemo />
+        </section>
+
+        {/* the three positions — why this studio rather than a hosted library.
+            Copy (and the note on what makes each claim true) lives in
+            lib/content.ts::PILLARS; this is layout only. Sits directly under
+            the hero because it is the argument, not a detail. */}
+        <section id="why" className="border-t border-white/5 py-14">
+          <div className="grid gap-4 lg:grid-cols-3">
+            {PILLARS.map((p, i) => (
+              <motion.div
+                key={p.key}
+                variants={rise} initial="hidden" whileInView="show"
+                viewport={{ once: true, margin: "-60px" }} custom={i}
+                className="glass-panel flex flex-col rounded-2xl p-6 transition hover:border-cyan-400/30"
+              >
+                <span className={EYEBROW_CLASS}>
+                  <span className="h-1.5 w-1.5 rounded-full bg-cyan-300" />
+                  {p.eyebrow}
+                </span>
+                <h3 className="font-instrument mt-4 text-2xl leading-tight text-white">{p.title}</h3>
+                <p className="mt-2 text-sm leading-relaxed text-slate-300/80">{p.body}</p>
+                <ul className="mt-4 space-y-2 border-t border-white/5 pt-4">
+                  {p.points.map((pt) => (
+                    <li key={pt} className="flex gap-2.5 text-[13px] leading-relaxed text-slate-300/75">
+                      <span aria-hidden className="mt-[7px] h-1 w-1 shrink-0 rounded-full bg-cyan-300/70" />
+                      <span>{pt}</span>
+                    </li>
+                  ))}
+                </ul>
+              </motion.div>
+            ))}
+          </div>
         </section>
 
         {/* voices */}
