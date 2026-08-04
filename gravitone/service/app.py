@@ -2498,6 +2498,13 @@ app.include_router(voices_router, dependencies=[
 # API key management (issue / rotate / revoke) — root TTS_API_KEY only.
 app.include_router(keys_router, dependencies=[Depends(require_scope("admin"))])
 # Character ingestion (scan a recording → review → commit) — "clone" scope.
+# The scope is mounted here; the per-IP BUDGETS are declared on the two
+# expensive routes themselves (`ingest_api.SCAN_BUDGET` / `AUDITION_BUDGET`,
+# env `TTS_BUDGET_INGEST_SCAN` / `TTS_BUDGET_INGEST_AUDITION`) rather than on
+# this mount, because a router-level dependency would charge the pollers too —
+# GET /v1/ingest/{job} is called every second by a client watching a scan, and
+# a budget that refuses the progress poller for the scan it is watching is
+# worse than no budget at all. Same limiter, same describe()-quoting 429.
 app.include_router(ingest_router, dependencies=[Depends(require_scope("clone"))])
 # Character Packs (export/import portable bundles) — exporting hands out the
 # raw voice embeddings, so both directions need the "voices" scope.

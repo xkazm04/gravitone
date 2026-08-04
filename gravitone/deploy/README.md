@@ -251,6 +251,16 @@ public re-perform and the anonymous take upload. Each is a fixed window plus a
 | `demo-clone` | `TTS_BUDGET_CLONE` | 20 / 600s | the clone route |
 | `take-upload` | `TTS_BUDGET_TAKE_UPLOAD` | 60 / 600s | `POST /v1/takes` (25 MB each) |
 | `reperform` | — | 5 / 300s | `POST /v1/takes/{id}/reperform` |
+| `ingest-scan` | `TTS_BUDGET_INGEST_SCAN` | 12 / 600s | `POST /v1/ingest/scan` |
+| `ingest-audition` | `TTS_BUDGET_INGEST_AUDITION` | 40 / 600s | `POST /v1/ingest/{job}/audition` |
+
+`ingest-scan` is the most expensive request the service takes from outside: two
+duration-billed ElevenLabs calls, five to eight Gemini calls and a torch model
+load. The ingest job cap (`INGEST_MAX_JOBS`) bounds how many run AT ONCE and
+releases as soon as one finishes — it is not a rate limit, and a client that
+waits its turn spends without one. The progress poller (`GET /v1/ingest/{job}`)
+is deliberately unbudgeted: refusing the poller for the scan it is watching
+would be worse than no budget at all.
 
 **These defaults assume one address is a ROOM, not a person.** The studio
 relays to the service server-side with the deployment's own key, so until you

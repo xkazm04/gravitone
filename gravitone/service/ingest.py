@@ -390,6 +390,27 @@ class Spend:
         with self._lock:
             self.escalations_failed += n
 
+    def restore(self, snap: dict) -> None:
+        """Re-seat a ledger from its own `snapshot()`, read back off disk.
+
+        A budget that only lives in memory is not a budget: a job whose state
+        was rehydrated — by a restart, or by another replica adopting it — used
+        to get a brand-new `Spend`, so the retry and escalation caps this class
+        exists to enforce reset themselves every time the process did. The
+        BUDGETS are deliberately NOT restored: they come from settings, so an
+        operator lowering a cap applies it to jobs already in flight.
+        """
+        with self._lock:
+            calls = snap.get("calls")
+            if isinstance(calls, dict):
+                self.calls = {str(k): int(v) for k, v in calls.items()
+                              if isinstance(v, (int, float)) and not isinstance(v, bool)}
+            for field in ("retries", "escalated", "escalations_failed",
+                          "escalations_skipped"):
+                value = snap.get(field)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    setattr(self, field, max(0, int(value)))
+
     def snapshot(self) -> dict:
         """JSON-safe view for the job's `partial`/`result` — what this job has
         actually spent, so cost is read rather than inferred."""

@@ -88,7 +88,7 @@ import wave
 from pathlib import Path
 from typing import Callable, Iterator
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
@@ -593,6 +593,46 @@ def build_recipes(work_dir: Path, result: dict) -> tuple[dict[str, dict[str, lis
 # cost is the whole job's. Per process, exactly like JOBS.
 _SPEND: dict[str, ingest.Spend] = {}
 
+# ── per-IP budgets on the expensive entrances ─────────────────────────────────
+# The whole ingest router shipped behind `require_scope("clone")` and nothing
+# else, while the CHEAP single-stem clone on /v1/voices carried a demo budget.
+# The asymmetry was backwards: one /scan is two ElevenLabs calls billed by
+# duration plus five to eight Gemini calls plus a torch model load, and a
+# scripted client with one valid key could run them back to back.
+#
+# `_admit` is not this. It bounds CONCURRENCY (how many scans at once) and
+# releases the moment a scan finishes, so a client that simply waits its turn
+# spends without limit. A budget bounds the RATE, per address, over a window.
+#
+# Sized for the SHIPPED shape of the traffic, exactly as app.py's budgets are:
+# the studio relays server-side with the deployment's own key, so every visitor
+# in the room arrives as ONE address until TTS_TRUST_PROXY is on. These are
+# therefore limits for the whole room, not per human:
+#
+#   scan     12 per 10 minutes, burst 3 — a dozen people in a live demo each
+#            uploading a recording, and a second attempt for the one whose
+#            first take was bad. A scripted client cannot mint 100 cloud scans.
+#   audition 40 per 10 minutes, burst 6 — auditions are local CPU synthesis and
+#            the point of the room is to click freely between candidates;
+#            `MAX_ACTIVE_AUDITIONS` already bounds how many run at once, so
+#            this only has to stop a script from queueing them all day.
+#
+# Both env-tunable, because the right number is a property of the deployment.
+def _budget_limit(env: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(env, "") or default))
+    except ValueError:
+        return default
+
+
+SCAN_BUDGET = ratelimit.per_ip_budget(
+    "ingest-scan", limit=_budget_limit("TTS_BUDGET_INGEST_SCAN", 12),
+    window_s=600, burst=3, methods=("POST",))
+AUDITION_BUDGET = ratelimit.per_ip_budget(
+    "ingest-audition", limit=_budget_limit("TTS_BUDGET_INGEST_AUDITION", 40),
+    window_s=600, burst=6, methods=("POST",))
+
+
 # ── upload validation ─────────────────────────────────────────────────────────
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 MIN_CLIP_SECONDS = 3.0
@@ -674,10 +714,25 @@ def check_duration(dur: float | None) -> str | None:
 
 
 def _spend_for(job_id: str) -> ingest.Spend:
+    """This job's external-spend ledger, RESUMED rather than reset.
+
+    `_SPEND` is per process, so a job rehydrated after a restart — or adopted
+    from a dead replica — used to be handed a fresh `Spend` and, with it, a
+    fresh retry/escalation budget against the same paid providers. The ledger
+    is mirrored into `state.json` by `_persist`, so the budget a job has
+    already spent survives the process that spent it.
+    """
     with _LOCK:
         led = _SPEND.get(job_id)
         if led is None:
             led = _SPEND[job_id] = ingest.Spend()
+            prior = (JOBS.get(job_id) or {}).get("spend")
+            if isinstance(prior, dict):
+                led.restore(prior)
+                logger.info("ingest job %s: resumed a ledger of %d external "
+                            "call(s), %d retr(ies)", job_id,
+                            int(prior.get("total_calls") or 0),
+                            int(prior.get("retries") or 0))
         return led
 
 
@@ -707,6 +762,12 @@ def _persist(job: dict) -> None:
     # Every state change is a heartbeat: GC ages a job from its last mutation,
     # so a job that is visibly progressing is never reaped mid-phase.
     job["touched"] = time.time()
+    # The external-spend ledger rides along with the state it belongs to, so a
+    # rehydrated job cannot mint itself a fresh budget of paid calls
+    # (`_spend_for`). Cheap: a dict copy under the ledger's own lock.
+    ledger = _SPEND.get(job.get("id"))
+    if ledger is not None:
+        job["spend"] = ledger.snapshot()
     try:
         with atomicio.file_lock(wd / ".state.lock"):
             atomicio.atomic_write_text(wd / "state.json", json.dumps(job))
@@ -1533,7 +1594,7 @@ def _do_rederive(job_id: str, character_id: str, emotions: list[str] | None) -> 
 
 
 # ── endpoints ─────────────────────────────────────────────────────────────────
-@router.post(f"{INGEST}/scan")
+@router.post(f"{INGEST}/scan", dependencies=[Depends(SCAN_BUDGET)])
 def start_scan(file: UploadFile = File(...), mode: str = Form("auto"),
                corpus: bool = Form(False)) -> dict:
     # NOT async: the prologue writes up to 50 MB, runs ffprobe and hashes the
@@ -1690,7 +1751,8 @@ class AuditionReq(BaseModel):
     recipe: str | None = None
 
 
-@router.post(INGEST + "/{job_id}/audition")
+@router.post(INGEST + "/{job_id}/audition",
+             dependencies=[Depends(AUDITION_BUDGET)])
 def audition(job_id: str, req: AuditionReq):
     """Hear a candidate stem AS A VOICE, before anything is committed.
 
