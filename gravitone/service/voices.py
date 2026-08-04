@@ -663,6 +663,38 @@ def label_check_for(meta_row: dict, emotion: str, character_id: str) -> dict | N
     return result if isinstance(result, dict) else None
 
 
+def stamp_measured(meta_row: dict, wav_path: Path, emotion: str,
+                   character_id: str) -> dict | None:
+    """Put this recording INTO the measured space, and report what it sounds like.
+
+    The one entry point for contract C2, shared by every path that mints a
+    registry row: it writes ``prosody`` onto the row (so
+    :func:`prosody_map` — and through it ``emotions.resolve``'s measured walk —
+    can ever see this Voice) and returns the advisory label check for the
+    response the caller is about to write.
+
+    It exists because the two halves have to happen in that ORDER and against
+    the SAME audio, and because a second implementation of the pair is a second
+    place for the measured space to go quietly empty. ``ingest.commit`` — the
+    studio's flow, and the primary way Voices are created on this box — stamped
+    neither, so every ``resolve(..., prosody=prosody_map(cid))` call site
+    degraded to the static prior for exactly the Characters most users have.
+    Call this instead of the two functions below it.
+
+    Advisory throughout (both halves swallow their own failures): a measurement
+    can never turn a finished clone into an error. ``wav_path`` is the audio the
+    Voice was cloned FROM — the cleaned clip on the upload path, the spliced
+    stem on the ingest one — and must exist when this is called; nothing here
+    touches the network.
+
+    Call it BEFORE the row is registered: the check compares this take against
+    the Character's OTHER slots, and a row that is already in the registry would
+    be compared against itself.
+    """
+    _probe_prosody(meta_row, Path(wav_path))
+    return label_check_for(meta_row, emotion, character_id)
+
+
 # ── assembly ──────────────────────────────────────────────────────────────────
 def _cloned_voices(meta: dict) -> list[Voice]:
     out: list[Voice] = []
@@ -1288,8 +1320,7 @@ def create_voice(
         else:
             log.warning("fidelity not measured for %s: the cleaned clip is not "
                         "readable PCM16 audio", voice_id)
-        _probe_prosody(row, clean)
-        label_check = label_check_for(row, emotion, cid)
+        label_check = stamp_measured(row, clean, emotion, cid)
 
         def _commit(meta: dict) -> None:
             # Re-check the emotion slot UNDER the registry lock. The check at

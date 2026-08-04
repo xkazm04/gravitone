@@ -69,7 +69,7 @@ from service.emotions import BASELINE, EMOTION_SCALE
 from service.errors import UserFacing
 from service.voices import (
     VOICES_DIR, _load_meta, _slug, mutate_meta, reject_builtin_collision,
-    slot_holder, voice_file_path,
+    slot_holder, stamp_measured, voice_file_path,
 )
 
 ELEVEN_KEY = os.environ.get("ELEVEN_LABS_API_KEY", "")
@@ -1799,6 +1799,17 @@ def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: st
             "sample_seconds": p["seconds"], "lang": "EN", "source": source}
         if identity is not None:
             _stamp_fidelity(entry, Path(p["src"]), identity)
+        # INTO THE MEASURED SPACE, through voices.py's own helper — the same
+        # call `create_voice` makes, deliberately not a second implementation.
+        # Without it a studio-committed Character has no `prosody` on any row,
+        # `voices.prosody_map` returns {} for it, and every
+        # `resolve(..., prosody=prosody_map(cid))` in app.py silently falls back
+        # to the static prior chain — for the PRIMARY creation path on this box.
+        # The stem is on disk right here (it is what the child just cloned), so
+        # this is local numpy over audio we already have: no network, no model.
+        # Called before `_add` registers the row, so the check compares this
+        # take against the Character's other slots rather than against itself.
+        label_check = stamp_measured(entry, Path(p["src"]), emo, cid)
         if derived_from is not None:
             # Provenance for a Voice this box REBUILT rather than recorded: what
             # corpus revision, splice DSP and model produced it. When any of the
@@ -1844,6 +1855,12 @@ def commit(work_dir: Path, character: str, emotions: list[str], existing_cid: st
                     progress(done, plan[done]["emotion"])
             continue
         made = {"voice_id": p["voice_id"], "emotion": emo, "seconds": p["seconds"]}
+        if label_check is not None:
+            # Reported, never stored — the same split `create_voice` makes. The
+            # probe is a durable fact about the audio; the check is a comparison
+            # against the roster AT THIS MOMENT, and a stored one would go stale
+            # the next time the Character gained a slot.
+            made["label_check"] = label_check
         if p.get("replaces"):
             made["replaced"] = p["replaces"]
         if identity is not None:
@@ -2483,6 +2500,17 @@ def rederive(character_id: str, work_dir: Path,
     whole job is local by construction. Re-export goes through the SAME one-load
     child `commit` already drives, with `replace=True` so an existing emotion is
     upgraded in place rather than skipped as a slot collision.
+
+    It is also THE upgrade path for the measured space. A Voice committed before
+    `commit` stamped `prosody` carries none, so it is invisible to
+    `voices.prosody_map` and to `emotions.resolve`'s measured walk; a rebuild
+    re-splices the stems and re-registers through the same `commit`, so it picks
+    the measurement up for free. A one-shot backfill CLI was considered and is
+    not possible for the rest: the stem a legacy Voice was cloned from lived in
+    the job workdir, which `_gc_once` rmtree's half an hour after the scan, and
+    an embedding cannot be probed. So the honest statement is — corpus-backed
+    Characters upgrade on the next rebuild, and a Character whose audio was
+    never retained can only regain a measurement by being ingested again.
 
     Three refusals, each named rather than empty-successful:
       * NO CORPUS       — nothing was ever captured for this character.
