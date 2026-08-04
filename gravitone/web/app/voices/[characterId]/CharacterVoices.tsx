@@ -119,10 +119,24 @@ export default function CharacterVoices({ characterId }: { characterId: string }
             </p>
           )}
         </div>
-        <span className="flex items-center gap-2">
+        <span className="flex flex-wrap items-center gap-2">
           <span className="font-jetbrains rounded-full border border-white/12 px-3 py-1 text-[11px] text-white/60">
             {character.category} · {character.lang} · {coverage}/{total} emotions
           </span>
+          {/* The other half of the clone loop. The studio (/voices/new) reads
+              `extend` and arms "Extend existing" with THIS character, so a
+              commit attaches its voices here and the completion screen sends the
+              user back to this page. Only cloned characters can be extended —
+              the studio's own dropdown is filtered the same way. */}
+          {character.category === "cloned" && (
+            <Link
+              href={`/voices/new?extend=${encodeURIComponent(character.character_id)}`}
+              title={`Scan a recording and add more emotion voices to ${character.name}`}
+              className="font-jetbrains rounded-full border border-cyan-400/30 bg-cyan-400/5 px-3 py-1 text-[11px] text-cyan-200 transition hover:bg-cyan-400/10"
+            >
+              ＋ clone from a recording
+            </Link>
+          )}
           {character.category === "cloned" && (
             <a
               href={`/api/characters/${encodeURIComponent(character.character_id)}/pack`}
