@@ -39,6 +39,10 @@ export const SERVICE_EXPOSED_HEADERS = [
   "X-Segments",
   "X-Speech-Digest",
   "X-Stream",
+  // Why an mp3 "stream" arrived as one body. Forwarded, not swallowed: the
+  // studio's proxy hiding it would put the caveat only on the header a browser
+  // cannot see, which is the same as not saying it.
+  "X-Stream-Fallback",
   "X-Stream-Segments",
   "X-Synth-Seconds",
   "X-Synth-Segments",

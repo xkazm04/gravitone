@@ -13,6 +13,7 @@ const MODULES = [
   { label: "Playground", href: "/playground" },
   { label: "Voices", href: "/voices" },
   { label: "API keys", href: "/keys" },
+  { label: "Ops", href: "/ops" },
 ];
 
 /** Obsidian app shell: aurora atmosphere + top nav. Wrap every module route.
