@@ -1,6 +1,7 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
 import {
-  EngineBusyError, isAbort, perform, refinePeaks, speak, spliceRegion, transcribeWords, uploadTake,
+  createStreamPlayer, EngineBusyError, isAbort, perform, refinePeaks, speak, speakStreaming,
+  spliceRegion, transcribeWords, uploadTake,
 } from "./engine";
 import { DEFAULT_EXPRESSION, type Segment, type Take } from "./shared";
 import { REMIX_PARENT_KEY } from "@/lib/composerStore";
@@ -163,6 +164,94 @@ describe("the take carries its own audio", () => {
 
   it("refinePeaks degrades to null rather than costing the user the take", async () => {
     expect(await refinePeaks(new Blob([new Uint8Array(44)]))).toBeNull();
+  });
+});
+
+// ── streamed first listen: the PLAYGROUND's half of the decision ────────────
+// The seam knows what may be streamed (lib/engineSeam::canStream); choosing to
+// use it — and quietly taking the buffered call when it may not be — is this
+// module's policy, exactly as choosing the browser voice on a failure is.
+
+describe("speakStreaming — which path a take actually takes", () => {
+  const objectUrl = () =>
+    vi.stubGlobal("URL", { ...URL, createObjectURL: () => "blob:x", revokeObjectURL: () => {} });
+
+  function pcm(samples: number): Response {
+    return new Response(
+      new ReadableStream<Uint8Array>({
+        start(c) { c.enqueue(new Uint8Array(samples * 2)); c.close(); },
+      }),
+      { status: 200, headers: { "Content-Type": "audio/pcm", "X-Sample-Rate": "24000" } },
+    );
+  }
+
+  it("streams an untagged solo take and reports its progress as it arrives", async () => {
+    const f = vi.fn().mockResolvedValue(pcm(24000));
+    vi.stubGlobal("fetch", f);
+    objectUrl();
+    const progress: number[] = [];
+    const r = await speakStreaming("hello there", "sarah", EXPR,
+                                   { onProgress: (s) => progress.push(s) });
+    expect(String(f.mock.calls[0][0])).toBe("/api/speak/stream");
+    expect(progress).toEqual([1]);
+    expect(r.mode).toBe("gravitone");
+    expect(r.seconds).toBe(1);
+  });
+
+  it("BUFFERS a tagged take — the streaming route would drop every tag", async () => {
+    const f = vi.fn().mockResolvedValue(wavResponse());
+    vi.stubGlobal("fetch", f);
+    objectUrl();
+    const r = await speakStreaming("hi [angry]you never called[/angry]", "sarah", EXPR);
+    expect(String(f.mock.calls[0][0])).toContain("/api/speak?");
+    expect(r.mode).toBe("gravitone");
+  });
+
+  it("buffers an mp3 take — an mp3 the user asked for must arrive as one", async () => {
+    const f = vi.fn().mockResolvedValue(wavResponse());
+    vi.stubGlobal("fetch", f);
+    objectUrl();
+    await speakStreaming("hello there", "sarah", EXPR, {}, undefined, "mp3_24000_128");
+    expect(String(f.mock.calls[0][0])).toContain("output_format=mp3_24000_128");
+  });
+
+  it("falls back to the browser voice on a degradable failure, as speak does", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("network")));
+    const r = await speakStreaming("hello there", "sarah", EXPR);
+    expect(r.mode).toBe("browser");
+    expect(r.fallbackReason).toBe("unreachable");
+  });
+
+  it("silences whatever is already scheduled when the stream fails", async () => {
+    // Audio that outlives the run that produced it is the worst outcome here.
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ detail: "boom" }), { status: 500 })));
+    const stop = vi.fn();
+    const player = { push: vi.fn(), stop, started: () => true };
+    await speakStreaming("hello there", "sarah", EXPR, { player });
+    expect(stop).toHaveBeenCalled();
+  });
+
+  it("hands a chunk to the player the moment it arrives", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(pcm(1200)));
+    objectUrl();
+    const push = vi.fn();
+    await speakStreaming("hello there", "sarah", EXPR,
+                         { player: { push, stop: () => {}, started: () => false } });
+    expect(push).toHaveBeenCalledTimes(1);
+    expect(push.mock.calls[0][0]).toHaveLength(1200);
+    expect(push.mock.calls[0][1]).toBe(24000);
+  });
+});
+
+describe("createStreamPlayer — a browser that cannot play must not cost the take", () => {
+  it("swallows a missing AudioContext instead of throwing at the caller", () => {
+    // jsdom has none, which is also a real browser state (autoplay policy, a
+    // context ceiling already reached).
+    const p = createStreamPlayer();
+    expect(() => p.push(new Float32Array(10), 24000)).not.toThrow();
+    expect(p.started()).toBe(false);
+    expect(() => p.stop()).not.toThrow();
   });
 });
 

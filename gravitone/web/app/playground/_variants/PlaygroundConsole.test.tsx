@@ -15,14 +15,22 @@ import type { SpeakResult } from "./engine";
 // stores) rather than anything added for testing: the assertions below are all
 // about what the user sees.
 
-const engineMocks = vi.hoisted(() => ({
-  speak: vi.fn(),
-  perform: vi.fn(),
-  uploadTake: vi.fn(),
-  // Waveform refinement decodes audio; returning null is the documented
-  // "keep the synthetic bars" degrade, so no AudioContext is needed.
-  refinePeaks: vi.fn(async () => null),
-}));
+const engineMocks = vi.hoisted(() => {
+  const speak = vi.fn();
+  return {
+    speak,
+    // The solo path calls speakStreaming, whose own policy is "stream when the
+    // request qualifies, otherwise take the buffered call". The harness drives
+    // ONE mock through both, so every existing solo test asserts what it always
+    // asserted; the tests that are ABOUT streaming override this directly.
+    speakStreaming: vi.fn((text: string, id: string, expr: unknown) => speak(text, id, expr)),
+    perform: vi.fn(),
+    uploadTake: vi.fn(),
+    // Waveform refinement decodes audio; returning null is the documented
+    // "keep the synthetic bars" degrade, so no AudioContext is needed.
+    refinePeaks: vi.fn(async () => null),
+  };
+});
 const storeMocks = vi.hoisted(() => ({
   getRecentTakes: vi.fn(async () => [] as Take[]),
   putTake: vi.fn(async () => {}),
@@ -235,6 +243,29 @@ describe("PlaygroundConsole — the render estimate names its basis or its absen
     expect(statusLine()).toHaveTextContent(/realtime factor is not visible to this studio/i);
     // …and the take itself is still in the log.
     expect(screen.getByText("Stored line.")).toBeInTheDocument();
+  });
+
+  it("replaces the estimate with MEASURED progress once audio is arriving", async () => {
+    // The whole apology UI — the estimate, its basis, the past-the-estimate
+    // state — exists because progress could not be observed. On the streaming
+    // path it can be, and a guess shown in front of a measurement is a choice.
+    await mountConsole({ health: healthWithMetrics({ queued: 0, in_flight: 0, realtime_factor: 0.4 }) });
+    let report!: (seconds: number) => void;
+    engineMocks.speakStreaming.mockImplementation(
+      (_t: string, _c: string, _e: unknown,
+       handlers: { onProgress?: (s: number) => void } = {}) => {
+        report = handlers.onProgress ?? (() => {});
+        return new Promise<never>(() => {});
+      });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Generate/ }));
+    });
+    await screen.findByText("rendering");
+    expect(statusLine()).toHaveTextContent(/the engine is averaging 0.4× realtime/i);
+
+    await act(async () => { report(1.4); });
+    expect(statusLine()).toHaveTextContent(/1\.4s of audio received and playing/i);
+    expect(statusLine()).not.toHaveTextContent(/Estimated ~/);
   });
 });
 

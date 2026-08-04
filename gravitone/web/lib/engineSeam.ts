@@ -21,6 +21,24 @@
 
 import { readDetail, throwDetail } from "@/lib/apiFetch";
 import { DEFAULT_OUTPUT_FORMAT, type OutputFormat } from "@/lib/audioFormats";
+import { encodeWav } from "@/lib/wavEncode";
+
+/** Little-endian PCM16 bytes → Float32 (-1..1).
+ *
+ *  Endian-EXPLICIT through a DataView, for the same reason
+ *  app/playground/_live/pcm.ts is: the wire is little-endian PCM16 always, and
+ *  an Int16Array over the raw buffer would inherit the host's byte order — on a
+ *  big-endian machine that is not a crash, it is a take that sounds like
+ *  static. Kept here rather than imported from the live-conversation module
+ *  because lib/ must not depend on a screen; if a third caller appears, that is
+ *  when the two merge. */
+function pcm16LEToFloat(bytes: Uint8Array): Float32Array {
+  const n = bytes.length >> 1;
+  const out = new Float32Array(n);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  for (let i = 0; i < n; i += 1) out[i] = view.getInt16(i * 2, true) / 0x8000;
+  return out;
+}
 
 // ── the wire shapes ─────────────────────────────────────────────────────────
 
@@ -141,13 +159,67 @@ export type EngineCaps = {
   onDevice: boolean;
   /** True if a reachable backend is required for any synthesis at all. */
   requiresBackend: boolean;
-  /** True if audio arrives incrementally. Neither engine streams today. */
+  /** True if the engine can deliver audio incrementally for AT LEAST some
+   *  requests. Which ones is `canStream`'s answer, never this flag's: a
+   *  capability that says "yes" and then buffers a tagged take is worse than
+   *  one that says no. */
   streaming: boolean;
 };
+
+/** One instalment of a streaming synthesis, as it arrives.
+ *
+ *  Mono Float32 at `rate` — what Web Audio plays and what `encodeWav` masters,
+ *  so the caller neither decodes a container nor waits for one. `seconds` is
+ *  the CUMULATIVE audio received, which is the only honest progress number a
+ *  stream has (the total is not known until it ends). */
+export type StreamChunk = { samples: Float32Array; rate: number; seconds: number };
 
 export interface SpeechEngineClient {
   synthesize(req: SynthesisRequest): Promise<TakeAudio>;
   capabilities(): EngineCaps;
+  /**
+   * Synthesize INCREMENTALLY: `onChunk` is called as audio arrives, and the
+   * resolved TakeAudio is the complete take — same shape, same blob, same
+   * persistence and publishing path as the buffered call.
+   *
+   * Optional on the interface because an engine may legitimately have no
+   * streaming surface. Callers must gate on `canStream` rather than on the
+   * method's presence: an engine that streams SOME requests still has to
+   * buffer the rest, and the caller cannot tell which from a method reference.
+   */
+  synthesizeStream?(req: SynthesisRequest,
+                    onChunk: (chunk: StreamChunk) => void): Promise<TakeAudio>;
+}
+
+/** The inline emotion grammar, as the service compiles it
+ *  (service/emotions.py `_TAG_RE = re.compile(r"\[(/?)([a-zA-Z_]*)\]")`). */
+const TAG_RE = /\[\/?[a-zA-Z_]*\]/;
+
+/**
+ * May THIS request be streamed by an engine that advertises streaming?
+ *
+ * Three conditions, and every one of them is a lie the streaming endpoint would
+ * otherwise tell:
+ *
+ *   solo only        — the streaming route takes ONE voice address; a
+ *                      performance is many, and there is no streaming surface
+ *                      that switches Characters mid-response.
+ *   no emotion tags  — the streaming route has no metatag grammar at all
+ *                      (app.py::_split_sentences). Handing it a tagged take
+ *                      returns audio in which every tag was silently ignored,
+ *                      which is the product's differentiator quietly removed.
+ *   wav out          — the studio masters the streamed PCM as wav. mp3 is a 501
+ *                      upstream (transcoding needs the whole clip), and an mp3
+ *                      the user asked for must arrive as an mp3.
+ *
+ * A punch-in fragment is a solo request and streams only if the caller asks:
+ * the splice needs the finished bytes anyway, so it passes no chunk handler and
+ * takes the buffered path exactly as before.
+ */
+export function canStream(req: SynthesisRequest, caps: EngineCaps): boolean {
+  if (!caps.streaming || req.kind !== "solo") return false;
+  if ((req.format ?? DEFAULT_OUTPUT_FORMAT) !== "wav_24000") return false;
+  return !TAG_RE.test(req.text);
 }
 
 // ── failure vocabulary ──────────────────────────────────────────────────────
@@ -388,7 +460,111 @@ export class ServerEngine implements SpeechEngineClient {
       formats: ["wav_24000", "mp3_24000_128"],
       onDevice: false,
       requiresBackend: true,
-      streaming: false,
+      // Honest, and narrow: the service's streaming route exists and this
+      // engine uses it — for the requests `canStream` admits, which is untagged
+      // solo wav. Everything else still buffers, and says so there.
+      streaming: true,
+    };
+  }
+
+  /**
+   * Stream an untagged solo take through /api/speak/stream.
+   *
+   * The wire is raw PCM16 at the rate the response names (X-Sample-Rate), so
+   * every chunk that arrives is immediately playable — no container to parse,
+   * no MediaSource (which supports neither wav nor raw PCM), and no waiting for
+   * a Content-Length that a stream does not have.
+   *
+   * What resolves is an ORDINARY TakeAudio: the frames are concatenated and
+   * mastered as one wav blob, so the take card, the peaks, the IndexedDB
+   * record, the download and the publish path receive exactly what they receive
+   * from the buffered call. The difference is only WHEN the first sound
+   * happened.
+   *
+   * Timing is reported as UNMEASURED (rtf / synth / queue = 0) and that is the
+   * truth: response headers are flushed before synthesis completes, so the
+   * service cannot put those numbers in them and this client must not invent
+   * them from its own wall clock — which would fold queueing and network into a
+   * figure the console then calibrates its estimates with.
+   */
+  async synthesizeStream(req: SynthesisRequest,
+                         onChunk: (chunk: StreamChunk) => void): Promise<TakeAudio> {
+    if (req.kind !== "solo") throw new Error("only a solo take can be streamed");
+    let res: Response;
+    try {
+      res = await fetch("/api/speak/stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          character_id: req.characterId,
+          text: req.text,
+          voice_settings: wireSettings(req.settings),
+        }),
+        signal: req.signal,
+      });
+    } catch (e) {
+      if (isAbort(e)) throw e;
+      throw new EngineDegraded("unreachable");
+    }
+    if (!res.ok) await throwForStatus(res);
+    if (!res.body) throw new EngineDegraded("failed", "the stream carried no audio");
+
+    const rate = Number(res.headers.get("X-Sample-Rate")) || 24000;
+    const reader = res.body.getReader();
+    const parts: Float32Array[] = [];
+    let total = 0;
+    // PCM16 is two bytes per sample and a chunk boundary can fall between them.
+    // Half a sample is not a sample: the odd byte is carried into the next read
+    // rather than decoded against a zero, which would be one click per chunk.
+    let carry: Uint8Array | null = null;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      let bytes: Uint8Array = value;
+      if (carry) {
+        const merged = new Uint8Array(carry.length + bytes.length);
+        merged.set(carry);
+        merged.set(bytes, carry.length);
+        bytes = merged;
+        carry = null;
+      }
+      if (bytes.length % 2) {
+        carry = bytes.subarray(bytes.length - 1).slice();
+        bytes = bytes.subarray(0, bytes.length - 1);
+      }
+      if (bytes.length === 0) continue;
+      const samples = pcm16LEToFloat(bytes);
+      parts.push(samples);
+      total += samples.length;
+      onChunk({ samples, rate, seconds: total / rate });
+    }
+
+    const channel = new Float32Array(total);
+    let at = 0;
+    for (const p of parts) { channel.set(p, at); at += p.length; }
+    const blob = encodeWav({ channels: [channel], sampleRate: rate });
+    return {
+      blob,
+      url: URL.createObjectURL(blob),
+      seconds: Math.round((total / rate) * 10) / 10,
+      kb: Math.round(blob.size / 1024),
+      rtf: 0, synthSeconds: 0, queueSeconds: 0,
+      ignoredSettings: decodeIgnored(res.headers.get("X-Ignored-Settings")),
+      // One segment, because that is what an untagged take IS — and it is
+      // built from what was MEASURED (the decoded duration) plus what the
+      // service reported about the voice it resolved, never from a report the
+      // streaming route does not send.
+      segments: [{
+        text: req.text,
+        requested: res.headers.get("X-Emotion-Requested") ?? "baseline",
+        used: res.headers.get("X-Emotion-Used") ?? "baseline",
+        fallback: res.headers.get("X-Emotion-Fallback") === "true",
+        voice_id: "",
+        seconds: Math.round((total / rate) * 100) / 100,
+      }],
+      reportCorrupt: false,
+      synthSegments: Math.max(0, Number(res.headers.get("X-Stream-Segments")) || 0),
+      format: "wav_24000",
     };
   }
 

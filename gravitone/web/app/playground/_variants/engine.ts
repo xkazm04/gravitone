@@ -4,7 +4,7 @@ import { apiJson } from "@/lib/apiFetch";
 import { DEFAULT_OUTPUT_FORMAT, formatMeta, type OutputFormat } from "@/lib/audioFormats";
 import { clearRemixParent, readRemixParent } from "@/lib/composerStore";
 import {
-  EngineDegraded, getEngine,
+  canStream, EngineDegraded, getEngine,
   type FallbackReason, type TakeAudio,
 } from "@/lib/engineSeam";
 import {
@@ -229,6 +229,122 @@ function takeFrom(audio: TakeAudio, seed: number): SpeakResult {
     reportCorrupt: audio.reportCorrupt,
     synthSegments: audio.synthSegments, format: audio.format,
   };
+}
+
+// ── streamed first listen ───────────────────────────────────────────────────
+//
+// Playback lead. Under ~60 ms a late chunk is audible as a gap; over ~250 ms
+// the take feels laggy even when the engine was fast. The same number, for the
+// same reason, as the live conversation's JITTER_S — that scheduler is the
+// shape this one follows.
+const STREAM_LEAD_S = 0.12;
+
+export type StreamPlayer = {
+  /** Queue one instalment for playback, gapless after whatever is scheduled. */
+  push(samples: Float32Array, rate: number): void;
+  /** Stop immediately and drop everything not yet heard (cancel, or a failure
+   *  mid-stream — a take that stopped arriving must not keep playing). */
+  stop(): void;
+  /** True once anything has actually been scheduled to sound. */
+  started(): boolean;
+};
+
+/**
+ * Schedule streamed PCM so a take is audible while it is still being made.
+ *
+ * Chunks arrive in bursts over a network; playing each one "now" leaves a gap
+ * at every burst boundary. A scheduling clock (`nextAt`) plus one lead means
+ * the take sounds continuous, and every scheduled source is held so a cancel
+ * can cut it dead.
+ *
+ * It uses the module's ONE AudioContext — the same one peaks are decoded on.
+ * Browsers cap live contexts (~6), and a player that minted its own per take
+ * would walk into that ceiling in a session of ordinary work.
+ *
+ * Never throws: a browser that will not give us a context (or an autoplay
+ * policy that keeps it suspended) costs the user early playback, never the
+ * take. The bytes are still collected and the finished take still lands.
+ */
+export function createStreamPlayer(): StreamPlayer {
+  let ctx: AudioContext | null = null;
+  let nextAt = 0;
+  let live: AudioBufferSourceNode[] = [];
+  let stopped = false;
+  let began = false;
+
+  return {
+    push(samples: Float32Array, rate: number) {
+      if (stopped || samples.length === 0) return;
+      try {
+        ctx ??= peakContext();
+        const buf = ctx.createBuffer(1, samples.length, rate);
+        buf.getChannelData(0).set(samples);
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        src.connect(ctx.destination);
+        // Behind the clock (a late chunk) restarts the lead rather than
+        // scheduling in the past, which a browser plays instantly and which
+        // sounds like the take skipping.
+        const at = Math.max(nextAt, ctx.currentTime + STREAM_LEAD_S);
+        src.start(at);
+        nextAt = at + buf.duration;
+        began = true;
+        live.push(src);
+        src.onended = () => { live = live.filter((s) => s !== src); };
+      } catch {
+        /* no context / no autoplay: the take still arrives, just not early */
+      }
+    },
+    stop() {
+      stopped = true;
+      for (const s of live) { try { s.stop(); } catch { /* already ended */ } }
+      live = [];
+    },
+    started() { return began; },
+  };
+}
+
+/**
+ * Speak an untagged solo take, playing it as it arrives.
+ *
+ * The POLICY, which is this module's job and not the seam's: stream only when
+ * the engine says it can AND this request qualifies (`canStream` — untagged,
+ * solo, wav), and fall back to the ordinary buffered call otherwise, silently,
+ * because a buffered take is the same take.
+ *
+ * `onProgress` is handed the seconds of audio received so far. It is what
+ * replaces the console's estimate on this path: an estimate is what you show
+ * when you cannot observe progress, and here progress is observable.
+ */
+export async function speakStreaming(
+  text: string, characterId: string, expr: Expression,
+  handlers: { player?: StreamPlayer; onProgress?: (seconds: number) => void } = {},
+  signal?: AbortSignal,
+  format: OutputFormat = DEFAULT_OUTPUT_FORMAT,
+): Promise<SpeakResult> {
+  const trimmed = text.trim();
+  const engine = getEngine();
+  const req = {
+    kind: "solo" as const, text: trimmed, characterId, settings: expr, format, signal,
+  };
+  if (!engine.synthesizeStream || !canStream(req, engine.capabilities())) {
+    return speak(text, characterId, expr, signal, format);
+  }
+  try {
+    const audio = await engine.synthesizeStream(req, (chunk) => {
+      handlers.player?.push(chunk.samples, chunk.rate);
+      handlers.onProgress?.(chunk.seconds);
+    });
+    return takeFrom(audio, trimmed.length * 31 + 7);
+  } catch (e) {
+    // A stream that died mid-flight must not keep sounding: whatever is
+    // already scheduled would play on past a take that no longer exists.
+    handlers.player?.stop();
+    if (e instanceof EngineDegraded) {
+      return browserFallback(stripTags(trimmed), e.reason, e.detail);
+    }
+    throw e;
+  }
 }
 
 /**

@@ -110,14 +110,29 @@ export async function proxyWavPost(
 ): Promise<Response> {
   const body = await readCappedText(req);
   if (body instanceof Response) return body;
+  return proxyAudioPost(withForwardedQuery(req.url, backendPath, opts.forwardQuery), body);
+}
 
+/** POST a JSON body to a synthesis endpoint and relay its audio, streaming.
+ *
+ *  The half of proxyWavPost that does not care where the body came from — split
+ *  out for /api/speak/stream, whose upstream PATH carries the voice address and
+ *  whose body is rebuilt rather than forwarded. Splitting it (rather than
+ *  writing a second relay) is what keeps ONE answer to the non-OK passthrough,
+ *  the Retry-After preservation, the header allowlist and the 503 shape.
+ */
+export async function proxyAudioPost(
+  backendPath: string,
+  body: string,
+  opts: { timeoutMs?: number } = {},
+): Promise<Response> {
   let upstream: Response;
   try {
-    upstream = await backendFetch(withForwardedQuery(req.url, backendPath, opts.forwardQuery), {
+    upstream = await backendFetch(backendPath, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body,
-      signal: AbortSignal.timeout(180_000),
+      signal: AbortSignal.timeout(opts.timeoutMs ?? 180_000),
     });
   } catch {
     return jsonError("backend unreachable", 503);
@@ -143,9 +158,10 @@ export async function proxyWavPost(
   // spent its RAM synthesizing it. The sibling helper below has always streamed;
   // this is the same shape.
   //
-  // This is NOT streamed playback: the studio still awaits res.blob() before the
-  // take joins the log, so the take, its blob, its peaks and its download are
-  // byte-for-byte what they were. Only the proxy's own memory changes.
+  // For /v1/speak this is memory only: the studio awaits res.blob() before the
+  // take joins the log. For /api/speak/stream it is the whole feature — the
+  // first PCM chunk has to reach the browser while the engine is still
+  // synthesizing the rest, so anything that buffers here defeats it.
   return new Response(upstream.body, { status: 200, headers });
 }
 

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  EngineBusyError, EngineDegraded, ServerEngine, getEngine, isAbort, registerEngine,
+  canStream, EngineBusyError, EngineDegraded, ServerEngine, getEngine, isAbort, registerEngine,
   type SpeechEngineClient, type SynthesisRequest, type TakeAudio,
 } from "./engineSeam";
 
@@ -171,6 +171,136 @@ describe("ServerEngine — what it reports about the audio", () => {
   });
 });
 
+// ── streaming ───────────────────────────────────────────────────────────────
+// The service has streamed since /v1/text-to-speech/{id}/stream existed; the
+// studio buffered anyway and shipped a ticking clock to apologise for it. What
+// the seam must get right is WHICH requests may take that route — the streaming
+// endpoint has no metatag grammar, so streaming a tagged take would return
+// audio in which every emotion tag was silently ignored.
+
+const CAPS = new ServerEngine().capabilities();
+
+/** An upstream PCM stream, opened chunk by chunk. */
+function pcmStream(chunks: number[][], headers: Record<string, string> = {}): Response {
+  const body = new ReadableStream<Uint8Array>({
+    start(c) {
+      for (const bytes of chunks) c.enqueue(new Uint8Array(bytes));
+      c.close();
+    },
+  });
+  return new Response(body, {
+    status: 200,
+    headers: { "Content-Type": "audio/pcm", "X-Sample-Rate": "24000", ...headers },
+  });
+}
+
+describe("canStream — what may honestly be streamed", () => {
+  it("declares streaming as a capability, because the engine has one", () => {
+    expect(CAPS.streaming).toBe(true);
+  });
+
+  it("streams an untagged solo wav take", () => {
+    expect(canStream(SOLO, CAPS)).toBe(true);
+    expect(canStream({ ...SOLO, format: "wav_24000" }, CAPS)).toBe(true);
+  });
+
+  it("REFUSES a take carrying emotion tags — the stream route ignores them", () => {
+    expect(canStream({ ...SOLO, text: "hi [angry]you never called[/angry]" }, CAPS)).toBe(false);
+    expect(canStream({ ...SOLO, text: "[whisper]not so loud" }, CAPS)).toBe(false);
+  });
+
+  it("refuses mp3 — the streaming endpoint 501s it, and a lie is worse", () => {
+    expect(canStream({ ...SOLO, format: "mp3_24000_128" }, CAPS)).toBe(false);
+  });
+
+  it("refuses a performance and a raw-voice line", () => {
+    expect(canStream(PERF, CAPS)).toBe(false);
+    expect(canStream(VOICE, CAPS)).toBe(false);
+  });
+
+  it("refuses everything for an engine that does not claim streaming", () => {
+    expect(canStream(SOLO, { ...CAPS, streaming: false })).toBe(false);
+  });
+});
+
+describe("ServerEngine.synthesizeStream", () => {
+  it("hands each chunk over as it arrives, with the running total", async () => {
+    const f = vi.fn().mockResolvedValue(pcmStream([[0, 0, 0, 0], [0, 0]]));
+    vi.stubGlobal("fetch", f);
+    stubObjectUrl();
+    const seen: number[] = [];
+    await new ServerEngine().synthesizeStream(SOLO, (c) => seen.push(c.samples.length));
+    expect(seen).toEqual([2, 1]);
+    expect(String(f.mock.calls[0][0])).toBe("/api/speak/stream");
+    expect(JSON.parse(f.mock.calls[0][1].body)).toEqual({
+      character_id: "sarah", text: "hi", voice_settings: SETTINGS,
+    });
+  });
+
+  it("carries a split sample across the chunk boundary rather than clicking", async () => {
+    // Three bytes then one: a naive decoder drops the odd byte and the next
+    // chunk decodes one sample out of phase for the rest of the take.
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(pcmStream([[1, 0, 2], [0]])));
+    stubObjectUrl();
+    const seen: number[] = [];
+    await new ServerEngine().synthesizeStream(SOLO, (c) => seen.push(c.samples.length));
+    expect(seen).toEqual([1, 1]);
+  });
+
+  it("resolves the ordinary take the buffered path resolves", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      pcmStream([new Array(48000).fill(0)], { "X-Stream-Segments": "3" })));
+    stubObjectUrl();
+    const got = await new ServerEngine().synthesizeStream(SOLO, () => {});
+    // 24000 samples at 24 kHz = one second, mastered as a real wav blob so the
+    // take card, the peaks, IndexedDB and publishing are unchanged.
+    expect(got.seconds).toBe(1);
+    expect(got.blob.type).toBe("audio/wav");
+    expect(got.blob.size).toBe(44 + 48000);
+    expect(got.format).toBe("wav_24000");
+    expect(got.synthSegments).toBe(3);
+    expect(got.segments).toHaveLength(1);
+    expect(got.segments[0]).toMatchObject({ text: "hi", used: "baseline", seconds: 1 });
+  });
+
+  it("reports the timing it did NOT measure as unmeasured, not as zero-ish truth", async () => {
+    // Headers are flushed before synthesis ends, so the service cannot send
+    // these — and a client that substituted its own wall clock would feed
+    // queueing and network into the console's estimate calibration.
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(pcmStream([[0, 0]])));
+    stubObjectUrl();
+    const got = await new ServerEngine().synthesizeStream(SOLO, () => {});
+    expect([got.rtf, got.synthSeconds, got.queueSeconds]).toEqual([0, 0, 0]);
+  });
+
+  it("reports the emotion the engine actually resolved", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(pcmStream([[0, 0]], {
+      "X-Emotion-Requested": "baseline", "X-Emotion-Used": "calm",
+      "X-Emotion-Fallback": "true",
+    })));
+    stubObjectUrl();
+    const got = await new ServerEngine().synthesizeStream(SOLO, () => {});
+    expect(got.segments[0]).toMatchObject({ used: "calm", fallback: true });
+  });
+
+  it("triages a failure exactly as the buffered path does", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ detail: "queue full" }), {
+        status: 429, headers: { "Retry-After": "9" },
+      })));
+    const err = await new ServerEngine().synthesizeStream(SOLO, () => {}).catch((e) => e);
+    expect(err).toBeInstanceOf(EngineBusyError);
+    expect(err.retryAfterSec).toBe(9);
+  });
+
+  it("propagates a cancel rather than degrading to a fake take", async () => {
+    const abort = Object.assign(new Error("aborted"), { name: "AbortError" });
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(abort));
+    const err = await new ServerEngine().synthesizeStream(SOLO, () => {}).catch((e) => e);
+    expect(isAbort(err)).toBe(true);
+  });
+});
+
 describe("ServerEngine — failures the caller must be able to tell apart", () => {
   it("marks a transport failure 'unreachable' with no detail to invent", async () => {
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("network")));
@@ -238,7 +368,10 @@ describe("isAbort", () => {
 describe("capabilities", () => {
   it("says the server engine is not on-device and needs a backend", () => {
     const caps = new ServerEngine().capabilities();
-    expect(caps).toMatchObject({ id: "server", onDevice: false, requiresBackend: true, streaming: false });
+    // `streaming` became true when this engine started using the service's
+    // streaming route. It is a claim about SOME requests, and `canStream` is
+    // the one that says which — see that suite.
+    expect(caps).toMatchObject({ id: "server", onDevice: false, requiresBackend: true, streaming: true });
   });
 
   it("claims every kind the studio actually asks for", () => {

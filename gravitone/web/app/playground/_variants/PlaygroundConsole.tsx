@@ -28,7 +28,14 @@ import {
 // Composer durability — the same IndexedDB mechanism the take log uses.
 import { loadComposer, reconcileCharacters, saveComposer, type ComposerState } from "@/lib/composerStore";
 import { DEFAULT_OUTPUT_FORMAT, OUTPUT_FORMATS, formatMeta, type OutputFormat } from "@/lib/audioFormats";
-import { speak, perform, uploadTake, refinePeaks, EngineBusyError, isAbort, type FallbackReason } from "./engine";
+// `speakStreaming` rather than `speak`: it IS the solo path now, and its own
+// policy is to take the buffered call for every request that may not honestly
+// be streamed. PunchIn still imports `speak` directly — a fragment re-render
+// needs the finished bytes to splice, so early playback buys it nothing.
+import {
+  speakStreaming, createStreamPlayer, perform, uploadTake, refinePeaks,
+  EngineBusyError, isAbort, type FallbackReason, type StreamPlayer,
+} from "./engine";
 // ONE character-list data layer, shared with the voices module — the playground
 // used to fetch /api/characters itself, so the app had two truths about the
 // roster (and two places to fix when it went stale).
@@ -106,9 +113,14 @@ function fmtElapsed(ms: number): string {
  * that re-measures on every render. The clock only ever drew this one row, so
  * this is where its state belongs. Nothing about what is displayed changed.
  */
-function RenderStatus({ startedAt, etaSec, estAudioSec, etaBasisLabel, noEtaLabel, queued, inFlight, metricsUnavailable, healthStale }: {
+function RenderStatus({ startedAt, etaSec, estAudioSec, etaBasisLabel, noEtaLabel, streamedSec, queued, inFlight, metricsUnavailable, healthStale }: {
   startedAt: number | null; etaSec: number | null; estAudioSec: number;
   etaBasisLabel: string; noEtaLabel: string;
+  // Seconds of audio ALREADY RECEIVED on a streaming render, or null when this
+  // run is not streaming. An estimate is what you show when progress cannot be
+  // observed; when it can, showing the estimate instead is a choice to guess in
+  // front of a measurement.
+  streamedSec: number | null;
   // null = the engine did not report this number. NOT the same as 0, which is
   // a real reading of an empty queue.
   queued: number | null; inFlight: number | null;
@@ -144,7 +156,12 @@ function RenderStatus({ startedAt, etaSec, estAudioSec, etaBasisLabel, noEtaLabe
         {/* An estimate presented as a measurement is a lie, so it is
             always labelled, always sourced, and when it is exceeded it
             says so instead of stalling at "1s remaining". */}
-        {etaSec === null ? (
+        {streamedSec !== null ? (
+          <span className="text-cyan-200/85">
+            Streaming — {streamedSec.toFixed(1)}s of audio received and playing. No estimate is
+            needed: this is what has arrived, not a guess at what will.
+          </span>
+        ) : etaSec === null ? (
           <span>{noEtaLabel}</span>
         ) : overEstimate ? (
           <span className="text-amber-200/80">
@@ -213,6 +230,10 @@ export default function PlaygroundConsole() {
   // A CPU-only render takes seconds or minutes and the console showed the same
   // decorative equalizer for both.
   const [startedAt, setStartedAt] = useState<number | null>(null);
+  // Seconds of audio received so far on a streaming solo render (null = this
+  // run is not streaming, which is every script take, every mp3 and every take
+  // carrying [emotion] tags — see lib/engineSeam::canStream).
+  const [streamedSec, setStreamedSec] = useState<number | null>(null);
   // Transient error surface so generation failures are never silent.
   const [toast, setToast] = useState<string | null>(null);
   // What to ANNOUNCE when a render finishes. Nothing announced one: the render
@@ -287,6 +308,11 @@ export default function PlaygroundConsole() {
   const railRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
   // In-flight generation, so it can be cancelled (or aborted on unmount).
   const runRef = useRef<AbortController | null>(null);
+  // The scheduler playing a streamed take while it is still being made. Held so
+  // a cancel (or leaving the page) can cut what is already scheduled: audio
+  // that outlives the run that produced it is the worst thing this feature
+  // could ship.
+  const streamRef = useRef<StreamPlayer | null>(null);
   const mounted = useMounted();
 
   const { playingId, paused, progress, toggle, stop, seekTo } = useAudioPlayer();
@@ -924,11 +950,13 @@ export default function PlaygroundConsole() {
   function cancelGenerate() {
     runRef.current?.abort();
     runRef.current = null;
+    streamRef.current?.stop();
+    streamRef.current = null;
   }
 
   // Abort on unmount too: navigating away should not leave a synthesis
   // request holding a worker slot for a page nobody is looking at.
-  useEffect(() => () => runRef.current?.abort(), []);
+  useEffect(() => () => { runRef.current?.abort(); streamRef.current?.stop(); }, []);
 
   // Count the backend's Retry-After down so the retry button can wait for it.
   useEffect(() => {
@@ -946,6 +974,7 @@ export default function PlaygroundConsole() {
     setFallback(null);
     setAnnouncement("");        // the PREVIOUS take's announcement is spent
     setStartedAt(Date.now());   // starts the render clock for this run
+    setStreamedSec(null);       // ...and no audio has arrived for it yet
   }
 
   /** Report a generation failure with what the backend actually said. Errors
@@ -1011,8 +1040,22 @@ export default function PlaygroundConsole() {
     setBusy(true);
     clearNotices();
     const ctrl = newRun();
+    // Streamed first listen: an untagged wav take starts sounding at
+    // first-SEGMENT time instead of whole-body time. `speakStreaming` falls
+    // back to the buffered call for everything else — a tagged take (the
+    // streaming route has no metatag grammar), an mp3, a script — so this one
+    // call site covers both paths and no screen has to know which it got.
+    const player = createStreamPlayer();
+    streamRef.current = player;
     try {
-      const r = await speak(text, character.character_id, expr, ctrl.signal, format);
+      const r = await speakStreaming(
+        text, character.character_id, expr,
+        {
+          player,
+          onProgress: (seconds) => { if (mounted.current) setStreamedSec(seconds); },
+        },
+        ctrl.signal, format,
+      );
       if (!mounted.current) return;
       seq.current += 1;
       // Timestamped id so restored takes (which keep their stored ids) never
@@ -1042,7 +1085,13 @@ export default function PlaygroundConsole() {
       } else {
         reportFailure(e);
       }
-    } finally { if (mounted.current) setBusy(false); }
+    } finally {
+      // The run owns the player only while it is running: once the take is in
+      // the log its tail may finish playing, but a LATER cancel must not reach
+      // back and silence it.
+      if (streamRef.current === player) streamRef.current = null;
+      if (mounted.current) { setBusy(false); setStreamedSec(null); }
+    }
   }
 
   return (
@@ -1472,7 +1521,7 @@ export default function PlaygroundConsole() {
           {busy && (
             <RenderStatus key="rendering" startedAt={startedAt} etaSec={etaSec}
               estAudioSec={estAudioSec} etaBasisLabel={etaBasisLabel} noEtaLabel={noEtaLabel}
-              queued={queued} inFlight={inFlight}
+              streamedSec={streamedSec} queued={queued} inFlight={inFlight}
               metricsUnavailable={metricsUnavailable} healthStale={healthStale} />
           )}
 
