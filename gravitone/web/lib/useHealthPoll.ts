@@ -19,7 +19,17 @@ export type Health = {
  *
  * A draining backend answers 503 {"status":"draining"} — that is a real state,
  * not a transport failure, so it is passed through rather than treated as down.
+ *
+ * It also stops while nobody is looking. The loop self-schedules forever, so a
+ * backgrounded tab used to poll /api/health all day — every 5 seconds, for the
+ * playground, on a box whose whole pitch is that it does not waste CPU. Hidden
+ * pauses the loop; visible polls IMMEDIATELY, because the first thing a
+ * returning user needs is a number that is not minutes old. The pause lives
+ * here rather than in each consumer, on the same principle as the AudioBus
+ * writer's own visibility handling: do not burn work nobody can see.
  */
+const hidden = () => typeof document !== "undefined" && document.hidden;
+
 export function useHealthPoll(intervalMs = 30_000) {
   const [health, setHealth] = useState<Health | null>(null);
   const [stale, setStale] = useState(false);
@@ -42,12 +52,15 @@ export function useHealthPoll(intervalMs = 30_000) {
     let lastAt = 0;
     const arm = () => {
       clearTimeout(timer);
+      // A hidden tab arms nothing at all; visibilitychange re-arms it.
+      if (hidden()) return;
       // Measured from the last request, so speeding the poller up shortens the
       // CURRENT wait instead of waiting out the old interval first (and slowing
       // it down never fires early).
       timer = setTimeout(tick, Math.max(0, delay.current - (Date.now() - lastAt)));
     };
     const tick = async () => {
+      if (hidden()) return;   // a wait that finished as the tab went away
       lastAt = Date.now();
       try {
         const r = await fetch("/api/health", { cache: "no-store" });
@@ -64,8 +77,28 @@ export function useHealthPoll(intervalMs = 30_000) {
       if (alive) arm();
     };
     reschedule.current = () => { if (alive && lastAt > 0) arm(); };
+
+    const onVisibility = () => {
+      if (!alive) return;
+      if (hidden()) { clearTimeout(timer); return; }
+      // Back on screen: poll NOW rather than serving a snapshot from before the
+      // tab was hidden, however long ago that was.
+      lastAt = 0;
+      arm();
+    };
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", onVisibility);
+    }
+
     void tick();
-    return () => { alive = false; clearTimeout(timer); reschedule.current = () => {}; };
+    return () => {
+      alive = false;
+      clearTimeout(timer);
+      reschedule.current = () => {};
+      if (typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", onVisibility);
+      }
+    };
   }, []);
 
   return { health, stale };

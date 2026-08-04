@@ -41,7 +41,7 @@ import {
 // roster (and two places to fix when it went stale).
 import { loadRoster, type Character } from "@/app/voices/_data/characters";
 import { putTake, getRecentTakes, deleteTake } from "@/lib/takeStore";
-import { useAudioPlayer } from "./useAudioPlayer";
+import { useAudioPlayer, usePlaybackProgress, type ProgressSource } from "./useAudioPlayer";
 import EmotionPicker from "./EmotionPicker";
 import TakeCode from "./TakeCode";
 import LiveStage from "../_live/LiveStage";
@@ -103,6 +103,24 @@ function fmtElapsed(ms: number): string {
   if (s < 60) return `${s.toFixed(1)}s`;
   const m = Math.floor(s / 60);
   return `${m}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+}
+
+/**
+ * Whatever it wraps, re-rendered on the PLAYHEAD and nothing else.
+ *
+ * Same fix as RenderStatus below, for the other four-times-a-second tick in
+ * this file: playback progress used to be console state, so a playing take
+ * re-rendered every take card — each one an AnimatePresence `layout` child that
+ * re-measures — for the whole length of the clip. The children this draws are
+ * the only things on screen that move with the playhead.
+ *
+ * `active` false subscribes to nothing: a row that is not playing is not
+ * waiting on a number it would render as 0 either way.
+ */
+function LiveProgress({ source, active = true, children }: {
+  source: ProgressSource; active?: boolean; children: (progress: number) => React.ReactNode;
+}) {
+  return <>{children(usePlaybackProgress(active ? source : null))}</>;
 }
 
 /**
@@ -315,7 +333,7 @@ export default function PlaygroundConsole() {
   const streamRef = useRef<StreamPlayer | null>(null);
   const mounted = useMounted();
 
-  const { playingId, paused, progress, toggle, stop, seekTo } = useAudioPlayer();
+  const { playingId, paused, progress: playhead, toggle, stop, seekTo } = useAudioPlayer();
 
   // Engine state BEFORE the user commits to a render. The page most affected by
   // a loading or draining engine used to discover that state only by failing a
@@ -1560,7 +1578,9 @@ export default function PlaygroundConsole() {
                   <button onClick={stop} disabled={!isCurrent} aria-label="Stop"
                     className="grid h-9 w-9 shrink-0 place-items-center rounded-full border border-white/15 text-white/70 transition enabled:hover:bg-white/5 disabled:opacity-25">■</button>
 
-                  <Bars peaks={t.peaks} progress={isCurrent ? progress : 0} active={isCurrent} className="h-9 min-w-0 flex-1" />
+                  <LiveProgress source={playhead} active={isCurrent}>
+                    {(at) => <Bars peaks={t.peaks} progress={at} active={isCurrent} className="h-9 min-w-0 flex-1" />}
+                  </LiveProgress>
 
                   <div className="font-jetbrains hidden shrink-0 items-center gap-4 text-[11px] text-white/65 sm:flex">
                     <span className="text-white/80">{t.characterName}</span>
@@ -1647,17 +1667,21 @@ export default function PlaygroundConsole() {
                 {/* Punch-in drill-down: the segment timeline plus the retake
                     lanes for whichever region is selected. */}
                 {punchFor === t.id && (
-                  <PunchIn
-                    take={t}
-                    characters={characters}
-                    charName={charName}
-                    playing={isCurrent}
-                    progress={isCurrent ? progress : 0}
-                    onSeek={(seconds) => { void seekTo(t, seconds); }}
-                    onCommit={(p) => commitPunch(t, p)}
-                    onStorageError={setStorageErr}
-                    engineBusy={busy}
-                  />
+                  <LiveProgress source={playhead} active={isCurrent}>
+                    {(at) => (
+                      <PunchIn
+                        take={t}
+                        characters={characters}
+                        charName={charName}
+                        playing={isCurrent}
+                        progress={at}
+                        onSeek={(seconds) => { void seekTo(t, seconds); }}
+                        onCommit={(p) => commitPunch(t, p)}
+                        onStorageError={setStorageErr}
+                        engineBusy={busy}
+                      />
+                    )}
+                  </LiveProgress>
                 )}
 
                 {/* segment ribbon — what actually ran */}

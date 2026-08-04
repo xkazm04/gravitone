@@ -1,14 +1,47 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { busRegister } from "@/components/ui/AudioBus";
 import { stripTags, type Take } from "./shared";
+
+/**
+ * Playback position, as something you SUBSCRIBE to rather than something the
+ * owner re-renders for.
+ *
+ * `timeupdate` fires ~4×/s, and progress lived in the console's own state — so
+ * every tick re-rendered a 1,700-line component whose take log is a list of
+ * AnimatePresence `layout` children, each of which re-measures on every render.
+ * Four times a second, for the whole time a take is playing. RenderStatus
+ * already fixed this for the render clock; the playhead was left behind.
+ *
+ * The value lives in a ref and the readers subscribe, so a tick re-renders the
+ * bars and the punch-in rail and NOTHING else. Same numbers, same UI.
+ */
+export type ProgressSource = {
+  get: () => number;
+  subscribe: (onChange: () => void) => () => void;
+};
+
+const NEVER: ProgressSource["subscribe"] = () => () => {};
+const ZERO = () => 0;
+
+/**
+ * Read a progress source. `null` — the row that is not the playing one — reads
+ * a constant 0 and subscribes to nothing.
+ */
+export function usePlaybackProgress(source: ProgressSource | null): number {
+  return useSyncExternalStore(
+    source ? source.subscribe : NEVER,
+    source ? source.get : ZERO,
+    ZERO, // the server has no playhead
+  );
+}
 
 /**
  * Unified transport for takes.
  *  - gravitone takes play a real WAV through an <audio> element (true seek/progress).
  *  - browser-fallback takes speak via SpeechSynthesis (progress is time-estimated).
- * Exposes play / pause / resume / stop and a 0..1 progress for the waveform.
+ * Exposes play / pause / resume / stop and a subscribable 0..1 progress.
  */
 export function useAudioPlayer() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -23,7 +56,23 @@ export function useAudioPlayer() {
 
   const [playingId, setPlayingId] = useState<string | null>(null);
   const [paused, setPaused] = useState(false);
-  const [progress, setProgress] = useState(0);
+
+  // The playhead: a ref plus its watchers, never state. Nothing that holds this
+  // hook re-renders because a take moved 250ms forward.
+  const progressRef = useRef(0);
+  const watchers = useRef(new Set<() => void>()).current;
+  const setProgress = useCallback((at: number) => {
+    if (progressRef.current === at) return;
+    progressRef.current = at;
+    for (const w of watchers) w();
+  }, [watchers]);
+  const progress = useRef<ProgressSource>({
+    get: () => progressRef.current,
+    subscribe: (onChange) => {
+      watchers.add(onChange);
+      return () => { watchers.delete(onChange); };
+    },
+  }).current;
 
   const getAudio = () => {
     if (!audioRef.current) {
@@ -91,7 +140,7 @@ export function useAudioPlayer() {
     setPlayingId(null);
     setPaused(false);
     setProgress(0);
-  }, []);
+  }, [setProgress]);
 
   const play = useCallback(
     async (take: Take) => {
@@ -132,7 +181,7 @@ export function useAudioPlayer() {
         runTimer(take);
       }
     },
-    [stop]
+    [stop, setProgress]
   );
 
   const pause = useCallback(() => {
@@ -192,7 +241,7 @@ export function useAudioPlayer() {
       }
       return true;
     },
-    [stop],
+    [stop, setProgress],
   );
 
   /** One control for the row button: play → pause → resume. */

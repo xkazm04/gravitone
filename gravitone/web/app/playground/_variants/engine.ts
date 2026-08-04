@@ -7,53 +7,16 @@ import {
   canStream, EngineDegraded, getEngine,
   type FallbackReason, type TakeAudio,
 } from "@/lib/engineSeam";
+// The browser half of decoding lives in lib/peaks, which the PUBLIC share page
+// imports too — it must not have to import this module to draw a waveform.
+import { computePeaks, decodePcm, peakContext } from "@/lib/peaks";
 import {
-  crossfadeConcat, encodeWav, fromDecodedAudio, peaksFromPcm, peaksFromSamples, pcmDuration,
-  slicePcm, type Pcm,
+  crossfadeConcat, encodeWav, peaksFromPcm, pcmDuration, slicePcm, type Pcm,
 } from "@/lib/wavEncode";
 import {
   scaleSegmentSeconds, segmentRegions, stripTags, waveHeights,
   type Expression, type PerfLine, type Segment, type Take,
 } from "./shared";
-
-// One module-level AudioContext shared across every peak computation. Browsers
-// cap the number of live AudioContexts (~6), so minting a fresh one per take
-// (and closing it) churned toward that ceiling; a single resumable context
-// decodes every take. Never closed — it lives for the page's lifetime.
-let sharedCtx: AudioContext | null = null;
-
-function peakContext(): AudioContext {
-  if (!sharedCtx) {
-    const AC: typeof AudioContext =
-      window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-    sharedCtx = new AC();
-  }
-  // A context can auto-suspend (autoplay policy); resume before decoding.
-  if (sharedCtx.state === "suspended") void sharedCtx.resume();
-  return sharedCtx;
-}
-
-/** Decode a WAV blob and reduce it to N peak bars + true duration. Throws if the
- *  blob cannot be decoded (no AudioContext, malformed WAV) — see refinePeaks. */
-export async function computePeaks(blob: Blob, n = 56): Promise<{ peaks: number[]; duration: number }> {
-  const ctx = peakContext();
-  const buf = await ctx.decodeAudioData(await blob.arrayBuffer());
-  // The reduction itself lives in lib/wavEncode so a SPLICED take's bars are
-  // computed by exactly the same arithmetic as a rendered one's.
-  return { peaks: peaksFromSamples(buf.getChannelData(0), n), duration: buf.duration };
-}
-
-/**
- * Decode any take/fragment blob into samples on the shared AudioContext.
- *
- * This is where "mp3 takes are decoded and re-mastered as WAV" happens: the
- * decoder does not care what container it was handed, and everything downstream
- * of here is Float32 at the context's rate.
- */
-export async function decodePcm(blob: Blob): Promise<Pcm> {
-  const ctx = peakContext();
-  return fromDecodedAudio(await ctx.decodeAudioData(await blob.arrayBuffer()));
-}
 
 /**
  * Best-effort real waveform for a take that is ALREADY on screen.
@@ -63,6 +26,8 @@ export async function decodePcm(blob: Blob): Promise<Pcm> {
  * simply stay. This is the same degrade the synthesis path used to do inline —
  * it just no longer happens before the take can be shown.
  */
+export { computePeaks, decodePcm };
+
 export async function refinePeaks(blob: Blob): Promise<{ peaks: number[]; duration: number } | null> {
   try {
     return await computePeaks(blob);

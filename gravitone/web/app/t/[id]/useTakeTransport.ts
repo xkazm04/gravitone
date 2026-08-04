@@ -15,7 +15,7 @@
 
 import { useEffect, useState } from "react";
 import { useTransport, type Transport } from "@/components/ui/useTransport";
-import { computePeaks } from "@/app/playground/_variants/engine";
+import { computePeaks } from "@/lib/peaks";
 
 export type TakeTransport = Transport & {
   /** Real peaks from the decoded take. Empty until it decodes — and it may

@@ -7,7 +7,17 @@ function healthFetch() {
     Promise.resolve(new Response(JSON.stringify({ status: "ready" }), { status: 200 })));
 }
 
-afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
+/** Drive document.hidden, which jsdom reports as a fixed false. */
+function visibility(hidden: boolean) {
+  Object.defineProperty(document, "hidden", { configurable: true, get: () => hidden });
+  document.dispatchEvent(new Event("visibilitychange"));
+}
+
+afterEach(() => {
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+  Object.defineProperty(document, "hidden", { configurable: true, get: () => false });
+});
 
 describe("useHealthPoll", () => {
   it("polls once on mount and then on its interval", async () => {
@@ -52,5 +62,49 @@ describe("useHealthPoll", () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
     expect(result.current.stale).toBe(true);
     expect(result.current.health?.status).toBe("ready"); // last snapshot kept
+  });
+
+  // A self-scheduling loop with no visibility handling is a tab left open
+  // overnight polling a CPU box every five seconds.
+  it("stops polling while the tab is hidden", async () => {
+    vi.useFakeTimers();
+    const f = healthFetch();
+    vi.stubGlobal("fetch", f);
+    renderHook(() => useHealthPoll(1_000));
+    await act(async () => { await Promise.resolve(); });
+    expect(f).toHaveBeenCalledTimes(1);
+
+    await act(async () => { visibility(true); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(f).toHaveBeenCalledTimes(1); // a whole minute, and not one request
+  });
+
+  it("polls immediately when the tab comes back, not on the next interval", async () => {
+    vi.useFakeTimers();
+    const f = healthFetch();
+    vi.stubGlobal("fetch", f);
+    renderHook(() => useHealthPoll(30_000));
+    await act(async () => { await Promise.resolve(); });
+    await act(async () => { visibility(true); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(120_000); });
+    expect(f).toHaveBeenCalledTimes(1);
+
+    await act(async () => { visibility(false); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    // The number on screen is two minutes old; it is refreshed now, not in 30s.
+    expect(f).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not poll at all when it mounts into a hidden tab", async () => {
+    vi.useFakeTimers();
+    const f = healthFetch();
+    vi.stubGlobal("fetch", f);
+    Object.defineProperty(document, "hidden", { configurable: true, get: () => true });
+    renderHook(() => useHealthPoll(1_000));
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    expect(f).not.toHaveBeenCalled();
+    await act(async () => { visibility(false); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(f).toHaveBeenCalledTimes(1);
   });
 });

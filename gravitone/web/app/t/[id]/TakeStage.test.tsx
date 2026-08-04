@@ -12,7 +12,7 @@ import TakeStage from "./TakeStage";
 
 // The peaks are decoration and need a real AudioContext; the transport is what
 // is under test.
-vi.mock("@/app/playground/_variants/engine", () => ({
+vi.mock("@/lib/peaks", () => ({
   computePeaks: vi.fn(async () => ({ peaks: [0.4, 0.8], duration: 4 })),
 }));
 

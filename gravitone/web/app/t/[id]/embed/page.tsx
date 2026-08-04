@@ -2,14 +2,14 @@
 // travels wherever the audio does.
 import { notFound } from "next/navigation";
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
-import { loadTake } from "@/lib/takes";
+import { readTake } from "@/lib/takes.server";
 import TakeCard from "../TakeCard";
 
 export const metadata = { robots: { index: false } };
 
 export default async function TakeEmbedPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  const loaded = await loadTake(id);
+  const loaded = await readTake(id);
   // Missing / evicted is a 404. An unreachable backend is NOT: this card is
   // embedded in someone else's page, and collapsing a restart into "not found"
   // told every host their embed had been deleted.

@@ -6,7 +6,9 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { Wordmark } from "@/components/ui/Primitives";
-import { loadLineage, loadTake } from "@/lib/takes";
+// Request-scoped reads: the metadata and the body below want the SAME take,
+// and a share view used to fetch it twice.
+import { readLineage, readTake } from "@/lib/takes.server";
 import Lineage from "./Lineage";
 import RePerform, { ReperformProvenance } from "./RePerform";
 import OpenInRack from "./OpenInRack";
@@ -14,7 +16,7 @@ import TakeStage from "./TakeStage";
 
 export async function generateMetadata({ params }: { params: Promise<{ id: string }> }): Promise<Metadata> {
   const { id } = await params;
-  const loaded = await loadTake(id);
+  const loaded = await readTake(id);
   // A backend that could not be read is NOT a take that does not exist — say
   // "unavailable" so a crawler (and a person reading a tab title) is not told
   // this share is dead when it is merely unreachable right now.
@@ -66,7 +68,7 @@ export default async function TakePage({ params }: { params: Promise<{ id: strin
   // Two independent reads. The lineage is provenance — it must never be able to
   // cost the page its take, so it is awaited beside the take and degrades to
   // null (no lineage shown) on its own.
-  const [loaded, lineage] = await Promise.all([loadTake(id), loadLineage(id)]);
+  const [loaded, lineage] = await Promise.all([readTake(id), readLineage(id)]);
   // A take the backend says is not there is a 404. A backend we could not read
   // is NOT — telling a visitor their link is dead during a restart is a lie
   // they cannot check, and one they would act on by throwing the link away.
