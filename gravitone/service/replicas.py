@@ -426,14 +426,24 @@ def introspect_doc(engine: object, index: Optional[int] = None) -> dict:
         "ready": bool(getattr(engine, "ready", False)),
         "draining": bool(getattr(engine, "draining", False)),
     }
-    # Voice affinity is the router's sleeper win, but engine.py is not ours to
-    # edit: light it up the moment the accessor lands, omit the key until then.
+    # Voice affinity is the router's sleeper win: light it up when the engine
+    # exposes the accessor, omit the key entirely when it does not, so a
+    # consumer can tell "no hot voices" from "this build cannot tell you".
+    #
+    # The failure this USED to swallow was real and self-inflicted: the
+    # accessor iterated a live worker's LRU, so it raised exactly when the box
+    # was busy — and `except: pass` deleted the evidence, leaving the router to
+    # read "no hot voices" and route affinity-blind at the worst moment. The
+    # engine now hands back a locked copy, so a raise here is a BUG. It is
+    # still not allowed to 500 an endpoint that a drain loop polls, so it is
+    # reported in the document and logged, never dropped.
     keys = getattr(engine, "voice_lru_keys", None)
     if callable(keys):
         try:
             doc["voice_lru_keys"] = sorted({str(k) for k in keys()})
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001 - admin must not 500 under load
+            logger.warning("voice_lru_keys failed on replica %s: %r", index, exc)
+            doc["voice_lru_keys_error"] = f"{type(exc).__name__}: {exc}"
     return doc
 
 
@@ -457,7 +467,8 @@ def aggregate_introspection(targets: list[tuple[int | None, str]],
             if not isinstance(data, dict):
                 raise TypeError("introspect did not return an object")
             entry.update({k: data.get(k) for k in INTROSPECT_KEYS})
-            for extra in ("ready", "draining", "voice_lru_keys"):
+            for extra in ("ready", "draining", "voice_lru_keys",
+                          "voice_lru_keys_error"):
                 if extra in data:
                     entry[extra] = data[extra]
             entry["ok"] = True

@@ -25,9 +25,22 @@ Nothing here is persisted; a restart starts cold. That is deliberate: the value
 is protecting the queue from repeated identical renders inside a process, not
 being a CDN.
 
-Threading: every entry point is called from the FastAPI event loop and does no
-blocking work, so the state needs no lock — but it is NOT safe to call from a
-worker thread.
+Threading: every MUTATING entry point is called from the FastAPI event loop and
+does no blocking work, so the state needs no lock — and it is NOT safe to
+mutate from another thread.
+
+``stats()`` is the one exception, and it is deliberate: the replica's admin
+server is a separate thread (``service/replicas.py``) and scrapes it while the
+loop is putting and evicting. It is safe there because of what it does NOT do —
+it never ITERATES the entry map, only samples ``len()`` and plain integer
+counters, each of which is a single bytecode under the GIL. Iterating a live
+``OrderedDict`` from another thread is the thing that raises
+``RuntimeError: dictionary changed size during iteration``, and this cache
+keeps that out of ``stats()`` by construction rather than by taking a lock the
+synthesis path would then have to pay for on every hit. What it therefore does
+NOT promise is a consistent instant: ``entries`` and ``bytes`` are sampled a
+few instructions apart and can disagree by one entry mid-eviction. That is a
+statistics document, not a ledger, and it says so here rather than pretending.
 
 **Two shapes of entry, one mechanism.** ``CachedAudio`` is a WAV for the HTTP
 synthesis routes; ``CachedPcm`` is raw PCM at a wire rate, for the conversation
@@ -151,17 +164,27 @@ class SynthCache(Generic[E]):
         self.bypassed += 1
 
     def stats(self) -> dict:
+        """A snapshot for the metrics surface — safe from ANOTHER thread.
+
+        Bound the containers to locals first, so a ``resize()`` swapping state
+        underneath cannot make this read half of one map and half of another,
+        and read each counter exactly once. No iteration, no lock, and
+        therefore no cost on the synthesis path: see the module docstring for
+        the guarantee this makes and the one it does not.
+        """
+        entries, inflight = self._entries, self._inflight
+        max_bytes = self._max_bytes
         return {
-            "enabled": self.enabled,
-            "entries": len(self._entries),
+            "enabled": max_bytes > 0,
+            "entries": len(entries),
             "bytes": self._bytes,
-            "max_bytes": self._max_bytes,
+            "max_bytes": max_bytes,
             "hits": self.hits,
             "misses": self.misses,
             "evictions": self.evictions,
             "collapsed": self.collapsed,
             "bypassed": self.bypassed,
-            "in_flight": len(self._inflight),
+            "in_flight": len(inflight),
         }
 
     # -- storage ----------------------------------------------------------

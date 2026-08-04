@@ -87,16 +87,32 @@ def file_lock(path: Path, timeout: float = LOCK_TIMEOUT_S,
             path.unlink()
 
 
-def atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
+def _atomic_write(path: Path, write) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     # Unique temp per process so two replicas writing concurrently don't clobber
     # each other's temp before the rename.
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
-        tmp.write_text(text, encoding)
+        write(tmp)
         os.replace(tmp, path)
     finally:
         # os.replace consumed tmp on success; clean it up only if it survived
         # (write or replace failed partway).
         if tmp.exists():
             tmp.unlink(missing_ok=True)
+
+
+def atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
+    _atomic_write(path, lambda tmp: tmp.write_text(text, encoding))
+
+
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    """The same guarantee for a binary payload.
+
+    Shares ``atomic_write_text``'s mechanism rather than repeating it, because
+    the failure it prevents is identical and size makes it likelier, not less
+    likely: a 25 MB share wav is the longest window this service has between
+    "the file exists" and "the file is complete", and a process killed inside
+    it used to leave a truncated wav that every reader would happily serve.
+    """
+    _atomic_write(path, lambda tmp: tmp.write_bytes(data))

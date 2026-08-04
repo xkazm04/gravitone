@@ -10,11 +10,18 @@ corpus a future auto-direction pass learns from; uncounted, they are thrown
 away the moment the child is written.
 
 Storage: direction_deltas.json next to emotion_demand.json — gitignored runtime
-state, written with demand.py's discipline (per-process lock + atomic replace,
-so a multi-replica fleet loses an increment at worst, never the file). The
-store is BOUNDED: MAX_CHARACTERS characters and MAX_KEYS keys per bucket, past
-which new keys are dropped (existing counts keep incrementing) — a telemetry
-file must not grow without limit on a box that is also synthesizing.
+state, written with demand.py's discipline: a per-process lock for threads, a
+`atomicio.file_lock` for the other replicas, and an atomic replace so no reader
+ever sees a half-written corpus. All three are load-bearing and none of them
+substitutes for another. `os.replace` keeps the FILE intact; it does not keep
+an UPDATE — two replicas that each read, each add their delta and each write
+produce a file with one replica's work in it, and this is a whole-file replace
+of a document that only ever grows, so the loss is every increment the loser
+had accumulated, not one. That is why the cross-process lock is here and not
+just a comment about a "demand signal" that undercounts. The store is BOUNDED:
+MAX_CHARACTERS characters and MAX_KEYS keys per bucket, past which new keys are
+dropped (existing counts keep incrementing) — a telemetry file must not grow
+without limit on a box that is also synthesizing.
 
 record_delta NEVER raises. Losing a statistic must never cost a user the take
 that produced it.
@@ -29,7 +36,7 @@ from pathlib import Path
 
 from fastapi import APIRouter
 
-from service.atomicio import atomic_write_text
+from service.atomicio import atomic_write_text, file_lock
 from service.config import SETTINGS
 
 logger = logging.getLogger(__name__)
@@ -38,6 +45,12 @@ router = APIRouter(prefix="/v1/direction", tags=["direction"])
 
 DIRECTION_PATH = Path(SETTINGS.voices_dir).parent / "direction_deltas.json"
 _LOCK = threading.Lock()
+
+
+def _lock_path() -> Path:
+    """The cross-process mutex, derived from the store at CALL time so that
+    redirecting DIRECTION_PATH (deployments do; tests do) moves both."""
+    return DIRECTION_PATH.with_name("." + DIRECTION_PATH.name + ".lock")
 _EMOTION_RE = re.compile(r"^[a-z_]{1,32}$")
 
 MAX_CHARACTERS = 200  # distinct characters tracked
@@ -125,7 +138,12 @@ def record_delta(parent: dict, child: dict) -> None:
         swapped = bool(parent_cid and child_cid and parent_cid != child_cid)
         if not child_cid and not swapped:
             return
-        with _LOCK:
+        # Both locks, in this order, exactly like voices.mutate_meta: the
+        # thread lock keeps this process's requests off each other, the file
+        # lock keeps the other replicas off the read-modify-write. A file lock
+        # alone would let two threads here contend on the filesystem; a thread
+        # lock alone is what this module had, and it excluded nothing.
+        with _LOCK, file_lock(_lock_path()):
             data = _load()
             chars = data["characters"]
             if child_cid:

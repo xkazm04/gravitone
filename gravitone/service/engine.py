@@ -1020,6 +1020,12 @@ class _Worker(threading.Thread):
         self.generation = generation
         # LRU: most-recently-used voice kept at the end; evict from the front.
         self._voice_cache: "OrderedDict[str, dict]" = OrderedDict()
+        # Guards ONLY the dict bookkeeping below — never a model call. Another
+        # thread (the replica's admin server, via TtsEngine.voice_lru_keys)
+        # reads these keys while this worker mutates them, and iterating a live
+        # OrderedDict from a second thread raises. An uncontended lock around
+        # three dict operations is not measurable next to a generation.
+        self._voice_lock = threading.Lock()
         # `ready` means "loaded AND serving": set after a successful load,
         # CLEARED again the moment the loop exits, so a dead worker never keeps
         # counting toward the engine's live capacity (see TtsEngine.ready).
@@ -1032,19 +1038,34 @@ class _Worker(threading.Thread):
 
     # -- voice loading (per-instance; states are model-specific) -----------
     def _voice_state(self, voice_id: str) -> dict:
-        st = self._voice_cache.get(voice_id)
-        if st is not None:
-            self._voice_cache.move_to_end(voice_id)  # mark most-recently-used
-            return st
+        with self._voice_lock:
+            st = self._voice_cache.get(voice_id)
+            if st is not None:
+                self._voice_cache.move_to_end(voice_id)  # most-recently-used
+                return st
         # 1) exported embedding in the voices dir, 2) a raw path, 3) a builtin name
         cand = Path(SETTINGS.voices_dir) / f"{voice_id}.safetensors"
         source = str(cand) if cand.is_file() else voice_id
+        # OUTSIDE the lock: this is the expensive load, and holding a lock a
+        # reader also wants across it would make an introspection scrape wait
+        # on a model load.
         st = self.model.get_state_for_audio_prompt(source, truncate=True)
-        self._voice_cache[voice_id] = st
-        self._voice_cache.move_to_end(voice_id)
-        if len(self._voice_cache) > _VOICE_CACHE_MAX:
-            self._voice_cache.popitem(last=False)  # evict least-recently-used
+        with self._voice_lock:
+            self._voice_cache[voice_id] = st
+            self._voice_cache.move_to_end(voice_id)
+            if len(self._voice_cache) > _VOICE_CACHE_MAX:
+                self._voice_cache.popitem(last=False)  # evict least-recently-used
         return st
+
+    def voice_cache_keys(self) -> list[str]:
+        """This worker's resident voice ids, copied under its own lock.
+
+        The copy is the whole point: handing a caller the live keys view meant
+        the reader iterated a dict this thread was inserting into, and got a
+        RuntimeError exactly when the box was busiest.
+        """
+        with self._voice_lock:
+            return list(self._voice_cache.keys())
 
     # -- generation --------------------------------------------------------
     def _generate(self, state: dict, job: "Job"):
@@ -1504,12 +1525,19 @@ class TtsEngine:
 
         Fabric's router uses this for affinity: routing to a replica that
         already holds the voice skips get_state_for_audio_prompt, the largest
-        avoidable cost on a cold voice. Snapshot of a live OrderedDict, so
-        treat it as advisory.
+        avoidable cost on a cold voice.
+
+        Called from ANOTHER THREAD (the replica's admin server) while the
+        workers are serving, so each worker hands back its own copy taken under
+        its own lock — never the live view, which is what used to raise
+        "dictionary changed size during iteration" precisely when the box was
+        busy enough for affinity to matter. Still advisory: the answer is a
+        snapshot of a set of snapshots, and a voice can be evicted a moment
+        after it is reported.
         """
         keys: set[str] = set()
         for w in self._workers:
-            keys.update(list(w._voice_cache.keys()))
+            keys.update(w.voice_cache_keys())
         return sorted(keys)
 
     # -- the deadline contract --------------------------------------------

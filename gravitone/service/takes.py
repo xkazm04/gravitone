@@ -46,6 +46,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from service import direction
+from service.atomicio import atomic_write_bytes, atomic_write_text, file_lock
 from service.config import SETTINGS
 from service.ratelimit import per_ip_budget
 
@@ -89,6 +90,20 @@ def _upload_limit() -> int:
 
 UPLOAD_BUDGET = per_ip_budget("take-upload", limit=_upload_limit(),
                               window_s=600, burst=6, methods=("POST",))
+
+
+# Both stores are bounded, and "bound" is a read-modify-write of a DIRECTORY:
+# list it, decide what to drop, drop it, add one. Two replicas doing that at
+# once can each decide the store is full and each evict — or evict the file the
+# other just wrote. `os.replace` says nothing about that; only a cross-process
+# mutex does. Derived at call time so redirecting the store (deployments do;
+# tests do) moves the lock with it.
+def _takes_lock() -> Path:
+    return TAKES_DIR / ".takes.lock"
+
+
+def _reviews_lock() -> Path:
+    return REVIEWS_DIR / ".reviews.lock"
 
 
 def _valid_id(take_id: str) -> bool:
@@ -296,9 +311,14 @@ def _write_take(record: dict, audio: bytes) -> None:
     construction (up to 25 MB plus a glob of the store) — callers on the event
     loop must hand it to a thread."""
     TAKES_DIR.mkdir(parents=True, exist_ok=True)
-    _evict_oldest()
-    (TAKES_DIR / f"{record['id']}.wav").write_bytes(audio)
-    (TAKES_DIR / f"{record['id']}.json").write_text(json.dumps(record), "utf-8")
+    with file_lock(_takes_lock()):
+        _evict_oldest()
+        # Atomic, and the WAV first: a reader finds a take through its JSON, so
+        # the pair only ever becomes visible in an order where the audio is
+        # already whole. Bare writes left both halves torn if the process died
+        # mid-write — 25 MB is the widest such window this service has.
+        atomic_write_bytes(TAKES_DIR / f"{record['id']}.wav", audio)
+        atomic_write_text(TAKES_DIR / f"{record['id']}.json", json.dumps(record))
 
     # The diff between parent and child is a human direction decision. Counted
     # after the take is safely on disk, and never able to fail it.
@@ -526,8 +546,9 @@ def create_review(req: ReviewReq) -> dict:
         "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "pick": None,  # {take_id, reviewer, note, picked_at}
     }
-    _evict_reviews()
-    _review_path(review_id).write_text(json.dumps(record), "utf-8")
+    with file_lock(_reviews_lock()):
+        _evict_reviews()
+        atomic_write_text(_review_path(review_id), json.dumps(record))
     return {"review_id": review_id}
 
 
@@ -616,6 +637,17 @@ def revise_review(review_id: str, req: ReviseReq) -> dict:
     rides in `derived_from` where the studio — and direction.py, once the
     re-render is published as a child take — can read it.
     """
+    # The whole round is decided INSIDE the store lock: the decision this
+    # revision quotes is read, the store is evicted to make room, and the new
+    # round is written, with no window in which another replica can evict the
+    # source review out from under the round that cites it or race this
+    # eviction with its own. The lock is the store's, not this review's —
+    # eviction is what makes every writer here a writer of everyone's files.
+    with file_lock(_reviews_lock()):
+        return _revise_locked(review_id, req)
+
+
+def _revise_locked(review_id: str, req: ReviseReq) -> dict:
     review = _load_review(review_id)
     pick = review.get("pick")
     if not pick:
@@ -646,7 +678,7 @@ def revise_review(review_id: str, req: ReviseReq) -> dict:
         },
     }
     _evict_reviews()
-    _review_path(new_id).write_text(json.dumps(record), "utf-8")
+    atomic_write_text(_review_path(new_id), json.dumps(record))
     return {"review_id": new_id, "round": round_no}
 
 
@@ -685,7 +717,10 @@ def pick_take(review_id: str, req: PickReq) -> dict:
         raise HTTPException(409, "this review has already been decided")
     try:
         review["pick"] = pick
-        _review_path(review_id).write_text(json.dumps(review), "utf-8")
+        # Atomic: the sentinel above already named the winner, so this write
+        # must not be able to leave the decision half-recorded — a torn review
+        # is unreadable, and its `.pick` sentinel would refuse every retry.
+        atomic_write_text(_review_path(review_id), json.dumps(review))
     except Exception:
         lock.unlink(missing_ok=True)  # let a transient write failure be retried
         raise
