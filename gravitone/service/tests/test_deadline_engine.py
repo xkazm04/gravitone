@@ -384,18 +384,39 @@ class ElasticQualityTests(_LiveEngineTests):
         self.assertEqual(job.overrides, {})
         self.assertIsNone(job.frames_after_eos)
 
-    def test_an_impossible_deadline_degrades_visibly_when_allowed(self) -> None:
+    def test_a_reachable_only_by_degrading_deadline_degrades_visibly(self) -> None:
         self._warm()
         self.eng.submit(voice_id="v", text="a" * 4000)
         self.assertTrue(self.model.entered.wait(5))
+        text = "b" * 4000
+        # A deadline that full quality misses but the FIRST rung (×0.7) makes.
+        full = self.eng.metrics.cost_estimate(
+            len(text), enginemod.SETTINGS.max_tokens)["est_synth_s"]
+        deadline = self.eng.predicted_wait_s() + full * 0.8
+        job = self.eng.submit(voice_id="v", text=text, deadline_s=deadline,
+                              degrade_allowed=True)
+        self.assertEqual(job.quality_level, "reduced")
+        self.assertEqual(job.overrides["lsd_decode_steps"], 2)
+        self.assertEqual(job.frames_after_eos, 2)
+        # The degraded job is CHEAPER than the full-quality estimate.
+        self.assertLess(job.est_synth_s, full)
+
+    def test_an_impossible_deadline_runs_at_full_quality_and_says_so(self) -> None:
+        # No rung fits. Degrading anyway would hand the caller the cheapest
+        # audio AND a missed deadline — they would have paid for the
+        # degradation and got nothing for it. Full quality is the honest
+        # outcome, and the engine RECORDS that it could not have made it.
+        self._warm()
+        self.eng.submit(voice_id="v", text="a" * 4000)
+        self.assertTrue(self.model.entered.wait(5))
+        before = self.eng.metrics.promises()["deadlines"]["unfittable"]
         job = self.eng.submit(voice_id="v", text="b" * 4000, deadline_s=0.001,
                               degrade_allowed=True)
-        self.assertEqual(job.quality_level, "minimal")
-        self.assertEqual(job.overrides["lsd_decode_steps"], 1)
-        self.assertEqual(job.frames_after_eos, 1)
-        # The degraded job is CHEAPER than the full-quality estimate.
-        full = self.eng.metrics.cost_estimate(4000, job.max_tokens)
-        self.assertLess(job.est_synth_s, full["est_synth_s"])
+        self.assertEqual(job.quality_level, enginemod.QUALITY_FULL)
+        self.assertEqual(job.overrides, {})
+        self.assertIsNone(job.frames_after_eos)
+        self.assertEqual(self.eng.metrics.promises()["deadlines"]["unfittable"],
+                         before + 1)
 
     def test_a_reachable_deadline_is_never_degraded(self) -> None:
         self.model.gate.set()

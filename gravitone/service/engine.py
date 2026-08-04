@@ -110,6 +110,12 @@ _INTERACTIVE_HORIZON_S = float(os.environ.get("TTS_INTERACTIVE_HORIZON_S") or 2.
 _INTERACTIVE_DEADLINE_FLOOR_S = float(
     os.environ.get("TTS_INTERACTIVE_DEADLINE_FLOOR_S") or 0.25)
 
+# How often the queued-cost accounting is re-derived from the queue itself
+# (TtsEngine._reconcile_pending). Event-driven — it runs on the submit path, not
+# on a timer thread — and rate-limited to this, because the walk is cheap but
+# not free and the number it corrects moves slowly.
+_PENDING_RECONCILE_S = float(os.environ.get("TTS_PENDING_RECONCILE_S") or 1.0)
+
 # Admission permits no BULK job may consume — the interactive floor. Zero by
 # default ON PURPOSE: a non-zero floor changes who gets a 429 on a saturated
 # box, and that is an operator decision, not a silent upgrade.
@@ -146,10 +152,28 @@ _MAX_SPREAD = 4.0
 # and always reported back on the job (Job.quality_level -> X-Quality-Level).
 QUALITY_FULL = "full"
 _QUALITY_LADDER = (
-    # (level, lsd_decode_steps, frames_after_eos, cost fraction)
+    # (level, lsd_decode_steps, frames_after_eos, ASSUMED cost fraction)
     ("reduced", 2, 2, 0.7),
     ("minimal", 1, 1, 0.5),
 )
+
+# The ladder fractions above are ASSUMPTIONS — 0.7 and 0.5 were invented, never
+# measured. The engine now measures them: every completed synth is recorded
+# against the quality level it ran at (Metrics.on_finish), and once a level has
+# this many samples of its own its real cost fraction is computed from the
+# observed real-time factors and used INSTEAD of the constant.
+#
+# Smaller than _WARM_WINDOW on purpose: degraded renders are rare by
+# construction (they only happen under deadline pressure with the caller's
+# permission), so a 20-sample gate would mean the fractions were never
+# calibrated on any real box. What a thin window buys is a fraction, not a
+# promise — and a promise built on an UNCALIBRATED fraction is withheld
+# entirely (see TtsEngine.submit), which is the honest floor.
+_LADDER_WARM_WINDOW = int(os.environ.get("TTS_LADDER_WARM_WINDOW") or 8)
+
+# {level: assumed fraction} — the fallback when a level has no window yet.
+_LADDER_ASSUMED = {level: fraction
+                   for level, _steps, _frames, fraction in _QUALITY_LADDER}
 
 
 # ----------------------------------------------------------------------------
@@ -420,6 +444,24 @@ class Metrics:
         self._latencies: deque[float] = deque(maxlen=window)   # end-to-end seconds
         self._proc: deque[float] = deque(maxlen=window)        # pure synth seconds
         self._audio: deque[float] = deque(maxlen=window)       # audio seconds produced
+        # --- promises vs reality (the engine grading its own homework) ------
+        # A promise nobody checks is a decoration. Every job that carried a
+        # promised_s is compared to the latency it actually took, and every job
+        # that carried a caller deadline is compared to that deadline.
+        self.promises_kept = 0
+        self.promises_missed = 0
+        self.deadlines_met = 0
+        self.deadlines_missed = 0
+        # Deadlines no ladder rung could meet (see TtsEngine._degrade): the
+        # engine ran at full quality and knew at admission it would miss.
+        self.deadlines_unfittable = 0
+        # Signed error, actual - promised: negative = came back early.
+        self._promise_err: deque[float] = deque(maxlen=window)
+        # Per-quality-level synth/audio windows, the raw material of a MEASURED
+        # ladder fraction. Keyed by level; QUALITY_FULL is the denominator.
+        self._level_proc: "dict[str, deque[float]]" = {}
+        self._level_audio: "dict[str, deque[float]]" = {}
+        self._window = window
         # Lifetime counter (not windowed) — feeds the "you'd have paid $X at
         # ElevenLabs" savings ticker in the web studio.
         self.audio_seconds_total = 0.0
@@ -496,7 +538,21 @@ class Metrics:
             with self._lock:
                 self.in_flight = max(0, self.in_flight - 1)
 
-    def on_finish(self, latency_s: float, proc_s: float, audio_s: float):
+    def on_finish(self, latency_s: float, proc_s: float, audio_s: float,
+                  quality_level: str = QUALITY_FULL,
+                  promised_s: Optional[float] = None,
+                  deadline_s: Optional[float] = None):
+        """Record one completed synthesis — and GRADE it.
+
+        ``promised_s`` is what the engine told the caller at admission
+        (X-Gravitone-Deadline); ``deadline_s`` is what the caller asked for.
+        Both are optional because most jobs carry neither, and a job that was
+        never promised anything can neither keep nor break a promise — it is
+        left out of the rate entirely rather than counted as a hit.
+
+        ``quality_level`` is what actually ran, which is what makes the elastic
+        ladder measurable instead of assumed (see ``ladder_fractions``).
+        """
         # in_flight is NOT touched here — job_running owns it.
         with self._lock:
             self.completed += 1
@@ -504,6 +560,32 @@ class Metrics:
             self._proc.append(proc_s)
             self._audio.append(audio_s)
             self.audio_seconds_total += audio_s
+            level = quality_level or QUALITY_FULL
+            self._level_proc.setdefault(
+                level, deque(maxlen=self._window)).append(proc_s)
+            self._level_audio.setdefault(
+                level, deque(maxlen=self._window)).append(audio_s)
+            if promised_s is not None:
+                self._promise_err.append(latency_s - promised_s)
+                if latency_s <= promised_s:
+                    self.promises_kept += 1
+                else:
+                    self.promises_missed += 1
+            if deadline_s is not None:
+                if latency_s <= float(deadline_s):
+                    self.deadlines_met += 1
+                else:
+                    self.deadlines_missed += 1
+
+    def on_deadline_unfittable(self):
+        """A deadline no ladder rung could meet: recorded at admission.
+
+        The job still runs at full quality (``TtsEngine._degrade``), so it will
+        ALSO be counted as a deadline miss when it completes. The two are
+        different facts: one says "we could not have made it however cheaply we
+        rendered", the other says "we did not make it"."""
+        with self._lock:
+            self.deadlines_unfittable += 1
 
     def on_error(self):
         # in_flight is NOT touched here — job_running owns it.
@@ -589,6 +671,85 @@ class Metrics:
             "audio_s_per_char": _AUDIO_S_PER_CHAR,
         }
 
+    def ladder_fractions(self) -> "dict[str, tuple[Optional[float], str]]":
+        """``{level: (fraction, basis)}`` — MEASURED cost fractions when known.
+
+        The fraction is the level's cost per second of audio relative to full
+        quality, i.e. ``rtf_full / rtf_level``, computed from the two windows
+        the engine already keeps per level. ``basis`` is ``"measured"`` when
+        both windows are thick enough (``_LADDER_WARM_WINDOW`` for the level,
+        ``_WARM_WINDOW`` for full quality) and ``"assumed"`` otherwise — in
+        which case the fraction is None and the caller falls back to the
+        ladder's invented constant AND must not turn the result into a promise.
+
+        Clamped to (0, 1]: a "cheaper" level that measured SLOWER than full
+        quality is not a saving, and letting a noisy window claim a fraction of
+        3.0 would make the estimate worse than the constant it replaced.
+        """
+        with self._lock:
+            full_proc = sum(self._level_proc.get(QUALITY_FULL, ()))
+            full_audio = sum(self._level_audio.get(QUALITY_FULL, ()))
+            full_n = len(self._level_proc.get(QUALITY_FULL, ()))
+            levels = {lv: (sum(self._level_proc.get(lv, ())),
+                           sum(self._level_audio.get(lv, ())),
+                           len(self._level_proc.get(lv, ())))
+                      for lv, _s, _f, _fr in _QUALITY_LADDER}
+        out: "dict[str, tuple[Optional[float], str]]" = {}
+        full_ok = full_n >= _WARM_WINDOW and full_proc > 0 and full_audio > 0
+        full_cost_per_audio_s = (full_proc / full_audio) if full_ok else None
+        for level, (proc, audio, n) in levels.items():
+            if (not full_ok or n < _LADDER_WARM_WINDOW
+                    or proc <= 0 or audio <= 0):
+                out[level] = (None, "assumed")
+                continue
+            frac = (proc / audio) / full_cost_per_audio_s
+            out[level] = (round(min(1.0, max(0.01, frac)), 3), "measured")
+        return out
+
+    def promises(self) -> dict:
+        """Promise-vs-actual, and deadline-vs-actual. The honesty surface.
+
+        Nested under one key on ``snapshot`` for the same reason ``cost_model``
+        is (see its docstring and ``replicas.AGG_KEYS``): rates and percentiles
+        are neither summable nor averageable across replicas, and every
+        top-level scalar in a snapshot must be classified as one or the other.
+
+        ``hit_rate`` is None rather than 1.0 when nothing was promised — a rate
+        over zero samples is not a perfect score, it is no score.
+        """
+        with self._lock:
+            kept, missed = self.promises_kept, self.promises_missed
+            met, dmissed = self.deadlines_met, self.deadlines_missed
+            unfittable = self.deadlines_unfittable
+            errors = sorted(self._promise_err)
+        promised = kept + missed
+        deadlines = met + dmissed
+        return {
+            "promised": promised,
+            "kept": kept,
+            "missed": missed,
+            "hit_rate": round(kept / promised, 3) if promised else None,
+            # Signed: negative means the engine came back EARLY. A promise
+            # surface that only reported |error| would hide the difference
+            # between "we are conservative" and "we are wrong".
+            "error_p50_s": self._pct(errors, 50),
+            "error_p95_s": self._pct(errors, 95),
+            "error_mean_s": (round(sum(errors) / len(errors), 4)
+                             if errors else None),
+            "deadlines": {
+                "seen": deadlines,
+                "met": met,
+                "missed": dmissed,
+                "hit_rate": round(met / deadlines, 3) if deadlines else None,
+                "unfittable": unfittable,
+            },
+            "ladder": {level: {"fraction": (frac if frac is not None
+                                            else _LADDER_ASSUMED[level]),
+                               "basis": basis,
+                               "samples": len(self._level_proc.get(level, ()))}
+                       for level, (frac, basis) in self.ladder_fractions().items()},
+        }
+
     def cost_estimate(self, text_len: int, max_tokens: Optional[int] = None) -> dict:
         """Seconds of synthesis this request is expected to cost.
 
@@ -637,6 +798,9 @@ class Metrics:
             # The decision layer's view of the same windows (nested — see
             # cost_model's docstring for why it is not top-level scalars).
             "cost_model": self.cost_model(),
+            # Whether the decisions above turned out to be TRUE (also nested,
+            # for the same AGG_KEYS reason: rates do not sum across replicas).
+            "promises": self.promises(),
         })
         return base
 
@@ -704,6 +868,11 @@ class Job:
     # in which case the API layer reports it as X-Quality-Level — degradation
     # that a caller cannot see is worse than a 429.
     quality_level: str = QUALITY_FULL
+    # How the degraded cost was arrived at: "measured" (the level's cost
+    # fraction came from this engine's own observations) or "assumed" (it came
+    # from the ladder's invented constant). None when nothing was degraded. A
+    # promise resting on "assumed" is 30-50% guess, so submit() withholds it.
+    degrade_basis: Optional[str] = None
     # Called exactly once, by whoever WINS claim(), to tell the engine this job
     # has left the queue's cost accounting. Wired by submit; None everywhere else
     # (a Job built by hand in a test owes the engine nothing).
@@ -797,6 +966,27 @@ class _DeadlineQueue:
 
     def task_done(self) -> None:
         self._q.task_done()
+
+    def pending_est_s(self) -> float:
+        """The TRUTH about queued cost: sum ``est_synth_s`` over the jobs that
+        are really still on this queue and not yet claimed.
+
+        The engine's running total is maintained by increment/decrement, which
+        is cheap and drifts (a settle hook that raised, a Job built outside
+        submit, a counter that was never reconciled against anything). This is
+        what it is reconciled AGAINST — a snapshot of the heap list, which is
+        bounded by ``workers + queue_max``, so it is a short walk and not a
+        sweeper. Claimed jobs are excluded: a claim has already settled their
+        cost, and the queue entry left behind is a tombstone.
+        """
+        with self._q.mutex:
+            entries = list(self._q.queue)
+        total = 0.0
+        for _priority, _seq, job in entries:
+            if job is None or getattr(job, "_claimed", False):
+                continue
+            total += float(getattr(job, "est_synth_s", 0.0) or 0.0)
+        return total
 
     def qsize(self) -> int:
         return self._q.qsize()
@@ -1010,6 +1200,12 @@ class _Worker(threading.Thread):
             self.engine.metrics.on_finish(
                 latency_s=time.perf_counter() - job.t_enqueue,
                 proc_s=synth_s, audio_s=audio_s,
+                # The grading inputs: what we PROMISED this caller, what they
+                # ASKED for, and which quality level actually produced these
+                # seconds (which is what calibrates the ladder).
+                quality_level=job.quality_level,
+                promised_s=job.promised_s,
+                deadline_s=job.deadline_s,
             )
             job.future.set_result(res)
         except BaseException as exc:  # noqa: BLE001 - surface to caller
@@ -1088,6 +1284,11 @@ class TtsEngine:
         # points: submit adds, Job.claim's settle hook subtracts.
         self._pending_lock = threading.Lock()
         self._pending_est_s = 0.0
+        # Reconciliation against the real queue (see _reconcile_pending): when
+        # it last ran, and what the last correction was worth (surfaced on
+        # config() so drift is visible instead of merely absent).
+        self._pending_reconciled_at = 0.0
+        self._pending_drift_s = 0.0
         # Admission slots = workers (in-flight) + queue_max (waiting).
         self._max_inflight = SETTINGS.workers + SETTINGS.queue_max
         self._admit = threading.Semaphore(self._max_inflight)
@@ -1318,10 +1519,42 @@ class TtsEngine:
         with self._pending_lock:
             self._pending_est_s = max(0.0, self._pending_est_s - job.est_synth_s)
 
+    def _reconcile_pending(self, force: bool = False) -> float:
+        """Re-derive ``_pending_est_s`` from the queue itself. Returns the total.
+
+        ``_pending_est_s`` is the numerator of every predicted wait and every
+        promise, and it was increment/decrement only: submit added, the settle
+        hook subtracted, and NOTHING ever checked the result against reality.
+        The settle hook is explicitly best-effort (``Job.claim`` swallows its
+        failures rather than lose a job), so drift was not hypothetical, and a
+        drifted numerator quietly poisons every number downstream of it.
+
+        Event-driven and rate-limited rather than a background sweeper: this
+        runs on the submit path (through ``predicted_wait_s``) at most once per
+        ``_PENDING_RECONCILE_S``, and costs one walk of a heap bounded by
+        ``workers + queue_max``. No new thread, no new lock — and note it is
+        ``_pending_lock``, NOT ``Metrics._lock``, so metrics hold times are
+        untouched.
+
+        The walk happens WHILE ``_pending_lock`` is held, which is what makes it
+        exact rather than a race: a settle that lands mid-reconcile blocks until
+        the fresh total is stored and then subtracts from it, instead of being
+        overwritten by a snapshot that still counted its job.
+        """
+        now = time.monotonic()
+        with self._pending_lock:
+            if not force and (now - self._pending_reconciled_at
+                              < _PENDING_RECONCILE_S):
+                return self._pending_est_s
+            truth = self._queue.pending_est_s()
+            self._pending_drift_s = round(truth - self._pending_est_s, 6)
+            self._pending_est_s = truth
+            self._pending_reconciled_at = now
+            return truth
+
     def pending_cost_s(self) -> float:
         """Estimated synthesis seconds sitting in the queue right now."""
-        with self._pending_lock:
-            return round(self._pending_est_s, 3)
+        return round(self._reconcile_pending(), 3)
 
     def predicted_wait_s(self, est_synth_s: float = 0.0) -> float:
         """How long a job costing ``est_synth_s`` would take to come back.
@@ -1368,28 +1601,49 @@ class TtsEngine:
         return job.t_enqueue + horizon
 
     @staticmethod
-    def _degrade(job: "Job", predicted_wait_s: float) -> None:
+    def _degrade(job: "Job", predicted_wait_s: float,
+                 fractions: "Optional[dict[str, tuple[Optional[float], str]]]" = None
+                 ) -> bool:
         """Fit ``job`` into its deadline by rendering it more cheaply.
 
-        Walks the quality ladder until the (assumed) cheaper render lands inside
-        the deadline, applies the level's decode knobs through the existing
+        Walks the quality ladder for the FIRST rung whose cost lands inside the
+        deadline, applies that level's decode knobs through the existing
         ``Job.overrides`` seam and STAMPS the level on the job. Never lowers a
         knob the caller already pinned lower, and never runs at all unless the
         caller allowed it — a cheaper render nobody asked for and nobody is told
         about is silent quality loss, which is worse than a refusal.
+
+        WHEN NO RUNG FITS, NOTHING IS DEGRADED. The job is left untouched at
+        full quality and this returns False. Walking to the bottom of the ladder
+        anyway — what this used to do — handed the caller the cheapest audio AND
+        a missed deadline: they paid for the degradation and got nothing for it.
+        Failing at full quality is the honest outcome, and the miss is recorded
+        (``Metrics.on_deadline_unfittable``) rather than papered over.
+
+        ``fractions`` are MEASURED cost fractions (``Metrics.ladder_fractions``)
+        when the engine has enough samples for a level; a level with no window
+        falls back to the ladder's assumed constant, and the basis of whichever
+        was used is stamped on ``job.degrade_basis`` so the promise layer can
+        refuse to promise on a guess.
         """
         deadline = float(job.deadline_s)
         full_cost = job.est_synth_s
-        for level, steps, frames, fraction in _QUALITY_LADDER:
+        for level, steps, frames, assumed in _QUALITY_LADDER:
+            measured, basis = (fractions or {}).get(level, (None, "assumed"))
+            fraction = assumed if measured is None else measured
+            cost = round(full_cost * fraction, 3)
+            if predicted_wait_s + cost > deadline:
+                continue        # this rung does not fit either
             job.quality_level = level
-            job.est_synth_s = round(full_cost * fraction, 3)
+            job.est_synth_s = cost
+            job.degrade_basis = basis
             want_steps = job.overrides.get("lsd_decode_steps")
             if want_steps is None or want_steps > steps:
                 job.overrides["lsd_decode_steps"] = steps
             if job.frames_after_eos is None or job.frames_after_eos > frames:
                 job.frames_after_eos = frames
-            if predicted_wait_s + job.est_synth_s <= deadline:
-                return   # this level fits; go no cheaper than we must
+            return True         # go no cheaper than we must
+        return False
 
     def submit(self, voice_id: str, text: str, overrides: Optional[dict] = None,
                max_tokens: Optional[int] = None,
@@ -1419,6 +1673,16 @@ class TtsEngine:
         max_tokens = max_tokens or SETTINGS.max_tokens
         cost = self.metrics.cost_estimate(len(text or ""), max_tokens)
         est_synth_s = cost["est_synth_s"]
+        # TWO different numbers, and conflating them was double-counting this
+        # job's own render:
+        #   queue_wait — how long until a worker picks THIS job up;
+        #   predicted  — the caller's whole round trip, queue_wait + its render.
+        # `predicted` is what a refusal reports (what you would have waited);
+        # `queue_wait` is what the deadline arithmetic below adds the render to.
+        # Using `predicted` there charged the render twice, which inflated every
+        # promise — invisible until promises started being measured, and a
+        # promise inflated by its own cost is a hit rate that means nothing.
+        queue_wait = self.predicted_wait_s()
         predicted = self.predicted_wait_s(est_synth_s)
         if not self._admit.acquire(blocking=False):
             self.metrics.on_rejected()
@@ -1450,14 +1714,26 @@ class TtsEngine:
             degrade_allowed=degrade_allowed, est_synth_s=est_synth_s,
         )
         # Elastic quality: a slightly cheaper render that lands on time beats a
-        # perfect one that misses (or 429s). Opt-in, and always reported.
-        if (deadline_s is not None and degrade_allowed
-                and predicted + est_synth_s > float(deadline_s)):
-            self._degrade(job, predicted)
+        # perfect one that misses (or 429s). Opt-in, and always reported. When
+        # NO rung fits, nothing is degraded — the job runs at full quality and
+        # the unmeetable deadline is recorded (see _degrade).
+        if (deadline_s is not None
+                and queue_wait + est_synth_s > float(deadline_s)):
+            fitted = (degrade_allowed
+                      and self._degrade(job, queue_wait,
+                                        self.metrics.ladder_fractions()))
+            if not fitted:
+                self.metrics.on_deadline_unfittable()
         # Promise ONLY from a warm window (Metrics.cost_estimate decides): an
-        # estimate off a two-sample window is a number, not a contract.
-        if cost["promise"]:
-            job.promised_s = round(predicted + job.est_synth_s, 3)
+        # estimate off a two-sample window is a number, not a contract. And
+        # only from a CALIBRATED basis: a degraded job's cost rests on the
+        # ladder fraction, which is an invented constant until this engine has
+        # measured the level for itself, so promising off it would stamp a
+        # header that is 30-50% guess with the same authority as a measured
+        # one. Withheld, not widened — the caller gets no number rather than a
+        # number they cannot rely on.
+        if cost["promise"] and job.degrade_basis in (None, "measured"):
+            job.promised_s = round(queue_wait + job.est_synth_s, 3)
         # Wired BEFORE the job is reachable by anyone else, so there is no
         # window in which abandoning it would silently keep the permit.
         job.abandoned._on_abandon = functools.partial(self._release_abandoned, job)
@@ -1500,6 +1776,12 @@ class TtsEngine:
                 "interactive_horizon_s": _INTERACTIVE_HORIZON_S,
                 "interactive_deadline_floor_s": _INTERACTIVE_DEADLINE_FLOOR_S,
                 "cost_warm_window": _WARM_WINDOW,
+                "ladder_warm_window": _LADDER_WARM_WINDOW,
+                "pending_reconcile_s": _PENDING_RECONCILE_S,
+                # What the last reconciliation had to correct. A number that
+                # stays at 0.0 is the accounting agreeing with the queue; a
+                # number that does not is the drift this exists to catch.
+                "pending_drift_s": self._pending_drift_s,
             },
             # What the CPU tuning ACTUALLY achieved (not what was requested):
             # set_flush_denormal can refuse, interop threads can be too late,
