@@ -24,7 +24,7 @@ import {
 } from "./_state/machine";
 import { candidates, commitRecipes, recipeById } from "./_state/audition";
 import { corpusNotice } from "./_state/corpus";
-import { isEdited } from "./_state/casting";
+import { identityMeasured, isEdited, stemIdentity } from "./_state/casting";
 import { useCasting } from "./_state/useCasting";
 import {
   ACCEPT_ATTR, LIMITS_HINT, checkBytes, checkDuration,
@@ -580,7 +580,12 @@ export default function NewCharacterPage() {
         )}
 
         {/* REVIEW — ledger */}
-        {phase === "review" && result && (
+        {phase === "review" && result && (() => {
+        // The pipeline scores every stem it writes; the column exists only when
+        // that produced something to say (see identityMeasured).
+        const showIdentity = identityMeasured(result.stems, dirty);
+        const cols = showIdentity ? 8 : 7;
+        return (
           <div className="mt-8">
             <div className="font-jetbrains flex flex-wrap gap-4 text-[12px] text-white/60">
               <span>{result.duration}s audio</span>
@@ -621,6 +626,11 @@ export default function NewCharacterPage() {
                     <th className="px-3 py-2 text-left font-normal">emotion</th>
                     <th className="px-3 py-2 text-left font-normal">length</th>
                     <th className="px-3 py-2 text-left font-normal">segments</th>
+                    {/* What the pipeline MEASURED about the stem it just wrote.
+                        It has always been served per stem and never shown. */}
+                    {showIdentity && (
+                      <th className="px-3 py-2 text-left font-normal">identity</th>
+                    )}
                     <th className="px-3 py-2 text-left font-normal">vocal cue</th>
                     {/* Two different things to listen to, so both are named:
                         the source recording, and the clone of it. */}
@@ -692,6 +702,19 @@ export default function NewCharacterPage() {
                             st.segments
                           )}
                         </td>
+                        {showIdentity && (() => {
+                          const cell = stemIdentity(st, cast, result.fidelity?.measures);
+                          return (
+                            <td className="font-jetbrains px-3 py-2 text-[12px]" title={cell.title}>
+                              <span className={
+                                cell.tone === "measured" ? "tabular-nums text-cyan-200/85"
+                                : cell.tone === "recast" ? "text-white/45"
+                                : "text-white/35"}>
+                                {cell.text}
+                              </span>
+                            </td>
+                          );
+                        })()}
                         <td className="px-3 py-2 text-[12px] italic text-white/50">{st.cues[0] ? `“${st.cues[0]}”` : "—"}</td>
                         <td className="px-3 py-2">
                           <div className="flex flex-wrap items-center gap-1.5">
@@ -739,7 +762,7 @@ export default function NewCharacterPage() {
                       </tr>
                       {board && (
                         <tr className="border-b border-white/5">
-                          <td colSpan={7} className="px-3 pb-4 pt-1">
+                          <td colSpan={cols} className="px-3 pb-4 pt-1">
                             <SegmentBoard
                               jobId={jobId!}
                               stem={st}
@@ -759,7 +782,7 @@ export default function NewCharacterPage() {
                       )}
                       {open && (
                         <tr className="border-b border-white/5">
-                          <td colSpan={7} className="px-3 pb-4 pt-1">
+                          <td colSpan={cols} className="px-3 pb-4 pt-1">
                             <AuditionPanel
                               emotion={st.emotion}
                               label={m.label}
@@ -856,7 +879,8 @@ export default function NewCharacterPage() {
               </label>
             </div>
           </div>
-        )}
+        );
+        })()}
 
         {/* COMMITTING — real per-emotion progress from the async commit */}
         {phase === "committing" && (() => {
@@ -960,16 +984,57 @@ export default function NewCharacterPage() {
                   ))}
                 </p>
               )}
+              {/* Each created Voice with the number measured ON IT: the clone is
+                  synthesized and scored against the speaker's own reference at
+                  commit, and this screen showed emotion names only. Where there
+                  is no number the backend said why, and that sentence is carried
+                  rather than an empty chip the user has to interpret. */}
               <div className="mt-4 flex flex-wrap gap-2">
                 {created.map((c) => {
                   const m = emotionMeta(c.emotion);
+                  const measured = typeof c.identity === "number";
                   return (
-                    <span key={c.voice_id} className="font-jetbrains inline-flex items-center gap-1.5 rounded-full border border-white/12 bg-white/5 px-2.5 py-1 text-[11px] text-white/80">
+                    <span key={c.voice_id}
+                      title={measured
+                        ? "Identity match: how closely the cloned voice sounds like the "
+                          + "speaker it was made from (1.00 is identical). It says nothing "
+                          + "about whether the take is good."
+                        : c.identity_reason
+                          ? `Identity was not measured — ${c.identity_reason}`
+                          : undefined}
+                      className="font-jetbrains inline-flex items-center gap-1.5 rounded-full border border-white/12 bg-white/5 px-2.5 py-1 text-[11px] text-white/80">
                       <span className="h-1.5 w-1.5 rounded-full" style={{ background: `hsl(${m.hue} 80% 62%)` }} />{m.label}
+                      {measured && (
+                        <span className="tabular-nums text-cyan-200/85">identity {c.identity!.toFixed(2)}</span>
+                      )}
+                      {!measured && c.identity_reason && (
+                        <span className="text-white/40">not measured</span>
+                      )}
                     </span>
                   );
                 })}
               </div>
+              {/* Why a number is missing, once — the reason is the same for every
+                  voice in a commit (it is decided before the model loads), so it
+                  is stated once rather than repeated per chip. */}
+              {created.some((c) => typeof c.identity !== "number" && c.identity_reason) && (
+                <p className="font-jetbrains mt-2 text-[11px] leading-relaxed text-white/40">
+                  identity was not measured — {created.find((c) => c.identity_reason)!.identity_reason}.
+                </p>
+              )}
+              {/* An extend-mode commit that OVERWROTE a voice used to say nothing
+                  at all. The previous embedding is gone by the time the row is
+                  swapped, so this is not a footnote — it is the outcome. */}
+              {created.some((c) => c.replaced) && (
+                <p className="font-jetbrains mt-2 rounded-lg border border-amber-400/25 bg-amber-400/5 px-3 py-2 text-[11px] leading-relaxed text-amber-200/85">
+                  {created.filter((c) => c.replaced).map((c) => (
+                    <span key={c.voice_id} className="block">
+                      replaced the previous {emotionMeta(c.emotion).label} voice
+                      {" "}({c.replaced}) — that embedding is gone.
+                    </span>
+                  ))}
+                </p>
+              )}
               {/* Coverage Coach — the recording produced an incomplete rack;
                   give every remaining slot a direct path to done. Stems that
                   were detected but too short to clone are called out. */}

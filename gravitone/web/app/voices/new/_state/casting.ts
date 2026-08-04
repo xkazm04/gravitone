@@ -136,3 +136,118 @@ export function shortBy(stem: Stem, minStem: number): number | null {
 export function isEdited(dirty: string[], emotion: string): boolean {
   return dirty.includes(emotion);
 }
+
+// ── what was MEASURED, and by whom ────────────────────────────────────────────
+//
+// Two numbers the pipeline has always produced and the review screen has always
+// thrown away: how much each spliced stem still sounds like the speaker, and
+// whether a segment's emotion label came from the cheap classifier or from the
+// paid second opinion. Both are presented the same way the rest of this flow
+// presents a measurement: the absent case is a STATE with its own sentence, and
+// nothing is ever rounded up into a claim the backend did not make.
+
+/** What the ledger's identity cell says. `tone` picks the palette, never the
+ *  meaning: `measured` is a number, `recast` and `absent` are both "no number"
+ *  for two different and non-interchangeable reasons. */
+export type IdentityCell = {
+  tone: "measured" | "recast" | "absent";
+  text: string;
+  title: string;
+};
+
+/**
+ * The per-stem identity match, as a cell.
+ *
+ * `measures` is the service's own caveat sentence (result.fidelity.measures) —
+ * quoted when it is there so the studio does not write its own definition of a
+ * similarity score.
+ */
+export function stemIdentity(
+  stem: Stem, edited: boolean, measures?: string | null,
+): IdentityCell {
+  if (typeof stem.identity === "number") {
+    return {
+      tone: "measured",
+      text: `identity ${stem.identity.toFixed(2)}`,
+      title: "Identity match: how closely this spliced stem still sounds like the "
+        + "same speaker (1.00 is identical). It says nothing about whether the "
+        + "take is good." + (measures ? ` Measured as ${measures}.` : ""),
+    };
+  }
+  if (edited) {
+    return {
+      tone: "recast",
+      text: "re-cast · not measured",
+      title: "The score here described the pipeline's own splice. You replaced "
+        + "that splice, so the number was dropped rather than left standing over "
+        + "audio it never measured — the voice made from this stem is scored "
+        + "when it is cloned.",
+    };
+  }
+  return {
+    tone: "absent",
+    text: "not measured",
+    title: "This scan did not measure speaker identity for this stem.",
+  };
+}
+
+/** Should the ledger carry an identity column at all? Only when there is
+ *  something to say: a pipeline that measured nothing must not render a column
+ *  of "not measured", and a row the user re-cast keeps the column alive so the
+ *  disappearance of its number is explained rather than silent. */
+export function identityMeasured(stems: Stem[], dirty: string[]): boolean {
+  return stems.some((s) => typeof s.identity === "number") || dirty.length > 0;
+}
+
+/** Where a segment's emotion label came from. Null when there is nothing worth
+ *  a badge — a mode with no classifier at all, or a label with no provenance. */
+export type LabelSource = {
+  tone: "paid" | "quick" | "unsure" | "none";
+  text: string;
+  title: string;
+};
+
+export function labelSource(s: Segment): LabelSource | null {
+  const model = s.model ?? null;
+  // The escalation is the expensive half and it is stated first, including both
+  // ways it can NOT have happened: the service records "skipped" (the scan's
+  // escalation budget was spent) and "failed" separately from a label that was
+  // simply confident, and a client that showed all three alike would present a
+  // guess as a checked answer.
+  if (s.escalation === "escalated") {
+    return {
+      tone: "paid", text: "second opinion",
+      title: `The quick classifier was unsure about this clip, so it was re-labelled `
+        + `by the more expensive model${model ? ` (${model})` : ""}.`,
+    };
+  }
+  if (s.escalation === "skipped") {
+    return {
+      tone: "unsure", text: "unsure · not re-checked",
+      title: "The quick classifier was unsure, and this scan's budget for second "
+        + "opinions was already spent — so its first guess stands.",
+    };
+  }
+  if (s.escalation === "failed") {
+    return {
+      tone: "unsure", text: "unsure · re-check failed",
+      title: "The quick classifier was unsure, the second opinion was attempted "
+        + "and failed, so its first guess stands.",
+    };
+  }
+  if (model === "error") {
+    return {
+      tone: "none", text: "not classified",
+      title: "The classifier said nothing about this clip, so it fell back to the "
+        + "baseline label.",
+    };
+  }
+  // Sovereign mode classifies nothing and labels everything locally; a badge on
+  // every row would be noise about a distinction that does not exist there.
+  if (!model || model === "local") return null;
+  return {
+    tone: "quick", text: "quick label",
+    title: `Labelled by the fast classifier (${model}); it was confident enough that `
+      + "no second opinion was bought.",
+  };
+}

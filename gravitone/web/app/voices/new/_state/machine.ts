@@ -31,7 +31,17 @@ export type Recipe = {
 // `recipes` is optional and absent whenever there is no real choice (a single
 // segment, or every candidate splice identical). Absent = the drill-down simply
 // does not exist for that row — never an empty "no alternatives" affordance.
-export type Stem = { emotion: string; seconds: number; segments: number; eligible: boolean; cues: string[]; note?: string | null; recipes?: Recipe[] };
+// `identity` is the number the pipeline measures on the WRITTEN stem — how much
+// the spliced audio still sounds like the speaker it was cut from
+// (service/ingest.py::score_stems, "the number the review screen shows per
+// stem"). It has always been served and the review screen never showed it.
+//
+// Absent is a real and correct state, in two different ways, and neither is an
+// error: this backend may not measure identity at all, and — the load-bearing
+// one — the service POPS the key the moment a stem is re-cast, because the
+// score described the splice the user has just replaced. A stale number is the
+// one thing that must never appear here.
+export type Stem = { emotion: string; seconds: number; segments: number; eligible: boolean; cues: string[]; note?: string | null; recipes?: Recipe[]; identity?: number };
 // `min_stem` is the seconds-of-audio floor a stem must clear to be cloneable
 // (service/ingest.py::MIN_STEM_SECONDS, echoed back per job) and `mode` is the
 // pipeline that produced this ledger. Both are served on every result and both
@@ -49,7 +59,16 @@ export type Segment = {
   text: string; model?: string; ok?: boolean;
   failure?: string | null; outlier?: string | null; escalation?: string | null;
 };
-export type Result = { duration: number; speakers: string[]; target: string; utterances: number; stems: Stem[]; min_stem: number; mode?: "cloud" | "sovereign"; segments?: Segment[] };
+export type Result = {
+  duration: number; speakers: string[]; target: string; utterances: number;
+  stems: Stem[]; min_stem: number; mode?: "cloud" | "sovereign"; segments?: Segment[];
+  // The scan's fidelity payload. Only two fields are read here: whether
+  // anything was measurable at all, and the service's OWN sentence about what
+  // the number means — quoted on hover rather than paraphrased, because a
+  // similarity score explained in the studio's words is a score the studio has
+  // started defining.
+  fidelity?: { available?: boolean; measures?: string | null } | null;
+};
 // What POST /api/ingest/{job}/stems answers with: every stem re-measured from
 // the file it just wrote. `assigned` is what this stem is now spliced from,
 // `proposed` what the pipeline chose, `takes` whether alternative recipes still
@@ -65,7 +84,25 @@ export type CastResult = {
   stems: CastStem[];
 };
 export type Character = { character_id: string; name: string };
-export type Created = { voice_id: string; emotion: string };
+/**
+ * One Voice the commit actually created (service/ingest.py::commit).
+ *
+ * The three fields past `emotion` were all measured, all served, and all
+ * dropped by this studio:
+ *   `identity`        — the clone is SYNTHESIZED and scored against the
+ *                       speaker's own reference, so this is the finished
+ *                       voice's own number, not the stem's.
+ *   `identity_reason` — why there is no number. Named, never silent: "not
+ *                       measured because …" and an empty slot are different
+ *                       facts, and exactly one of the two is ever present.
+ *   `replaced`        — the voice id this one UPGRADED out of the slot. An
+ *                       extend-mode commit that overwrites an existing voice
+ *                       said nothing at all about it.
+ */
+export type Created = {
+  voice_id: string; emotion: string; seconds?: number;
+  identity?: number; identity_reason?: string; replaced?: string;
+};
 
 export type Job = {
   status: string; step: string | null; steps: LoaderStep[]; partial: PartialData;
@@ -334,11 +371,18 @@ export function reducer(state: State, action: Action): State {
     case "CAST_SYNCED": {
       if (!state.result) return state;
       const by = new Map(action.cast.stems.map((s) => [s.emotion, s]));
+      // The stems the service actually RE-SPLICED. It pops each one's identity
+      // score server-side (the number described the previous splice), and the
+      // re-splice answer carries no identity at all — so a client that merged
+      // the answer over the old row would keep showing a measurement of audio
+      // that no longer exists. Absent is the honest state; a stale number is not.
+      const changed = new Set(action.cast.changed);
       const stems = state.result.stems.map((st) => {
         const c = by.get(st.emotion);
         if (!c) return st;
         const next: Stem = { ...st, seconds: c.seconds, segments: c.segments,
           eligible: c.eligible, note: c.note ?? null };
+        if (changed.has(c.emotion)) delete next.identity;
         // The alternative takes were readings of the splice the pipeline
         // proposed. Once a row is re-cast the backend withdraws them, and an
         // offer it would refuse at commit must leave the screen with it.

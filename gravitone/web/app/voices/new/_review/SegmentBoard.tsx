@@ -5,9 +5,19 @@ import TakePlayer from "@/components/ui/TakePlayer";
 import { emotionMeta } from "@/lib/emotions";
 import type { Result, Stem } from "../_state/machine";
 import {
-  boardRows, castableElsewhere, moveSegment, shortBy, stemProgress, toggleSegment,
-  wouldEmpty, type SegmentRow,
+  boardRows, castableElsewhere, labelSource, moveSegment, shortBy, stemProgress,
+  toggleSegment, wouldEmpty, type SegmentRow,
 } from "../_state/casting";
+
+/** Palette for where a label came from. Amber is reserved for the two cases
+ *  where the pipeline was UNSURE and did not (or could not) buy a second
+ *  opinion — the same amber this repo uses for "succeeded, with caveats". */
+const SOURCE_STYLE: Record<string, string> = {
+  paid: "border-cyan-400/30 bg-cyan-400/10 text-cyan-100/90",
+  quick: "border-white/10 text-white/45",
+  unsure: "border-amber-400/25 bg-amber-400/10 text-amber-200",
+  none: "border-white/10 text-white/40",
+};
 
 /**
  * The Segment Casting Board for ONE ledger row.
@@ -266,6 +276,23 @@ function SegmentRowView(props: {
             {Math.round(row.confidence * 100)}% sure
           </span>
         )}
+        {/* WHERE the label came from. The scan already records whether a
+            segment's emotion is the cheap classifier's first guess, a paid
+            second opinion, or a first guess whose second opinion was skipped
+            for budget / failed outright — and the board rendered all four the
+            same, so a guess read exactly like a checked answer. */}
+        {(() => {
+          const src = labelSource(row);
+          if (!src) return null;
+          return (
+            <span
+              title={src.title}
+              className={`font-jetbrains shrink-0 rounded-full border px-2 py-0.5 text-[10px] ${SOURCE_STYLE[src.tone]}`}
+            >
+              {src.text}
+            </span>
+          );
+        })()}
         {row.outlier === "flagged" && (
           <span className="font-jetbrains shrink-0 rounded bg-amber-400/10 px-1.5 py-0.5 text-[10px] text-amber-200">
             unlike the rest

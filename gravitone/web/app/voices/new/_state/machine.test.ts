@@ -78,6 +78,23 @@ describe("SCAN_STARTED", () => {
 });
 
 describe("JOB_POLLED", () => {
+  it("carries what was MEASURED about each created voice, and what it replaced", () => {
+    // Post-commit the service reports a clone's own identity, a named reason
+    // when it could not be measured, and the voice id an extend-mode commit
+    // OVERWROTE. The complete screen used to render emotion names only, so a
+    // commit that destroyed an existing embedding said nothing about it.
+    const s = run(scanned,
+      { type: "COMMIT_STARTED", character: "Sarah", cid: "sarah", total: 2 },
+      { type: "JOB_POLLED", job: job({ status: "committed", committed: [
+        { voice_id: "v1", emotion: "angry", seconds: 12, identity: 0.93 },
+        { voice_id: "v2", emotion: "sad", identity_reason: "no reference audio", replaced: "v0" },
+      ] }) });
+    expect(s.created[0].identity).toBe(0.93);
+    expect(s.created[1].identity).toBeUndefined();
+    expect(s.created[1].identity_reason).toBe("no reference audio");
+    expect(s.created[1].replaced).toBe("v0");
+  });
+
   it("carries the retention outcome through to the screen that states it", () => {
     // The service names this on EVERY job, including "not requested" — a key
     // the reducer dropped would be indistinguishable from a capture that failed.

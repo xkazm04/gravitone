@@ -5,10 +5,10 @@
 // screen is always the one the service measured" — not the shape of the module.
 import { describe, expect, it } from "vitest";
 import {
-  blockedReason, boardRows, castableElsewhere, moveSegment, shortBy,
-  stemProgress, toggleSegment, wouldEmpty,
+  blockedReason, boardRows, castableElsewhere, identityMeasured, labelSource,
+  moveSegment, shortBy, stemIdentity, stemProgress, toggleSegment, wouldEmpty,
 } from "./casting";
-import { initialState, reducer, type CastResult, type Job, type Result, type Segment } from "./machine";
+import { initialState, reducer, type CastResult, type Job, type Result, type Segment, type Stem } from "./machine";
 
 function seg(over: Partial<Segment> & { i: number }): Segment {
   return {
@@ -247,4 +247,104 @@ describe("casting state", () => {
   it("CAST_SYNCED before a ledger exists is a no-op, not a crash", () => {
     expect(reducer(initialState, { type: "CAST_SYNCED", cast: cast() })).toBe(initialState);
   });
+});
+
+describe("what was measured, and by whom", () => {
+  const stem = (over: Partial<Stem> = {}): Stem =>
+    ({ emotion: "happy", seconds: 4.2, segments: 2, eligible: true, cues: [], ...over });
+
+  it("shows the number when the pipeline measured one", () => {
+    const cell = stemIdentity(stem({ identity: 0.9137 }), false, "cosine similarity");
+    expect(cell.tone).toBe("measured");
+    expect(cell.text).toBe("identity 0.91");
+    // The service's own caveat is quoted, not paraphrased.
+    expect(cell.title).toMatch(/cosine similarity/);
+  });
+
+  it("keeps 'not measured' and 're-cast' as two DIFFERENT states", () => {
+    // The service pops a stem's identity when the user re-casts it, because the
+    // score described a splice that no longer exists. Presenting that the same
+    // way as "this backend never measured anything" hides the reason the number
+    // vanished after the user's own edit.
+    const never = stemIdentity(stem(), false);
+    const recast = stemIdentity(stem(), true);
+    expect(never.tone).toBe("absent");
+    expect(recast.tone).toBe("recast");
+    expect(recast.text).toMatch(/re-cast/);
+    expect(recast.title).toMatch(/replaced that splice/i);
+  });
+
+  it("never renders an absent measurement as a number", () => {
+    expect(stemIdentity(stem(), false).text).not.toMatch(/\d/);
+    expect(stemIdentity(stem({ identity: 0 }), false).text).toBe("identity 0.00");
+  });
+
+  it("carries the identity column only when there is something to say", () => {
+    const measured = [stem({ identity: 0.9 }), stem({ emotion: "sad" })];
+    const none = [stem(), stem({ emotion: "sad" })];
+    expect(identityMeasured(measured, [])).toBe(true);
+    expect(identityMeasured(none, [])).toBe(false);
+    // A row the user re-cast keeps the column, so the number's disappearance is
+    // explained rather than silent.
+    expect(identityMeasured(none, ["happy"])).toBe(true);
+  });
+
+  it("tells a paid second opinion apart from the cheap first guess", () => {
+    const paid = labelSource(seg({ i: 1, model: "gemini-3.1-pro-preview", escalation: "escalated" }))!;
+    const quick = labelSource(seg({ i: 1, model: "gemini-3.5-flash" }))!;
+    expect(paid.tone).toBe("paid");
+    expect(paid.text).toMatch(/second opinion/);
+    expect(quick.tone).toBe("quick");
+    expect(quick.title).toMatch(/gemini-3.5-flash/);
+  });
+
+  it("says an unsure label was NOT re-checked, and why", () => {
+    // Both halves the service records separately: the budget ran out, and the
+    // escalation was attempted and failed. Either way the flash guess stands,
+    // and either way that must not read like a confident answer.
+    const skipped = labelSource(seg({ i: 1, model: "gemini-3.5-flash", escalation: "skipped" }))!;
+    const failed = labelSource(seg({ i: 1, model: "gemini-3.5-flash", escalation: "failed" }))!;
+    expect(skipped.tone).toBe("unsure");
+    expect(skipped.title).toMatch(/budget/);
+    expect(failed.tone).toBe("unsure");
+    expect(failed.title).toMatch(/failed/);
+  });
+
+  it("badges nothing where there is no classifier to distinguish", () => {
+    // Sovereign mode labels everything locally; a badge on every row would be
+    // noise about a distinction that does not exist there.
+    expect(labelSource(seg({ i: 1, model: "local" }))).toBeNull();
+    expect(labelSource(seg({ i: 1 }))).toBeNull();
+    expect(labelSource(seg({ i: 1, model: "error" }))!.text).toBe("not classified");
+  });
+});
+
+it("CAST_SYNCED drops a re-cast stem's identity, and only that one's", () => {
+  // The service pops `identity` for every stem it re-spliced (it measured the
+  // splice the user just replaced) and the answer carries no identity at all.
+  // Merging that answer over the old rows would leave a stale number standing
+  // over audio that no longer exists — and would silently keep it on the rows
+  // the user never touched too if the client over-corrected the other way.
+  const scored = [
+    { type: "SCAN_STARTED", jobId: "j1" } as const,
+    { type: "JOB_POLLED", job: job({ status: "done", casting: { assignments: proposed, edited: [] },
+      result: result({ stems: [
+        { emotion: "happy", seconds: 4.2, segments: 2, eligible: true, cues: [], identity: 0.91 },
+        { emotion: "sad", seconds: 1.5, segments: 1, eligible: false, cues: [], identity: 0.88 },
+      ] }) }) } as const,
+  ].reduce(reducer, initialState);
+
+  const synced = reducer(scored, { type: "CAST_SYNCED", cast: cast({
+    edited: ["happy"], changed: ["happy"],
+    stems: [
+      { emotion: "happy", seconds: 3, segments: 1, eligible: false, note: null,
+        assigned: [1], proposed: [1, 2], edited: true, takes: false },
+      { emotion: "sad", seconds: 1.5, segments: 1, eligible: false, note: null,
+        assigned: [4], proposed: [4], edited: false, takes: false },
+    ],
+  }) });
+
+  const by = Object.fromEntries(synced.result!.stems.map((s) => [s.emotion, s]));
+  expect(by.happy.identity).toBeUndefined();
+  expect(by.sad.identity).toBe(0.88);
 });
