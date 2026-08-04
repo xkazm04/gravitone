@@ -2,30 +2,47 @@
 
 // Voice Card — the shareable, emotion-synced player. As playback crosses each
 // [emotion] segment, the active glyph swaps and the card's glow shifts to
-// that emotion's hue; the segment ribbon tracks progress. `compact` renders
-// the embeddable variant (no text block, tighter chrome).
+// that emotion's hue. `compact` renders the embeddable variant (no text block,
+// tighter chrome).
+//
+// The card does NOT own its audio any more. It drives a <TakeTransport>, which
+// it either builds itself (the embed, the review picker — one card, alone on a
+// page) or is HANDED by a parent that gives the same transport to the score
+// beside it (the share page). One clip, one element, two surfaces.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useMemo } from "react";
 import Link from "next/link";
 import EmotionArt from "@/components/ui/EmotionArt";
 import { emotionMeta } from "@/lib/emotions";
 import { useCopyFeedback } from "@/lib/useCopyFeedback";
-import { computePeaks } from "@/app/playground/_variants/engine";
+import { useTakeTransport, type TakeTransport } from "./useTakeTransport";
 
 // The take payload shape lives with its loader in lib/takes; re-exported here
 // so the existing `import TakeCard, { type SharedTake }` call sites keep working.
 import type { SharedTake } from "@/lib/takes";
 export type { SharedTake };
 
-export default function TakeCard({ take, compact = false }: { take: SharedTake; compact?: boolean }) {
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  const [peaks, setPeaks] = useState<number[]>([]);
-  const [playing, setPlaying] = useState(false);
-  const [progress, setProgress] = useState(0); // 0..1
+export default function TakeCard({
+  take,
+  compact = false,
+  transport,
+  ribbon = true,
+}: {
+  take: SharedTake;
+  compact?: boolean;
+  /** The shared transport, when a parent owns the audio. Absent → this card
+   *  fetches and drives the take on its own, exactly as it always did. */
+  transport?: TakeTransport;
+  /** Draw the segment chips. The share page turns this OFF, because the score
+   *  underneath draws the same segments in TIME — twice was a duplicate, and
+   *  the ribbon is the lesser of the two pictures. */
+  ribbon?: boolean;
+}) {
+  // Called unconditionally; inert when a parent already owns the audio.
+  const own = useTakeTransport(transport ? null : take.id, compact ? 40 : 64);
+  const t = transport ?? own;
+  const { playing, progress, peaks, error: audioErr } = t;
   const { copy: copyText, copied, failed: copyFailed } = useCopyFeedback<"link" | "embed">();
-  // Audio fetch/decode failure — previously swallowed, leaving a play button
-  // that rendered enabled and did nothing, forever.
-  const [audioErr, setAudioErr] = useState<string | null>(null);
 
   // Cumulative segment boundaries (seconds) → active segment during playback.
   const bounds = useMemo(() => {
@@ -36,77 +53,30 @@ export default function TakeCard({ take, compact = false }: { take: SharedTake; 
   }, [take.segments]);
   const duration = bounds[bounds.length - 1] || take.seconds || 1;
   const activeIdx = useMemo(() => {
-    const t = progress * duration;
-    const i = bounds.findIndex((b) => t < b);
+    const at = progress * duration;
+    const i = bounds.findIndex((b) => at < b);
     return i === -1 ? take.segments.length - 1 : i;
   }, [progress, duration, bounds, take.segments.length]);
   const active = take.segments[Math.max(0, activeIdx)] ?? { used: "baseline" };
   const meta = emotionMeta(active.used);
 
-  // Load audio once; peaks for the waveform come from the decoded wav.
-  useEffect(() => {
-    let alive = true;
-    let url: string | null = null;
-    (async () => {
-      try {
-        const r = await fetch(`/api/takes/${take.id}/audio`);
-        if (!r.ok) {
-          if (alive) setAudioErr("audio unavailable — shares are evicted oldest-first");
-          return;
-        }
-        const blob = await r.blob();
-        url = URL.createObjectURL(blob);
-        // If we unmounted while the fetch was in flight, the cleanup already
-        // ran (when url was still null), so revoke the URL we just minted here
-        // — otherwise this decoded-wav blob leaks until the tab closes.
-        if (!alive) { URL.revokeObjectURL(url); return; }
-        const a = new Audio(url);
-        a.ontimeupdate = () => setProgress(a.duration ? a.currentTime / a.duration : 0);
-        a.onended = () => { setPlaying(false); setProgress(0); };
-        audioRef.current = a;
-        try {
-          const { peaks: p } = await computePeaks(blob, compact ? 40 : 64);
-          if (alive) setPeaks(p);
-        } catch { /* waveform is decoration */ }
-      } catch {
-        // card still renders — but say the player is dead instead of hiding it
-        if (alive) setAudioErr("audio unavailable — couldn't reach the studio");
-      }
-    })();
-    return () => {
-      alive = false;
-      audioRef.current?.pause();
-      if (url) URL.revokeObjectURL(url);
-    };
-  }, [take.id, compact]);
-
-  const toggle = useCallback(() => {
-    const a = audioRef.current;
-    if (!a) return;
-    if (playing) { a.pause(); setPlaying(false); }
-    else {
-      // Await the rejection: an unplayable source used to leave the card
-      // showing ⏸ with the glow on and progress frozen at 0, forever.
-      setPlaying(true);
-      void a.play().catch(() => {
-        setPlaying(false);
-        setAudioErr("this take could not be played");
-      });
-    }
-  }, [playing]);
-
-  const copy = useCallback(async (what: "link" | "embed") => {
+  const copy = async (what: "link" | "embed") => {
     const link = `${window.location.origin}/t/${take.id}`;
     const text = what === "link" ? link
       : `<iframe src="${link}/embed" width="480" height="220" frameborder="0" title="Gravitone voice card"></iframe>`;
     await copyText(text, what);
-  }, [take.id, copyText]);
+  };
 
   return (
     <div
       className="glass-panel rounded-3xl p-6 transition-shadow duration-700"
       style={{ boxShadow: playing ? `0 0 60px hsl(${meta.hue} 85% 60% / .25)` : undefined }}
     >
+      {/* The one element for this take. Never shown — no browser chrome — and
+          rendered HERE even when the transport was handed down, because a card
+          is the single place a take's audio is mounted. */}
+      <audio {...t.audioProps} className="hidden" />
+
       <div className="flex items-center justify-between">
         <span className="font-jetbrains text-[11px] uppercase tracking-widest"
           style={{ color: audioErr ? "rgb(253 164 175 / 0.8)" : `hsl(${meta.hue} 85% 70%)` }}>
@@ -117,7 +87,7 @@ export default function TakeCard({ take, compact = false }: { take: SharedTake; 
 
       <div className="mt-4 flex items-center gap-4">
         {/* the glyph IS the playhead: it morphs with the active segment */}
-        <button onClick={toggle} disabled={!!audioErr} title={audioErr ?? undefined}
+        <button onClick={t.toggle} disabled={!!audioErr} title={audioErr ?? undefined}
           aria-label={audioErr ?? (playing ? "Pause" : "Play")}
           className="group relative grid h-20 w-20 shrink-0 cursor-pointer place-items-center overflow-hidden rounded-2xl border bg-black/50 transition disabled:cursor-not-allowed disabled:opacity-40"
           style={{ borderColor: `hsl(${meta.hue} 85% 60% / ${playing ? 0.7 : 0.3})` }}>
@@ -145,9 +115,11 @@ export default function TakeCard({ take, compact = false }: { take: SharedTake; 
         </div>
       </div>
 
-      {/* emotion ribbon — the differentiator on display */}
-      {take.segments.length > 0 && (
-        <div className="mt-4 flex flex-wrap items-center gap-1.5">
+      {/* Emotion ribbon — the ORDER of the performance, for a surface that has
+          no room for its shape. The share page draws the score instead. */}
+      {ribbon && take.segments.length > 0 && (
+        <div role="group" aria-label="Segments in order"
+          className="mt-4 flex flex-wrap items-center gap-1.5">
           {take.segments.map((s, i) => {
             const m = emotionMeta(s.used);
             const isActive = playing && i === activeIdx;

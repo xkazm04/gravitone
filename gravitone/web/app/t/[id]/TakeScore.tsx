@@ -11,16 +11,20 @@
 // and the studio already has a grammar for it (<Track> + <Region>), so the share
 // page draws the take with the same primitives the editor draws a script with.
 //
-// It is strictly READ-ONLY: no edges, no drag, no tag writing. A visitor is not
+// It is not an EDITOR: no edges, no drag, no tag writing. A visitor is not
 // editing this take, and a control that looks editable and is not would be a
-// worse lie than no control at all.
+// worse lie than no control at all. It is, however, a TRANSPORT — when it is
+// handed one.
 //
-// It also claims nothing it cannot do:
+// It claims nothing it cannot do:
 //   * no segments (or no duration) -> it renders NOTHING, rather than an empty
 //     rail implying a take with no structure;
-//   * the player on this page (TakeCard) owns its <audio> privately and exposes
-//     no seek seam, so clicking a segment SELECTS it and shows what was said —
-//     it does not pretend to move playback;
+//   * given a `transport` (the share page hands it the same one the card
+//     plays), the rails carry a playhead and seek: clicking a span jumps
+//     playback to where that span starts. Without one — the score rendered
+//     alone, with no audio behind it — the rails stay inert and a click only
+//     SELECTS, because moving a playhead that does not exist is the lie this
+//     file exists to avoid;
 //   * when the take reports no per-segment seconds, the spans are spaced evenly
 //     and say so: that is a picture of the ORDER, not of the timing.
 
@@ -31,6 +35,15 @@ import Region from "@/components/ui/Region";
 import Track, { clock } from "@/components/ui/Track";
 import { emotionMeta } from "@/lib/emotions";
 import { castOf, type SharedTake } from "@/lib/takes";
+
+/** What the score needs from the page's transport: where playback is, and a
+ *  way to move it. Narrow on purpose — the score plays nothing itself. */
+export type ScoreTransport = {
+  playing: boolean;
+  /** 0..1 through the take. */
+  progress: number;
+  seekFraction: (fraction: number) => void;
+};
 
 const LANE_HEIGHT = 46;
 /** Stacked lanes are shorter — a six-hander has to stay one screen. */
@@ -101,13 +114,32 @@ export function laneSegments(spans: Placed[]): Lane[] {
   return lanes;
 }
 
-export default function TakeScore({ take, className = "" }: { take: SharedTake; className?: string }) {
+/** The timeline the score draws on: the segments' own reported seconds when it
+ *  has them, else the take's stated length. */
+function scoreDuration(take: SharedTake): number {
+  const reported = take.segments.reduce((n, s) => n + (s.seconds > 0 ? s.seconds : 0), 0);
+  return reported > 0 ? reported : take.seconds;
+}
+
+/** Whether this take has a score to draw at all — the question the share page
+ *  asks before deciding whether the card still needs its segment ribbon. */
+export function hasScore(take: SharedTake): boolean {
+  return placeSegments(take.segments, scoreDuration(take)).spans.length > 0;
+}
+
+export default function TakeScore({
+  take,
+  transport,
+  className = "",
+}: {
+  take: SharedTake;
+  /** The page's transport. Absent → the score is a picture, not a control. */
+  transport?: ScoreTransport;
+  className?: string;
+}) {
   const [selected, setSelected] = useState<number | null>(null);
 
-  const duration = useMemo(() => {
-    const reported = take.segments.reduce((n, s) => n + (s.seconds > 0 ? s.seconds : 0), 0);
-    return reported > 0 ? reported : take.seconds;
-  }, [take.segments, take.seconds]);
+  const duration = useMemo(() => scoreDuration(take), [take]);
 
   const { spans, even } = useMemo(
     () => placeSegments(take.segments, duration),
@@ -127,6 +159,18 @@ export default function TakeScore({ take, className = "" }: { take: SharedTake; 
   // fact the header already states.
   const laned = lanes.length > 1;
 
+  // Every lane is a view of the SAME timeline, so each rail carries the same
+  // playhead and seeks the same audio. Absent transport → none of it is passed,
+  // and <Track> stays a labelled group rather than a slider.
+  const rail = transport
+    ? {
+        progress: transport.progress,
+        playing: transport.playing,
+        onSeek: transport.seekFraction,
+        valueText: (f: number) => `${clock(f * duration)} of ${clock(duration)}`,
+      }
+    : {};
+
   /** One span, drawn on whichever rail it belongs to. */
   const region = (s: Placed, count: number) => {
     const m = emotionMeta(s.segment.used);
@@ -144,7 +188,13 @@ export default function TakeScore({ take, className = "" }: { take: SharedTake; 
         count={count}
         selected={selected === s.index}
         badge={<EmotionArt emotion={s.segment.used} size={14} />}
-        onSelect={() => setSelected((cur) => (cur === s.index ? null : s.index))}
+        onSelect={() => {
+          setSelected((cur) => (cur === s.index ? null : s.index));
+          // Selecting a span is also the most direct thing a visitor can mean
+          // by clicking it: play from there. Fractions, not seconds — the
+          // score's timeline is the take's REPORT, and the audio is the truth.
+          if (duration > 0) transport?.seekFraction(s.start / duration);
+        }}
       />
     );
   };
@@ -187,6 +237,7 @@ export default function TakeScore({ take, className = "" }: { take: SharedTake; 
                 height={CAST_LANE_HEIGHT}
                 hue={characterHue(lane.characterId)}
                 bars={0}
+                {...rail}
               >
                 {lane.spans.map((s) => region(s, spans.length))}
               </Track>
@@ -200,6 +251,7 @@ export default function TakeScore({ take, className = "" }: { take: SharedTake; 
             height={LANE_HEIGHT}
             hue={emotionMeta(spans[0].segment.used).hue}
             bars={0}
+            {...rail}
           >
             {spans.map((s) => region(s, spans.length))}
           </Track>

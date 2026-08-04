@@ -14,8 +14,8 @@
 //     empty box),
 //   * a <Playhead> bound to a 0..1 `progress` scalar — exactly what
 //     useAudioPlayer already returns,
-//   * click-to-seek, as a real ARIA slider so the rail is operable from the
-//     keyboard and not only from a mouse,
+//   * click-, drag- and keyboard-to-seek, as a real ARIA slider so the rail is
+//     operable from the keyboard and not only from a mouse,
 //   * an overlay for whatever the caller wants placed ON the rail (regions).
 //
 // It is PURELY presentational: it owns no audio, no player and no data. It is
@@ -108,6 +108,29 @@ export default function Track({
 
   const seekBy = (delta: number) => onSeek?.(clamp01(at + delta));
 
+  // Scrubbing. A rail that only takes discrete clicks is a rail you cannot
+  // sweep, and sweeping is how anyone finds a moment in a clip. Pointer capture
+  // keeps the drag alive past the rail's own edges.
+  const scrubbing = useRef(false);
+
+  function onPointerDown(e: React.PointerEvent<HTMLDivElement>) {
+    if (!onSeek || e.button !== 0) return;
+    scrubbing.current = true;
+    (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+    onSeek(fractionAt(e.clientX));
+  }
+
+  function onPointerMove(e: React.PointerEvent<HTMLDivElement>) {
+    if (!scrubbing.current || !onSeek) return;
+    onSeek(fractionAt(e.clientX));
+  }
+
+  function endScrub(e: React.PointerEvent<HTMLDivElement>) {
+    if (!scrubbing.current) return;
+    scrubbing.current = false;
+    (e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId);
+  }
+
   function onKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
     if (!onSeek) return;
     const move =
@@ -171,7 +194,11 @@ export default function Track({
           aria-valuetext={valueText ? valueText(at) : `${Math.round(at * 100)}%`}
           onKeyDown={onKeyDown}
           onClick={(e) => onSeek?.(fractionAt(e.clientX))}
-          className="absolute inset-0 z-10 cursor-pointer rounded-xl focus-visible:outline-2 focus-visible:outline-offset-2"
+          onPointerDown={onPointerDown}
+          onPointerMove={onPointerMove}
+          onPointerUp={endScrub}
+          onPointerCancel={endScrub}
+          className="absolute inset-0 z-10 touch-none cursor-pointer rounded-xl focus-visible:outline-2 focus-visible:outline-offset-2"
           style={{ outlineColor: `hsl(${hue} 85% 68%)` } as CSSProperties}
         />
       )}

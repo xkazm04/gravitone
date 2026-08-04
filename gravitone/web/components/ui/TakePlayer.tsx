@@ -7,8 +7,8 @@
 // keyboard-operable, and — because it registers its element with the AudioBus —
 // bars that move with the actual waveform instead of a CSS timer.
 
-import { useCallback, useEffect, useId, useRef, useState } from "react";
-import { useAudioBus } from "./AudioBus";
+import { useCallback, useId } from "react";
+import { useTransport } from "./useTransport";
 import { Waveform } from "./Primitives";
 
 const DEFAULT_HUE = 190; // the cyan accent, in hue terms
@@ -40,83 +40,29 @@ export default function TakePlayer({
   autoPlay?: boolean;
   className?: string;
 }) {
-  const bus = useAudioBus();
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  const [playing, setPlaying] = useState(false);
-  const [current, setCurrent] = useState(0);
-  const [duration, setDuration] = useState(0);
-  const [failed, setFailed] = useState(false);
+  // The transport itself is the shared hook — this component is its chrome.
+  const { playing, position, duration, failed, progress, toggle, seek, audioProps } =
+    useTransport({ src, autoPlay, onEnded });
   const railId = useId();
 
   const tint = Number.isFinite(hue) ? (hue as number) : DEFAULT_HUE;
 
-  // Register once the element exists. The bus routes it back to the speakers —
-  // createMediaElementSource would otherwise mute it (see AudioBus).
-  const attach = useCallback(
-    (el: HTMLAudioElement | null) => {
-      audioRef.current = el;
-      if (el) bus.register(el);
-    },
-    [bus],
-  );
-  useEffect(() => {
-    const el = audioRef.current;
-    return () => bus.unregister(el);
-  }, [bus]);
-
-  // A new src is a new take: reset the transport rather than leaving the old
-  // duration/progress on screen describing audio that is gone.
-  useEffect(() => {
-    setCurrent(0);
-    setDuration(0);
-    setFailed(false);
-    setPlaying(false);
-  }, [src]);
-
-  useEffect(() => {
-    if (!autoPlay) return;
-    const el = audioRef.current;
-    if (!el) return;
-    // Autoplay may be refused; that is not an error state, the user just presses
-    // play. Never report a play we did not get.
-    void Promise.resolve(el.play?.()).catch(() => setPlaying(false));
-  }, [autoPlay, src]);
-
-  const toggle = useCallback(() => {
-    const el = audioRef.current;
-    if (!el) return;
-    if (el.paused) void Promise.resolve(el.play?.()).catch(() => setPlaying(false));
-    else el.pause();
-  }, []);
-
-  const seekTo = useCallback((seconds: number) => {
-    const el = audioRef.current;
-    if (!el) return;
-    const max = Number.isFinite(el.duration) && el.duration > 0 ? el.duration : duration;
-    const next = Math.max(0, Math.min(max || 0, seconds));
-    el.currentTime = next;
-    setCurrent(next);
-  }, [duration]);
-
   const onRailKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
-      const el = audioRef.current;
-      if (!el) return;
-      const max = Number.isFinite(el.duration) ? el.duration : duration;
       switch (e.key) {
         case "ArrowRight":
         case "ArrowUp":
-          seekTo(current + SEEK_STEP);
+          seek(position + SEEK_STEP);
           break;
         case "ArrowLeft":
         case "ArrowDown":
-          seekTo(current - SEEK_STEP);
+          seek(position - SEEK_STEP);
           break;
         case "Home":
-          seekTo(0);
+          seek(0);
           break;
         case "End":
-          seekTo(max);
+          seek(Number.MAX_SAFE_INTEGER); // clamped to the take's real duration
           break;
         case " ":
         case "Enter":
@@ -127,19 +73,18 @@ export default function TakePlayer({
       }
       e.preventDefault();
     },
-    [current, duration, seekTo, toggle],
+    [position, seek, toggle],
   );
 
   const onRailClick = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
       const rect = e.currentTarget.getBoundingClientRect();
       if (!rect.width || !duration) return;
-      seekTo(((e.clientX - rect.left) / rect.width) * duration);
+      seek(((e.clientX - rect.left) / rect.width) * duration);
     },
-    [duration, seekTo],
+    [duration, seek],
   );
 
-  const progress = duration > 0 ? Math.min(1, current / duration) : 0;
   const accent = `hsl(${tint} 85% 62%)`;
 
   return (
@@ -152,28 +97,7 @@ export default function TakePlayer({
       style={{ boxShadow: `inset 0 0 0 1px hsl(${tint} 85% 62% / 0.08)` }}
     >
       {/* The element itself is never shown — no browser chrome anywhere. */}
-      <audio
-        ref={attach}
-        src={src}
-        preload="metadata"
-        onPlay={() => setPlaying(true)}
-        onPause={() => setPlaying(false)}
-        onTimeUpdate={(e) => setCurrent(e.currentTarget.currentTime)}
-        onLoadedMetadata={(e) => {
-          const d = e.currentTarget.duration;
-          if (Number.isFinite(d)) setDuration(d);
-        }}
-        onEnded={() => {
-          setPlaying(false);
-          setCurrent(0);
-          onEnded?.();
-        }}
-        onError={() => {
-          // A dead object URL used to leave the transport frozen mid-play.
-          setFailed(true);
-          setPlaying(false);
-        }}
-      />
+      <audio {...audioProps} />
 
       <button
         type="button"
@@ -201,8 +125,8 @@ export default function TakePlayer({
         aria-label={`Seek ${label}`}
         aria-valuemin={0}
         aria-valuemax={Math.round(duration)}
-        aria-valuenow={Math.round(current)}
-        aria-valuetext={`${clock(current)} of ${clock(duration)}`}
+        aria-valuenow={Math.round(position)}
+        aria-valuetext={`${clock(position)} of ${clock(duration)}`}
         onKeyDown={onRailKeyDown}
         onClick={onRailClick}
         className="group relative h-2 min-w-16 flex-1 cursor-pointer rounded-full bg-white/10 focus-visible:outline-2 focus-visible:outline-offset-4"
@@ -219,7 +143,7 @@ export default function TakePlayer({
       </div>
 
       <span className="font-jetbrains shrink-0 text-[11px] tabular-nums text-white/55">
-        {failed ? "unplayable" : `${clock(current)} / ${clock(duration)}`}
+        {failed ? "unplayable" : `${clock(position)} / ${clock(duration)}`}
       </span>
     </div>
   );

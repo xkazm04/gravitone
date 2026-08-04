@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
-import TakeScore, { laneSegments, placeSegments } from "./TakeScore";
+import TakeScore, { hasScore, laneSegments, placeSegments } from "./TakeScore";
 import type { SharedTake } from "@/lib/takes";
 
 const seg = (over: Partial<SharedTake["segments"][number]>): SharedTake["segments"][number] => ({
@@ -150,5 +150,74 @@ describe("TakeScore — an ensemble take is drawn as a scene", () => {
     mount({ ...TAKE, segments: TAKE.segments.map((s) => ({ ...s, character_id: "sarah", character_name: "Sarah" })) });
     expect(screen.getByRole("group", { name: /Performance score/ })).toBeInTheDocument();
     expect(screen.queryByText(/voices ·/)).toBeNull();
+  });
+});
+
+// ── the seek seam ───────────────────────────────────────────────────────────
+// The score used to be read-only by inheritance: the card next to it owned its
+// <audio> privately, so there was nothing to seek. Handed the page's transport,
+// every rail becomes the transport it always looked like.
+
+const transport = (over: Partial<React.ComponentProps<typeof TakeScore>["transport"] & object> = {}) => ({
+  playing: false,
+  progress: 0,
+  seekFraction: vi.fn(),
+  ...over,
+});
+
+describe("TakeScore — seeking the transport it is handed", () => {
+  it("is an inert picture with no transport, and a slider with one", () => {
+    const { unmount } = mount();
+    expect(screen.queryByRole("slider")).toBeNull();
+    unmount();
+    render(<TakeScore take={TAKE} transport={transport()} />);
+    expect(screen.getByRole("slider", { name: /Performance score/ })).toBeInTheDocument();
+  });
+
+  it("seeks to where the rail was operated, as a fraction of the take", () => {
+    const t = transport();
+    render(<TakeScore take={TAKE} transport={t} />);
+    const rail = screen.getByRole("slider", { name: /Performance score/ });
+    fireEvent.keyDown(rail, { key: "End" });
+    expect(t.seekFraction).toHaveBeenLastCalledWith(1);
+    fireEvent.keyDown(rail, { key: "Home" });
+    expect(t.seekFraction).toHaveBeenLastCalledWith(0);
+  });
+
+  it("plays from the start of the span you select", () => {
+    const t = transport();
+    render(<TakeScore take={TAKE} transport={t} />);
+    // Segment two starts at 0:01 of a 0:04 take.
+    fireEvent.click(screen.getByRole("button", { name: /Region 2 of 2/ }));
+    expect(t.seekFraction).toHaveBeenCalledWith(0.25);
+    // …and still says what it covers. Seeking replaced nothing.
+    expect(screen.getByText(/calm · 0:01–0:04/)).toBeInTheDocument();
+  });
+
+  it("draws the playhead on every lane of an ensemble, over one timeline", () => {
+    const { container } = render(
+      <TakeScore take={ENSEMBLE} transport={transport({ playing: true, progress: 0.5 })} />,
+    );
+    const heads = [...container.querySelectorAll("[style*='box-shadow']")] as HTMLElement[];
+    expect(heads).toHaveLength(2); // one per Character lane
+    expect(heads.every((h) => h.style.left === "50%")).toBe(true);
+  });
+
+  it("seeks the SAME timeline from a cast lane", () => {
+    const t = transport();
+    render(<TakeScore take={ENSEMBLE} transport={t} />);
+    fireEvent.keyDown(screen.getByRole("slider", { name: /^Malik/ }), { key: "End" });
+    expect(t.seekFraction).toHaveBeenLastCalledWith(1);
+  });
+});
+
+describe("hasScore — what the share page asks before dropping the ribbon", () => {
+  it("is true for a take with placeable segments", () => {
+    expect(hasScore(TAKE)).toBe(true);
+  });
+
+  it("is false when there is nothing to draw, so the ribbon stays the fallback", () => {
+    expect(hasScore({ ...TAKE, segments: [] })).toBe(false);
+    expect(hasScore({ ...TAKE, seconds: 0, segments: [seg({ seconds: 0 })] })).toBe(false);
   });
 });

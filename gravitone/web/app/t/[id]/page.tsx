@@ -9,9 +9,8 @@ import { Wordmark } from "@/components/ui/Primitives";
 import { loadLineage, loadTake } from "@/lib/takes";
 import Lineage from "./Lineage";
 import RePerform, { ReperformProvenance } from "./RePerform";
-import TakeScore from "./TakeScore";
 import OpenInRack from "./OpenInRack";
-import TakeCard from "./TakeCard";
+import TakeStage from "./TakeStage";
 
 export async function generateMetadata({ params }: { params: Promise<{ id: string }> }): Promise<Metadata> {
   const { id } = await params;
@@ -98,10 +97,9 @@ export default async function TakePage({ params }: { params: Promise<{ id: strin
 
   return (
     <TakeShell>
-        <div className="pt-8">
-          <TakeCard take={take} />
-        </div>
-        <TakeScore take={take} />
+        {/* The card and the score, over ONE transport — a click on the score
+            moves the audio the card is playing. */}
+        <TakeStage take={take} />
 
         {lineage && <Lineage lineage={lineage} />}
         <ReperformProvenance take={take} />
