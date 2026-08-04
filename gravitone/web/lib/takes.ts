@@ -70,20 +70,66 @@ export async function loadLineage(id: string): Promise<TakeLineage | null> {
   }
 }
 
-/** Fetch one published take server-side.
+/**
+ * The three answers a share link can honestly get.
  *
- *  null when it is missing, evicted from the bounded store, or the backend is
- *  unreachable/stalled (the read is timeout-bounded) — every caller renders
- *  notFound() for all three, which is the honest outcome for a share link.
+ * `gone` and `unreachable` used to be one null, and every caller turned that
+ * null into a 404 page. So during a backend restart — a deploy, an OOM, a
+ * stopped container — every live share link on the internet told its visitor
+ * the take DID NOT EXIST. It does exist; this studio just could not read it,
+ * and those are not the same sentence to a person who was sent that link. The
+ * distinction is also the difference between a permanent answer (a crawler may
+ * drop the URL, the visitor should stop retrying) and a temporary one.
+ *
+ * `detail` carries what the read actually failed with, through the same
+ * backend `detail` contract the rest of the studio reports failures in.
  */
-export async function loadTake(id: string): Promise<SharedTake | null> {
+export type TakeLoad =
+  | { status: "ok"; take: SharedTake }
+  | { status: "gone" }
+  | { status: "unreachable"; detail: string };
+
+/** Fetch one published take server-side, saying WHICH failure happened.
+ *
+ *  gone         — the backend answered, and this take is not there (missing, or
+ *                 evicted from the bounded store). A permanent 404.
+ *  unreachable  — the backend never answered, or answered with a server error /
+ *                 the studio's own 503. The take may be perfectly fine.
+ */
+export async function loadTake(id: string): Promise<TakeLoad> {
+  let r: Response;
   try {
-    const r = await backendFetch(`/v1/takes/${encodeURIComponent(id)}`, {
+    r = await backendFetch(`/v1/takes/${encodeURIComponent(id)}`, {
       cache: "no-store",
       signal: AbortSignal.timeout(READ_TIMEOUT_MS),
     });
-    return r.ok ? ((await r.json()) as SharedTake) : null;
   } catch {
-    return null;
+    // No response at all: connection refused, DNS, or the read timeout fired.
+    return { status: "unreachable", detail: "Gravitone backend unreachable" };
   }
+  if (r.status === 404) return { status: "gone" };
+  if (!r.ok) {
+    return { status: "unreachable", detail: await readTakeDetail(r) };
+  }
+  try {
+    return { status: "ok", take: (await r.json()) as SharedTake };
+  } catch {
+    // A 200 whose body is not JSON is a broken backend, not a missing take.
+    return { status: "unreachable", detail: "the backend answered with an unreadable take" };
+  }
+}
+
+/** The backend's own sentence for a failed read, defensively parsed — the same
+ *  contract lib/apiFetch applies on the client, applied here because this read
+ *  happens on the server and cannot use it. */
+async function readTakeDetail(r: Response): Promise<string> {
+  try {
+    const body = (await r.json()) as { detail?: unknown };
+    if (typeof body?.detail === "string" && body.detail) return body.detail;
+  } catch {
+    /* not JSON — fall through to the status sentence */
+  }
+  return r.status === 503
+    ? "Gravitone backend unreachable"
+    : `the backend answered ${r.status} for this take`;
 }

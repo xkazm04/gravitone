@@ -982,7 +982,8 @@ export default function PlaygroundConsole() {
         mode: r.mode, fallbackReason: r.fallbackReason, fallbackDetail: r.fallbackDetail,
         url: r.url, blob: r.blob, peaks: r.peaks, seconds: r.seconds, kb: r.kb, rtf: r.rtf,
         synthSeconds: r.synthSeconds, queueSeconds: r.queueSeconds,
-        ignoredSettings: r.ignoredSettings, segments: r.segments, expr: { ...expr },
+        ignoredSettings: r.ignoredSettings, segments: r.segments, reportCorrupt: r.reportCorrupt,
+        expr: { ...expr },
         createdAt: Date.now(), format: r.format, lines,
         timingVersion: TAKE_TIMING_VERSION,
       };
@@ -1013,7 +1014,8 @@ export default function PlaygroundConsole() {
         mode: r.mode, fallbackReason: r.fallbackReason, fallbackDetail: r.fallbackDetail,
         url: r.url, blob: r.blob, peaks: r.peaks, seconds: r.seconds, kb: r.kb, rtf: r.rtf,
         synthSeconds: r.synthSeconds, queueSeconds: r.queueSeconds,
-        ignoredSettings: r.ignoredSettings, segments: r.segments, expr: { ...expr },
+        ignoredSettings: r.ignoredSettings, segments: r.segments, reportCorrupt: r.reportCorrupt,
+        expr: { ...expr },
         createdAt: Date.now(), format: r.format,
         timingVersion: TAKE_TIMING_VERSION,
       };
@@ -1647,6 +1649,19 @@ export default function PlaygroundConsole() {
                     {edits.regions.map((r) => r.i + 1).join(", ")} re-rendered and spliced
                     <span className="text-white/40">·</span>
                     <span className="text-white/55">base {edits.source}</span>
+                  </p>
+                )}
+
+                {/* The engine DID report its segments and this build could not
+                    read the header. Without this, that take draws exactly like
+                    a one-segment take: no ribbon, no rail, no substitution
+                    notice — and nothing on screen to say the difference. The
+                    audio is untouched and correct; only the report is lost. */}
+                {t.reportCorrupt && (
+                  <p className="font-jetbrains mt-3 inline-flex flex-wrap items-center gap-1.5 rounded-lg border border-amber-400/20 bg-amber-400/5 px-2.5 py-1 text-[11px] text-amber-200/85">
+                    <span aria-hidden>⚠</span>
+                    the engine&apos;s per-segment report could not be read — the audio is complete,
+                    but this take&apos;s emotion breakdown is missing (it is not a single-segment take).
                   </p>
                 )}
 

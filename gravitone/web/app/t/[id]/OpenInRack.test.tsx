@@ -8,7 +8,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const { push, saveComposer } = vi.hoisted(() => ({ push: vi.fn(), saveComposer: vi.fn() }));
 vi.mock("next/navigation", () => ({ useRouter: () => ({ push }) }));
-vi.mock("@/lib/composerStore", () => ({ saveComposer }));
+// PARTIAL mock: only the IndexedDB write is stubbed. The remix-parent helpers
+// are the real ones, because the one-shot lifecycle (written here, spent by the
+// publish path) is exactly what this page's half of the contract is.
+vi.mock("@/lib/composerStore", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/composerStore")>()),
+  saveComposer,
+}));
 
 import OpenInRack, { REMIX_PARENT_KEY } from "./OpenInRack";
 import type { SharedTake } from "@/lib/takes";

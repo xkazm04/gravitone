@@ -17,13 +17,16 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { DEFAULT_EXPRESSION } from "@/app/playground/_variants/shared";
-import { saveComposer } from "@/lib/composerStore";
+import { saveComposer, setRemixParent } from "@/lib/composerStore";
 import type { SharedTake } from "@/lib/takes";
 
-/** The take id the next publish should be minted as a CHILD of. Read by the
- *  playground's publish path; a session-scoped key, so closing the tab ends the
- *  fork rather than silently attributing a later, unrelated take to a parent. */
-export const REMIX_PARENT_KEY = "gravitone.remix.parent";
+/** The take id the next publish should be minted as a CHILD of. It lives in
+ *  lib/composerStore beside the composer hand-off it travels with — this page
+ *  and the playground's publish path used to name the same sessionStorage key
+ *  as two separate string literals, which is how the slot came to be written
+ *  here and never cleared there. Re-exported so nothing that imports it from
+ *  this module has to move. */
+export { REMIX_PARENT_KEY } from "@/lib/composerStore";
 
 /** Does this browser hold a studio session? Any `gravitone.apiKey.*` slot means
  *  someone signed in here and minted a key — the same evidence lib/mintKey
@@ -63,12 +66,9 @@ export default function OpenInRack({ take }: { take: SharedTake }) {
         charId: take.character_id,
         activeLine: 0,
       });
-      try {
-        sessionStorage.setItem(REMIX_PARENT_KEY, take.id);
-      } catch {
-        // The fork still works; only its lineage stamp is lost. Not worth
-        // refusing the edit over — but not worth claiming either.
-      }
+      // The fork still works when storage refuses; only its lineage stamp is
+      // lost. Not worth refusing the edit over — but not worth claiming either.
+      setRemixParent(take.id);
       router.push("/playground");
     } catch (e) {
       // saveComposer throws when the composer could NOT be stored. Navigating

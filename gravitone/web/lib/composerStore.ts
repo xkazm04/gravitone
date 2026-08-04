@@ -128,6 +128,57 @@ export async function loadComposer(): Promise<ComposerState | null> {
   }
 }
 
+// ── the remix hand-off ──────────────────────────────────────────────────────
+//
+// "Open this take in the rack" (app/t/[id]/OpenInRack) saves the composer AND
+// leaves the source take's id here, so the NEXT take published is filed as that
+// take's child. It rides beside the composer hand-off because it is the same
+// hand-off: one gesture on a share page loads a take into the studio, and its
+// lineage is half of what was loaded.
+//
+// It is ONE-SHOT, and that is the whole point of these three functions
+// existing instead of a `sessionStorage` literal at each end. Nothing used to
+// clear the slot: the fork's own take published as a child correctly, and then
+// so did every unrelated take that browser published for the rest of the tab's
+// life — a session of ordinary work silently filed as one take's remix
+// descendants. `clearRemixParent` is called by the publish path AFTER the
+// upload succeeds, so a failed publish keeps the fork intact and a retry is
+// still a child.
+
+/** The take id the next publish should be minted as a CHILD of. Session-scoped,
+ *  so closing the tab ends the fork rather than outliving it. */
+export const REMIX_PARENT_KEY = "gravitone.remix.parent";
+
+/** Mark the take a fork descends from. Storage unavailable = the fork still
+ *  works, it just publishes unlinked; returns false so the caller knows. */
+export function setRemixParent(takeId: string): boolean {
+  try {
+    sessionStorage.setItem(REMIX_PARENT_KEY, takeId);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The pending remix parent, or "" when there is none (or no storage). Does NOT
+ *  clear it — a publish that fails has consumed nothing. */
+export function readRemixParent(): string {
+  try {
+    return sessionStorage.getItem(REMIX_PARENT_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+/** Spend the remix parent. Called only once a publish has actually landed. */
+export function clearRemixParent(): void {
+  try {
+    sessionStorage.removeItem(REMIX_PARENT_KEY);
+  } catch {
+    /* nothing was stored, so nothing is left over */
+  }
+}
+
 /** Forget the stored composer (nothing left worth restoring). */
 export async function clearComposer(): Promise<void> {
   let db: IDBDatabase | null = null;

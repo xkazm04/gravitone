@@ -4,6 +4,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
+import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { Wordmark } from "@/components/ui/Primitives";
 import { loadLineage, loadTake } from "@/lib/takes";
 import Lineage from "./Lineage";
@@ -14,8 +15,19 @@ import TakeCard from "./TakeCard";
 
 export async function generateMetadata({ params }: { params: Promise<{ id: string }> }): Promise<Metadata> {
   const { id } = await params;
-  const take = await loadTake(id);
-  if (!take) return { title: "Take not found — Gravitone" };
+  const loaded = await loadTake(id);
+  // A backend that could not be read is NOT a take that does not exist — say
+  // "unavailable" so a crawler (and a person reading a tab title) is not told
+  // this share is dead when it is merely unreachable right now.
+  if (loaded.status !== "ok") {
+    return {
+      title: loaded.status === "gone"
+        ? "Take not found — Gravitone"
+        : "Take temporarily unavailable — Gravitone",
+      robots: { index: false },
+    };
+  }
+  const take = loaded.take;
   const emotions = [...new Set(take.segments.map((s) => s.used))].join(", ");
   return {
     title: `${take.character_name} performs — Gravitone`,
@@ -28,14 +40,10 @@ export async function generateMetadata({ params }: { params: Promise<{ id: strin
   };
 }
 
-export default async function TakePage({ params }: { params: Promise<{ id: string }> }) {
-  const { id } = await params;
-  // Two independent reads. The lineage is provenance — it must never be able to
-  // cost the page its take, so it is awaited beside the take and degrades to
-  // null (no lineage shown) on its own.
-  const [take, lineage] = await Promise.all([loadTake(id), loadLineage(id)]);
-  if (!take) notFound();
-
+/** The page shell every state of this route wears — the take, and the state
+ *  where there is no take to show. A visitor who followed a share link lands
+ *  somewhere branded either way. */
+function TakeShell({ children }: { children: React.ReactNode }) {
   return (
     <div className="font-hanken relative min-h-screen overflow-hidden bg-[#080a10] text-slate-200 grain">
       <div className="pointer-events-none absolute inset-0 aurora" />
@@ -48,7 +56,48 @@ export default async function TakePage({ params }: { params: Promise<{ id: strin
             what is this? →
           </Link>
         </nav>
+        {children}
+      </div>
+    </div>
+  );
+}
 
+export default async function TakePage({ params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  // Two independent reads. The lineage is provenance — it must never be able to
+  // cost the page its take, so it is awaited beside the take and degrades to
+  // null (no lineage shown) on its own.
+  const [loaded, lineage] = await Promise.all([loadTake(id), loadLineage(id)]);
+  // A take the backend says is not there is a 404. A backend we could not read
+  // is NOT — telling a visitor their link is dead during a restart is a lie
+  // they cannot check, and one they would act on by throwing the link away.
+  if (loaded.status === "gone") notFound();
+  if (loaded.status === "unreachable") {
+    return (
+      <TakeShell>
+        <div className="pt-12">
+          <h1 className="font-jetbrains text-[13px] uppercase tracking-widest text-white/50">
+            take {id}
+          </h1>
+          <p className="mt-3 text-lg text-white/80">
+            This take could not be loaded right now.
+          </p>
+          <ErrorBanner severity="error">
+            {loaded.detail} — the share link is still valid; this studio could not reach the engine
+            that stores it. Reload in a moment.
+          </ErrorBanner>
+          <p className="mt-4 text-sm text-white/55">
+            Nothing has been deleted: an unreadable backend is not a missing take, and this page
+            will not claim otherwise.
+          </p>
+        </div>
+      </TakeShell>
+    );
+  }
+  const take = loaded.take;
+
+  return (
+    <TakeShell>
         <div className="pt-8">
           <TakeCard take={take} />
         </div>
@@ -77,7 +126,6 @@ export default async function TakePage({ params }: { params: Promise<{ id: strin
             runs on arm · self-hostable · mit
           </span>
         </footer>
-      </div>
-    </div>
+    </TakeShell>
   );
 }

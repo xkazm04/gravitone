@@ -1,6 +1,7 @@
-// The share page's two server-side reads. Both degrade to null rather than
-// throwing, and the two failures are NOT the same: a missing take is a 404
-// page, a missing lineage is a page with no provenance strip.
+// The share page's two server-side reads. Neither throws, and their failures
+// are NOT interchangeable: a missing take is a 404 page, an UNREACHABLE backend
+// is an error state on a page that still exists, and a missing lineage is a
+// page with no provenance strip.
 
 import { describe, expect, it, vi } from "vitest";
 
@@ -16,14 +17,42 @@ function json(body: unknown, status = 200): Response {
 describe("loadTake", () => {
   it("returns the take", async () => {
     backendFetch.mockResolvedValueOnce(json({ id: "abc", text: "hi" }));
-    expect((await loadTake("abc"))?.id).toBe("abc");
+    const loaded = await loadTake("abc");
+    expect(loaded.status).toBe("ok");
+    expect(loaded.status === "ok" && loaded.take.id).toBe("abc");
   });
 
-  it("is null for a missing/evicted take and for an unreachable backend", async () => {
-    backendFetch.mockResolvedValueOnce(json({ detail: "gone" }, 404));
-    expect(await loadTake("abc")).toBeNull();
+  it("calls a 404 GONE — a permanent answer the visitor can act on", async () => {
+    backendFetch.mockResolvedValueOnce(json({ detail: "take not found" }, 404));
+    expect(await loadTake("abc")).toEqual({ status: "gone" });
+  });
+
+  it("does NOT call an unreachable backend a missing take", async () => {
+    // No response at all (connection refused / the read timeout fired).
     backendFetch.mockRejectedValueOnce(new TypeError("network"));
-    expect(await loadTake("abc")).toBeNull();
+    expect(await loadTake("abc")).toEqual({
+      status: "unreachable", detail: "Gravitone backend unreachable",
+    });
+  });
+
+  it("reports the backend's own detail for a server-side failure", async () => {
+    backendFetch.mockResolvedValueOnce(json({ detail: "internal error [req 7f3a]" }, 500));
+    expect(await loadTake("abc")).toEqual({
+      status: "unreachable", detail: "internal error [req 7f3a]",
+    });
+  });
+
+  it("treats an unreadable 200 body as unreachable, not as a missing take", async () => {
+    backendFetch.mockResolvedValueOnce(new Response("<html>proxy error</html>", { status: 200 }));
+    const loaded = await loadTake("abc");
+    expect(loaded.status).toBe("unreachable");
+  });
+
+  it("names the 503 the studio's own proxy answers", async () => {
+    backendFetch.mockResolvedValueOnce(new Response("service unavailable", { status: 503 }));
+    expect(await loadTake("abc")).toEqual({
+      status: "unreachable", detail: "Gravitone backend unreachable",
+    });
   });
 });
 

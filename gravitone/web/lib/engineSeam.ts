@@ -121,6 +121,10 @@ export type TakeAudio = {
   /** Settings the engine accepted but could not honestly apply. */
   ignoredSettings: string[];
   segments: SynthSegment[];
+  /** The engine SENT a per-segment report and this build could not read it, so
+   *  `segments` is empty for a reason that is not "there was one segment".
+   *  Callers must not draw a single-segment take; they must say so. */
+  reportCorrupt: boolean;
   /** How many synth jobs the text became (X-Synth-Segments), 0 when unreported. */
   synthSegments: number;
   format: OutputFormat;
@@ -221,12 +225,30 @@ function decodeIgnored(header: string | null): string[] {
   return header.split(",").map((s) => s.trim()).filter(Boolean);
 }
 
-function decodeSegments(header: string | null): SynthSegment[] {
-  if (!header) return [];
+/**
+ * A decoded per-segment report, and whether decoding it FAILED.
+ *
+ * Both decoders used to answer `[]` for two entirely different events: "the
+ * engine sent no report" (an ordinary single-segment take, or an engine that
+ * does not report) and "the engine sent a report this build could not read"
+ * (truncated base64 through a proxy, a header mangled by an intermediary, a
+ * shape from another version). The second one silently erased the emotion
+ * ribbon, the score rail and every substitution notice from a take that really
+ * did switch voices mid-sentence — and left it looking exactly like a take that
+ * never switched at all. `corrupt` is what makes those sayable apart.
+ */
+type DecodedReport = { segments: SynthSegment[]; corrupt: boolean };
+
+const NO_REPORT: DecodedReport = { segments: [], corrupt: false };
+
+function decodeSegments(header: string | null): DecodedReport {
+  if (!header) return NO_REPORT;
   try {
-    return JSON.parse(atob(header)) as SynthSegment[];
+    const rows = JSON.parse(atob(header));
+    if (!Array.isArray(rows)) return { segments: [], corrupt: true };
+    return { segments: rows as SynthSegment[], corrupt: false };
   } catch {
-    return [];
+    return { segments: [], corrupt: true };
   }
 }
 
@@ -235,19 +257,23 @@ function decodeSegments(header: string | null): SynthSegment[] {
  * segment) into segments carrying the speaking Character + source line index,
  * mirroring how X-Segments is decoded for solo takes.
  */
-function decodePerformanceReport(header: string | null): SynthSegment[] {
-  if (!header) return [];
+function decodePerformanceReport(header: string | null): DecodedReport {
+  if (!header) return NO_REPORT;
   try {
     const rows = JSON.parse(atob(header)) as Array<
       SynthSegment & { character_id?: string; line?: number }
     >;
-    return rows.map((r) => ({
-      text: r.text, requested: r.requested, used: r.used, fallback: r.fallback,
-      voice_id: r.voice_id, seconds: r.seconds,
-      characterId: r.character_id, line: r.line,
-    }));
+    if (!Array.isArray(rows)) return { segments: [], corrupt: true };
+    return {
+      segments: rows.map((r) => ({
+        text: r.text, requested: r.requested, used: r.used, fallback: r.fallback,
+        voice_id: r.voice_id, seconds: r.seconds,
+        characterId: r.character_id, line: r.line,
+      })),
+      corrupt: false,
+    };
   } catch {
-    return [];
+    return { segments: [], corrupt: true };
   }
 }
 
@@ -283,7 +309,7 @@ async function throwForStatus(res: Response): Promise<never> {
 }
 
 /** Build a TakeAudio from a successful audio response. */
-async function readAudio(res: Response, segments: SynthSegment[],
+async function readAudio(res: Response, report: DecodedReport,
                          format: OutputFormat): Promise<TakeAudio> {
   const blob = await res.blob();
   const url = URL.createObjectURL(blob);
@@ -299,7 +325,8 @@ async function readAudio(res: Response, segments: SynthSegment[],
     synthSeconds: Number.isFinite(hdrSynth) ? hdrSynth : 0,
     queueSeconds: Number.isFinite(hdrQueue) ? hdrQueue : 0,
     ignoredSettings: decodeIgnored(res.headers.get("X-Ignored-Settings")),
-    segments,
+    segments: report.segments,
+    reportCorrupt: report.corrupt,
     synthSegments: Math.max(0, Number(res.headers.get("X-Synth-Segments")) || 0),
     format,
   };
@@ -392,10 +419,10 @@ export class ServerEngine implements SpeechEngineClient {
 
     if (!res.ok) await throwForStatus(res);
 
-    const segments = req.kind === "performance"
+    const report = req.kind === "performance"
       ? decodePerformanceReport(res.headers.get("X-Performance-Report"))
       : decodeSegments(res.headers.get("X-Segments"));
-    return readAudio(res, segments, format);
+    return readAudio(res, report, format);
   }
 }
 

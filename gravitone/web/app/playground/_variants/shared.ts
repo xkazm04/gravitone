@@ -70,6 +70,11 @@ export type Take = {
   queueSeconds: number;
   ignoredSettings: string[];
   segments: Segment[];
+  // The engine sent a per-segment report this build could not decode, so
+  // `segments` is empty for a reason that is not "one segment". Optional:
+  // absent on every take stored before the distinction existed, where it reads
+  // as false — which is what those takes recorded.
+  reportCorrupt?: boolean;
   // The expression knobs this take was rendered with — together with text +
   // characterId this is the exact reproduction recipe for the code export.
   expr: Expression;

@@ -2,6 +2,7 @@
 
 import { apiJson } from "@/lib/apiFetch";
 import { DEFAULT_OUTPUT_FORMAT, formatMeta, type OutputFormat } from "@/lib/audioFormats";
+import { clearRemixParent, readRemixParent } from "@/lib/composerStore";
 import {
   EngineDegraded, getEngine,
   type FallbackReason, type TakeAudio,
@@ -95,8 +96,14 @@ export async function uploadTake(t: Take,
   fd.append("file", blob, `take.${formatMeta(t.format).ext}`);
   // Remix lineage: /t/[id]'s "open in the rack" leaves the source take id in
   // sessionStorage, so the take rendered from it publishes as that take's CHILD.
-  let parentId = "";
-  try { parentId = sessionStorage.getItem("gravitone.remix.parent") ?? ""; } catch { /* no storage - publish unlinked */ }
+  //
+  // ONE-SHOT. This slot used to be read on every publish and cleared by nobody,
+  // so after one fork every later take that browser published — unrelated
+  // scripts, other Characters, hours later — was filed as that take's child and
+  // /t/{id}'s lineage strip said so. It is spent below, once the upload has
+  // actually landed: a publish that failed consumed nothing, and its retry is
+  // still the fork.
+  const parentId = readRemixParent();
   fd.append("meta", JSON.stringify({
     character_id: t.characterId, character_name: t.characterName,
     text: t.text, seconds: t.seconds, rtf: t.rtf, segments: t.segments,
@@ -107,6 +114,7 @@ export async function uploadTake(t: Take,
   // id included) reaches the caller's banner instead of a generic sentence.
   const j = await apiJson<{ take_id: string }>(
     "/api/takes", { method: "POST", body: fd }, "could not publish the take");
+  if (parentId) clearRemixParent();
   return j.take_id;
 }
 
@@ -137,6 +145,12 @@ export type SpeakResult = {
   // (e.g. similarity_boost, style) — surfaced so the no-op is never silent.
   ignoredSettings: string[];
   segments: Segment[];
+  // The engine reported its segments and this build could not read the report
+  // (see lib/engineSeam::DecodedReport). `segments` is therefore empty for a
+  // reason that is NOT "this take had one segment", and the console says so:
+  // an unreadable report and a genuinely single-segment take used to render
+  // identically, which made a broken proxy header invisible.
+  reportCorrupt: boolean;
   // How many synth jobs the script became (X-Synth-Segments), or 0 when the
   // backend did not report it (single-segment takes, browser fallback).
   //
@@ -167,7 +181,7 @@ function browserFallback(plain: string, reason: FallbackReason, detail?: string)
   return {
     mode: "browser", peaks: waveHeights(plain.length * 31 + 7, 56),
     seconds, kb: 0, rtf: 0, synthSeconds: 0, queueSeconds: 0,
-    ignoredSettings: [], segments: [], synthSegments: 0,
+    ignoredSettings: [], segments: [], reportCorrupt: false, synthSegments: 0,
     format: DEFAULT_OUTPUT_FORMAT, fallbackReason: reason,
     fallbackDetail: detail,
   };
@@ -191,6 +205,7 @@ function takeFrom(audio: TakeAudio, seed: number): SpeakResult {
     seconds: audio.seconds, kb: audio.kb, rtf: audio.rtf,
     synthSeconds: audio.synthSeconds, queueSeconds: audio.queueSeconds,
     ignoredSettings: audio.ignoredSettings, segments,
+    reportCorrupt: audio.reportCorrupt,
     synthSegments: audio.synthSegments, format: audio.format,
   };
 }

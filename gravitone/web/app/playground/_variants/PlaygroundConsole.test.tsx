@@ -132,7 +132,7 @@ async function generateOnce(result: Partial<SpeakResult> = {}) {
     // `satisfies` is what pointed here — keep it, so the next field addition
     // fails at this one fixture instead of somewhere downstream.
     synthSegments: 1, format: "wav_24000",
-    ignoredSettings: [], segments: [], ...result,
+    ignoredSettings: [], segments: [], reportCorrupt: false, ...result,
   } satisfies SpeakResult);
   await act(async () => {
     fireEvent.click(screen.getByRole("button", { name: /Generate/ }));

@@ -3,6 +3,7 @@ import {
   EngineBusyError, isAbort, perform, refinePeaks, speak, spliceRegion, transcribeWords, uploadTake,
 } from "./engine";
 import { DEFAULT_EXPRESSION, type Segment, type Take } from "./shared";
+import { REMIX_PARENT_KEY } from "@/lib/composerStore";
 
 const EXPR = DEFAULT_EXPRESSION;
 
@@ -14,7 +15,7 @@ function wavResponse(): Response {
   });
 }
 
-afterEach(() => { vi.unstubAllGlobals(); });
+afterEach(() => { vi.unstubAllGlobals(); sessionStorage.clear(); });
 
 describe("speak — why we fell back", () => {
   it("marks a transport failure 'unreachable'", async () => {
@@ -195,6 +196,49 @@ describe("uploadTake", () => {
     vi.stubGlobal("fetch", f);
     await expect(uploadTake(take({ url: undefined, blob: undefined }))).rejects.toThrow(/cannot be shared/);
     expect(f).not.toHaveBeenCalled();
+  });
+
+  // ── the remix parent is ONE-SHOT ──────────────────────────────────────────
+  // It used to be written by /t/[id] and cleared by nobody, so every take a
+  // browser published after one fork — for the rest of the tab's life — was
+  // filed as that fork's child.
+  describe("remix lineage", () => {
+    function metaOf(f: ReturnType<typeof vi.fn>, call = 0): Record<string, unknown> {
+      const fd = f.mock.calls[call][1].body as FormData;
+      return JSON.parse(fd.get("meta") as string);
+    }
+    const ok = () => new Response(JSON.stringify({ take_id: "t1" }), { status: 200 });
+
+    it("files the FIRST publish as the fork's child and nothing after it", async () => {
+      sessionStorage.setItem(REMIX_PARENT_KEY, "parent9");
+      const f = vi.fn().mockResolvedValue(ok());
+      vi.stubGlobal("fetch", f);
+
+      await uploadTake(take());
+      expect(metaOf(f, 0)).toMatchObject({ parent_id: "parent9", derived_from: { kind: "remix" } });
+
+      // The very next take is an unrelated one. Before the slot was spent, it
+      // published as parent9's child too.
+      f.mockResolvedValue(ok());
+      await uploadTake(take({ id: "take-2", text: "something else entirely" }));
+      expect(metaOf(f, 1).parent_id).toBeUndefined();
+      expect(sessionStorage.getItem(REMIX_PARENT_KEY)).toBeNull();
+    });
+
+    it("keeps the fork when the publish FAILS — a retry is still a child", async () => {
+      sessionStorage.setItem(REMIX_PARENT_KEY, "parent9");
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ detail: "take store full" }), { status: 500 })));
+      await expect(uploadTake(take())).rejects.toThrow();
+      expect(sessionStorage.getItem(REMIX_PARENT_KEY)).toBe("parent9");
+    });
+
+    it("publishes unlinked when no fork is pending", async () => {
+      const f = vi.fn().mockResolvedValue(ok());
+      vi.stubGlobal("fetch", f);
+      await uploadTake(take());
+      expect(metaOf(f)).not.toHaveProperty("parent_id");
+    });
   });
 });
 

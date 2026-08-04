@@ -138,6 +138,37 @@ describe("ServerEngine — what it reports about the audio", () => {
     stubObjectUrl();
     expect((await new ServerEngine().synthesize(SOLO)).segments).toEqual([]);
   });
+
+  it("says a corrupt report is CORRUPT — not a single-segment take", async () => {
+    // The two used to be one empty array, so a header mangled in transit
+    // rendered as an ordinary take that simply never switched emotion.
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(audioResponse({ "X-Segments": "not-base64!!" })));
+    stubObjectUrl();
+    expect((await new ServerEngine().synthesize(SOLO)).reportCorrupt).toBe(true);
+  });
+
+  it("says the same for a corrupt performance report", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      audioResponse({ "X-Performance-Report": btoa("{not json") })));
+    stubObjectUrl();
+    const got = await new ServerEngine().synthesize(PERF);
+    expect(got.segments).toEqual([]);
+    expect(got.reportCorrupt).toBe(true);
+  });
+
+  it("does NOT call a report-less take corrupt", async () => {
+    // No header at all is the ordinary shape of a one-segment take.
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(audioResponse()));
+    stubObjectUrl();
+    expect((await new ServerEngine().synthesize(SOLO)).reportCorrupt).toBe(false);
+  });
+
+  it("calls a well-formed-but-not-an-array report corrupt", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      audioResponse({ "X-Segments": b64({ oops: true }) })));
+    stubObjectUrl();
+    expect((await new ServerEngine().synthesize(SOLO)).reportCorrupt).toBe(true);
+  });
 });
 
 describe("ServerEngine — failures the caller must be able to tell apart", () => {
