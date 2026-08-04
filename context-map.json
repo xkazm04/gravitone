@@ -62,7 +62,8 @@
           "filePaths": [
             "gravitone/service/app.py",
             "gravitone/service/config.py",
-            "gravitone/service/keys.py"
+            "gravitone/service/keys.py",
+            "gravitone/docs/SWITCH_FROM_ELEVENLABS.md"
           ],
           "target": null,
           "apiRoutes": [
@@ -197,6 +198,22 @@
           ]
         },
         {
+          "name": "Ops Transparency",
+          "description": "Live engine telemetry in the studio: polls the backend's /metrics through a server-side proxy and renders in-flight, queue depth, latency percentiles and realtime factor — with an explicit degraded-connection state and no fabricated zeros.",
+          "businessFeature": "Ops Transparency",
+          "category": "ui",
+          "filePaths": [
+            "gravitone-web/app/ops/page.tsx",
+            "gravitone-web/app/ops/OpsView.tsx",
+            "gravitone-web/app/api/metrics/route.ts",
+            "gravitone-web/lib/useMetricsPoll.ts"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/api/metrics"
+          ]
+        },
+        {
           "name": "TTS Playground",
           "description": "Interactive console to type text, pick a voice and emotion, and hear synthesized speech; streams audio through server-side proxy routes that hide the backend and avoid CORS.",
           "businessFeature": "TTS Playground",
@@ -306,13 +323,14 @@
     "TTS Service Core › Voice & Emotion Library [lib] — 2 files",
     "TTS Service Core › Voice Cloning & Ingest Pipeline [api] — 4 files",
     "TTS Service Core › Concurrency Engine & Metrics [lib] — 2 files",
-    "TTS Service Core › Speech Synthesis API [api] — 3 files",
+    "TTS Service Core › Speech Synthesis API [api] — 4 files",
     "Performance & Deployment › Packaging & Deployment [config] — 3 files",
     "Performance & Deployment › Load Testing & Benchmarks [test] — 5 files",
     "Web Studio › Auth & Profile [ui] — 4 files",
     "Web Studio › API Key Management [ui] — 6 files",
     "Web Studio › Voice Creation Studio [ui] — 9 files",
     "Web Studio › Character & Voice Management [ui] — 12 files",
+    "Web Studio › Ops Transparency [ui] — 4 files",
     "Web Studio › TTS Playground [ui] — 8 files",
     "Design System & Brand › App Shell & Landing [ui] — 6 files",
     "Design System & Brand › Emotion Glyph Art [lib] — 12 files",
@@ -320,14 +338,14 @@
   ],
   "summary": {
     "totalGroups": 4,
-    "totalContexts": 14,
-    "totalFiles": 78,
+    "totalContexts": 15,
+    "totalFiles": 83,
     "categories": {
       "lib": 3,
       "api": 2,
       "config": 1,
       "test": 1,
-      "ui": 7
+      "ui": 8
     },
     "domains": {
       "feature": 2,
