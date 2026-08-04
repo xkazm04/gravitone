@@ -361,6 +361,23 @@ class ReperformTests(_TakesBase):
                             "GRAVITONE_RATELIMIT_TEST_BYPASS", bypass)
         parent = self._open_take()
         limiter = takes.REPERFORM_BUDGET.limiter
+        # Freeze the limiter's clock for the duration. The refusals below come
+        # from the burst sub-window (1s), and on a loaded box the eight HTTP
+        # round trips this test makes can take longer than that — the burst
+        # window rolls mid-assertion and the final "still refused" request is
+        # honestly allowed (measured 0.413s idle; flaked under full-suite
+        # load). The property under test is the limiter's arithmetic, not the
+        # wall clock's mood, so every request lands at one instant.
+        frozen_at = limiter._clock()
+        real_clock = limiter._clock
+        limiter._clock = lambda: frozen_at
+        limiter.reset()
+
+        def _restore_clock() -> None:
+            limiter._clock = real_clock
+            limiter.reset()
+
+        self.addCleanup(_restore_clock)
         codes = [self.client.post(f"/v1/takes/{parent}/reperform",
                                   json={"text": "Hi."}).status_code
                  for _ in range(limiter.limit + 2)]
