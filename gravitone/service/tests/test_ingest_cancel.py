@@ -88,24 +88,53 @@ class LabelCancelTests(unittest.TestCase):
             to_wav.assert_not_called()
             lab.assert_not_called()
 
-    def test_analyze_cancels_before_the_second_paid_call(self) -> None:
-        # Scribe has run; cancel arrives; the Isolator (the second paid call)
-        # must never be invoked.
+    def test_analyze_cancelled_mid_flight_abandons_both_paid_calls(self) -> None:
+        """The overlapped shape, stated honestly.
+
+        Scribe and the Isolator now start TOGETHER (they are independent calls
+        on the same file and were the two longest waits in a scan), so a cancel
+        that arrives once scribe is running can no longer PREVENT the second
+        call — it is already out. What it does is abandon both: `Cancelled`
+        propagates, nothing is written, and the ledger still shows what the
+        cancel could not un-bill. `test_analyze_cancelled_up_front_...` below
+        pins the case where a cancel does still save the money.
+        """
         with TemporaryDirectory() as td:
             wd = Path(td)
             flag = {"cancel": False}
+            ledger = ingest.Spend()
 
             def fake_scribe(path, spend=None):
+                (spend or ledger).charge(ingest.ELEVEN)
                 flag["cancel"] = True
                 return {"words": [], "audio_duration_secs": 5, "text": "hi"}
+
+            def fake_isolate(path, dst, spend=None):
+                (spend or ledger).charge(ingest.ELEVEN)
 
             with mock.patch.object(ingest, "ELEVEN_KEY", "k"), \
                  mock.patch.object(ingest, "GEMINI_KEY", "k"), \
                  mock.patch.object(ingest, "scribe", side_effect=fake_scribe), \
+                 mock.patch.object(ingest, "clean_audio"), \
+                 mock.patch.object(ingest, "voice_isolate",
+                                   side_effect=fake_isolate) as iso:
+                with self.assertRaises(ingest.Cancelled):
+                    ingest.analyze(wd / "in.wav", wd, spend=ledger,
+                                   should_cancel=lambda: flag["cancel"])
+            iso.assert_called_once()          # in flight, not preventable
+            # Abandoned, not free: what was spent is still on the ledger.
+            self.assertEqual(ledger.snapshot()["calls"][ingest.ELEVEN], 2)
+
+    def test_analyze_cancelled_up_front_pays_for_nothing(self) -> None:
+        with TemporaryDirectory() as td:
+            wd = Path(td)
+            with mock.patch.object(ingest, "ELEVEN_KEY", "k"), \
+                 mock.patch.object(ingest, "GEMINI_KEY", "k"), \
+                 mock.patch.object(ingest, "scribe") as scr, \
                  mock.patch.object(ingest, "voice_isolate") as iso:
                 with self.assertRaises(ingest.Cancelled):
-                    ingest.analyze(wd / "in.wav", wd,
-                                   should_cancel=lambda: flag["cancel"])
+                    ingest.analyze(wd / "in.wav", wd, should_cancel=lambda: True)
+            scr.assert_not_called()
             iso.assert_not_called()
 
 

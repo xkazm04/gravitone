@@ -959,10 +959,33 @@ def analyze(audio: Path, work_dir: Path,
     """Steps 1-2 + per-speaker stats. Saves clean.wav, segments.json, and a
     preview clip per speaker. Returns { duration, transcript, speakers:[...] }.
 
-    `should_cancel` is polled before each of the two PAID calls (Scribe, the
-    Isolator) and before the local preview pass; a cancel raises `Cancelled`.
-    Before this the only cancellable phase was commit, so pressing cancel during
-    a scan stopped nothing — the isolator call still ran, and still billed."""
+    THE TWO PAID CALLS RUN CONCURRENTLY. Scribe and the Isolator are the two
+    largest wall-clock items in a scan (minutes each, 300s timeout each), they
+    are independent HTTP requests against the same file, and neither consumes
+    the other's output — the transcript's word timings are applied to
+    `clean.wav` only after both have landed. Running them back to back doubled
+    the wait for nothing. They are two `_call`s on one `urllib` module with no
+    shared session or client object, and both charge the SAME `Spend`, whose
+    counters are already under its own lock because labelling fans out over a
+    pool — so the ledger stays honest even when one of them fails.
+
+    What overlapping costs, stated rather than hidden:
+
+    * A cancel can no longer PREVENT the second call. `should_cancel` is polled
+      once, before both start; after that both are in flight and a cancel
+      abandons their results instead of saving their price. That is inherent to
+      overlapping and it is the trade this makes for halving the wall clock.
+    * A scribe failure is reported after the isolator's request returns
+      (bounded by its own 300s timeout) rather than immediately, because the
+      alternative is leaving a thread writing into a workdir the job is about to
+      abandon — the drain doctrine this module's shutdown path is built on.
+    * Peak memory holds both multipart bodies at once (`_multipart` reads the
+      file), so ~2x the upload rather than 1x. `MAX_UPLOAD_BYTES` is 50 MB.
+
+    `should_cancel` is polled before the paid calls and before the local preview
+    pass; a cancel raises `Cancelled`. Before this the only cancellable phase
+    was commit, so pressing cancel during a scan stopped nothing — the isolator
+    call still ran, and still billed."""
     assert ELEVEN_KEY and GEMINI_KEY, "ELEVEN_LABS_API_KEY / GEMINI_API_KEY missing"
     work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -972,24 +995,68 @@ def analyze(audio: Path, work_dir: Path,
 
     ledger = spend or Spend()
     _check(should_cancel)
-    prog("transcribe", "active")
-    tr = scribe(audio, ledger)
-    words = tr.get("words", [])
-    duration = tr.get("audio_duration_secs", 0)
-    transcript = (tr.get("text") or "")[:600]
-    all_segs = build_segments(words)
-    if partial:
-        partial({"words": sum(1 for w in words if w.get("type") == "word"),
-                 "speakers": sorted({s["speaker"] for s in all_segs}),
-                 "transcript": transcript, "spend": ledger.snapshot()})
-    prog("transcribe", "done")
 
-    _check(should_cancel)          # the isolator is the second paid call
-    prog("isolate", "active")
+    # Both steps go active together because both really are: the reporting has
+    # to describe the overlap rather than invent a sequence that no longer
+    # happens. Each is marked done by whichever side finishes it.
     iso = work_dir / "iso.mp3"
-    voice_isolate(audio, iso, ledger)
     clean = work_dir / "clean.wav"
-    clean_audio(iso, clean)  # canonical cleanup (adds loudnorm) after isolation
+    prog("transcribe", "active")
+    prog("isolate", "active")
+
+    isolation: dict[str, BaseException | None] = {"error": None}
+
+    def _isolate() -> None:
+        try:
+            voice_isolate(audio, iso, ledger)
+            # Canonical cleanup (adds loudnorm) after isolation. It rides in
+            # this thread too: it is the rest of the isolate STEP, and doing it
+            # here overlaps the ffmpeg pass with the transcription as well.
+            clean_audio(iso, clean)
+        except BaseException as exc:  # noqa: BLE001 - carried out, never swallowed
+            isolation["error"] = exc
+
+    worker = threading.Thread(target=_isolate, name="ingest-isolate", daemon=True)
+    worker.start()
+
+    transcription: BaseException | None = None
+    tr: dict = {}
+    try:
+        tr = scribe(audio, ledger)
+    except BaseException as exc:  # noqa: BLE001 - re-raised below, after the join
+        transcription = exc
+
+    all_segs: list[dict] = []
+    duration = 0
+    transcript = ""
+    if transcription is None:
+        # Published the moment the transcript lands, BEFORE waiting on the
+        # isolator: the word count and speaker list are what the loader shows
+        # while the other call is still out.
+        words = tr.get("words", [])
+        duration = tr.get("audio_duration_secs", 0)
+        transcript = (tr.get("text") or "")[:600]
+        all_segs = build_segments(words)
+        if partial:
+            partial({"words": sum(1 for w in words if w.get("type") == "word"),
+                     "speakers": sorted({s["speaker"] for s in all_segs}),
+                     "transcript": transcript, "spend": ledger.snapshot()})
+        prog("transcribe", "done")
+
+    worker.join()
+    # ABANDONMENT BEATS BOTH RESULTS. A cancel that lands while the two calls
+    # are out cannot un-bill them, but it does mean nobody is waiting for what
+    # they returned — including for the reason either of them failed. Same
+    # user-visible outcome as before (the job is torn down either way), said as
+    # the abandonment it is.
+    _check(should_cancel)
+    # Scribe first when BOTH failed: that is the error this phase raised before
+    # the two calls overlapped (the isolator never ran), and a user-visible
+    # message must not change because of an internal scheduling decision.
+    if transcription is not None:
+        raise transcription
+    if isolation["error"] is not None:
+        raise isolation["error"]
     prog("isolate", "done")
 
     # per-speaker stats + a preview clip (their longest utterance, capped)

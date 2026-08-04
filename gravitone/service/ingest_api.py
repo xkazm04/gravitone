@@ -421,6 +421,93 @@ def _wav_seconds(path: Path) -> float:
         return 0.0
 
 
+# ── the per-job segment-metrics memo ──────────────────────────────────────────
+# One scan's segment wavs get measured over and over. `segment_rows` opens each
+# one for its duration; `_variants` runs `ingest.measure_levels` — a FULL
+# frame-RMS decode of the file — over every candidate to order the `tightest`
+# recipe; and `_board` re-runs `segment_rows` on every /stems call (a debounce
+# target: the studio fires one per drag) and again at commit. A `reset` re-runs
+# `build_recipes` end to end, so the whole decode pass repeats.
+#
+# What is actually expensive, stated precisely rather than repeated from the
+# proposal: `_wav_seconds` is a HEADER read (wave.open + getnframes), cheap but
+# repeated once per segment per call; `ingest.measure_levels` streams and
+# squares every frame, and that is the pass worth never taking twice.
+#
+# Both answers are pure functions of BYTES ON DISK, so the memo is keyed on the
+# file's (size, mtime_ns) rather than invalidated by a protocol. That is the
+# design choice, and it is the one the flow's own facts argue for: `/stems`
+# rewrites `stem_{emotion}.wav`, never `seg_%03d.wav` — a segment wav is written
+# once by the label phase and never touched again — so a re-splice has NOTHING
+# to invalidate. Rather than encode that as an assumption, a `stat` per lookup
+# (microseconds against a decode) makes the memo self-invalidating: if anything
+# ever does rewrite a segment, the next reader measures the new bytes.
+#
+# LOCKING: `_METRICS_LOCK` is a LEAF. Nothing is acquired while it is held, and
+# the measurement itself runs OUTSIDE it — so it cannot participate in the
+# `_STEM_LOCK` → `_LOCK` order that `restem` and `commit` depend on, and a slow
+# decode never blocks another job's lookup. Two threads racing the same miss
+# both measure and both store; the functions are deterministic, so the loser
+# writes the identical answer.
+_METRICS_LOCK = threading.Lock()
+# work_dir -> wav path -> {"key": (size, mtime_ns), "seconds": ..., "levels": ...}
+_METRICS: dict[str, dict[str, dict]] = {}
+
+
+def _stat_key(path: Path) -> tuple[int, int] | None:
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_size, st.st_mtime_ns)
+
+
+def _metric(work_dir: Path, wav: Path, name: str, compute: Callable[[Path], object]):
+    """One memoized measurement of one segment wav.
+
+    A miss (or a file whose bytes changed) measures OUTSIDE the lock and stores
+    the result against the current stat key. A file that cannot be stat'd is
+    measured and NOT cached — there is nothing to key it on, and answering from
+    a stale entry for a file that has gone is worse than paying for the read.
+    """
+    key = _stat_key(wav)
+    wd, path = str(work_dir), str(wav)
+    if key is not None:
+        with _METRICS_LOCK:
+            entry = _METRICS.get(wd, {}).get(path)
+            if entry is not None and entry["key"] == key and name in entry:
+                return entry[name]
+    value = compute(wav)
+    if key is None:
+        return value
+    with _METRICS_LOCK:
+        per_job = _METRICS.setdefault(wd, {})
+        entry = per_job.get(path)
+        if entry is None or entry["key"] != key:
+            entry = per_job[path] = {"key": key}
+        entry[name] = value
+    return value
+
+
+def segment_seconds(work_dir: Path, wav: Path) -> float:
+    """This segment's duration, measured once per job."""
+    return float(_metric(work_dir, wav, "seconds", _wav_seconds))
+
+
+def segment_levels(work_dir: Path, wav: Path) -> "ingest.Levels":
+    """This segment's speech/floor/threshold levels, decoded once per job."""
+    return _metric(work_dir, wav, "levels", ingest.measure_levels)
+
+
+def forget_metrics(work_dir: str | Path) -> None:
+    """Drop a job's memo. Called wherever its workdir is rmtree'd, so the memo
+    cannot outlive the audio it describes (it is keyed by path, and job ids —
+    hence paths — are not reused, but an unbounded dict on a long-lived replica
+    is a leak whether or not it is ever read again)."""
+    with _METRICS_LOCK:
+        _METRICS.pop(str(work_dir), None)
+
+
 def segment_rows(work_dir: Path, result: dict) -> tuple[list[dict], str | None]:
     """The scan's per-segment labels re-joined to their extracted wavs.
 
@@ -446,7 +533,7 @@ def segment_rows(work_dir: Path, result: dict) -> tuple[list[dict], str | None]:
             if not s.get("failure"):
                 return [], "segment audio is missing for this scan"
             continue
-        seconds = _wav_seconds(wav)
+        seconds = segment_seconds(work_dir, wav)
         declared = float(s.get("dur") or 0.0)
         if declared and abs(seconds - declared) > 0.35:
             return [], "segment audio could not be matched to its labels"
@@ -482,7 +569,8 @@ def _prefix_to_target(cands: list[dict], order: list[dict], target: float) -> li
     return sorted(picked, key=lambda r: r["i"])
 
 
-def _variants(cands: list[dict], target: float) -> list[tuple[str, list[dict]]]:
+def _variants(work_dir: Path, cands: list[dict],
+              target: float) -> list[tuple[str, list[dict]]]:
     """Every candidate splice for one emotion, in offer order. A variant that
     would be identical to one already offered is not offered — an A/B between two
     identical takes is a fake choice, and this flow's whole problem was fake
@@ -499,7 +587,7 @@ def _variants(cands: list[dict], target: float) -> list[tuple[str, list[dict]]]:
                 cands, sorted(cands, key=lambda r: (-r["confidence"], r["i"])), target)))
         snr: list[tuple[float, dict]] = []
         for r in cands:
-            lv = ingest.measure_levels(Path(r["wav"]))
+            lv = segment_levels(work_dir, Path(r["wav"]))
             if lv.measured:
                 snr.append((lv.speech_db - lv.floor_db, r))
         if len(snr) == len(cands) and len(cands) >= 3:
@@ -555,7 +643,7 @@ def build_recipes(work_dir: Path, result: dict) -> tuple[dict[str, dict[str, lis
             # here than it does one row above.
             cands = list(ingest.plan_baseline(by_emotion, min_stem).labs)
             for c in cands:
-                c.setdefault("seconds", _wav_seconds(Path(c["wav"])))
+                c.setdefault("seconds", segment_seconds(work_dir, Path(c["wav"])))
         else:
             cands = sorted(by_emotion.get(emo, []), key=lambda r: r["i"])
         if len(cands) < 2:
@@ -564,7 +652,7 @@ def build_recipes(work_dir: Path, result: dict) -> tuple[dict[str, dict[str, lis
         target = max(min_stem, min(RECIPE_TARGET_SECONDS, total * RECIPE_TARGET_SHARE))
 
         offers: list[dict] = []
-        for kind, sel in _variants(cands, target):
+        for kind, sel in _variants(work_dir, cands, target):
             label, how = RECIPE_LABELS[kind]
             if kind == RECIPE_FULL:
                 seconds, segments = stem.get("seconds"), stem.get("segments")
@@ -1091,6 +1179,7 @@ def _gc_once() -> None:
             # used to recreate the directory behind GC's back).
             JOBS[jid]["cancel"] = True
             shutil.rmtree(JOBS[jid]["work_dir"], ignore_errors=True)
+            forget_metrics(JOBS[jid]["work_dir"])
             JOBS.pop(jid, None)
             _SPEND.pop(jid, None)
         live = {v["work_dir"] for v in JOBS.values()}
@@ -2395,6 +2484,7 @@ def cancel_job(job_id: str):
         rebuilt = list((prior.get("rederive") or {}).get("voices") or [])
         _record_rederive(job, "cancelled", rebuilt)
     shutil.rmtree(work_dir, ignore_errors=True)
+    forget_metrics(work_dir)
     if is_rederive:
         return {"status": "cancelled", "rebuilt": rebuilt, "kept": True}
     return {"status": "cancelled"}
