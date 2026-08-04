@@ -135,14 +135,17 @@ class SamplingKnobsArePureTests(unittest.TestCase):
 
     def test_nothing_seed_shaped_reaches_the_model(self) -> None:
         # A seed knob was considered and deliberately NOT shipped
-        # (docs/DETERMINISM.md, "Why a seed knob was not added"). If one is ever
-        # added, this test should fail — and the document must be updated in the
-        # same change, because a half-wired seed is a guarantee callers would
-        # build on and we could not keep.
+        # (docs/DETERMINISM.md, "Why a seed knob was not added"). The ElevenLabs
+        # compat surface DOES declare `seed` on TTSRequest — so an unmodified EL
+        # client is not rejected and the drop is reported on X-Ignored-Settings
+        # rather than silent — but declared-and-inert is the only shape it may
+        # have: the moment it leaves _INERT_REQUEST_FIELDS or shows up in
+        # _overrides, someone has half-wired a guarantee we cannot keep, and the
+        # document must change in the same commit.
         keys = set(appmod._overrides(self._settings(temperature=0.7)))
         self.assertNotIn("seed", keys)
         self.assertFalse({k for k in keys if "seed" in k or "rand" in k})
-        self.assertNotIn("seed", appmod.TTSRequest.model_fields)
+        self.assertIn("seed", appmod._INERT_REQUEST_FIELDS)
         self.assertNotIn("seed", appmod.VoiceSettings.model_fields)
 
     def test_the_inert_compatibility_settings_change_nothing(self) -> None:

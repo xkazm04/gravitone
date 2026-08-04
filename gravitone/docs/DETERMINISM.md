@@ -95,9 +95,11 @@ Pocket TTS samples: `service/engine.py::_Worker._generate` calls
 `model.generate_audio(state, text, max_tokens=…, frames_after_eos=…,
 copy_state=True)` with a `temp` (default 0.7) that is a sampling temperature.
 Nothing in this repository seeds a random number generator on the synthesis
-path — there is no `torch.manual_seed`, no `seed` field on `TTSRequest`, and no
-`seed` on `engine.Job`. Two renders of one input will therefore differ at the
-sample level.
+path — there is no `torch.manual_seed` and no `seed` on `engine.Job`. The
+ElevenLabs-compatible request body *accepts* a `seed` field so an unmodified
+client is not rejected, but it is declared inert (`_INERT_REQUEST_FIELDS`),
+reported on `X-Ignored-Settings`, and read by nothing downstream. Two renders
+of one input will therefore differ at the sample level.
 
 ### Why a seed knob was not added
 
