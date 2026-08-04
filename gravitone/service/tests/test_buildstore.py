@@ -422,6 +422,132 @@ class BuildRouteTests(_RouteCase):
         self.assertEqual(r.headers["Retry-After"], "1")
 
 
+class WavePackingTests(unittest.TestCase):
+    """``_pack_waves``: the unit budget a build spends, and the order it keeps."""
+
+    def test_waves_fill_to_the_cap_in_order(self) -> None:
+        self.assertEqual(appmod._pack_waves([1, 1, 1, 1, 1], 2),
+                         [[0, 1], [2, 3], [4]])
+
+    def test_an_item_heavier_than_the_cap_gets_a_wave_of_its_own(self) -> None:
+        # Never split, never dropped: a long line is one render whatever its
+        # unit count, and it must not drag its neighbours over the budget.
+        self.assertEqual(appmod._pack_waves([3, 1, 1], 2), [[0], [1, 2]])
+
+    def test_nothing_to_do_is_no_waves(self) -> None:
+        self.assertEqual(appmod._pack_waves([], 4), [])
+
+
+class BuildConcurrencyTests(_RouteCase):
+    """/v1/build renders through the pool — and the ARTIFACT never notices.
+
+    The route made for 300-line scripts used to be the only synthesis path that
+    rendered strictly sequentially. It now submits in waves like /v1/speak and
+    /v1/performance, which puts the burden of proof here: parallel rendering
+    must not reorder a lockfile, rename a digest, or land one line's bytes
+    under another line's name.
+
+    The fake pool is configured so completion order is the REVERSE of manifest
+    order (line one takes 30× line three), so every ordering assertion below
+    fails if anything in the build is assembled from completion order.
+    """
+
+    _MANIFEST = {"lines": [
+        {"id": "one", "voice": "alba", "text": "Line one."},
+        {"id": "two", "voice": "alba", "text": "Line two.",
+         "format": "pcm_24000"},
+        {"id": "three", "voice": "alba", "text": "Line three."},
+    ]}
+
+    def setUp(self) -> None:
+        super().setUp()
+        import dataclasses
+        self.engine.close()  # the single-worker default from _RouteCase
+        orig_settings = appmod.SETTINGS
+        appmod.SETTINGS = dataclasses.replace(orig_settings, workers=4)
+        self.addCleanup(lambda: setattr(appmod, "SETTINGS", orig_settings))
+        self.engine = fake_engine.FakeEngine(
+            workers=4, delay=0.01,
+            delays={"Line one.": 0.30, "Line two.": 0.15, "Line three.": 0.01})
+        appmod.ENGINE = self.engine
+
+    def test_lines_render_concurrently_without_reordering_the_artifact(self) -> None:
+        built = self.client.post("/v1/build", json=self._MANIFEST).json()
+        self.assertEqual(built["rendered"], 3)
+        self.assertGreater(self.engine.max_concurrent, 1,
+                           "the build still rendered one line at a time")
+        self.assertEqual([l["id"] for l in built["lines"]],
+                         ["one", "two", "three"],
+                         "the response followed completion order, not the script")
+        # And the names are exactly the ones the identity-only route computes:
+        # rendering in waves moved no digest, so no existing store was
+        # invalidated.
+        lock = self.client.post("/v1/build/lock", json=self._MANIFEST).json()
+        self.assertEqual([l["digest"] for l in built["lines"]],
+                         [lock["lines"][i]["digest"]
+                          for i in ("one", "two", "three")])
+
+    def test_each_line_gets_its_own_bytes_under_its_own_digest(self) -> None:
+        built = self.client.post("/v1/build", json=self._MANIFEST).json()
+        by_id = {l["id"]: l for l in built["lines"]}
+        # The pcm line is the same audio as a wav minus the 44-byte header, and
+        # it is stored as octet-stream: a wave result assembled onto the wrong
+        # line would show up here as the wrong length AND the wrong container.
+        self.assertEqual(by_id["two"]["bytes"], by_id["one"]["bytes"] - 44)
+        for lid, ctype in (("one", "audio/wav"),
+                           ("two", "application/octet-stream"),
+                           ("three", "audio/wav")):
+            served = self.client.get(f"/v1/audio/{by_id[lid]['digest']}")
+            self.assertEqual(served.status_code, 200)
+            self.assertEqual(served.headers["content-type"], ctype)
+            self.assertEqual(len(served.content), by_id[lid]["bytes"])
+
+    def test_the_zip_of_a_concurrent_build_is_ordered_and_reproducible(self) -> None:
+        import io
+        import zipfile as zf
+        first = self.client.post("/v1/build", json=self._MANIFEST).json()
+        one = self.client.get(f"/v1/build/{first['build_id']}.zip")
+        second = self.client.post("/v1/build", json=self._MANIFEST).json()
+        self.assertEqual(second["fresh"], 3, "a rebuilt manifest re-rendered")
+        self.assertEqual(second["build_id"], first["build_id"])
+        two = self.client.get(f"/v1/build/{first['build_id']}.zip")
+        self.assertEqual(one.content, two.content,
+                         "the archive of an unchanged build moved")
+        with zf.ZipFile(io.BytesIO(one.content)) as archive:
+            self.assertEqual(archive.namelist(),
+                             ["gravitone.lock", "audio/one.wav",
+                              "audio/two.pcm", "audio/three.wav"])
+
+    def test_identical_lines_in_one_wave_still_render_once(self) -> None:
+        # The sequential loop deduped AFTER each render (`rendered_now`); a wave
+        # has no "after", so the dedupe has to happen before dispatch.
+        dup = {"lines": [{"id": cid, "voice": "alba", "text": "Same words."}
+                         for cid in ("a", "b", "c", "d")]}
+        body = self.client.post("/v1/build", json=dup).json()
+        self.assertEqual((body["rendered"], body["fresh"]), (1, 3))
+        self.assertEqual(len({l["digest"] for l in body["lines"]}), 1)
+        self.assertEqual(len(self.engine.jobs), 1, "one render, not four")
+        self.assertEqual([l["state"] for l in body["lines"]],
+                         ["rendered", "fresh", "fresh", "fresh"],
+                         "the FIRST occurrence is the one that rendered")
+
+    def test_a_rejection_mid_wave_keeps_the_siblings_that_finished(self) -> None:
+        self.engine.close()
+        self.engine = fake_engine.FakeEngine(workers=4, delay=0.2, capacity=2)
+        appmod.ENGINE = self.engine
+        manifest = {"lines": [{"id": str(i), "voice": "alba",
+                               "text": f"Refused wave line {i}."}
+                              for i in range(4)]}
+        r = self.client.post("/v1/build", json=manifest)
+        self.assertEqual(r.status_code, 429)
+        self.assertEqual(r.headers["Retry-After"], "1")
+        # A retry RESUMES, and now from further along than the sequential loop
+        # managed: the lines that WERE admitted are awaited and stored rather
+        # than thrown away with the 429 their sibling earned.
+        plan = self.client.post("/v1/build/plan", json=manifest).json()
+        self.assertEqual(plan["fresh"], 2)
+
+
 class OneIdentityTests(_RouteCase):
     """The whole point: a plain call and a build line are the same artifact."""
 

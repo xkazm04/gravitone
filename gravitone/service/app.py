@@ -562,6 +562,36 @@ async def _submit_and_gather_in_waves(specs: list[tuple[str, str, dict]],
     return results
 
 
+def _pack_waves(weights: list[int], cap: int) -> list[list[int]]:
+    """Group item indices into waves whose total UNIT count stays inside ``cap``.
+
+    The sibling of ``_submit_and_gather_in_waves`` for a caller whose items are
+    not bare specs but whole renders (``/v1/build``: one ``_render_tts`` per
+    manifest line, each of which may itself segment into several units). Same
+    budget, ``_max_batch_units()``, because "how many units may one request
+    submit at one instant" must have ONE answer whether the units came from one
+    long body or from four lines of a script — the alternative is a manifest
+    submitting ``cap`` lines × ``cap`` units and 429ing itself on exactly the
+    input the route exists for.
+
+    Order-preserving and greedy: waves go in item order, and an item heavier
+    than the cap gets a wave to itself rather than being split or dropped.
+    """
+    waves: list[list[int]] = []
+    current: list[int] = []
+    load = 0
+    for i, weight in enumerate(weights):
+        weight = max(1, int(weight))
+        if current and load + weight > cap:
+            waves.append(current)
+            current, load = [], 0
+        current.append(i)
+        load += weight
+    if current:
+        waves.append(current)
+    return waves
+
+
 async def _gather_results(jobs: list):
     """Await a whole batch, abandoning every job if any of them fails.
 
@@ -1256,6 +1286,56 @@ def _segmentation_version() -> str:
             f"/chunk={SETTINGS.chunk_chars}/units={_max_batch_units()}")
 
 
+class _RequestIdentity:
+    """The parts of a speech digest that are constant across ONE request.
+
+    ``_engine_version``/``_segmentation_version`` rebuild an f-string out of
+    SETTINGS, and ``_voice_fingerprint`` stats a ``.safetensors`` — none of
+    which is a property of the LINE being named. A single-line route pays that
+    once and never notices; ``/v1/build`` names up to
+    ``BUILD_MANIFEST_MAX_LINES`` lines per request and was paying all of it per
+    line, including the stat calls, on the event loop.
+
+    So the constants are computed ONCE per request and memoized here, and the
+    fingerprint is memoized per voice id (a cast of five speaking three hundred
+    lines is five stats, not six hundred). Built at REQUEST time, never at
+    import: a test that rebinds ``SETTINGS`` before a call must still be
+    honoured, which is the property ``_engine_version``'s docstring names.
+
+    The digest INPUTS are byte-for-byte what ``buildstore.speech_digest``
+    always received — this is a memo, not a new identity. Anything that could
+    change within one request (the voice's bytes being rewritten mid-manifest)
+    is exactly what a request-scoped memo is allowed to miss: the manifest is
+    named under the voice it started with, consistently for every line.
+    """
+
+    __slots__ = ("engine_version", "segmentation", "_fingerprints")
+
+    def __init__(self) -> None:
+        self.engine_version = _engine_version()
+        self.segmentation = _segmentation_version()
+        self._fingerprints: dict[str, str] = {}
+
+    def fingerprint(self, voice_id: str) -> str:
+        fp = self._fingerprints.get(voice_id)
+        if fp is None:
+            fp = self._fingerprints[voice_id] = _voice_fingerprint(voice_id)
+        return fp
+
+    def digest(self, voice_id: str, text: str, overrides: dict,
+               frames_after_eos: int | None, output_format: str) -> str:
+        return buildstore.speech_digest(
+            voice_id=voice_id,
+            voice_fingerprint=self.fingerprint(voice_id),
+            text=text,
+            overrides=overrides,
+            frames_after_eos=frames_after_eos,
+            output_format=output_format,
+            engine_version=self.engine_version,
+            segmentation=self.segmentation,
+        )
+
+
 def _speech_digest(voice_id: str, text: str, overrides: dict,
                    frames_after_eos: int | None, output_format: str) -> str:
     """``sha256:<hex>`` for a RESOLVED (voice, text, settings, format) request.
@@ -1263,18 +1343,12 @@ def _speech_digest(voice_id: str, text: str, overrides: dict,
     One function, every route: the drop-in route and a ``/v1/build`` line with
     identical inputs MUST produce the same string, because that identity is the
     entire product claim — a lockfile written by a build is what an ordinary
-    synthesis call answers to.
+    synthesis call answers to. Naming ONE clip; a route naming a whole manifest
+    holds a ``_RequestIdentity`` instead, which is this call with its constants
+    hoisted out of the loop.
     """
-    return buildstore.speech_digest(
-        voice_id=voice_id,
-        voice_fingerprint=_voice_fingerprint(voice_id),
-        text=text,
-        overrides=overrides,
-        frames_after_eos=frames_after_eos,
-        output_format=output_format,
-        engine_version=_engine_version(),
-        segmentation=_segmentation_version(),
-    )
+    return _RequestIdentity().digest(voice_id, text, overrides,
+                                     frames_after_eos, output_format)
 
 
 def _digest_headers(digest: str) -> dict[str, str]:
@@ -2011,11 +2085,13 @@ class BuildRequest(BaseModel):
     # so an unbounded manifest is a way for one caller to hold the pool.
     lines: list[BuildLine] = Field(
         ..., min_length=1, max_length=buildstore.BUILD_MANIFEST_MAX_LINES)
-    # PER-LINE horizon, not a budget for the whole manifest: a build renders its
-    # lines one after another (each line's bytes must be stored before the next
-    # is identified), so "this build must finish in 5s" is not a thing the
-    # scheduler can act on, while "schedule each of my lines against a 5s
-    # horizon" is exactly what the queue key consumes.
+    # PER-LINE horizon, not a budget for the whole manifest: a build is a
+    # variable number of independent renders spread over as many waves as the
+    # pool's parallelism needs, so "this build must finish in 5s" is not a thing
+    # the scheduler can act on, while "schedule each of my lines against a 5s
+    # horizon" is exactly what the queue key consumes. Each line is one render
+    # and gets the WHOLE number — never a 1/N slice, which would make a long
+    # manifest look more urgent per line than a short one.
     deadline_s: float | None = Field(None, gt=0, le=3600)
     # Accepted so it can be REFUSED loudly rather than ignored silently — see
     # build()'s 400. A build artifact is content-addressed and elastic quality
@@ -2023,23 +2099,105 @@ class BuildRequest(BaseModel):
     degrade_allowed: bool = False
 
 
-async def _line_identity(line: BuildLine, index: int) -> tuple[str, str, str, dict]:
-    """(resolved voice, output_format, digest, emotion headers) for one line.
+async def _manifest_identity(lines: list[BuildLine]) -> tuple[list[dict], str]:
+    """Resolve and NAME every line of a manifest. Returns (rows, engine_version).
+
+    Each row is ``{"id", "voice" (resolved), "format", "overrides", "digest"}``
+    in manifest order — the identity half of every build route, shared so that
+    plan, lock and build cannot drift into three different answers.
 
     Fails the whole manifest on an unknown voice/character, naming the line — a
-    build that silently skipped a line would produce a lockfile with a hole in it.
+    build that silently skipped a line would produce a lockfile with a hole in
+    it — and it fails on the FIRST bad line, so resolution stays sequential and
+    in order (``_resolve_emotion_address`` also records fallbacks in the emotion
+    demand ledger, which is order- and count-sensitive).
+
+    Naming, by contrast, is one batch: the digests for the whole manifest are
+    computed in a SINGLE executor hop, which is what takes the per-line
+    ``Path.stat()`` of ``_voice_fingerprint`` and the per-line sha256 off the
+    event loop, and ``_RequestIdentity`` hoists the version strings out of the
+    loop entirely. The inputs to each digest are unchanged, so every store
+    written by the old per-line path is still addressed by the same name.
     """
-    fmt_str = (line.format or "wav_24000")
-    _parse_format(fmt_str)  # 400s on an unsupported format, before any work
-    try:
-        resolved, emotion_headers = await _resolve_emotion_address(line.voice,
-                                                                   line.emotion)
-    except HTTPException as exc:
-        raise HTTPException(status_code=exc.status_code,
-                            detail=f"line {index} ({line.id!r}): {exc.detail}")
-    digest = _speech_digest(resolved, line.text, _overrides(line.settings),
-                            line.frames_after_eos, fmt_str)
-    return resolved, fmt_str, digest, emotion_headers
+    rows: list[dict] = []
+    for i, line in enumerate(lines):
+        fmt_str = (line.format or "wav_24000")
+        _parse_format(fmt_str)  # 400s on an unsupported format, before any work
+        try:
+            resolved, _emotion_headers = await _resolve_emotion_address(
+                line.voice, line.emotion)
+        except HTTPException as exc:
+            raise HTTPException(status_code=exc.status_code,
+                                detail=f"line {i} ({line.id!r}): {exc.detail}")
+        rows.append({"id": line.id, "voice": resolved, "format": fmt_str,
+                     "overrides": _overrides(line.settings)})
+
+    def _name_them() -> tuple[list[str], str]:
+        ident = _RequestIdentity()
+        return ([ident.digest(row["voice"], line.text, row["overrides"],
+                              line.frames_after_eos, row["format"])
+                 for row, line in zip(rows, lines)],
+                ident.engine_version)
+
+    digests, engine_version = await _offload(_name_them)
+    for row, digest in zip(rows, digests):
+        row["digest"] = digest
+    return rows, engine_version
+
+
+def _lock_lines(rows: list[dict], engine_version: str) -> list[dict]:
+    """The lockfile/record shape of a named manifest, in MANIFEST order.
+
+    Order matters even though ``lockfile`` and ``build_id`` sort: the build
+    record keeps this list as-is and ``zip_member_names`` walks it, so the
+    archive's member order is the order the caller wrote their script in —
+    never the order the pool happened to finish rendering it.
+    """
+    return [{"id": row["id"], "digest": row["digest"], "voice": row["voice"],
+             "format": row["format"], "engine_version": engine_version}
+            for row in rows]
+
+
+async def _stored_digests(digests: list[str]) -> set[str]:
+    """Which of these digests the artifact store already holds. ONE offload.
+
+    ``BUILD_STORE.has`` is a single ``is_file()``, but a manifest asked it once
+    per line through ``_offload`` — 300 lines were 300 executor round-trips
+    before the first worker was woken, each one a hop the event loop pays for.
+    Deduped first, because a manifest may legitimately name the same audio twice.
+    """
+    wanted = list(dict.fromkeys(digests))
+    if not wanted:
+        return set()
+    return set(await _offload(
+        lambda: [digest for digest in wanted if BUILD_STORE.has(digest)]))
+
+
+async def _render_build_line(line: BuildLine, row: dict,
+                             deadline_s: float | None):
+    """Render ONE build line and store its artifact under the row's digest.
+
+    Returns the response fragment for a rendered line, or the ordinary 429
+    JSONResponse when admission refused — backpressure is a RESPONSE here for
+    the same reason it is in ``_render_tts``: so a wave can settle around it
+    instead of each caller re-deriving it from an exception.
+
+    The emotion address is handed to ``_render_tts`` ALREADY resolved (the row
+    holds what ``_manifest_identity`` resolved to compute the digest): resolving
+    twice would count this line twice in the emotion demand ledger.
+    """
+    fmt = _parse_format(row["format"])
+    tts_req = TTSRequest(text=line.text, voice_settings=line.settings,
+                         frames_after_eos=line.frames_after_eos,
+                         deadline_s=deadline_s)
+    rendered = await _render_tts(line.voice, tts_req, line.emotion, None,
+                                 resolved=(row["voice"], {}))
+    if isinstance(rendered, JSONResponse):
+        return rendered
+    body, _format_headers = await _encode_audio(
+        fmt, rendered.audio.wav_bytes, rendered.audio.sample_rate)
+    await _store_artifact(row["digest"], body, fmt, rendered.audio)
+    return {"bytes": len(body), "audio_seconds": rendered.audio.audio_seconds}
 
 
 @app.post("/v1/build/plan", dependencies=[Depends(require_scope("tts"))])
@@ -2051,12 +2209,11 @@ async def build_plan(req: BuildRequest):
     reports 4,998 ``fresh`` and 2 ``would_render`` without waking a worker.
     Run it in a pull request and you know the audio diff before you pay for it.
     """
-    lines = []
-    for i, line in enumerate(req.lines):
-        _resolved, fmt_str, digest, _emotion = await _line_identity(line, i)
-        stored = await _offload(BUILD_STORE.has, digest)
-        lines.append({"id": line.id, "digest": digest, "format": fmt_str,
-                      "state": "fresh" if stored else "would_render"})
+    rows, _engine_version = await _manifest_identity(req.lines)
+    stored = await _stored_digests([row["digest"] for row in rows])
+    lines = [{"id": row["id"], "digest": row["digest"], "format": row["format"],
+              "state": "fresh" if row["digest"] in stored else "would_render"}
+             for row in rows]
     return {
         "lines": lines,
         "fresh": sum(1 for l in lines if l["state"] == "fresh"),
@@ -2086,13 +2243,8 @@ async def build_lock(req: BuildRequest):
     if dupes:
         raise HTTPException(status_code=422,
                             detail=buildstore.DUPLICATE_LINE_ID + ", ".join(dupes))
-    engine_version = _engine_version()
-    lines = []
-    for i, line in enumerate(req.lines):
-        resolved, fmt_str, digest, _emotion = await _line_identity(line, i)
-        lines.append({"id": line.id, "digest": digest, "voice": resolved,
-                      "format": fmt_str, "engine_version": engine_version})
-    return buildstore.lockfile(lines)
+    rows, engine_version = await _manifest_identity(req.lines)
+    return buildstore.lockfile(_lock_lines(rows, engine_version))
 
 
 @app.post("/v1/build", dependencies=[Depends(require_scope("tts"))])
@@ -2111,9 +2263,32 @@ async def build(req: BuildRequest):
     ordinary call with the same inputs report the same digest and produce the
     same artifact — the two must never be two synthesis paths.
 
+    AND IT GOES THROUGH THE POOL, not one line at a time. This route is the one
+    made for 300-line scripts and was the only synthesis path that rendered
+    strictly sequentially, taking N× the serial latency of a script that
+    /v1/speak and /v1/performance would have rendered in waves. Lines are
+    rendered in waves of ``_max_batch_units()`` UNITS (``_pack_waves``) — the
+    same budget, from the same function, as every other batched route, because
+    two different answers to "how many units may one request submit" would be
+    worse than one wrong one.
+
+    Concurrency is invisible in the ARTIFACT, which is the whole point: the
+    lockfile, the build id, the response lines and the zip are all assembled
+    from the manifest-ordered rows, never from completion order, and each line's
+    bytes are stored under a digest computed before a worker was woken. Which
+    lines happen to share a wave, and which finishes first, changes nothing a
+    caller can observe. (Worker COUNT is a different matter and always was: it
+    is folded into ``_segmentation_version`` because it decides where a long
+    line's seams land, and seams are audible.)
+
     Admission is untouched and shared: a saturated pool returns the ordinary 429
     + ``Retry-After``, and the lines already rendered are already stored, so a
-    retried build resumes instead of restarting.
+    retried build resumes instead of restarting. A rejection mid-manifest now
+    resumes from FURTHER along than it used to: the refused line's in-flight
+    siblings are awaited and stored rather than thrown away (they are finished
+    audio, not a burning worker slot — the same trade
+    ``_submit_and_gather_in_waves`` makes), and the 429 is still returned
+    before any build record is written.
 
     ``deadline_s`` reaches the engine for every line it renders (a PER-LINE
     horizon — see BuildRequest). ``degrade_allowed`` is REFUSED with a 400
@@ -2132,35 +2307,61 @@ async def build(req: BuildRequest):
                    "cheaper render would store different bytes under that same "
                    "name. Use deadline_s alone here, or the /v1/text-to-speech "
                    "routes if you want elastic quality.")
+    rows, engine_version = await _manifest_identity(req.lines)
+    lock_lines = _lock_lines(rows, engine_version)
+    stored = await _stored_digests([row["digest"] for row in rows])
+
+    # WHICH lines actually run: the FIRST occurrence of each unstored digest.
+    # Deduping before dispatch (rather than as the sequential loop's
+    # ``rendered_now`` did, after each render) is what keeps "two lines with
+    # identical inputs are rendered once" true when the two would otherwise be
+    # in the same wave.
+    todo: dict[str, int] = {}
+    for i, row in enumerate(rows):
+        if row["digest"] not in stored and row["digest"] not in todo:
+            todo[row["digest"]] = i
+    pending = list(todo.values())
+
+    cap = max(1, _max_batch_units())
+    # A line's weight is the unit count ``_render_tts`` will submit for it —
+    # the same pure ``_chunk_text`` call it makes — so a wave never exceeds the
+    # unit budget just because its lines were long.
+    weights = [len(_chunk_text(req.lines[i].text, max_units=cap))
+               for i in pending]
+    outcome: dict[str, dict] = {}
+    for wave in _pack_waves(weights, cap):
+        # return_exceptions: a sibling that already finished has already stored
+        # its artifact, and cancelling it mid-await would throw away audio a
+        # retry would otherwise find fresh. The problem is raised (or returned)
+        # after the wave settles, in manifest order, so WHICH line fails a
+        # manifest does not depend on scheduling.
+        settled = await asyncio.gather(
+            *(_render_build_line(req.lines[pending[k]], rows[pending[k]],
+                                 req.deadline_s) for k in wave),
+            return_exceptions=True)
+        problem = None
+        for k, result in zip(wave, settled):
+            if isinstance(result, dict):
+                outcome[rows[pending[k]]["digest"]] = result
+            elif problem is None:
+                problem = result
+        if isinstance(problem, JSONResponse):
+            return problem  # backpressure — same 429 every other route returns
+        if problem is not None:
+            raise problem
+
     results = []
-    lock_lines = []
-    engine_version = _engine_version()
-    rendered_now: set[str] = set()
-    for i, line in enumerate(req.lines):
-        resolved, fmt_str, digest, _emotion = await _line_identity(line, i)
-        lock_lines.append({"id": line.id, "digest": digest, "voice": resolved,
-                           "format": fmt_str, "engine_version": engine_version})
-        if digest in rendered_now or await _offload(BUILD_STORE.has, digest):
-            results.append({"id": line.id, "digest": digest, "format": fmt_str,
-                            "state": "fresh"})
-            continue
-        fmt = _parse_format(fmt_str)
-        tts_req = TTSRequest(text=line.text, voice_settings=line.settings,
-                             frames_after_eos=line.frames_after_eos,
-                             deadline_s=req.deadline_s)
-        rendered = await _render_tts(line.voice, tts_req, line.emotion, None,
-                                     resolved=(resolved, {}))
-        if isinstance(rendered, JSONResponse):
-            return rendered  # backpressure — same 429 every other route returns
-        body, _format_headers = await _encode_audio(
-            fmt, rendered.audio.wav_bytes, rendered.audio.sample_rate)
-        await _store_artifact(digest, body, fmt, rendered.audio)
-        rendered_now.add(digest)
-        results.append({
-            "id": line.id, "digest": digest, "format": fmt_str,
-            "state": "rendered", "bytes": len(body),
-            "audio_seconds": rendered.audio.audio_seconds,
-        })
+    for i, row in enumerate(rows):
+        # ``todo[digest] == i`` and not merely "this digest was rendered": the
+        # repeat of a digest is ``fresh`` off its twin's render, exactly as the
+        # sequential loop reported it.
+        got = outcome.get(row["digest"]) if todo.get(row["digest"]) == i else None
+        entry = {"id": row["id"], "digest": row["digest"],
+                 "format": row["format"],
+                 "state": "rendered" if got is not None else "fresh"}
+        if got is not None:
+            entry.update(got)
+        results.append(entry)
     build_ident = await _record_build(lock_lines)
     return {
         "lines": results,
@@ -2231,12 +2432,15 @@ async def get_build_zip(build_id: str):
         raise HTTPException(status_code=404, detail=buildstore.BUILD_NOT_FOUND)
 
     lines = [ln for ln in (record.get("lines") or []) if ln.get("digest")]
-    missing, total = [], 0
-    for line in lines:
-        size = await _offload(BUILD_STORE.size_of, line["digest"])
-        if not size:
-            missing.append(line["digest"])
-        total += size
+    # ONE executor hop for the whole pre-flight, not one per line: a 300-line
+    # build used to be 300 thread round-trips before its first byte moved, all
+    # of them to ask for a stat. (The member READS stay lazy and per line —
+    # they are the point of streaming, and Starlette already iterates this
+    # sync generator off the loop.)
+    sizes = await _offload(
+        lambda: [BUILD_STORE.size_of(ln["digest"]) for ln in lines])
+    missing = [ln["digest"] for ln, size in zip(lines, sizes) if not size]
+    total = sum(sizes)
     if missing:
         raise HTTPException(status_code=410,
                             detail=buildstore.BUILD_PRUNED + ", ".join(missing))
