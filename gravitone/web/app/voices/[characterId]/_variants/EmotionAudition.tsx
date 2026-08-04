@@ -84,6 +84,17 @@ export default function EmotionAudition({ name, slots }: {
 
   return (
     <div className="glass-panel mt-4 rounded-xl p-4">
+      {/* The run's one announcement. `aria-live` without `role="status"` on
+          purpose: it is the same live-region mechanism, and it does not add a
+          second element with the status role to a page that already has one. */}
+      <p aria-live="polite" className="sr-only">
+        {running
+          ? ""
+          : tally.ready + tally.failed > 0
+            ? `Audition finished — ${tally.ready} of ${targets.length} voices rendered`
+              + (tally.failed > 0 ? `, ${tally.failed} failed.` : ".")
+            : ""}
+      </p>
       <div className="font-jetbrains mb-3 flex flex-wrap items-center justify-between gap-2 text-[11px] uppercase tracking-widest text-white/60">
         <span>emotion audition</span>
         <span>
@@ -167,7 +178,13 @@ export default function EmotionAudition({ name, slots }: {
                 <button
                   onClick={() => void play(t)}
                   disabled={!ready}
-                  aria-label={isPlaying ? `Stop ${t.label}` : `Play ${t.label}`}
+                  // Named for the AUDITION, not just the emotion: the rack row
+                  // above has its own "Play Baseline", and two controls sharing
+                  // one accessible name is a real ambiguity for anyone who
+                  // navigates by name rather than by position.
+                  aria-label={isPlaying
+                    ? `Stop the auditioned ${t.label} take`
+                    : `Play the auditioned ${t.label} take`}
                   title={ready ? `Play ${name}'s ${t.label} take of this line` : "Audition first"}
                   className="grid h-7 w-7 shrink-0 place-items-center rounded-full text-[11px] text-slate-950 transition hover:brightness-110 disabled:opacity-25"
                   style={{ background: `hsl(${hue} 85% 64%)` }}
@@ -175,10 +192,10 @@ export default function EmotionAudition({ name, slots }: {
                   {isPlaying ? "⏸" : "▶"}
                 </button>
               </div>
-              {/* role=status, not an alert: these transitions narrate a run the
-                  user started, and eight alerts would shout over each other. */}
+              {/* Not a live region: eight tiles each announcing themselves
+                  would shout over each other (and over the page's own status
+                  region). The run gets ONE announcement, above. */}
               <p
-                role="status"
                 title={cell?.kind === "failed" ? cell.reason : undefined}
                 className={`font-jetbrains mt-2 line-clamp-2 text-[11px] leading-relaxed ${status.tone}`}
               >

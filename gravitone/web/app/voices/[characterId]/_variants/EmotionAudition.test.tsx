@@ -69,7 +69,7 @@ describe("EmotionAudition", () => {
     // The other tile still succeeded — one failure is not a failed run.
     expect(screen.getByText("1/2 rendered")).toBeInTheDocument();
     // And the failed tile is NOT left offering a play button over nothing.
-    expect(screen.getByRole("button", { name: /^Play Happy$/ })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /Play the auditioned Happy take/ })).toBeDisabled();
   });
 
   it("reads a 429 as a wait with the backend's own Retry-After", async () => {
