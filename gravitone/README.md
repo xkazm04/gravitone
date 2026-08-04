@@ -465,6 +465,27 @@ curl -X POST "localhost:8080/v1/performance" \
 curl -s -H "xi-api-key: $KEY" localhost:8080/v1/characters/sarah/manifest
 ```
 
+### What repeats, and what doesn't — the determinism contract
+
+Emotion here is a **recording you auditioned**, not a knob you nudged, so the
+things that repeat are worth stating precisely — and so are the things that
+don't. Full document: [`docs/DETERMINISM.md`](docs/DETERMINISM.md), asserted by
+`service/tests/test_determinism.py`.
+
+- **Emotion selection is arithmetic, not a suggestion.** `sarah:angry` resolves
+  to the same embedding every time; the fallback walk is a pure function of the
+  Character's slots, independent of registry ordering.
+- **The sampling knobs are a fixed function of your request.** Nothing between
+  the HTTP body and the model adds jitter, and inert compatibility settings are
+  reported via `X-Ignored-Settings` rather than secretly mapped onto something.
+- **An identical request is replayed, not re-rolled** — byte-for-byte, while the
+  render is held (`X-Cache: hit`; per process, byte-budgeted, not persisted,
+  and skippable with `Cache-Control: no-store`).
+- **A cold re-render is NOT byte-identical, and we don't pretend it is.** Pocket
+  TTS samples at `temp` and nothing on this path seeds an RNG. There is no
+  `seed` parameter, deliberately — `docs/DETERMINISM.md` explains why a
+  three-line one was rejected rather than shipped.
+
 ### Consent receipts — every clone is on the record
 
 Cloning is gated on an ownership attestation, and the **exact** statement the
