@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, computed_field
 
 import numpy as np
 
@@ -114,6 +114,26 @@ class Voice(BaseModel):
     # remark about one recording at the moment it was made — not a property of
     # the Voice. Absent (the normal case) means no check was available.
     label_check: dict | None = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def labels(self) -> dict[str, str]:
+        """ElevenLabs' free-form `labels` map — the field EL clients filter on.
+
+        COMPUTED, never stored: every value below is one of this Voice's own
+        fields restated under the name an EL client already looks for, so it
+        cannot drift from the row and no construction site had to change. That
+        is also why nothing is invented here — an EL voice's labels typically
+        carry `accent`/`age`/`gender`/`use case`, and we do not know any of
+        those about a cloned voice, so we do not claim them. A missing key is
+        readable; a guessed one is not.
+        """
+        return {
+            "character": self.character_id,
+            "emotion": self.emotion,
+            "language": self.lang.lower(),
+            "origin": self.origin,  # recorded | derived
+        }
 
 
 class Character(BaseModel):

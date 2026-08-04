@@ -233,6 +233,220 @@ class IgnoredSettingsTests(_Base):
         self.assertNotIn("x-ignored-settings", r.headers)
 
 
+# The body an UNMODIFIED ElevenLabs client sends today: every field the current
+# text_to_speech.convert / .stream contract can put on the wire. The one thing
+# this file exists to guarantee is that this dict never produces a 422.
+ELEVENLABS_BODY = {
+    "text": "Same request, new base URL.",
+    "model_id": "eleven_multilingual_v2",
+    "language_code": "en",
+    "voice_settings": {
+        "stability": 0.5,
+        "similarity_boost": 0.75,
+        "style": 0.2,
+        "use_speaker_boost": True,
+        "speed": 1.0,
+    },
+    "seed": 12345,
+    "previous_text": "The sentence before.",
+    "next_text": "The sentence after.",
+    "previous_request_ids": ["req_a"],
+    "next_request_ids": ["req_b"],
+    "pronunciation_dictionary_locators": [
+        {"pronunciation_dictionary_id": "pd_1", "version_id": "v_1"}],
+    "apply_text_normalization": "auto",
+    "apply_language_text_normalization": False,
+    "use_pvc_as_ivc": False,
+}
+
+
+class UnmodifiedElevenLabsClientTests(_Base):
+    """A stock EL SDK request must synthesize — never 422, never silently.
+
+    Two halves, and both matter:
+      * every field above is ACCEPTED (the drop-in promise), and
+      * every field we cannot act on is NAMED on X-Ignored-Settings (the
+        honesty promise — a parameter that silently does nothing is a bug
+        report waiting to happen).
+    """
+
+    def test_full_elevenlabs_body_synthesizes(self) -> None:
+        r = self.client.post("/v1/text-to-speech/alba", json=ELEVENLABS_BODY)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.headers["content-type"], "audio/wav")
+        self.assertEqual(r.content[:4], b"RIFF")
+
+    def test_no_elevenlabs_field_is_a_422(self) -> None:
+        """Each field ALONE, so one bad annotation can't hide behind another."""
+        for key, value in ELEVENLABS_BODY.items():
+            if key == "text":
+                continue
+            with self.subTest(field=key):
+                r = self.client.post("/v1/text-to-speech/alba",
+                                     json={"text": "Hi.", key: value})
+                self.assertEqual(r.status_code, 200, f"{key}: {r.text}")
+
+    def test_every_inert_field_is_named_on_the_header(self) -> None:
+        r = self.client.post("/v1/text-to-speech/alba", json=ELEVENLABS_BODY)
+        named = set(r.headers["x-ignored-settings"].split(","))
+        # voice_settings level
+        for f in ("similarity_boost", "style", "use_speaker_boost", "speed"):
+            self.assertIn(f, named)
+        # top level
+        for f in appmod._INERT_REQUEST_FIELDS:
+            self.assertIn(f, named)
+        # ...and the ones we DO honour are not slandered as ignored.
+        for f in ("stability", "temperature", "quality", "model_id", "text"):
+            self.assertNotIn(f, named)
+
+    def test_honoured_settings_survive_the_inert_ones(self) -> None:
+        """stability still maps, and the inert fields add no phantom overrides.
+
+        The risk this pins is the opposite of a 422: that accepting more fields
+        quietly starts sending something extra to the model. The override dict
+        an EL-shaped body produces must be EXACTLY the stability mapping.
+        """
+        vs = appmod.VoiceSettings(**ELEVENLABS_BODY["voice_settings"])
+        # stability 0.5 -> 2.5 - 2.0*0.5 = 1.5, and nothing else.
+        self.assertEqual(appmod._overrides(vs), {"noise_clamp": 1.5})
+
+    def test_top_level_fields_only_reported_when_sent(self) -> None:
+        """model_fields_set, not value: an unsent field is not "ignored"."""
+        r = self.client.post("/v1/text-to-speech/alba",
+                             json={"text": "Hi.", "seed": 7})
+        self.assertEqual(r.headers["x-ignored-settings"], "seed")
+
+    def test_false_valued_field_is_still_reported(self) -> None:
+        """`use_pvc_as_ivc: false` was SENT — a value-only check would miss it."""
+        r = self.client.post("/v1/text-to-speech/alba",
+                             json={"text": "Hi.", "use_pvc_as_ivc": False,
+                                   "apply_language_text_normalization": False})
+        named = r.headers["x-ignored-settings"].split(",")
+        self.assertIn("use_pvc_as_ivc", named)
+        self.assertIn("apply_language_text_normalization", named)
+
+    def test_elevenlabs_stream_default_format_succeeds(self) -> None:
+        """The EL SDK streams mp3_44100_128 by default; it must not 501."""
+        captured: dict = {}
+
+        def fake_run(cmd, input=None, stdout=None, stderr=None, **kw):
+            captured["cmd"] = cmd
+            import types as _t
+            return _t.SimpleNamespace(returncode=0, stdout=b"MP3DATA", stderr=b"")
+
+        orig = enginemod.subprocess.run
+        enginemod.subprocess.run = fake_run
+        try:
+            r = self.client.post("/v1/text-to-speech/alba/stream",
+                                 params={"output_format": "mp3_44100_128"},
+                                 json=ELEVENLABS_BODY)
+        finally:
+            enginemod.subprocess.run = orig
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.headers["content-type"], "audio/mpeg")
+        # Not a stream, and it says so rather than pretending.
+        self.assertEqual(r.headers["x-stream"], "full-body")
+        self.assertIn("cannot be transcoded incrementally",
+                      r.headers["x-stream-fallback"])
+        # The requested rate still reached ffmpeg — the fallback is about
+        # chunking, not about ignoring the format.
+        self.assertEqual(captured["cmd"][captured["cmd"].index("-ar") + 1], "44100")
+
+    def test_stream_with_timestamps_alias_is_not_a_404(self) -> None:
+        """EL's /stream/with-timestamps path resolves to our handler.
+
+        Whether it then answers 200 or 501 depends on whether this replica has
+        a transcriber (the alignment is computed by listening — see the route's
+        docstring). What it must never be again is 404, which reads to a
+        migrating client as "you typed the URL wrong".
+        """
+        r = self.client.post("/v1/text-to-speech/alba/stream/with-timestamps",
+                             json=ELEVENLABS_BODY)
+        self.assertNotEqual(r.status_code, 404)
+        self.assertIn(r.status_code, (200, 501))
+
+
+class MigrationGuideClaimsTests(_Base):
+    """Claims docs/SWITCH_FROM_ELEVENLABS.md makes, pinned to the code.
+
+    A migration guide is a promise to someone who has not run the code yet, so
+    every row of its tables has to be a fact about this build rather than an
+    aspiration. These are the claims that are not already covered above.
+    """
+
+    def test_unknown_query_params_are_ignored_not_rejected(self) -> None:
+        """"Unknown query parameters ... never fail a request"."""
+        r = self.client.post(
+            "/v1/text-to-speech/alba",
+            params={"output_format": "wav_24000",
+                    "optimize_streaming_latency": 3,
+                    "enable_logging": "true",
+                    "a_param_that_does_not_exist": "x"},
+            json={"text": "Hi."})
+        self.assertEqual(r.status_code, 200, r.text)
+
+    def test_unsupported_format_families_are_400_not_a_substitution(self) -> None:
+        """"ogg_*, ulaw_*, alaw_* -> 400, listing the supported grammar"."""
+        for bad in ("ogg_24000", "ulaw_8000", "alaw_8000", "flac"):
+            with self.subTest(output_format=bad):
+                r = self.client.post("/v1/text-to-speech/alba",
+                                     params={"output_format": bad},
+                                     json={"text": "Hi."})
+                self.assertEqual(r.status_code, 400)
+                self.assertIn("Supported", r.json()["detail"])
+
+    def test_there_is_no_credit_meter_to_read(self) -> None:
+        """"GET /v1/user, /v1/user/subscription -> 404, on purpose".
+
+        This asserts an ABSENCE, deliberately: the guide tells a migrating
+        developer to delete their quota-guard code, and that instruction is only
+        safe while these endpoints do not exist. If someone ever adds a
+        subscription surface, this test should fail and the guide should change
+        with it.
+        """
+        for path in ("/v1/user", "/v1/user/subscription"):
+            with self.subTest(path=path):
+                self.assertEqual(self.client.get(path).status_code, 404)
+
+    def test_repeatability_is_offered_by_digest_since_seed_is_inert(self) -> None:
+        """The guide sends `seed` users to X-Speech-Digest + If-None-Match."""
+        r = self.client.post("/v1/text-to-speech/alba", json={"text": "Hi."})
+        digest = r.headers["x-speech-digest"]
+        self.assertTrue(digest.startswith("sha256:"))
+        again = self.client.post("/v1/text-to-speech/alba", json={"text": "Hi."},
+                                 headers={"If-None-Match": r.headers["etag"]})
+        self.assertEqual(again.status_code, 304)
+
+    def test_the_guides_curl_and_fetch_shape_synthesizes(self) -> None:
+        """The exact shape of the curl / requests / fetch examples."""
+        r = self.client.post(
+            "/v1/text-to-speech/alba",
+            params={"output_format": "mp3_44100_128"},
+            headers={"xi-api-key": "anything", "Content-Type": "application/json"},
+            json={"text": "Same request, no per-character bill."})
+        # ffmpeg may or may not exist on this box; what the guide promises is
+        # that the REQUEST is accepted, not that this machine can encode mp3.
+        self.assertNotIn(r.status_code, (400, 422), r.text)
+
+
+class VoiceLabelsTests(_Base):
+    def test_labels_are_present_and_derived_from_the_row(self) -> None:
+        v = self.client.get("/v1/voices").json()["voices"][0]
+        self.assertIn("labels", v)
+        labels = v["labels"]
+        # Every value restates a field of the SAME voice — nothing invented.
+        self.assertEqual(labels["character"], v["character_id"])
+        self.assertEqual(labels["emotion"], v["emotion"])
+        self.assertEqual(labels["language"], v["lang"].lower())
+        self.assertEqual(labels["origin"], v["origin"])
+
+    def test_no_guessed_elevenlabs_labels(self) -> None:
+        """We do not know a cloned voice's accent/age/gender. So we don't say."""
+        labels = self.client.get("/v1/voices").json()["voices"][0]["labels"]
+        for guessed in ("accent", "age", "gender", "use case", "descriptive"):
+            self.assertNotIn(guessed, labels)
+
+
 class PremiumRouteFormatTests(_Base):
     """/v1/speak and /v1/performance honour the SAME output_format grammar.
 

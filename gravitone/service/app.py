@@ -183,7 +183,8 @@ CORS_EXPOSE_HEADERS = [
     "X-Ignored-Settings", "X-Performance-Report", "X-Quality-Level",
     "X-Queue-Seconds",
     "X-Realtime-Factor", "X-Sample-Rate", "X-Segments", "X-Speech-Digest",
-    "X-Stream", "X-Stream-Segments", "X-Synth-Seconds", "X-Synth-Segments",
+    "X-Stream", "X-Stream-Fallback", "X-Stream-Segments",
+    "X-Synth-Seconds", "X-Synth-Segments",
 ]
 # What the API actually accepts. Named explicitly rather than "*": the
 # allow-list IS the policy, and a browser's preflight asks about exactly these.
@@ -258,6 +259,14 @@ class VoiceSettings(BaseModel):
         `X-Ignored-Settings: similarity_boost,style` header so the no-op is
         visible, never silent. If pocket-tts later exposes a reference-adherence
         or style knob, map it here and drop the name from `_ignored_settings`.
+
+        `use_speaker_boost` and `speed` are the rest of the current EL
+        VoiceSettings contract and are inert for the same reason: there is no
+        speaker-boost stage in this pipeline, and pocket-tts has no rate control
+        (resampling would change the pitch, which is not what `speed` means).
+        They are DECLARED here rather than left to pydantic's extra-ignore
+        because a field the model does not know about is dropped SILENTLY — and
+        a silent drop is the one thing this header exists to prevent.
     """
     # 0.5 (consistent) .. 1.0 (expressive). Model default 0.7.
     temperature: float | None = None
@@ -266,9 +275,11 @@ class VoiceSettings(BaseModel):
     # 1 (fast) .. 5 (best). Mapped to `lsd_decode_steps`; costs realtime factor.
     quality: int | None = None
     # Accepted for ElevenLabs compatibility; inert (see class docstring). A
-    # request that sets either is reported via the X-Ignored-Settings header.
+    # request that sets any of these is reported via X-Ignored-Settings.
     similarity_boost: float | None = None
     style: float | None = None
+    use_speaker_boost: bool | None = None
+    speed: float | None = None
 
 
 def _overrides(vs: VoiceSettings | None) -> dict:
@@ -287,6 +298,10 @@ def _overrides(vs: VoiceSettings | None) -> dict:
     return o
 
 
+# VoiceSettings fields that reach nothing. Ordered, so the header is stable.
+_INERT_VOICE_SETTINGS = ("similarity_boost", "style", "use_speaker_boost", "speed")
+
+
 def _ignored_settings(vs: VoiceSettings | None) -> list[str]:
     """ElevenLabs VoiceSettings fields we accept but cannot honestly honour.
 
@@ -294,18 +309,64 @@ def _ignored_settings(vs: VoiceSettings | None) -> list[str]:
     appears when a client really sent one), preserving a stable order."""
     if vs is None:
         return []
-    ignored = []
-    if vs.similarity_boost is not None:
-        ignored.append("similarity_boost")
-    if vs.style is not None:
-        ignored.append("style")
-    return ignored
+    return [name for name in _INERT_VOICE_SETTINGS
+            if getattr(vs, name, None) is not None]
 
 
-def _ignored_headers(vs: VoiceSettings | None) -> dict[str, str]:
-    """{'X-Ignored-Settings': 'similarity_boost,style'} or {} if none ignored."""
-    names = _ignored_settings(vs)
+def _ignored_request_fields(req: "TTSRequest | None") -> list[str]:
+    """Top-level ElevenLabs request fields we accept but do not act on.
+
+    Same contract as `_ignored_settings`, one level up. These are reported by
+    `model_fields_set` — "the client actually sent it" — rather than by value,
+    because several of them (`use_pvc_as_ivc: false`,
+    `apply_language_text_normalization: false`) have a meaningful default that
+    is indistinguishable from absence if you only look at the value.
+    """
+    if req is None:
+        return []
+    sent = req.model_fields_set
+    return [name for name in _INERT_REQUEST_FIELDS if name in sent]
+
+
+def _ignored_headers(vs: VoiceSettings | None,
+                     req: "TTSRequest | None" = None) -> dict[str, str]:
+    """{'X-Ignored-Settings': 'similarity_boost,seed'} or {} if none ignored.
+
+    ONE header for both levels of the request: a client debugging "why did my
+    parameter do nothing" should not have to know whether the parameter it sent
+    lived in `voice_settings` or at the top level. `req` is optional because the
+    Gravitone-native routes (/v1/speak, /v1/performance) have their own body
+    models, which never carried the EL top-level fields.
+    """
+    names = _ignored_settings(vs) + _ignored_request_fields(req)
     return {"X-Ignored-Settings": ",".join(names)} if names else {}
+
+
+# Top-level ElevenLabs request-body fields that reach nothing here. Declared on
+# TTSRequest (below) so they are ACKNOWLEDGED rather than silently dropped by
+# pydantic's extra-ignore, and reported on X-Ignored-Settings. Ordered.
+#
+# Why each is inert, so nobody "fixes" one by wiring it to the nearest knob:
+#   seed                              - pocket-tts exposes no sampler seed, so
+#                                       there is nothing to make deterministic.
+#                                       (Repeatability IS available, by a
+#                                       different mechanism: X-Speech-Digest /
+#                                       If-None-Match return the same bytes.)
+#   language_code                     - one English model; see GET /v1/models.
+#   previous_text / next_text         - no cross-request prosody conditioning.
+#   previous_request_ids /
+#     next_request_ids                - same, by request id.
+#   pronunciation_dictionary_locators - no pronunciation dictionaries.
+#   apply_text_normalization /
+#     apply_language_text_normalization - normalization here is fixed, not a
+#                                       per-request switch.
+#   use_pvc_as_ivc                    - no PVC/IVC distinction in our voices.
+_INERT_REQUEST_FIELDS = (
+    "seed", "language_code", "previous_text", "next_text",
+    "previous_request_ids", "next_request_ids",
+    "pronunciation_dictionary_locators", "apply_text_normalization",
+    "apply_language_text_normalization", "use_pvc_as_ivc",
+)
 
 
 class TTSRequest(BaseModel):
@@ -313,6 +374,21 @@ class TTSRequest(BaseModel):
     model_id: str | None = "pocket_tts"
     voice_settings: VoiceSettings | None = None
     frames_after_eos: int | None = None
+    # --- ElevenLabs drop-in: accepted, typed, and inert (see
+    # _INERT_REQUEST_FIELDS). Typed loosely on purpose: the point is that an
+    # unmodified EL client never gets a 422 for sending its own contract, so a
+    # field whose exact EL type drifts must not become a validation failure
+    # here. Nothing downstream reads them.
+    seed: int | None = None
+    language_code: str | None = None
+    previous_text: str | None = None
+    next_text: str | None = None
+    previous_request_ids: list[str] | None = None
+    next_request_ids: list[str] | None = None
+    pronunciation_dictionary_locators: list[dict] | None = None
+    apply_text_normalization: str | None = None
+    apply_language_text_normalization: bool | None = None
+    use_pvc_as_ivc: bool | None = None
     # The deadline contract. Absent = the previous behaviour exactly: bulk
     # class, arrival order, full quality. degrade_allowed is opt-in because a
     # cheaper render nobody asked for is silent quality loss.
@@ -1548,7 +1624,7 @@ async def text_to_speech(
             **extra_headers,
             **rendered.emotion_headers,
             **digest_headers,
-            **_ignored_headers(req.voice_settings),
+            **_ignored_headers(req.voice_settings, req),
             **verify_headers,
         },
     )
@@ -1759,6 +1835,15 @@ def _alignment_payload(text: str, transcript, audio: CachedAudio) -> _CachedAlig
 
 @app.post("/v1/text-to-speech/{voice_id}/with-timestamps",
           dependencies=[Depends(require_scope("tts"))])
+# ElevenLabs' streaming timestamps path, served by the SAME handler. It is an
+# alias, not a stream: EL's version emits a sequence of JSON alignment frames,
+# and ours cannot — the alignment is computed by listening to the FINISHED clip
+# (see the docstring), so there is nothing to emit until it exists. A 404 on
+# this path told a migrating client "wrong URL", which is a worse answer than
+# the complete, correctly-shaped payload it was asking for. The `X-Stream:
+# full-body` header on the response says which one it got.
+@app.post("/v1/text-to-speech/{voice_id}/stream/with-timestamps",
+          dependencies=[Depends(require_scope("tts"))])
 async def text_to_speech_with_timestamps(
     voice_id: str,
     req: TTSRequest,
@@ -1825,12 +1910,58 @@ async def text_to_speech_with_timestamps(
             **rendered.timing_headers(),
             **extra_headers,
             **rendered.emotion_headers,
-            **_ignored_headers(req.voice_settings),
+            **_ignored_headers(req.voice_settings, req),
             # The verdict travels as a header too, so a client that only wants
             # "was it right?" does not have to parse the timeline to find out.
             "X-Fidelity-Score": verify.format_score(
                 entry.data["fidelity"]["score"]),
             "X-Alignment-Cache": "hit" if align_cached else "miss",
+            # Only on the /stream/with-timestamps alias, so the original path's
+            # response is byte-identical to what it always returned.
+            **({"X-Stream": "full-body"}
+               if request is not None
+               and request.url.path.endswith("/stream/with-timestamps") else {}),
+        },
+    )
+
+
+_MP3_STREAM_FALLBACK = (
+    "mp3 cannot be transcoded incrementally, so this response is the complete "
+    "clip in one body rather than a progressive stream. Use output_format="
+    "pcm_24000 or wav_24000 for a genuinely chunked stream."
+)
+
+
+async def _stream_mp3_full_body(voice_id: str, req: "TTSRequest",
+                                emotion: str | None, fmt: _AudioFormat,
+                                request: Request | None):
+    """Serve `/stream` + `mp3_*` as one full body, labelled as such.
+
+    Shares the drop-in route's synthesis path (`_render_tts`) rather than
+    re-deriving one, so the cache, admission, emotion resolution and timing
+    headers are the SAME here as on `/v1/text-to-speech` — a fallback that
+    behaved differently from the route it falls back to would be a second
+    answer to "what does this request produce".
+
+    Timing headers ARE emitted (unlike the real streaming path, which cannot
+    know them when its headers flush) because nothing is progressive here:
+    the clip is finished before a byte is written.
+    """
+    rendered = await _render_tts(voice_id, req, emotion, request)
+    if isinstance(rendered, JSONResponse):
+        return rendered  # backpressure — identical to the streaming path's 429
+    body, format_headers = await _encode_audio(fmt, rendered.audio.wav_bytes,
+                                               rendered.audio.sample_rate)
+    return Response(
+        content=body, media_type=fmt.content_type,
+        headers={
+            **rendered.timing_headers(),
+            **dict(rendered.extra_headers),
+            **format_headers,
+            **rendered.emotion_headers,
+            **_ignored_headers(req.voice_settings, req),
+            "X-Stream": "full-body",
+            "X-Stream-Fallback": _MP3_STREAM_FALLBACK,
         },
     )
 
@@ -1842,6 +1973,7 @@ async def text_to_speech_stream(
     req: TTSRequest,
     output_format: str = Query("wav_24000"),
     emotion: str | None = Query(None, description="Gravitone extension: address a Character's emotion voice (or use {character_id}:{emotion} as the path voice_id)"),
+    request: Request = None,
 ):
     """Low-latency streaming synthesis (ElevenLabs' headline feature).
 
@@ -1860,9 +1992,24 @@ async def text_to_speech_stream(
     streamed — the failure scaled exactly with the input people demo with.
 
     Formats: `pcm_*` streams raw PCM16 chunks; `wav_*` streams a single
-    streaming WAV header then raw PCM16 samples; `mp3_*` returns 501 (MP3 needs
-    the whole clip to transcode, which defeats streaming — use the non-stream
-    route for MP3).
+    streaming WAV header then raw PCM16 samples.
+
+    `mp3_*` is INCREMENTALLY IMPOSSIBLE here — the transcode needs the complete
+    clip — but it is the ElevenLabs SDK's DEFAULT for this endpoint
+    (`mp3_44100_128`), so refusing it means an unmodified EL client's
+    `stream()` call fails on a base-URL swap. It used to 501 for exactly that
+    reason and that was the wrong trade: correctness of the word "stream"
+    bought at the price of the drop-in promise. So mp3 renders the whole clip
+    and answers with a single full body — the same bytes the non-stream route
+    would return, delivered as one chunk. Every mp3 response says so out loud:
+
+        X-Stream: full-body
+        X-Stream-Fallback: mp3 cannot be transcoded incrementally …
+
+    That is an honest degradation, not a silent one: a client that cares about
+    time-to-first-byte can read the header and switch to `pcm_*`/`wav_*` (which
+    genuinely stream), and one that only wanted audio out of `client.stream()`
+    gets audio. This is the only format that takes this path.
 
     Timing headers: the per-synthesis timing headers of the non-stream route
     (X-Synth-Seconds, X-Realtime-Factor, …) are intentionally ABSENT here —
@@ -1886,12 +2033,7 @@ async def text_to_speech_stream(
     assert ENGINE is not None
     fmt = _parse_format(output_format)  # 400s early on an unsupported format
     if fmt.kind == "mp3":
-        raise HTTPException(
-            status_code=501,
-            detail="mp3 is not supported on the streaming endpoint (transcoding "
-                   "needs the complete clip); use output_format=pcm_24000 or "
-                   "wav_24000 to stream, or the non-streaming route for mp3",
-        )
+        return await _stream_mp3_full_body(voice_id, req, emotion, fmt, request)
     voice_id, emotion_headers = await _resolve_emotion_address(voice_id, emotion)
 
     chunks = _chunk_text(req.text)
@@ -2016,7 +2158,7 @@ async def text_to_speech_stream(
         "X-Stream": "true",
         "X-Stream-Segments": str(total),
         **emotion_headers,
-        **_ignored_headers(req.voice_settings),
+        **_ignored_headers(req.voice_settings, req),
     }
     if fmt.kind == "pcm":
         stream_headers["X-Sample-Rate"] = str(fmt.sample_rate)
