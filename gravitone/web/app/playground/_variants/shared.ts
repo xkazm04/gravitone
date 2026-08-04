@@ -16,6 +16,11 @@ export type Segment = {
   // line index in the script (absent for solo takes — one Character throughout).
   characterId?: string;
   line?: number;
+  // The speaker's DISPLAY name, stamped in by the console (the engine reports
+  // ids; names are the roster's, and only the studio holds the roster). It
+  // exists so a published ensemble take can be laned and re-performed by name
+  // on a share page, where there is no roster to look ids up in.
+  characterName?: string;
 };
 
 /**

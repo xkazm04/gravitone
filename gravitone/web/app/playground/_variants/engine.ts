@@ -72,6 +72,27 @@ export async function refinePeaks(blob: Blob): Promise<{ peaks: number[]; durati
 }
 
 /**
+ * Segments in the shape the take store reads them (service/takes.py
+ * `_clean_segment`) — snake_case, and carrying the CAST.
+ *
+ * The console's `Segment` is the engine's report plus the studio's own
+ * knowledge of who each id is. Publishing it verbatim shipped `characterId`
+ * into a reader that only looks for `character_id`, so an ensemble take was
+ * stored as a flat list of segments naming nobody: /t/{id} could draw one rail,
+ * re-perform had one voice to work with, and the scene was gone. The pair is
+ * emitted only when the take actually has it, so a solo take publishes exactly
+ * the body it always published.
+ */
+function wireSegments(segments: Segment[]): Array<Record<string, unknown>> {
+  return segments.map((s) => ({
+    text: s.text, requested: s.requested, used: s.used,
+    fallback: s.fallback, seconds: s.seconds,
+    ...(s.characterId ? { character_id: s.characterId } : {}),
+    ...(s.characterId && s.characterName ? { character_name: s.characterName } : {}),
+  }));
+}
+
+/**
  * Publish a take to the backend as a public Voice Card and return its id.
  * The single upload path shared by "↗ share" and the client-review flow — both
  * turn the take's audio blob into the same multipart POST to /api/takes.
@@ -106,7 +127,7 @@ export async function uploadTake(t: Take,
   const parentId = readRemixParent();
   fd.append("meta", JSON.stringify({
     character_id: t.characterId, character_name: t.characterName,
-    text: t.text, seconds: t.seconds, rtf: t.rtf, segments: t.segments,
+    text: t.text, seconds: t.seconds, rtf: t.rtf, segments: wireSegments(t.segments),
     ...(parentId ? { parent_id: parentId, derived_from: { kind: "remix" } } : {}),
     ...(opts.allowReperform ? { allow_reperform: true } : {}),
   }));

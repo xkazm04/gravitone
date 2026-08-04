@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
-import TakeScore, { placeSegments } from "./TakeScore";
+import TakeScore, { laneSegments, placeSegments } from "./TakeScore";
 import type { SharedTake } from "@/lib/takes";
 
 const seg = (over: Partial<SharedTake["segments"][number]>): SharedTake["segments"][number] => ({
@@ -86,5 +86,69 @@ describe("TakeScore — the shared take, read-only", () => {
       segments: [seg({ seconds: 0 })],
     });
     expect(container).toBeEmptyDOMElement();
+  });
+});
+
+// ── the cast ────────────────────────────────────────────────────────────────
+// A published ensemble used to arrive here as one flat rail, every span drawn
+// as though a single voice had said all of it.
+
+const ENSEMBLE: SharedTake = {
+  ...TAKE,
+  seconds: 6,
+  segments: [
+    seg({ text: "you said you would call", seconds: 2,
+          character_id: "sarah", character_name: "Sarah" }),
+    seg({ text: "I know", seconds: 1, character_id: "malik", character_name: "Malik" }),
+    seg({ text: "well?", seconds: 3, character_id: "sarah", character_name: "Sarah" }),
+  ],
+};
+
+describe("laneSegments — one lane per speaker, in first-spoken order", () => {
+  it("groups a Character's spans together and keeps their absolute time", () => {
+    const { spans } = placeSegments(ENSEMBLE.segments, 6);
+    const lanes = laneSegments(spans);
+    expect(lanes.map((l) => l.characterId)).toEqual(["sarah", "malik"]);
+    expect(lanes[0].spans.map((s) => [s.start, s.end])).toEqual([[0, 2], [3, 6]]);
+    expect(lanes[1].spans.map((s) => [s.start, s.end])).toEqual([[2, 3]]);
+  });
+
+  it("is ONE lane for a take that names no cast", () => {
+    const { spans } = placeSegments(TAKE.segments, 4);
+    expect(laneSegments(spans)).toHaveLength(1);
+  });
+
+  it("falls back to the id when a segment names one with no display name", () => {
+    const { spans } = placeSegments([seg({ character_id: "x9", seconds: 1 })], 1);
+    expect(laneSegments(spans)[0].name).toBe("x9");
+  });
+});
+
+describe("TakeScore — an ensemble take is drawn as a scene", () => {
+  it("stacks one labelled rail per Character", () => {
+    mount(ENSEMBLE);
+    expect(screen.getByRole("group", { name: /^Sarah — 2 segments over 0:06/ })).toBeInTheDocument();
+    expect(screen.getByRole("group", { name: /^Malik — 1 segment over 0:06/ })).toBeInTheDocument();
+    // ...and NOT the single flat rail the take used to get.
+    expect(screen.queryByRole("group", { name: /Performance score/ })).toBeNull();
+  });
+
+  it("counts the voices in the header", () => {
+    mount(ENSEMBLE);
+    expect(screen.getByText(/2 voices · 3 segments/)).toBeInTheDocument();
+  });
+
+  it("names the speaker of the span you select", () => {
+    mount(ENSEMBLE);
+    fireEvent.click(screen.getByRole("button", { name: /Region 2 of 3/ }));
+    expect(screen.getByText("Malik:")).toBeInTheDocument();
+  });
+
+  it("draws a single-Character take exactly as it always did", () => {
+    // One named speaker is not a cast: stacking one lane and labelling it
+    // would be ceremony around a fact the header already states.
+    mount({ ...TAKE, segments: TAKE.segments.map((s) => ({ ...s, character_id: "sarah", character_name: "Sarah" })) });
+    expect(screen.getByRole("group", { name: /Performance score/ })).toBeInTheDocument();
+    expect(screen.queryByText(/voices ·/)).toBeNull();
   });
 });

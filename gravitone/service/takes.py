@@ -23,6 +23,16 @@ can walk the chain, and `direction.py` can count what the human changed.
 Eviction is lineage-aware: dropping a mid-chain link would leave a child
 pointing at a parent that no longer exists, so the store evicts LEAF-FIRST.
 
+CAST: a take's segments each name WHO SPOKE THEM (`character_id` +
+`character_name`), so an ensemble take survives publication as an ensemble.
+Before this, a multi-character performance was stored under the FIRST line's
+character with the label "Ensemble - N voices" and a flat list of segments
+that named nobody — the share page could draw one rail, the re-perform path
+had one voice to work with, and the scene the studio composed was gone the
+moment it was shared. The fields are OPTIONAL at every layer: a solo take
+carries neither, and every take published before they existed reads as one
+that names no cast, which is exactly what it is.
+
 PUBLIC RE-PERFORM: a visitor to /t/{id} may edit the text and render a CHILD
 take — but only if the publisher opted in (`allow_reperform`, default OFF).
 That flag is the whole consent model: forking puts NEW WORDS in someone's
@@ -48,6 +58,10 @@ from pydantic import BaseModel, Field
 from service import direction
 from service.atomicio import atomic_write_bytes, atomic_write_text, file_lock
 from service.config import SETTINGS
+# The one WAV joiner in the service (24 kHz mono 16-bit, no ffmpeg). A cast
+# re-perform renders one line per Character and joins them; engine.py imports
+# no service module, so this is a leaf import and not the cycle app.py is.
+from service.engine import concat_wavs
 from service.ratelimit import per_ip_budget
 
 router = APIRouter(prefix="/v1/takes", tags=["takes"])
@@ -67,6 +81,12 @@ MAX_DERIVED_KEYS = 10      # fields kept from a client's derived_from block
 # this box's CPU gets a fraction of MAX_TEXT. Refused by NAME, not by a
 # pydantic 422, because the panel shows the sentence to a human.
 MAX_REPERFORM_TEXT = 1000
+# How many CAST LINES one public re-perform may be split into. The compute
+# budget is the character cap above, which is enforced over the SUM of the
+# lines — so a cast re-perform costs the box exactly what a single-voice one of
+# the same length costs. This cap exists only to bound the number of separate
+# render calls (each pays its own model setup and admission).
+MAX_REPERFORM_LINES = 12
 
 # The public-compute budget. Deliberately small and slow: a fork is seconds of
 # CPU on a box that is also serving the studio, and the honest ceiling for an
@@ -275,6 +295,51 @@ def create_take(
     return {"take_id": record["id"]}
 
 
+def _clean_segment(s: dict) -> dict:
+    """One stored segment: what was said, which emotion was asked for and used,
+    how long it took — and WHO SPOKE IT, when the client said so.
+
+    The cast pair is written only when it is actually present, so a solo take's
+    record is byte-identical to what it has always been and a reader can tell
+    "this take names no cast" from "this segment was spoken by nobody".
+    """
+    out = {
+        "text": str(s.get("text", ""))[:300],
+        "requested": str(s.get("requested", "baseline"))[:32],
+        "used": str(s.get("used", "baseline"))[:32],
+        "fallback": bool(s.get("fallback", False)),
+        "seconds": float(s.get("seconds", 0) or 0),
+    }
+    cid = str(s.get("character_id") or "")[:100]
+    cname = str(s.get("character_name") or "")[:100]
+    if cid:
+        out["character_id"] = cid
+        # A name without an id would be a label pointing at nothing — the id is
+        # what /t/{id} lanes and re-perform address, so the name rides with it.
+        if cname:
+            out["character_name"] = cname
+    return out
+
+
+def cast_of(meta: dict) -> dict[str, str]:
+    """The take's cast: character id -> display name, in first-spoken order.
+
+    Empty for a take that names no cast — a solo take, or one published before
+    segments carried a speaker. Callers must treat that as "unknown", never as
+    "one voice": a legacy ensemble take is indistinguishable from a solo one
+    HERE, which is precisely why the re-perform path says so out loud instead
+    of guessing.
+    """
+    out: dict[str, str] = {}
+    for s in meta.get("segments") or []:
+        if not isinstance(s, dict):
+            continue
+        cid = str(s.get("character_id") or "")
+        if cid and cid not in out:
+            out[cid] = str(s.get("character_name") or "") or cid
+    return out
+
+
 def _build_record(*, character_id: str, character_name: str, text: str,
                   seconds: float, rtf: float, segments: list,
                   parent_id: str = "", derived_from: dict | None = None,
@@ -289,16 +354,7 @@ def _build_record(*, character_id: str, character_name: str, text: str,
         "text": text,
         "seconds": seconds,
         "rtf": rtf,
-        "segments": [
-            {
-                "text": str(s.get("text", ""))[:300],
-                "requested": str(s.get("requested", "baseline"))[:32],
-                "used": str(s.get("used", "baseline"))[:32],
-                "fallback": bool(s.get("fallback", False)),
-                "seconds": float(s.get("seconds", 0) or 0),
-            }
-            for s in segments if isinstance(s, dict)
-        ],
+        "segments": [_clean_segment(s) for s in segments if isinstance(s, dict)],
         "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "parent_id": parent_id or None,
         "derived_from": derived_from or None,
@@ -413,23 +469,55 @@ def set_speak_provider(provider) -> None:
     _SPEAK_PROVIDER = provider
 
 
+class ReperformLine(BaseModel):
+    """One line of a CAST re-perform: who says it, and what they now say."""
+    character_id: str = Field(..., min_length=1, max_length=100)
+    text: str = Field(..., min_length=1)
+
+
 class ReperformReq(BaseModel):
     """One edit, one render. The text is the parent's, as the visitor changed
-    it — emotion metatags and all."""
-    text: str = Field(..., min_length=1)
+    it — emotion metatags and all.
+
+    Two forms, exactly one of them per request:
+
+      * ``text``  — the whole re-performance in ONE voice (the parent take's
+        Character). This is the original shape and is unchanged on the wire.
+      * ``lines`` — a CAST re-performance: one entry per speaker line, each
+        rendered in its own Character's voice and concatenated in order. Only
+        Characters the PARENT take actually cast may appear: consent was given
+        for re-performing THIS take, not for putting words in any voice this
+        box happens to host.
+
+    ``text`` lost its ``min_length=1`` so the cast form does not have to send a
+    dummy; the handler refuses an empty request BY NAME, which is what a
+    visitor reading the panel needs instead of a 422.
+    """
+    text: str = Field("")
+    lines: list[ReperformLine] = Field(default_factory=list,
+                                       max_length=MAX_REPERFORM_LINES)
 
 
 @router.post("/{take_id}/reperform", status_code=201,
              dependencies=[Depends(REPERFORM_BUDGET)])
 async def reperform(take_id: str, req: ReperformReq) -> dict:
-    """Fork a published take: render the edited text in the same Character's
-    voice and mint a CHILD take with lineage.
+    """Fork a published take: render the edited words and mint a CHILD take.
+
+    IN WHOSE VOICE depends on what the parent take actually recorded. A take
+    whose segments name a cast is re-performed line by line, each line in its
+    own Character's voice; a take that names no cast is re-performed in the one
+    Character it does name — and the response SAYS SO (``single_voice`` plus a
+    ``notice``). It used to say nothing at all while flattening an entire
+    ensemble into its first speaker's voice, which is the one outcome a
+    listener could not detect from the result.
 
     Every refusal is named, because this runs for an anonymous visitor who
     cannot read a log: `not-published-for-reperform` (the publisher did not opt
-    in), `too-long`, `engine-absent`, plus the limiter's `rate-limited` (429 +
-    Retry-After) and whatever the render path itself says (a 429 for
-    backpressure, a 404 for a Character deleted since the take was published).
+    in), `empty`, `too-long`, `ambiguous` (both request forms sent),
+    `cast-mismatch` (a Character the parent never cast), `engine-absent`, plus
+    the limiter's `rate-limited` (429 + Retry-After) and whatever the render
+    path itself says (a 429 for backpressure, a 404 for a Character deleted
+    since the take was published).
 
     The child is NOT itself forkable: consent was given for one fork of one
     published take, and inheriting the flag would turn one opt-in into an
@@ -443,19 +531,8 @@ async def reperform(take_id: str, req: ReperformReq) -> dict:
             403, "not-published-for-reperform: whoever published this take did "
                  "not open it for public re-performance")
 
-    text = req.text.strip()
-    if not text:
-        raise HTTPException(400, "empty: there is nothing to perform")
-    if len(text) > MAX_REPERFORM_TEXT:
-        raise HTTPException(
-            413, f"too-long: a public re-perform is capped at "
-                 f"{MAX_REPERFORM_TEXT} characters ({len(text)} sent)")
-
-    character_id = str(parent.get("character_id") or "")
-    if not character_id:
-        raise HTTPException(
-            409, "character-absent: this take does not name a Character to "
-                 "perform with")
+    cast = cast_of(parent)
+    parts = _reperform_parts(req, parent, cast)
 
     provider = _SPEAK_PROVIDER
     if provider is None:
@@ -463,28 +540,56 @@ async def reperform(take_id: str, req: ReperformReq) -> dict:
             503, "engine-absent: this deployment has no renderer wired for "
                  "public re-performance")
 
-    try:
-        rendered = await provider(character_id, text)
-    except HTTPException:
-        raise  # already a named refusal from the render path (404 / 429 / 503)
-    except Exception as exc:  # noqa: BLE001 - a render failure is not a crash report
-        raise HTTPException(502, f"render-failed: {type(exc).__name__}") from exc
+    wavs: list[bytes] = []
+    segments: list[dict] = []
+    seconds = 0.0
+    synth_seconds = 0.0
+    for character_id, line_text in parts:
+        try:
+            rendered = await provider(character_id, line_text)
+        except HTTPException:
+            raise  # already a named refusal from the render path (404 / 429 / 503)
+        except Exception as exc:  # noqa: BLE001 - a render failure is not a crash report
+            raise HTTPException(502, f"render-failed: {type(exc).__name__}") from exc
 
-    audio = rendered.get("audio") or b""
-    if not isinstance(audio, (bytes, bytearray)) or audio[:4] != b"RIFF":
-        raise HTTPException(502, "render-failed: the renderer returned no wav")
-    audio = bytes(audio)
+        audio = rendered.get("audio") or b""
+        if not isinstance(audio, (bytes, bytearray)) or audio[:4] != b"RIFF":
+            raise HTTPException(502, "render-failed: the renderer returned no wav")
+        wavs.append(bytes(audio))
+        # Every segment of the child records WHO SPOKE IT, so the fork of an
+        # ensemble is itself an ensemble take and its own share page can lane it.
+        name = cast.get(character_id) or str(parent.get("character_name", "Character"))
+        for seg in list(rendered.get("segments") or []):
+            if isinstance(seg, dict):
+                segments.append({**seg, "character_id": character_id,
+                                 "character_name": name})
+        line_seconds = float(rendered.get("seconds", 0) or 0)
+        seconds += line_seconds
+        line_rtf = float(rendered.get("rtf", 0) or 0)
+        if line_rtf > 0:
+            synth_seconds += line_seconds / line_rtf
+
+    # Joining N wavs walks every sample; the handler is on the event loop.
+    audio = wavs[0] if len(wavs) == 1 else await asyncio.to_thread(concat_wavs, wavs)
     if len(audio) > MAX_AUDIO_BYTES:
         raise HTTPException(
             413, f"too-long: the render is over {MAX_AUDIO_BYTES // 2**20} MB")
 
+    voices = list(dict.fromkeys(cid for cid, _ in parts))
+    single_voice = len(voices) == 1
+    names = [cast.get(cid) or str(parent.get("character_name", "Character"))
+             for cid in voices]
     record = _build_record(
-        character_id=character_id,
-        character_name=str(parent.get("character_name", "Character"))[:100],
-        text=text[:MAX_TEXT],
-        seconds=float(rendered.get("seconds", 0) or 0),
-        rtf=float(rendered.get("rtf", 0) or 0),
-        segments=list(rendered.get("segments") or [])[:MAX_SEGMENTS],
+        character_id=parts[0][0],
+        character_name=(names[0] if single_voice
+                        else f"Ensemble - {len(voices)} voices")[:100],
+        text=" ".join(t for _, t in parts)[:MAX_TEXT],
+        seconds=round(seconds, 2),
+        # Wall-clock-equivalent: the lines rendered one after another, so the
+        # request's factor is the total audio over the total synthesis time,
+        # never an average of the per-line factors.
+        rtf=round(seconds / synth_seconds, 3) if synth_seconds > 0 else 0.0,
+        segments=segments[:MAX_SEGMENTS],
         parent_id=take_id,
         derived_from={"kind": "public-reperform"},
         allow_reperform=False,
@@ -492,8 +597,73 @@ async def reperform(take_id: str, req: ReperformReq) -> dict:
     # Off the event loop: writing the wav and globbing the store to evict are
     # both blocking, and this handler is async because the render is.
     await asyncio.to_thread(_write_take, record, audio)
-    return {"take_id": record["id"], "parent_id": take_id,
-            "seconds": record["seconds"]}
+    return {
+        "take_id": record["id"], "parent_id": take_id,
+        "seconds": record["seconds"],
+        "voices": voices,
+        "single_voice": single_voice,
+        # Said out loud whenever the result is one voice for a reason the
+        # visitor could not see: the parent recorded no cast, so there was
+        # never more than one voice available to perform with.
+        "notice": (
+            f"This take names no per-line cast, so the whole re-performance "
+            f"was rendered in one voice ({names[0]}). If the original had more "
+            f"than one speaker, that is not preserved."
+            if single_voice and not cast else None
+        ),
+    }
+
+
+def _reperform_parts(req: ReperformReq, parent: dict,
+                     cast: dict[str, str]) -> list[tuple[str, str]]:
+    """(character_id, text) per line to render, or a NAMED refusal.
+
+    The two request forms are mutually exclusive, and the compute cap is
+    enforced over the SUM of the lines — a cast re-perform of 1000 characters
+    costs this box what a single-voice one of 1000 characters costs.
+
+    A line may only name a Character the PARENT take cast. The publisher
+    consented to THIS take being re-performed; accepting an arbitrary
+    character_id would turn that into consent to put a visitor's words into any
+    voice the deployment hosts, which is not a thing they were asked.
+    """
+    lines = [(l.character_id.strip(), l.text.strip()) for l in req.lines]
+    lines = [(cid, text) for cid, text in lines if text]
+    text = req.text.strip()
+
+    if lines and text:
+        raise HTTPException(
+            400, "ambiguous: send either 'text' (one voice) or 'lines' (a "
+                 "cast), not both")
+    if not lines and not text:
+        raise HTTPException(400, "empty: there is nothing to perform")
+
+    if lines:
+        if not cast:
+            raise HTTPException(
+                409, "cast-absent: this take records no per-line cast, so it "
+                     "can only be re-performed as one voice — send 'text'")
+        unknown = [cid for cid, _ in lines if cid not in cast]
+        if unknown:
+            raise HTTPException(
+                403, f"cast-mismatch: '{unknown[0][:100]}' is not one of this "
+                     f"take's Characters; a re-perform may only use the cast "
+                     f"the publisher already put in it")
+        parts = lines
+    else:
+        character_id = str(parent.get("character_id") or "")
+        if not character_id:
+            raise HTTPException(
+                409, "character-absent: this take does not name a Character to "
+                     "perform with")
+        parts = [(character_id, text)]
+
+    total = sum(len(t) for _, t in parts)
+    if total > MAX_REPERFORM_TEXT:
+        raise HTTPException(
+            413, f"too-long: a public re-perform is capped at "
+                 f"{MAX_REPERFORM_TEXT} characters ({total} sent)")
+    return parts
 
 
 # ── review sets (client approval loop) ────────────────────────────────────────

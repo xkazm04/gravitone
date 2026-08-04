@@ -25,13 +25,16 @@
 //     and say so: that is a picture of the ORDER, not of the timing.
 
 import { useMemo, useState } from "react";
+import { characterHue } from "@/app/playground/_variants/shared";
 import EmotionArt from "@/components/ui/EmotionArt";
 import Region from "@/components/ui/Region";
 import Track, { clock } from "@/components/ui/Track";
 import { emotionMeta } from "@/lib/emotions";
-import type { SharedTake } from "@/lib/takes";
+import { castOf, type SharedTake } from "@/lib/takes";
 
 const LANE_HEIGHT = 46;
+/** Stacked lanes are shorter — a six-hander has to stay one screen. */
+const CAST_LANE_HEIGHT = 38;
 
 type Placed = {
   index: number;
@@ -69,6 +72,35 @@ export function placeSegments(
   return { spans, even: sum <= 0 };
 }
 
+/** The spans one Character speaks, in a stacked-lane score. Absolute time is
+ *  kept — a lane is a filtered view of the SAME timeline, so the gaps between
+ *  a Character's spans are the moments somebody else was speaking. */
+type Lane = { characterId: string; name: string; spans: Placed[] };
+
+/**
+ * Split placed spans into one lane per speaker, or a single lane when the take
+ * names no cast (a solo take, and every take published before segments carried
+ * a speaker).
+ *
+ * Order is FIRST-SPOKEN, not alphabetical: a scene reads top to bottom in the
+ * order its voices enter.
+ */
+export function laneSegments(spans: Placed[]): Lane[] {
+  const lanes: Lane[] = [];
+  const at = new Map<string, Lane>();
+  for (const span of spans) {
+    const id = span.segment.character_id ?? "";
+    let lane = at.get(id);
+    if (!lane) {
+      lane = { characterId: id, name: span.segment.character_name || id, spans: [] };
+      at.set(id, lane);
+      lanes.push(lane);
+    }
+    lane.spans.push(span);
+  }
+  return lanes;
+}
+
 export default function TakeScore({ take, className = "" }: { take: SharedTake; className?: string }) {
   const [selected, setSelected] = useState<number | null>(null);
 
@@ -88,6 +120,34 @@ export default function TakeScore({ take, className = "" }: { take: SharedTake; 
 
   const chosen = selected !== null ? spans[selected] : undefined;
   const substituted = take.segments.filter((s) => s.fallback).length;
+  const cast = castOf(take);
+  const lanes = laneSegments(spans);
+  // A take with ONE speaker (or none named) draws exactly the rail it always
+  // drew — stacking a single lane and labelling it would be ceremony around a
+  // fact the header already states.
+  const laned = lanes.length > 1;
+
+  /** One span, drawn on whichever rail it belongs to. */
+  const region = (s: Placed, count: number) => {
+    const m = emotionMeta(s.segment.used);
+    return (
+      <Region
+        key={s.index}
+        start={s.start}
+        end={s.end}
+        total={duration}
+        hue={m.hue}
+        label={m.label}
+        text={s.segment.text}
+        spanText={`${clock(s.start)} to ${clock(s.end)}`}
+        index={s.index}
+        count={count}
+        selected={selected === s.index}
+        badge={<EmotionArt emotion={s.segment.used} size={14} />}
+        onSelect={() => setSelected((cur) => (cur === s.index ? null : s.index))}
+      />
+    );
+  };
 
   return (
     <section aria-label="Performance score" className={`glass-panel mt-4 rounded-2xl p-4 ${className}`}>
@@ -96,40 +156,55 @@ export default function TakeScore({ take, className = "" }: { take: SharedTake; 
           score
         </span>
         <span className="font-jetbrains text-[10px] text-white/40">
+          {laned && `${cast.size} voices · `}
           {spans.length} segment{spans.length === 1 ? "" : "s"} · {clock(duration)}
           {even && " · order only, this take reported no per-segment timing"}
         </span>
       </div>
 
-      <div className="mt-3">
-        <Track
-          label={`Performance score — ${spans.length} emotion segment${spans.length === 1 ? "" : "s"} over ${clock(duration)}`}
-          height={LANE_HEIGHT}
-          hue={emotionMeta(spans[0].segment.used).hue}
-          bars={0}
-        >
-          {spans.map((s) => {
-            const m = emotionMeta(s.segment.used);
-            return (
-              <Region
-                key={s.index}
-                start={s.start}
-                end={s.end}
-                total={duration}
-                hue={m.hue}
-                label={m.label}
-                text={s.segment.text}
-                spanText={`${clock(s.start)} to ${clock(s.end)}`}
-                index={s.index}
-                count={spans.length}
-                selected={selected === s.index}
-                badge={<EmotionArt emotion={s.segment.used} size={14} />}
-                onSelect={() => setSelected((cur) => (cur === s.index ? null : s.index))}
-              />
-            );
-          })}
-        </Track>
-      </div>
+      {laned ? (
+        // ONE LANE PER CHARACTER, over the same timeline: the gaps in a lane
+        // are the moments somebody else had the floor, which is what makes a
+        // scene legible as a scene. A published ensemble used to arrive here as
+        // a single flat rail under the label "Ensemble · N voices" — every
+        // span drawn as though one voice said all of it.
+        <div className="mt-3 space-y-1.5">
+          {lanes.map((lane) => (
+            <div key={lane.characterId}>
+              <div className="font-jetbrains mb-1 flex items-center gap-1.5 text-[10px] text-white/55">
+                <span
+                  aria-hidden
+                  className="h-1.5 w-1.5 rounded-full"
+                  style={{ background: `hsl(${characterHue(lane.characterId)} 85% 65%)` }}
+                />
+                {lane.name}
+                <span className="text-white/30">
+                  · {lane.spans.length} segment{lane.spans.length === 1 ? "" : "s"}
+                </span>
+              </div>
+              <Track
+                label={`${lane.name} — ${lane.spans.length} segment${lane.spans.length === 1 ? "" : "s"} over ${clock(duration)}`}
+                height={CAST_LANE_HEIGHT}
+                hue={characterHue(lane.characterId)}
+                bars={0}
+              >
+                {lane.spans.map((s) => region(s, spans.length))}
+              </Track>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="mt-3">
+          <Track
+            label={`Performance score — ${spans.length} emotion segment${spans.length === 1 ? "" : "s"} over ${clock(duration)}`}
+            height={LANE_HEIGHT}
+            hue={emotionMeta(spans[0].segment.used).hue}
+            bars={0}
+          >
+            {spans.map((s) => region(s, spans.length))}
+          </Track>
+        </div>
+      )}
 
       {/* What the selected span actually says. The only thing a click can
           honestly do here, and the thing the ribbon's tooltip hid. */}
@@ -145,6 +220,11 @@ export default function TakeScore({ take, className = "" }: { take: SharedTake; 
             >
               {chosen.segment.used} · {clock(chosen.start)}–{clock(chosen.end)}
             </span>
+            {chosen.segment.character_name && (
+              <span className="font-jetbrains mr-2 text-[11px] text-white/55">
+                {chosen.segment.character_name}:
+              </span>
+            )}
             {chosen.segment.text}
             {chosen.segment.fallback && (
               <span className="text-white/45">

@@ -8,6 +8,36 @@
 
 import { backendFetch, READ_TIMEOUT_MS } from "./backend";
 
+/** One segment of a published take, as the store holds it.
+ *
+ *  The CAST pair is optional at every layer and absent together: a solo take
+ *  names one Character at the top level and nobody per segment, and every take
+ *  published before segments carried a speaker has neither key on disk. Present
+ *  = "this segment was spoken by this Character"; absent = "this take names no
+ *  cast", which is NOT the same as "one voice" — a take published before the
+ *  cast existed may well have been an ensemble, and nothing here can tell. */
+export type SharedSegment = {
+  text: string;
+  requested: string;
+  used: string;
+  fallback: boolean;
+  seconds: number;
+  character_id?: string;
+  character_name?: string;
+};
+
+/** Who a take cast, id → display name, in first-spoken order. Empty when the
+ *  take names no cast (see SharedSegment). */
+export function castOf(take: Pick<SharedTake, "segments">): Map<string, string> {
+  const cast = new Map<string, string>();
+  for (const s of take.segments) {
+    if (s.character_id && !cast.has(s.character_id)) {
+      cast.set(s.character_id, s.character_name || s.character_id);
+    }
+  }
+  return cast;
+}
+
 export type SharedTake = {
   id: string;
   character_id: string;
@@ -15,7 +45,7 @@ export type SharedTake = {
   text: string;
   seconds: number;
   rtf: number;
-  segments: { text: string; requested: string; used: string; fallback: boolean; seconds: number }[];
+  segments: SharedSegment[];
   created: string;
   // Lineage. Optional on the type because every take published before
   // re-performable takes existed has neither key on disk — a child take is a

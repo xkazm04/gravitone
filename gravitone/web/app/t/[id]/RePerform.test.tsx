@@ -6,7 +6,9 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import RePerform, { MAX_REPERFORM_TEXT, ReperformProvenance } from "./RePerform";
+import RePerform, {
+  castLines, MAX_REPERFORM_LINES, MAX_REPERFORM_TEXT, ReperformProvenance,
+} from "./RePerform";
 import type { SharedTake } from "@/lib/takes";
 
 const TAKE: SharedTake = {
@@ -76,8 +78,10 @@ describe("RePerform — rendering", () => {
     answer(403, { detail: "not-published-for-reperform: whoever published this take did not open it" });
     render(<RePerform take={TAKE} />);
     fireEvent.click(button()!);
-    expect(await screen.findByRole("alert"))
-      .toHaveTextContent(/not-published-for-reperform/);
+    // findByText, not findByRole("alert"): the panel already carries a
+    // standing warning for a take that names no cast, so "the alert" is no
+    // longer a unique thing to assert on.
+    expect(await screen.findByText(/not-published-for-reperform/)).toBeInTheDocument();
   });
 
   it("tells a rate-limited visitor how long to wait", async () => {
@@ -85,8 +89,7 @@ describe("RePerform — rendering", () => {
            { "Retry-After": "212" });
     render(<RePerform take={TAKE} />);
     fireEvent.click(button()!);
-    const alert = await screen.findByRole("alert");
-    expect(alert).toHaveTextContent(/rate-limited/);
+    const alert = await screen.findByText(/rate-limited/);
     expect(alert).toHaveTextContent(/Try again in 212s/);
   });
 
@@ -94,7 +97,7 @@ describe("RePerform — rendering", () => {
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("network down")));
     render(<RePerform take={TAKE} />);
     fireEvent.click(button()!);
-    expect(await screen.findByRole("alert")).toHaveTextContent(/offline/);
+    expect(await screen.findByText(/offline/)).toBeInTheDocument();
   });
 
   it("refuses over-long text locally, before spending a budgeted request", () => {
@@ -110,6 +113,112 @@ describe("RePerform — rendering", () => {
     render(<RePerform take={TAKE} />);
     fireEvent.change(field(), { target: { value: "   " } });
     expect(button()).toBeDisabled();
+  });
+});
+
+// ── the cast ────────────────────────────────────────────────────────────────
+// This panel used to promise "a new version in the same voice" for every take,
+// and the service then rendered a whole published ensemble in its first
+// speaker's voice with no notice on the page or in the response.
+
+const ENSEMBLE: SharedTake = {
+  ...TAKE,
+  text: "Sarah: you said you would call · Malik: I know",
+  segments: [
+    { text: "you said you would call", requested: "angry", used: "angry",
+      fallback: false, seconds: 2, character_id: "sarah", character_name: "Sarah" },
+    { text: "I know", requested: "baseline", used: "baseline",
+      fallback: false, seconds: 1, character_id: "malik", character_name: "Malik" },
+  ],
+};
+
+describe("castLines — the turns a visitor may edit", () => {
+  it("is empty for a take that names fewer than two speakers", () => {
+    expect(castLines(TAKE)).toEqual([]);
+    expect(castLines({ ...TAKE, segments: [ENSEMBLE.segments[0]] })).toEqual([]);
+  });
+
+  it("re-emits the tags the segments were compiled from", () => {
+    expect(castLines(ENSEMBLE)).toEqual([
+      { characterId: "sarah", name: "Sarah", text: "[angry]you said you would call[/angry]" },
+      { characterId: "malik", name: "Malik", text: "I know" },
+    ]);
+  });
+
+  it("merges a Character's consecutive segments into ONE turn", () => {
+    const merged = castLines({ ...ENSEMBLE, segments: [
+      ...ENSEMBLE.segments,
+      { text: "well?", requested: "baseline", used: "baseline", fallback: false,
+        seconds: 1, character_id: "malik", character_name: "Malik" },
+    ] });
+    expect(merged).toHaveLength(2);
+    expect(merged[1].text).toBe("I know well?");
+  });
+});
+
+describe("RePerform — a cast take is re-performed as a cast", () => {
+  it("offers one field per turn, labelled with its Character", () => {
+    render(<RePerform take={ENSEMBLE} />);
+    expect((screen.getByLabelText("Sarah") as HTMLTextAreaElement).value)
+      .toBe("[angry]you said you would call[/angry]");
+    expect((screen.getByLabelText("Malik") as HTMLTextAreaElement).value).toBe("I know");
+    expect(screen.getByText(/a cast of 2 voices/)).toBeInTheDocument();
+  });
+
+  it("posts LINES, each addressed to its own Character", async () => {
+    const f = answer(201, { take_id: "child00001", single_voice: false, notice: null });
+    render(<RePerform take={ENSEMBLE} />);
+    fireEvent.change(screen.getByLabelText("Malik"), { target: { value: "I meant to." } });
+    fireEvent.click(button()!);
+
+    await waitFor(() => expect(screen.getByRole("link", { name: /open your version/i }))
+      .toBeInTheDocument());
+    expect(JSON.parse(f.mock.calls[0][1].body)).toEqual({
+      lines: [
+        { character_id: "sarah", text: "[angry]you said you would call[/angry]" },
+        { character_id: "malik", text: "I meant to." },
+      ],
+    });
+  });
+
+  it("counts the character budget over the WHOLE cast, not per line", () => {
+    const f = answer(201, { take_id: "c" });
+    render(<RePerform take={ENSEMBLE} />);
+    const half = "x".repeat(MAX_REPERFORM_TEXT / 2 + 10);
+    fireEvent.change(screen.getByLabelText("Sarah"), { target: { value: half } });
+    fireEvent.change(screen.getByLabelText("Malik"), { target: { value: half } });
+    expect(button()).toBeDisabled();
+    fireEvent.click(button()!);
+    expect(f).not.toHaveBeenCalled();
+  });
+
+  it("refuses a scene with more turns than a public fork may have", () => {
+    const many = Array.from({ length: MAX_REPERFORM_LINES + 1 }, (_, i) => ({
+      text: `line ${i}`, requested: "baseline", used: "baseline", fallback: false,
+      seconds: 1, character_id: i % 2 ? "sarah" : "malik",
+      character_name: i % 2 ? "Sarah" : "Malik",
+    }));
+    render(<RePerform take={{ ...ENSEMBLE, segments: many }} />);
+    expect(screen.getByRole("alert")).toHaveTextContent(/capped at 12/);
+    expect(button()).toBeDisabled();
+  });
+});
+
+describe("RePerform — a take with no cast says so instead of implying one", () => {
+  it("warns up front that the render is one voice and the cast is unknown", () => {
+    render(<RePerform take={TAKE} />);
+    expect(screen.getByRole("alert")).toHaveTextContent(/renders as ONE voice — Sarah/);
+    expect(screen.getByRole("alert")).toHaveTextContent(/not preserved/);
+  });
+
+  it("shows the service's own notice after the render", async () => {
+    answer(201, {
+      take_id: "child00001", single_voice: true,
+      notice: "This take names no per-line cast, so the whole re-performance was rendered in one voice (Sarah).",
+    });
+    render(<RePerform take={TAKE} />);
+    fireEvent.click(button()!);
+    await waitFor(() => expect(screen.getByText(/names no per-line cast/)).toBeInTheDocument());
   });
 });
 

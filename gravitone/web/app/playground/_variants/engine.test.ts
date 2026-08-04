@@ -198,6 +198,51 @@ describe("uploadTake", () => {
     expect(f).not.toHaveBeenCalled();
   });
 
+  // ── the cast travels with the take ────────────────────────────────────────
+  describe("cast", () => {
+    const wireMeta = (f: ReturnType<typeof vi.fn>) =>
+      JSON.parse((f.mock.calls[0][1].body as FormData).get("meta") as string);
+    const segment = (over: Partial<Segment> = {}): Segment => ({
+      text: "hi", requested: "baseline", used: "baseline", fallback: false,
+      voice_id: "v1", seconds: 1, ...over,
+    });
+
+    it("publishes each segment's speaker in the shape the store reads", async () => {
+      // The console names segments `characterId`; the take store looks only for
+      // `character_id`, so publishing verbatim stored an ensemble as a flat
+      // list naming nobody.
+      const f = vi.fn().mockResolvedValue(new Response(JSON.stringify({ take_id: "t1" }), { status: 200 }));
+      vi.stubGlobal("fetch", f);
+      await uploadTake(take({ segments: [
+        segment({ text: "one", characterId: "sarah", characterName: "Sarah" }),
+        segment({ text: "two", characterId: "malik", characterName: "Malik" }),
+      ] }));
+      expect(wireMeta(f).segments).toEqual([
+        { text: "one", requested: "baseline", used: "baseline", fallback: false,
+          seconds: 1, character_id: "sarah", character_name: "Sarah" },
+        { text: "two", requested: "baseline", used: "baseline", fallback: false,
+          seconds: 1, character_id: "malik", character_name: "Malik" },
+      ]);
+    });
+
+    it("publishes a solo take's segments with no cast keys at all", async () => {
+      // "This take names no cast" has to stay distinguishable from "this
+      // segment was spoken by nobody".
+      const f = vi.fn().mockResolvedValue(new Response(JSON.stringify({ take_id: "t1" }), { status: 200 }));
+      vi.stubGlobal("fetch", f);
+      await uploadTake(take({ segments: [segment()] }));
+      expect(wireMeta(f).segments[0]).not.toHaveProperty("character_id");
+      expect(wireMeta(f).segments[0]).not.toHaveProperty("character_name");
+    });
+
+    it("drops a name with no id — it would point at nothing", async () => {
+      const f = vi.fn().mockResolvedValue(new Response(JSON.stringify({ take_id: "t1" }), { status: 200 }));
+      vi.stubGlobal("fetch", f);
+      await uploadTake(take({ segments: [segment({ characterName: "Nobody" })] }));
+      expect(wireMeta(f).segments[0]).not.toHaveProperty("character_name");
+    });
+  });
+
   // ── the remix parent is ONE-SHOT ──────────────────────────────────────────
   // It used to be written by /t/[id] and cleared by nobody, so every take a
   // browser published after one fork — for the rest of the tab's life — was

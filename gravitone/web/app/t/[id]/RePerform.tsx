@@ -20,16 +20,61 @@
 
 import { useState } from "react";
 import Link from "next/link";
-import type { SharedTake } from "@/lib/takes";
+import { castOf, type SharedTake } from "@/lib/takes";
 import { readDetail } from "@/lib/apiFetch";
+import { ErrorBanner } from "@/components/ui/ErrorBanner";
 
 /** The service's own cap (service/takes.py::MAX_REPERFORM_TEXT). Mirrored so
  *  the field can say so BEFORE a visitor spends a request finding out — the
  *  service is still the enforcer, and its "too-long" refusal is what shows if
- *  the two ever drift. */
+ *  the two ever drift. It is a cap on the WHOLE re-performance: a cast fork of
+ *  N lines gets the same budget a one-voice fork of the same length gets, so
+ *  splitting the words across voices never buys more of this box's CPU. */
 export const MAX_REPERFORM_TEXT = 1000;
 
-type Result = { take_id: string };
+type Result = { take_id: string; single_voice?: boolean; notice?: string | null };
+
+/** The service's cap on how many voice lines one public fork may be split into
+ *  (service/takes.py::MAX_REPERFORM_LINES). */
+export const MAX_REPERFORM_LINES = 12;
+
+/** One editable line of a CAST re-perform: whose voice, and what they say. */
+export type CastLine = { characterId: string; name: string; text: string };
+
+/**
+ * The speaker turns a take offers for editing, in performance order.
+ *
+ * Empty when the take names fewer than two speakers — a solo take, and every
+ * take published before segments carried a cast — which is what puts the panel
+ * on its single-voice path.
+ *
+ * Consecutive segments of the SAME Character are one turn, with each
+ * non-baseline segment re-wrapped in the `[emotion]` tag it was written with.
+ * That is the round trip: the segments are what the tags COMPILED to, so
+ * re-emitting them as tags hands the visitor back the line the publisher
+ * actually typed rather than a de-tagged transcript of it.
+ */
+export function castLines(take: SharedTake): CastLine[] {
+  if (castOf(take).size < 2) return []; // one voice (or none named) is not a cast
+  const turns: CastLine[] = [];
+  for (const s of take.segments) {
+    if (!s.character_id) continue;
+    const piece = s.requested && s.requested !== "baseline"
+      ? `[${s.requested}]${s.text}[/${s.requested}]`
+      : s.text;
+    const last = turns[turns.length - 1];
+    if (last && last.characterId === s.character_id) {
+      last.text = `${last.text} ${piece}`.trim();
+    } else {
+      turns.push({
+        characterId: s.character_id,
+        name: s.character_name || s.character_id,
+        text: piece,
+      });
+    }
+  }
+  return turns;
+}
 
 /** The banner a take rendered BY A VISITOR wears on its own share page.
  *
@@ -51,28 +96,46 @@ export function ReperformProvenance({ take }: { take: SharedTake }) {
 }
 
 export default function RePerform({ take }: { take: SharedTake }) {
+  // The take's cast, decided once from what it actually recorded. A take with
+  // two or more named speakers is re-performed LINE BY LINE, each in its own
+  // voice; anything else is one voice and says so.
+  const [lines, setLines] = useState<CastLine[]>(() => castLines(take));
   const [text, setText] = useState(take.text);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [child, setChild] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   // The publisher's decision. Absent (every take published before the toggle
   // existed) reads as NO — an unanswered consent question is not a yes.
   if (!take.allow_reperform) return null;
 
-  const tooLong = text.length > MAX_REPERFORM_TEXT;
-  const empty = text.trim().length === 0;
+  const cast = lines.length > 0;
+  const used = cast ? lines.reduce((n, l) => n + l.text.length, 0) : text.length;
+  const overLines = cast && lines.length > MAX_REPERFORM_LINES;
+  const tooLong = used > MAX_REPERFORM_TEXT;
+  const empty = cast
+    ? lines.every((l) => l.text.trim().length === 0)
+    : text.trim().length === 0;
+  const voices = cast ? new Set(lines.map((l) => l.characterId)).size : 1;
 
   async function render() {
-    if (busy || tooLong || empty) return;
+    if (busy || tooLong || empty || overLines) return;
     setBusy(true);
     setError(null);
     setChild(null);
+    setNotice(null);
     try {
       const r = await fetch(`/t/${encodeURIComponent(take.id)}/reperform`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
+        // Exactly one of the two forms — the service refuses both at once by
+        // name, and sending an unused empty field would be that request.
+        body: JSON.stringify(cast
+          ? { lines: lines
+              .filter((l) => l.text.trim())
+              .map((l) => ({ character_id: l.characterId, text: l.text.trim() })) }
+          : { text }),
       });
       if (!r.ok) {
         // The service names every refusal (not-published-for-reperform,
@@ -90,6 +153,10 @@ export default function RePerform({ take }: { take: SharedTake }) {
       }
       const body = (await r.json()) as Result;
       setChild(body.take_id);
+      // The service says whether the result really is one voice, and why. A
+      // legacy take flattened into its one named Character is exactly the
+      // event this sentence exists for.
+      setNotice(body.notice ?? null);
     } catch {
       setError("this re-perform could not be sent — the studio may be offline");
     } finally {
@@ -102,32 +169,90 @@ export default function RePerform({ take }: { take: SharedTake }) {
       <div className="font-jetbrains text-[11px] uppercase tracking-widest text-cyan-300/80">
         re-perform this
       </div>
-      <p className="mt-1 text-sm text-white/70">
-        {take.character_name} was published open for re-performance. Change the words — or one{" "}
-        <span className="font-jetbrains text-cyan-300">[emotion]</span> tag — and render a new
-        version in the same voice. It becomes a take of its own, filed as this one&apos;s child.
-      </p>
+      {/* WHAT will actually happen, before anything is typed. The old sentence
+          promised "the same voice" for every take — including a published
+          ensemble, whose entire cast the render then collapsed into its first
+          speaker with no notice anywhere. */}
+      {cast ? (
+        <p className="mt-1 text-sm text-white/70">
+          This take was published open for re-performance, with a cast of {voices} voices.
+          Change any line — or one <span className="font-jetbrains text-cyan-300">[emotion]</span>{" "}
+          tag — and each line is rendered in its OWN Character&apos;s voice, in this order. It
+          becomes a take of its own, filed as this one&apos;s child.
+        </p>
+      ) : (
+        <p className="mt-1 text-sm text-white/70">
+          {take.character_name} was published open for re-performance. Change the words — or one{" "}
+          <span className="font-jetbrains text-cyan-300">[emotion]</span> tag — and render a new
+          version. It becomes a take of its own, filed as this one&apos;s child.
+        </p>
+      )}
 
-      <label htmlFor="reperform-text" className="sr-only">Text to re-perform</label>
-      <textarea
-        id="reperform-text"
-        value={text}
-        onChange={(e) => setText(e.target.value)}
-        rows={3}
-        disabled={busy}
-        className="font-jetbrains mt-3 w-full resize-y rounded-xl border border-white/15 bg-black/30 p-3 text-sm text-white/85 outline-none transition focus:border-cyan-400/40 disabled:opacity-60"
-      />
+      {!cast && (
+        // The honest sentence for every non-cast take, legacy ensembles
+        // included: this take records ONE Character, so one voice is all this
+        // page can perform with — and it cannot tell whether the original had
+        // more.
+        <ErrorBanner severity="warning" className="mt-3">
+          This renders as ONE voice — {take.character_name}. This take carries no per-line cast,
+          so if the original had more than one speaker, that is not preserved here.
+        </ErrorBanner>
+      )}
+
+      {cast ? (
+        <div className="mt-3 space-y-2">
+          {lines.map((l, i) => (
+            <div key={i}>
+              <label htmlFor={`reperform-line-${i}`}
+                className="font-jetbrains mb-1 block text-[11px] text-cyan-200/80">
+                {l.name}
+              </label>
+              <textarea
+                id={`reperform-line-${i}`}
+                value={l.text}
+                onChange={(e) => setLines((cur) =>
+                  cur.map((c, j) => (j === i ? { ...c, text: e.target.value } : c)))}
+                rows={2}
+                disabled={busy}
+                className="font-jetbrains w-full resize-y rounded-xl border border-white/15 bg-black/30 p-3 text-sm text-white/85 outline-none transition focus:border-cyan-400/40 disabled:opacity-60"
+              />
+            </div>
+          ))}
+        </div>
+      ) : (
+        <>
+          <label htmlFor="reperform-text" className="sr-only">Text to re-perform</label>
+          <textarea
+            id="reperform-text"
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            rows={3}
+            disabled={busy}
+            className="font-jetbrains mt-3 w-full resize-y rounded-xl border border-white/15 bg-black/30 p-3 text-sm text-white/85 outline-none transition focus:border-cyan-400/40 disabled:opacity-60"
+          />
+        </>
+      )}
+
+      {overLines && (
+        <ErrorBanner severity="error" className="mt-3">
+          This take has {lines.length} speaker turns; a public re-perform is capped at{" "}
+          {MAX_REPERFORM_LINES}. Open it in the studio to re-perform the whole scene.
+        </ErrorBanner>
+      )}
 
       <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
         <span className={`font-jetbrains text-[11px] ${tooLong ? "text-rose-300" : "text-white/45"}`}>
-          {text.length} / {MAX_REPERFORM_TEXT} characters
+          {used} / {MAX_REPERFORM_TEXT} characters
+          {cast && ` · ${lines.length} line${lines.length === 1 ? "" : "s"}`}
         </span>
         <button
           onClick={() => void render()}
-          disabled={busy || tooLong || empty}
+          disabled={busy || tooLong || empty || overLines}
           title={tooLong
             ? `A public re-perform is capped at ${MAX_REPERFORM_TEXT} characters`
-            : "Render these words in this voice on the machine serving this page"}
+            : cast
+              ? "Render each line in its own Character's voice on the machine serving this page"
+              : "Render these words in this voice on the machine serving this page"}
           className="font-jetbrains cursor-pointer rounded-full border border-cyan-400/40 bg-cyan-400/10 px-4 py-2 text-[12px] text-cyan-200 transition hover:bg-cyan-400/20 disabled:cursor-not-allowed disabled:opacity-50"
         >
           {busy ? "rendering..." : "render this take →"}
@@ -157,6 +282,7 @@ export default function RePerform({ take }: { take: SharedTake }) {
           </Link>
         </p>
       )}
+      {notice && <ErrorBanner severity="warning" className="mt-3">{notice}</ErrorBanner>}
       {error && <p role="alert" className="mt-3 text-sm text-rose-300">{error}</p>}
     </section>
   );

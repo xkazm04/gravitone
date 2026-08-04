@@ -23,7 +23,7 @@ import EmotionArt from "@/components/ui/EmotionArt";
 import {
   appendEdit, composerLimit, DEFAULT_EXPRESSION, DEFAULT_TEXT, isTimingBasis, MAX_SCRIPT_LINES,
   MAX_TEXT_CHARS, readEdits, stripTags, TAKE_TIMING_VERSION,
-  type Expression, type PerfLine, type ScriptLine, type Take,
+  type Expression, type PerfLine, type ScriptLine, type Segment, type Take,
 } from "./shared";
 // Composer durability — the same IndexedDB mechanism the take log uses.
 import { loadComposer, reconcileCharacters, saveComposer, type ComposerState } from "@/lib/composerStore";
@@ -976,13 +976,22 @@ export default function PlaygroundConsole() {
       const distinct = [...new Set(lines.map((l) => l.character_id))];
       const label = distinct.length === 1 ? charName(distinct[0]) : `Ensemble · ${distinct.length} voices`;
       const transcript = lines.map((l) => `${charName(l.character_id)}: ${stripTags(l.text)}`).join("  ·  ");
+      // Stamp the CAST onto the segments. The engine reports who spoke each
+      // segment as an id; the roster that turns an id into a name lives here
+      // and nowhere else, and a share page has no roster to look one up in. A
+      // published ensemble used to arrive on /t/{id} as a flat list of
+      // segments naming nobody, under one label reading "Ensemble · N voices"
+      // — the scene, gone at the exact moment it was shared.
+      const cast: Segment[] = r.segments.map((s) => (
+        s.characterId ? { ...s, characterName: charName(s.characterId) } : s
+      ));
       const take: Take = {
         id: `take-${Date.now()}-${seq.current}`, text: transcript,
         characterId: lines[0].character_id, characterName: label,
         mode: r.mode, fallbackReason: r.fallbackReason, fallbackDetail: r.fallbackDetail,
         url: r.url, blob: r.blob, peaks: r.peaks, seconds: r.seconds, kb: r.kb, rtf: r.rtf,
         synthSeconds: r.synthSeconds, queueSeconds: r.queueSeconds,
-        ignoredSettings: r.ignoredSettings, segments: r.segments, reportCorrupt: r.reportCorrupt,
+        ignoredSettings: r.ignoredSettings, segments: cast, reportCorrupt: r.reportCorrupt,
         expr: { ...expr },
         createdAt: Date.now(), format: r.format, lines,
         timingVersion: TAKE_TIMING_VERSION,

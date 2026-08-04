@@ -378,6 +378,210 @@ class ReperformTests(_TakesBase):
                         .json()["allow_reperform"])
 
 
+class CastTests(_TakesBase):
+    """A published take remembers WHO SPOKE each segment.
+
+    Before this, an ensemble was stored under its first speaker with a flat
+    segment list naming nobody — /t/{id} could only draw one rail and re-perform
+    only had one voice to work with.
+    """
+
+    def test_a_segments_speaker_survives_publication(self) -> None:
+        take_id = self._create_take(segments=[
+            {"text": "You said you would call.", "requested": "angry",
+             "used": "angry", "character_id": "sarah", "character_name": "Sarah"},
+            {"text": "I know.", "requested": "sad", "used": "sad",
+             "character_id": "malik", "character_name": "Malik"},
+        ])
+        stored = self.client.get(f"/v1/takes/{take_id}").json()["segments"]
+        self.assertEqual([s.get("character_id") for s in stored], ["sarah", "malik"])
+        self.assertEqual([s.get("character_name") for s in stored], ["Sarah", "Malik"])
+        self.assertEqual(takes.cast_of({"segments": stored}),
+                         {"sarah": "Sarah", "malik": "Malik"})
+
+    def test_a_solo_takes_record_is_unchanged(self) -> None:
+        # No cast in = no cast keys out. A reader must be able to tell "this
+        # take names no cast" from "this segment was spoken by nobody".
+        take_id = self._create_take(segments=[
+            {"text": "Hello there.", "requested": "baseline", "used": "baseline"}])
+        stored = self.client.get(f"/v1/takes/{take_id}").json()["segments"]
+        self.assertNotIn("character_id", stored[0])
+        self.assertNotIn("character_name", stored[0])
+        self.assertEqual(takes.cast_of({"segments": stored}), {})
+
+    def test_a_name_without_an_id_is_dropped(self) -> None:
+        # A label pointing at nothing: the id is what lanes and re-perform
+        # address, so a name that names no addressable Character is not kept.
+        take_id = self._create_take(segments=[
+            {"text": "Hi.", "requested": "baseline", "used": "baseline",
+             "character_name": "Nobody"}])
+        stored = self.client.get(f"/v1/takes/{take_id}").json()["segments"]
+        self.assertNotIn("character_name", stored[0])
+
+    def test_the_cast_is_first_spoken_order_and_deduplicated(self) -> None:
+        meta = {"segments": [
+            {"character_id": "malik", "character_name": "Malik"},
+            {"character_id": "sarah", "character_name": "Sarah"},
+            {"character_id": "malik", "character_name": "Malik"},
+        ]}
+        self.assertEqual(list(takes.cast_of(meta)), ["malik", "sarah"])
+
+    def test_an_id_with_no_name_falls_back_to_the_id(self) -> None:
+        self.assertEqual(takes.cast_of({"segments": [{"character_id": "x9"}]}),
+                         {"x9": "x9"})
+
+
+def _wav(seconds: float = 0.1, rate: int = 24000) -> bytes:
+    """A real (silent) 24 kHz mono 16-bit WAV — concat_wavs parses its header,
+    so the RIFF-sniff stub is not enough for a multi-line cast render."""
+    import wave as _wave
+    buf = io.BytesIO()
+    with _wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"\x00\x00" * int(rate * seconds))
+    return buf.getvalue()
+
+
+class ReperformCastTests(_TakesBase):
+    """Whose voice a public fork actually renders in — and whether the answer
+    is stated.
+
+    The bug this replaces: an ensemble take was re-performed by handing its
+    WHOLE text to the first speaker's Character, in one voice, with nothing in
+    the response or on the page saying the cast had been collapsed.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.rendered: list[tuple[str, str]] = []
+        self._orig_provider = takes._SPEAK_PROVIDER
+        takes.set_speak_provider(self._render)
+        takes.REPERFORM_BUDGET.limiter.reset()
+
+    def tearDown(self) -> None:
+        takes.set_speak_provider(self._orig_provider)
+        takes.REPERFORM_BUDGET.limiter.reset()
+        super().tearDown()
+
+    async def _render(self, character_id: str, text: str) -> dict:
+        self.rendered.append((character_id, text))
+        return {"audio": _wav(), "seconds": 1.0, "rtf": 0.5,
+                "segments": [{"text": text, "requested": "baseline",
+                              "used": "baseline", "seconds": 1.0}]}
+
+    def _ensemble(self) -> str:
+        return self._create_take(
+            allow_reperform=True, character_id="sarah",
+            segments=[
+                {"text": "You said you would call.", "requested": "angry",
+                 "used": "angry", "character_id": "sarah", "character_name": "Sarah"},
+                {"text": "I know.", "requested": "baseline", "used": "baseline",
+                 "character_id": "malik", "character_name": "Malik"},
+            ])
+
+    def _solo(self) -> str:
+        return self._create_take(
+            allow_reperform=True, character_id="sarah",
+            segments=[{"text": "Hello there.", "requested": "baseline",
+                       "used": "baseline"}])
+
+    def test_a_cast_fork_renders_each_line_in_its_own_voice(self) -> None:
+        parent = self._ensemble()
+        r = self.client.post(f"/v1/takes/{parent}/reperform", json={"lines": [
+            {"character_id": "sarah", "text": "You never called."},
+            {"character_id": "malik", "text": "I meant to."},
+        ]})
+        self.assertEqual(r.status_code, 201, r.text)
+        self.assertEqual(self.rendered,
+                         [("sarah", "You never called."), ("malik", "I meant to.")])
+        body = r.json()
+        self.assertEqual(body["voices"], ["sarah", "malik"])
+        self.assertFalse(body["single_voice"])
+        self.assertIsNone(body["notice"])
+
+    def test_the_child_of_a_cast_fork_is_itself_an_ensemble(self) -> None:
+        parent = self._ensemble()
+        child_id = self.client.post(f"/v1/takes/{parent}/reperform", json={"lines": [
+            {"character_id": "sarah", "text": "One."},
+            {"character_id": "malik", "text": "Two."},
+        ]}).json()["take_id"]
+        child = self.client.get(f"/v1/takes/{child_id}").json()
+        self.assertEqual(takes.cast_of(child), {"sarah": "Sarah", "malik": "Malik"})
+        self.assertEqual(child["character_name"], "Ensemble - 2 voices")
+        # Sequential lines: the factor is total audio over total synthesis, not
+        # an average of the per-line factors.
+        self.assertEqual(child["seconds"], 2.0)
+        self.assertEqual(child["rtf"], 0.5)
+
+    def test_a_take_with_no_cast_says_plainly_that_it_is_one_voice(self) -> None:
+        parent = self._solo()
+        body = self.client.post(f"/v1/takes/{parent}/reperform",
+                                json={"text": "Hi again."}).json()
+        self.assertTrue(body["single_voice"])
+        self.assertIn("one voice", body["notice"])
+        self.assertIn("not preserved", body["notice"])
+
+    def test_a_cast_take_reperformed_as_one_voice_invents_no_notice(self) -> None:
+        # The publisher's own take DOES name a cast; a visitor who chose the
+        # single-voice form got what they asked for and needs no warning.
+        parent = self._ensemble()
+        body = self.client.post(f"/v1/takes/{parent}/reperform",
+                                json={"text": "Just me."}).json()
+        self.assertTrue(body["single_voice"])
+        self.assertIsNone(body["notice"])
+
+    def test_lines_may_only_name_the_takes_own_cast(self) -> None:
+        parent = self._ensemble()
+        r = self.client.post(f"/v1/takes/{parent}/reperform", json={"lines": [
+            {"character_id": "someone_elses_voice", "text": "Say this."},
+        ]})
+        self.assertEqual(r.status_code, 403)
+        self.assertIn("cast-mismatch", r.json()["detail"])
+        self.assertEqual(self.rendered, [])
+
+    def test_lines_against_a_castless_take_refuse_by_name(self) -> None:
+        r = self.client.post(f"/v1/takes/{self._solo()}/reperform", json={"lines": [
+            {"character_id": "sarah", "text": "Hi."},
+        ]})
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("cast-absent", r.json()["detail"])
+
+    def test_both_forms_at_once_is_refused_rather_than_guessed(self) -> None:
+        r = self.client.post(f"/v1/takes/{self._ensemble()}/reperform",
+                             json={"text": "A", "lines": [
+                                 {"character_id": "sarah", "text": "B"}]})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("ambiguous", r.json()["detail"])
+
+    def test_neither_form_is_the_named_empty_refusal_not_a_422(self) -> None:
+        r = self.client.post(f"/v1/takes/{self._ensemble()}/reperform", json={})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("empty", r.json()["detail"])
+
+    def test_the_character_cap_is_the_SUM_of_the_lines(self) -> None:
+        # Splitting the words across voices must not buy more of this box's CPU.
+        parent = self._ensemble()
+        half = "x" * (takes.MAX_REPERFORM_TEXT // 2 + 10)
+        r = self.client.post(f"/v1/takes/{parent}/reperform", json={"lines": [
+            {"character_id": "sarah", "text": half},
+            {"character_id": "malik", "text": half},
+        ]})
+        self.assertEqual(r.status_code, 413)
+        self.assertIn("too-long", r.json()["detail"])
+        self.assertEqual(self.rendered, [])
+
+    def test_more_lines_than_the_cap_is_refused_by_the_schema(self) -> None:
+        parent = self._ensemble()
+        r = self.client.post(f"/v1/takes/{parent}/reperform", json={"lines": [
+            {"character_id": "sarah", "text": "a"}
+            for _ in range(takes.MAX_REPERFORM_LINES + 1)
+        ]})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(self.rendered, [])
+
+
 class ReviewsErrorTests(_TakesBase):
     def test_review_of_unknown_take_is_404(self) -> None:
         resp = self.client.post(
