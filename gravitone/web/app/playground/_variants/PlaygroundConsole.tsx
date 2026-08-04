@@ -36,6 +36,7 @@ import { loadRoster, type Character } from "@/app/voices/_data/characters";
 import { putTake, getRecentTakes, deleteTake } from "@/lib/takeStore";
 import { useAudioPlayer } from "./useAudioPlayer";
 import EmotionPicker from "./EmotionPicker";
+import EmotionAB from "./EmotionAB";
 import TakeCode from "./TakeCode";
 import LiveStage from "../_live/LiveStage";
 import ScoreEditor from "./ScoreEditor";
@@ -1393,6 +1394,20 @@ export default function PlaygroundConsole() {
           </p>
         </div>
       </div>
+
+      {/* Emotion A/B — Solo only: it holds ONE line and ONE Character still and
+          varies exactly one thing, which a multi-character script is not. It is
+          handed the console's single transport rather than owning an audio
+          element, so A and B can never play over each other. */}
+      {mode === "solo" && character && (
+        <EmotionAB
+          characterId={character.character_id} characterName={character.name}
+          scale={scale} recorded={character.emotions ?? []}
+          text={text} expr={expr} format={format}
+          playingId={playingId} paused={paused} toggle={toggle} stop={stop}
+          onKeep={(pair) => pair.forEach(addTake)}
+        />
+      )}
 
       {liveOn && (
         <LiveStage characters={characters} charId={charId} generateBusy={busy} onTake={addTake}
