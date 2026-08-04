@@ -7,7 +7,7 @@
 // keyboard-operable, and — because it registers its element with the AudioBus —
 // bars that move with the actual waveform instead of a CSS timer.
 
-import { useCallback, useId } from "react";
+import { useCallback, useEffect, useId, useRef } from "react";
 import { useTransport } from "./useTransport";
 import { Waveform } from "./Primitives";
 
@@ -25,6 +25,7 @@ export default function TakePlayer({
   hue,
   compact = false,
   onEnded,
+  onFail,
   label = "take",
   autoPlay = false,
   className = "",
@@ -35,6 +36,13 @@ export default function TakePlayer({
   /** Dense inline variant (rows, lists) instead of the full-width transport. */
   compact?: boolean;
   onEnded?: () => void;
+  /**
+   * This source would not play. The pill can only ever say "unplayable" — the
+   * element is handed a URL and told nothing about WHY the server refused it —
+   * so a surface that can find out (the ingest board re-asks the proxy for the
+   * service's sentence) gets told when there is something to find out about.
+   */
+  onFail?: () => void;
   /** Spoken name of this audio, used for the group + button labels. */
   label?: string;
   autoPlay?: boolean;
@@ -44,6 +52,15 @@ export default function TakePlayer({
   const { playing, position, duration, failed, progress, toggle, seek, audioProps } =
     useTransport({ src, autoPlay, onEnded });
   const railId = useId();
+
+  // Fire once per failure, from an effect rather than the transport's onError
+  // so the two agree: what the pill renders as "unplayable" is exactly what the
+  // caller is told about.
+  const onFailRef = useRef(onFail);
+  onFailRef.current = onFail;
+  useEffect(() => {
+    if (failed) onFailRef.current?.();
+  }, [failed, src]);
 
   const tint = Number.isFinite(hue) ? (hue as number) : DEFAULT_HUE;
 

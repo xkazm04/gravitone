@@ -185,18 +185,37 @@ function withForwardedQuery(
   return `${backendPath}${backendPath.includes("?") ? "&" : "?"}${qs}`;
 }
 
-/** Stream an immutable ingest audio asset (a stem or speaker preview) through.
+/** Stream an immutable ingest audio asset (a stem, segment or speaker preview).
  *
- *  Shared by the two ingest preview routes, which differed only in their
+ *  Shared by the three ingest asset routes, which differed only in their
  *  upstream path segment. Streams the body rather than buffering it, and caches:
  *  these wavs are written once and never change.
+ *
+ *  A REFUSAL is passed through exactly as proxyJson passes one: the upstream
+ *  status, the upstream body, and Retry-After. This proxy used to flatten every
+ *  non-OK answer to `{"detail":"not found"}` — which threw away the four
+ *  distinguished sentences the service writes about a segment it will not serve
+ *  (`ingest_api.py::_segment_refusal`: "measured as not the target speaker",
+ *  "could not be decoded", …), the "job not found or expired" that means the
+ *  whole session is gone, and any Retry-After on the way. It was the one proxy
+ *  in the app that did this.
  */
 export async function streamIngestAsset(upstreamPath: string): Promise<Response> {
   try {
     const r = await backendFetch(upstreamPath, {
       signal: AbortSignal.timeout(READ_TIMEOUT_MS),
     });
-    if (!r.ok) return jsonError("not found", r.status);
+    if (!r.ok) {
+      const headers = new Headers({ "Content-Type": "application/json" });
+      const retryAfter = r.headers.get("Retry-After");
+      if (retryAfter) headers.set("Retry-After", retryAfter);
+      const body = await r.text();
+      // An upstream that says nothing still gets a body the client can read:
+      // readDetail must never be handed an empty response to parse.
+      return body
+        ? new Response(body, { status: r.status, headers })
+        : jsonError("not found", r.status);
+    }
     return new Response(r.body, {
       status: 200,
       headers: {

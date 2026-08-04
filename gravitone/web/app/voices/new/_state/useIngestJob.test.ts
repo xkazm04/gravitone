@@ -7,7 +7,7 @@
 // implementation detail — the assertions are about the shape of the ladder.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, renderHook } from "@testing-library/react";
-import { useIngestJob } from "./useIngestJob";
+import { WATCH_MS, useIngestJob } from "./useIngestJob";
 import type { Job } from "./machine";
 
 function body(over: Partial<Job> = {}): string {
@@ -17,12 +17,18 @@ function body(over: Partial<Job> = {}): string {
   });
 }
 
-function mount(fetchImpl: ReturnType<typeof vi.fn>, jobId: string | null = "j1", enabled = true) {
+function mount(
+  fetchImpl: ReturnType<typeof vi.fn>,
+  jobId: string | null = "j1",
+  enabled = true,
+  watch = false,
+) {
   vi.stubGlobal("fetch", fetchImpl);
   const onJob = vi.fn();
   const onExpired = vi.fn();
   const onStalled = vi.fn();
-  const view = renderHook(() => useIngestJob({ jobId, enabled, onJob, onExpired, onStalled }));
+  const view = renderHook(() =>
+    useIngestJob({ jobId, enabled, watch, onJob, onExpired, onStalled }));
   return { ...view, onJob, onExpired, onStalled, fetchImpl };
 }
 
@@ -162,6 +168,73 @@ describe("useIngestJob", () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
     const after = at.slice(before).map((t, i) => t - (i === 0 ? at[before - 1] : at[before + i - 1]));
     expect(Math.min(...after)).toBe(1_500);
+  });
+
+  // ── watch mode: the review screen ──────────────────────────────────────────
+  // The service ages a job from its last state MUTATION (a GET is not one), so
+  // a user reading the ledger for 30 minutes had a dead session under a live
+  // screen and found out from a commit that 404'd.
+  describe("watching a reviewed job", () => {
+    it("keeps asking even though the status is terminal", async () => {
+      vi.useFakeTimers();
+      const at: number[] = [];
+      const { fetchImpl } =
+        mount(timedFetch(() => new Response(body({ status: "done" })), at), "j1", true, true);
+      await act(async () => { await vi.advanceTimersByTimeAsync(WATCH_MS * 3 + 100); });
+      expect(fetchImpl.mock.calls.length).toBeGreaterThanOrEqual(3);
+    });
+
+    it("costs far less than the analyze cadence", async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(0);
+      const at: number[] = [];
+      mount(timedFetch(() => new Response(body({ status: "done" })), at), "j1", true, true);
+      await act(async () => { await vi.advanceTimersByTimeAsync(120_000); });
+      expect(at.length).toBeLessThanOrEqual(120_000 / WATCH_MS + 1);
+      expect(at[0]).toBe(WATCH_MS);
+    });
+
+    it("never re-seeds the ledger the user is editing", async () => {
+      vi.useFakeTimers();
+      const at: number[] = [];
+      const { onJob } =
+        mount(timedFetch(() => new Response(body({ status: "done" })), at), "j1", true, true);
+      await act(async () => { await vi.advanceTimersByTimeAsync(WATCH_MS * 2 + 100); });
+      expect(onJob).not.toHaveBeenCalled();
+    });
+
+    it("ends the flow when the session has aged out under the review screen", async () => {
+      vi.useFakeTimers();
+      const at: number[] = [];
+      const { onExpired, fetchImpl } = mount(
+        timedFetch((i) => i === 0
+          ? new Response(body({ status: "done" }))
+          : new Response(JSON.stringify({ status: "expired", detail: "job not found or expired" }),
+              { status: 404 }), at),
+        "j1", true, true);
+      await act(async () => { await vi.advanceTimersByTimeAsync(WATCH_MS * 2 + 100); });
+      expect(onExpired).toHaveBeenCalledTimes(1);
+      const after = fetchImpl.mock.calls.length;
+      await act(async () => { await vi.advanceTimersByTimeAsync(WATCH_MS * 3); });
+      expect(fetchImpl).toHaveBeenCalledTimes(after);   // no reschedule after expiry
+    });
+
+    it("treats a session torn down elsewhere as ended too", async () => {
+      vi.useFakeTimers();
+      const at: number[] = [];
+      const { onExpired } =
+        mount(timedFetch(() => new Response(body({ status: "cancelled" })), at), "j1", true, true);
+      await act(async () => { await vi.advanceTimersByTimeAsync(WATCH_MS + 100); });
+      expect(onExpired).toHaveBeenCalledTimes(1);
+    });
+
+    it("still admits a degraded connection", async () => {
+      vi.useFakeTimers();
+      const f = vi.fn().mockRejectedValue(new TypeError("network"));
+      const { onStalled } = mount(f, "j1", true, true);
+      await act(async () => { await vi.advanceTimersByTimeAsync(WATCH_MS * 3 + 100); });
+      expect(onStalled).toHaveBeenCalledWith(true);
+    });
   });
 
   it("stops on unmount", async () => {

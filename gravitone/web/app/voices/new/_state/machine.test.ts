@@ -5,7 +5,7 @@
 // of the reducer. A refactor that keeps those promises keeps these green.
 import { describe, expect, it } from "vitest";
 import {
-  POLLING_PHASES, TERMINAL_STATUSES, initialState, reducer, statusToPhase,
+  POLLING_PHASES, TERMINAL_STATUSES, WATCH_PHASES, initialState, reducer, statusToPhase,
   type Action, type Job, type Result, type State,
 } from "./machine";
 
@@ -54,6 +54,18 @@ describe("statusToPhase", () => {
     expect([...POLLING_PHASES].sort()).toEqual(["committing", "processing", "speaker"]);
     expect(POLLING_PHASES.has("review")).toBe(false);
     expect(POLLING_PHASES.has("complete")).toBe(false);
+  });
+
+  it("watches review — the phase where a job dies of idleness under the user", () => {
+    expect([...WATCH_PHASES]).toEqual(["review"]);
+    // Watching is the OTHER leg, never the live one: overlapping the two would
+    // mean a running job polled at the watch cadence, or a reviewed ledger
+    // re-seeded from the server every 1.5s.
+    for (const p of WATCH_PHASES) expect(POLLING_PHASES.has(p)).toBe(false);
+    // Nothing is watched once the flow is over or has not started.
+    for (const p of ["upload", "complete", "expired"] as const) {
+      expect(WATCH_PHASES.has(p)).toBe(false);
+    }
   });
 
   it("treats every finished status as terminal for polling", () => {

@@ -1,8 +1,11 @@
 "use client";
 
+import { useCallback, useState } from "react";
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import TakePlayer from "@/components/ui/TakePlayer";
 import { emotionMeta } from "@/lib/emotions";
+import { useMounted } from "@/lib/useMounted";
+import { assetRefusal } from "../_state/failures";
 import type { Result, Stem } from "../_state/machine";
 import {
   boardRows, castableElsewhere, labelSource, moveSegment, shortBy, stemProgress,
@@ -234,6 +237,18 @@ function SegmentRowView(props: {
 }) {
   const { row, jobId, hue, others, busy } = props;
   const label = emotionMeta(row.emotion);
+  const src = `/api/ingest/${jobId}/segment/${row.i}`;
+  // What the SERVICE says about audio it would not serve. The transport can
+  // only report "unplayable" — it never sees the body — and this row is the one
+  // place where the difference between "measured as not the target speaker",
+  // "could not be decoded" and "this session has expired" is the whole answer.
+  const [refusal, setRefusal] = useState<string | null>(null);
+  const mounted = useMounted();
+  const onFail = useCallback(() => {
+    void assetRefusal(src).then((detail) => {
+      if (detail && mounted.current) setRefusal(detail);
+    });
+  }, [src, mounted]);
   return (
     <li
       className={`glass-panel rounded-xl px-3 py-2.5 transition ${
@@ -307,21 +322,23 @@ function SegmentRowView(props: {
         <span className="ml-auto flex min-w-[13rem] flex-1 justify-end">
           {row.available ? (
             <TakePlayer
-              src={`/api/ingest/${jobId}/segment/${row.i}`}
+              src={src}
               hue={hue}
               compact
               className="w-full max-w-xs"
               label={`segment ${row.i}, ${label.label}`}
+              onFail={onFail}
             />
           ) : row.ok !== false && !row.failure ? (
             // Rejected but extracted: the audio exists and hearing it is the
             // only way to check the verdict.
             <TakePlayer
-              src={`/api/ingest/${jobId}/segment/${row.i}`}
+              src={src}
               hue={hue}
               compact
               className="w-full max-w-xs"
               label={`rejected segment ${row.i}`}
+              onFail={onFail}
             />
           ) : (
             <span className="font-jetbrains text-[11px] text-white/35">no audio to play</span>
@@ -352,6 +369,12 @@ function SegmentRowView(props: {
           {row.cue && <span className="text-white/35">{row.cue}</span>}
           {row.blocked && <span className="text-rose-200/70">{row.blocked}</span>}
         </div>
+      )}
+      {/* Amber, not rose: the segment did not play, and the scan is fine. */}
+      {refusal && (
+        <ErrorBanner severity="warning" className="mt-1.5">
+          segment {row.i} wouldn&apos;t play — {refusal}
+        </ErrorBanner>
       )}
     </li>
   );

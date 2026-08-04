@@ -181,6 +181,18 @@ export const POLLING_PHASES: ReadonlySet<Phase> = new Set<Phase>([
   "processing", "speaker", "committing",
 ]);
 
+// Phases where NOTHING is progressing server-side — but the job can still die
+// under the user, so it is watched at a slow cadence.
+//
+// The service ages a job from its last state MUTATION, not from the last read:
+// `touched` is written only by `_persist` (ingest_api.py), and `get_job` does a
+// bare `JOBS.get` under the lock without persisting anything. So a GET neither
+// keeps a job alive nor defeats GC — which is exactly what makes watching
+// review safe: a user reading the ledger for the full 30-minute idle TTL had a
+// dead job under a live-looking screen, and the first they heard of it was a
+// commit that 404'd into COMMIT_FAILED, on a screen with no way out.
+export const WATCH_PHASES: ReadonlySet<Phase> = new Set<Phase>(["review"]);
+
 // Server statuses that are terminal for polling — the hook stops on these.
 export const TERMINAL_STATUSES: ReadonlySet<string> = new Set([
   "done", "committed", "error", "cancelled", "expired",

@@ -19,9 +19,10 @@ import { DetectionFinding, SovereignLimits, segmentFailureNote, type LoaderData 
 import AuditionPanel from "./_review/AuditionPanel";
 import SegmentBoard from "./_review/SegmentBoard";
 import {
-  reducer, initialState, POLLING_PHASES,
+  reducer, initialState, POLLING_PHASES, WATCH_PHASES,
   type CastResult, type Character, type Job, type ModeInfo, type Stem,
 } from "./_state/machine";
+import { CANCEL_UNFINISHED, assetRefusal, cancelIngest } from "./_state/failures";
 import { candidates, commitRecipes, recipeById } from "./_state/audition";
 import { corpusNotice } from "./_state/corpus";
 import { identityMeasured, isEdited, stemIdentity } from "./_state/casting";
@@ -101,6 +102,13 @@ export default function NewCharacterPage() {
   const submitting = useRef(false); // re-entrancy guard for scan/speaker/commit
   const [pending, setPending] = useState<Pending>(null); // the same fact, visible
   const [playing, setPlaying] = useState<string | null>(null);
+  // The service's own sentence about a clip that would not play.
+  const [clipRefusal, setClipRefusal] = useState<string | null>(null);
+  // A DELETE that did NOT tear the job down. Load-bearing: while this is set,
+  // the flow has not been reset, because resetting would tell the user the
+  // session is gone while the backend may still be cloning into their roster.
+  const [cancelFailed, setCancelFailed] = useState<string | null>(null);
+  const cancelling = useRef(false); // atomic gate — Cancel is double-clickable
   const mounted = useMounted();
   // Which ledger row has its Audition Room open. Exactly one at a time, and null
   // is the normal state: the fast path is still keep/descope then commit.
@@ -174,11 +182,15 @@ export default function NewCharacterPage() {
     return () => { alive = false; };
   }, []);
 
-  // ONE poller for both the analyze leg and the commit leg.
+  // ONE poller for the analyze leg, the commit leg AND the review watch — the
+  // last of which exists because a job dies of idleness while it is being
+  // reviewed (see WATCH_PHASES) and the screen used to keep looking alive.
   const [pollStalled, setPollStalled] = useState(false);
+  const watching = WATCH_PHASES.has(phase);
   useIngestJob({
     jobId,
-    enabled: POLLING_PHASES.has(phase),
+    enabled: POLLING_PHASES.has(phase) || watching,
+    watch: watching,
     onJob: (j: Job) => dispatch({ type: "JOB_POLLED", job: j }),
     onExpired: () => dispatch({ type: "JOB_EXPIRED" }),
     onStalled: setPollStalled,
@@ -287,14 +299,22 @@ export default function NewCharacterPage() {
   }
 
   function playClip(url: string, id: string) {
+    setClipRefusal(null);
     if (playing === id) { audioRef.current?.pause(); setPlaying(null); return; }
     audioRef.current?.pause();
     const a = audioRef.current ?? (audioRef.current = new Audio());
     a.src = url; a.onended = () => setPlaying(null);
     setPlaying(id);
     // Reset on rejection (missing/expired preview, autoplay block) instead of
-    // leaving the row stuck showing "playing".
-    void a.play().catch(() => setPlaying((cur) => (cur === id ? null : cur)));
+    // leaving the row stuck showing "playing" — and then ASK why: a refused
+    // preview has a sentence behind it (the stem is gone, the session expired)
+    // and the element is told none of it.
+    void a.play().catch(() => {
+      setPlaying((cur) => (cur === id ? null : cur));
+      void assetRefusal(url).then((detail) => {
+        if (detail && mounted.current) setClipRefusal(detail);
+      });
+    });
   }
 
   /** Hear an emotion AS A VOICE — the clone of its chosen (or default) take,
@@ -348,12 +368,29 @@ export default function NewCharacterPage() {
   async function cancelCommit() {
     // DELETE tears down the whole job server-side (workdir included), so the
     // review ledger is gone too — the only honest place to land is upload.
-    try { await fetch(`/api/ingest/${jobId}`, { method: "DELETE" }); } catch { /* ignore */ }
-    startOver();
+    //
+    // But ONLY if the DELETE actually happened. This used to swallow its
+    // failure and start over unconditionally: the user was shown a fresh
+    // dropzone, told nothing, while the backend kept cloning voices into their
+    // roster. A failed cancel now stays on this screen and says what is still
+    // true (the poller keeps running, so a commit that finishes anyway still
+    // lands on the complete screen).
+    if (!jobId || cancelling.current) return;
+    cancelling.current = true;
+    setCancelFailed(null);
+    try {
+      const outcome = await cancelIngest(jobId);
+      if (!mounted.current) return;
+      if (!outcome.ok) { setCancelFailed(outcome.detail); return; }
+      startOver();
+    } finally {
+      cancelling.current = false;
+    }
   }
 
   function startOver() {
     setFile(null); setBusyNotice(null); setKeepCorpus(false);
+    setCancelFailed(null); setClipRefusal(null);
     dispatch({ type: "RESET", kind: "start-over" });
   }
 
@@ -362,6 +399,7 @@ export default function NewCharacterPage() {
     // decision about THIS audio, and carrying it forward would keep a second
     // recording on the box on the strength of a tick about the first.
     setFile(null); setBusyNotice(null); setKeepCorpus(false);
+    setCancelFailed(null); setClipRefusal(null);
     dispatch({ type: "RESET", kind: "scan-another" });
   }
 
@@ -418,9 +456,22 @@ export default function NewCharacterPage() {
             </span>
           </ErrorBanner>
         )}
-        {pollStalled && POLLING_PHASES.has(phase) && (
+        {pollStalled && (POLLING_PHASES.has(phase) || watching) && (
           <ErrorBanner severity="warning">
-            connection to the studio is degraded — retrying. Your job keeps running server-side.
+            {watching
+              // Nothing is running to keep running: what is at stake here is
+              // that we cannot tell whether the session is still there, and a
+              // commit against a session that has gone will fail.
+              ? "connection to the studio is degraded — retrying. Until it is back we can't tell whether this scan session is still open."
+              : "connection to the studio is degraded — retrying. Your job keeps running server-side."}
+          </ErrorBanner>
+        )}
+        {/* A clip that would not play, in the service's own words. The <audio>
+            element never sees the refusal body, so the sentence is fetched from
+            the proxy after the failure — see _state/failures#assetRefusal. */}
+        {clipRefusal && (
+          <ErrorBanner severity="warning">
+            that clip wouldn&apos;t play — {clipRefusal}
           </ErrorBanner>
         )}
 
@@ -845,6 +896,14 @@ export default function NewCharacterPage() {
                     : `${mode === "new" ? "Create character" : "Add to character"} (${selected.size})`}
                 </Button>
               </div>
+              {/* The way out. Review is where a user spends the most time and
+                  it was the one phase with no exit at all: a commit that failed
+                  landed back HERE, and the only escape from a ledger the user
+                  had given up on was reloading the page by hand. */}
+              <button onClick={startOver}
+                className="font-jetbrains mt-3 cursor-pointer text-[11px] text-white/45 underline decoration-dotted underline-offset-4 transition hover:text-white">
+                start over with a different recording
+              </button>
               <label className="mt-4 flex cursor-pointer items-start gap-2 text-[13px] text-white/70">
                 <input type="checkbox" checked={consented} onChange={(e) => setConsented(e.target.checked)}
                   className="mt-0.5 accent-cyan-300" />
@@ -903,8 +962,22 @@ export default function NewCharacterPage() {
               </div>
               <button onClick={cancelCommit}
                 className="font-jetbrains mt-6 cursor-pointer rounded-full border border-white/15 px-5 py-2 text-[13px] text-white/70 transition hover:bg-white/5">
-                Cancel
+                {cancelFailed ? "Try cancelling again" : "Cancel"}
               </button>
+              {/* The cancel did not happen, and the copy names the state that
+                  leaves behind rather than the one the user asked for. */}
+              {cancelFailed && (
+                <ErrorBanner severity="warning" className="mx-auto mt-4 max-w-xl text-left">
+                  <span className="block">
+                    {cancelFailed} — {CANCEL_UNFINISHED}. This screen keeps
+                    following the job, so if the clone finishes you will see it.
+                  </span>
+                  <button onClick={startOver}
+                    className="mt-2 cursor-pointer underline decoration-dotted underline-offset-4 transition hover:text-amber-100">
+                    leave this screen anyway
+                  </button>
+                </ErrorBanner>
+              )}
             </div>
           );
         })()}

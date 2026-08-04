@@ -22,6 +22,19 @@ import { TERMINAL_STATUSES, type Job } from "./machine";
  * first ~20s of a step, 3s for the next ~20s, then 5s. The clock resets each
  * time the server's `step` changes, so every new stage gets tight polling
  * again.
+ *
+ * WATCH MODE (`watch: true`) is the review screen's leg, and it is a different
+ * job: nothing is progressing, so there is nothing to follow — but the service
+ * ages a job from its last state MUTATION on a 30-minute idle TTL, and a GET is
+ * not one (see WATCH_PHASES in machine.ts). So we ask once every WATCH_MS for
+ * exactly one fact: is this session still there. Consequences of that being the
+ * only question:
+ *   * a terminal status does NOT stop the loop (review IS the terminal status);
+ *   * the payload is deliberately NOT handed to `onJob`. The ledger on screen
+ *     is the one the user is editing — re-seeding it from a poll would throw
+ *     away their selections, their auditions and their casting every 30s;
+ *   * a job that has gone (404) or that the server itself reports as
+ *     expired/cancelled ends the flow, which is the whole point.
  */
 function pollDelay(msInStep: number): number {
   if (msInStep < 20_000) return 1500;
@@ -30,15 +43,20 @@ function pollDelay(msInStep: number): number {
 }
 
 const STALL_AFTER = 3; // consecutive failed polls before the UI is told
+/** Watch cadence. The TTL it guards is 30 minutes, so "within a minute" is
+ *  plenty of resolution and costs ~2 requests a minute for an idle screen. */
+export const WATCH_MS = 30_000;
 
 export function useIngestJob(opts: {
   jobId: string | null;
   enabled: boolean;
+  /** Watch for expiry only — see WATCH MODE above. */
+  watch?: boolean;
   onJob: (job: Job) => void;
   onExpired: () => void;
   onStalled?: (stalled: boolean) => void;
 }): void {
-  const { jobId, enabled } = opts;
+  const { jobId, enabled, watch = false } = opts;
   const onJob = useRef(opts.onJob);
   const onExpired = useRef(opts.onExpired);
   const onStalled = useRef(opts.onStalled);
@@ -66,19 +84,29 @@ export function useIngestJob(opts: {
         if (failures >= STALL_AFTER) onStalled.current?.(false);
         failures = 0;
         if (job.status === "expired") { onExpired.current(); return; }
-        if (job.step !== stepKey) { stepKey = job.step; stepSince = Date.now(); }
-        onJob.current(job);
-        if (TERMINAL_STATUSES.has(job.status)) return;         // terminal: stop
+        if (watch) {
+          // A session torn down elsewhere (another tab's DELETE) reports itself
+          // cancelled rather than 404ing until GC runs — same outcome for the
+          // user, so it ends the flow the same way.
+          if (job.status === "cancelled") { onExpired.current(); return; }
+          // Deliberately no onJob: see WATCH MODE. Keep watching.
+        } else {
+          if (job.step !== stepKey) { stepKey = job.step; stepSince = Date.now(); }
+          onJob.current(job);
+          if (TERMINAL_STATUSES.has(job.status)) return;       // terminal: stop
+        }
       } catch {
         // transient transport error — retry, but stop pretending all is well
         if (stopped) return;
         failures += 1;
         if (failures === STALL_AFTER) onStalled.current?.(true);
       }
-      if (!stopped) timer = setTimeout(tick, pollDelay(Date.now() - stepSince));
+      if (!stopped) {
+        timer = setTimeout(tick, watch ? WATCH_MS : pollDelay(Date.now() - stepSince));
+      }
     };
 
-    timer = setTimeout(tick, 1500);
+    timer = setTimeout(tick, watch ? WATCH_MS : 1500);
     return () => { stopped = true; clearTimeout(timer); };
-  }, [jobId, enabled]);
+  }, [jobId, enabled, watch]);
 }
