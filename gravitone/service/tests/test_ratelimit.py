@@ -133,8 +133,35 @@ class ClientIdentityTest(unittest.TestCase):
         self.assertEqual(client_ip(req), "10.0.0.9")
 
     def test_forwarded_for_is_honoured_only_behind_proxy_trust(self) -> None:
-        req = _FakeRequest("10.0.0.9", {"x-forwarded-for": "1.1.1.1, 10.0.0.1"})
+        req = _FakeRequest("10.0.0.9", {"x-forwarded-for": "1.1.1.1"})
         self.assertEqual(client_ip(req, trust_proxy=True), "1.1.1.1")
+
+    def test_one_trusted_hop_reads_the_entry_that_hop_wrote(self) -> None:
+        # Every proxy APPENDS, so with one proxy of ours in front, the entry we
+        # trust is the LAST one — the address our proxy actually saw. The
+        # leftmost is whatever the client typed.
+        req = _FakeRequest("10.0.0.9",
+                           {"x-forwarded-for": "9.9.9.9, 203.0.113.7"})
+        self.assertEqual(client_ip(req, trust_proxy=True, hops=1), "203.0.113.7")
+
+    def test_a_forged_leading_entry_cannot_pick_its_own_bucket(self) -> None:
+        # Two clients forging different left-hand entries must still land in
+        # one bucket when they come through the same proxy from one address.
+        a = _FakeRequest("10.0.0.9", {"x-forwarded-for": "1.1.1.1, 198.51.100.4"})
+        b = _FakeRequest("10.0.0.9", {"x-forwarded-for": "2.2.2.2, 198.51.100.4"})
+        self.assertEqual(client_ip(a, trust_proxy=True),
+                         client_ip(b, trust_proxy=True))
+
+    def test_more_hops_reads_further_left(self) -> None:
+        # A CDN in front of our own proxy: two hops are ours, so the caller is
+        # the entry the CDN wrote.
+        req = _FakeRequest("10.0.0.9",
+                           {"x-forwarded-for": "forged, 203.0.113.7, 10.0.0.2"})
+        self.assertEqual(client_ip(req, trust_proxy=True, hops=2), "203.0.113.7")
+
+    def test_a_chain_shorter_than_the_claimed_hops_uses_what_it_has(self) -> None:
+        req = _FakeRequest("10.0.0.9", {"x-forwarded-for": "203.0.113.7"})
+        self.assertEqual(client_ip(req, trust_proxy=True, hops=4), "203.0.113.7")
 
     def test_trusted_proxy_with_no_header_falls_back_to_the_peer(self) -> None:
         self.assertEqual(client_ip(_FakeRequest("10.0.0.9"), trust_proxy=True), "10.0.0.9")

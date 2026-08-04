@@ -73,6 +73,23 @@ MAX_REPERFORM_TEXT = 1000
 # so /metrics-shaped introspection and the tests can find it.
 REPERFORM_BUDGET = per_ip_budget("reperform", limit=5, window_s=300, burst=2)
 
+# Publishing a take is an anonymous 25 MB upload into a bounded store, and it
+# had no budget at all: one client could churn the entire share store (and its
+# disk) as fast as it could send. Slower than a render but far from tight — a
+# studio session ends in a handful of shares, and every studio visitor arrives
+# as ONE address until TTS_TRUST_PROXY is on, so this is a budget for the room:
+# 60 uploads per 10 minutes, six at a time. Env-tunable, because the honest
+# number depends on the box's disk and its audience.
+def _upload_limit() -> int:
+    try:
+        return max(1, int(os.environ.get("TTS_BUDGET_TAKE_UPLOAD", "") or 60))
+    except ValueError:
+        return 60
+
+
+UPLOAD_BUDGET = per_ip_budget("take-upload", limit=_upload_limit(),
+                              window_s=600, burst=6, methods=("POST",))
+
 
 def _valid_id(take_id: str) -> bool:
     """Ids are minted here (10 hex chars); anything else is a caller's string
@@ -194,7 +211,7 @@ def _summary(meta: dict) -> dict:
 
 
 # NOT async: writes up to 25 MB and globs/stats the whole takes dir to evict.
-@router.post("", status_code=201)
+@router.post("", status_code=201, dependencies=[Depends(UPLOAD_BUDGET)])
 def create_take(
     file: UploadFile = File(...),
     meta: str = Form(...),

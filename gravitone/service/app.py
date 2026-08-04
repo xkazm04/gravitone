@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import struct
 import time
@@ -1303,9 +1304,42 @@ async def _store_artifact(digest: str, body: bytes, fmt: _AudioFormat,
 # Hero-demo hardening: the unauthenticated relay path (/api/tts -> here,
 # /api/voices -> the clone route) gets a per-IP budget. Tighten once
 # TTS_TRUST_PROXY is on and the studio is not one address for every visitor.
-DEMO_TTS_BUDGET = per_ip_budget("demo-tts", limit=60, window_s=60, burst=6)
-DEMO_CLONE_BUDGET = per_ip_budget("demo-clone", limit=20, window_s=600,
-                                  burst=4, methods=("POST",))
+#
+# EVERY compute route carries one, not just the drop-in: /v1/speak and
+# /v1/performance spend the same worker permits and the same CPU seconds, and a
+# budget that covers one of three entrances is decoration. All of them are
+# env-tunable because the right number is a property of the deployment, not of
+# the code, and all of them are sized for the SHIPPED shape of the traffic: the
+# studio relays server-side with the deployment's own key, so every studio
+# visitor arrives as ONE address (the proxy host) until TTS_TRUST_PROXY is on.
+# A limit that would be generous per human is therefore a limit for the whole
+# room, and these are set accordingly — high enough that a live demo with a
+# dozen people at it never sees a 429, low enough that a scripted client cannot
+# hold the queue.
+def _budget_limit(env: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(env, "") or default))
+    except ValueError:
+        return default
+
+
+DEMO_TTS_BUDGET = per_ip_budget(
+    "demo-tts", limit=_budget_limit("TTS_BUDGET_TTS", 60), window_s=60, burst=6)
+DEMO_CLONE_BUDGET = per_ip_budget(
+    "demo-clone", limit=_budget_limit("TTS_BUDGET_CLONE", 20), window_s=600,
+    burst=4, methods=("POST",))
+# /v1/speak is the studio's own render path (metatagged multi-segment lines):
+# a working session is a handful of renders a minute per person, so 120/60s is
+# roughly a dozen people rendering steadily, and the burst of 12 is what a
+# "render all lines" click legitimately looks like.
+SPEAK_BUDGET = per_ip_budget(
+    "speak", limit=_budget_limit("TTS_BUDGET_SPEAK", 120), window_s=60, burst=12)
+# /v1/performance renders a whole cast against a script — the single most
+# expensive request this service takes. Fewer, slower, and it is deliberately
+# not something a room full of demo visitors should be running at once.
+PERFORMANCE_BUDGET = per_ip_budget(
+    "performance", limit=_budget_limit("TTS_BUDGET_PERFORMANCE", 30),
+    window_s=60, burst=5)
 
 
 @app.post("/v1/text-to-speech/{voice_id}",
@@ -2306,7 +2340,8 @@ class SpeakRequest(BaseModel):
     degrade_allowed: bool = False
 
 
-@app.post("/v1/speak", dependencies=[Depends(require_scope("tts"))])
+@app.post("/v1/speak",
+          dependencies=[Depends(require_scope("tts")), Depends(SPEAK_BUDGET)])
 async def speak(
     req: SpeakRequest,
     output_format: str = Query("wav_24000"),
@@ -2452,7 +2487,9 @@ class PerformanceRequest(BaseModel):
     degrade_allowed: bool = False
 
 
-@app.post("/v1/performance", dependencies=[Depends(require_scope("performance"))])
+@app.post("/v1/performance",
+          dependencies=[Depends(require_scope("performance")),
+                        Depends(PERFORMANCE_BUDGET)])
 async def performance(req: PerformanceRequest,
                       output_format: str = Query("wav_24000")):
     """Character Performance API — a multi-character script in one call.

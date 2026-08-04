@@ -187,6 +187,11 @@ def replica_env(replicas: int, cores: int, base: Optional[dict] = None) -> dict:
     """
     env = dict(os.environ if base is None else base)
     env["TTS_WORKERS"] = "1"
+    # How many processes share every per-IP budget. Without it each replica
+    # counts alone and "60 per minute" is silently N x 60 for the pool; with it
+    # `service/ratelimit.py` counts the window across the replicas through a
+    # file and the 429 body quotes the number that is actually enforced.
+    env["TTS_REPLICAS"] = str(max(1, int(replicas)))
     per = str(per_replica_threads(replicas, cores))
     for var in _THREAD_ENV_VARS:
         env[var] = per
@@ -846,6 +851,50 @@ _HOP_BY_HOP = frozenset({
 
 _PROXY_CHUNK = 64 * 1024
 
+_FORWARDED_FOR = "X-Forwarded-For"
+# One address is one bucket downstream, so a forged chain must not be able to
+# grow without bound: a client sending 10k entries would otherwise push our own
+# appended entry past any hop count an operator could sanely configure.
+_MAX_FORWARDED_ENTRIES = 16
+_MAX_FORWARDED_CHARS = 64
+
+
+def forwarded_for(existing: str, peer: str) -> str:
+    """The ``X-Forwarded-For`` value this hop should send on.
+
+    APPEND, never replace: the standard reading of the header is "oldest first,
+    each proxy adds the address it saw", and a downstream reader that counts
+    trusted hops from the right (``service.ratelimit.client_ip``) needs our
+    entry to be the LAST one. Replacing would also throw away a real CDN's
+    entry; trusting the inbound chain is the reader's decision, not ours.
+    """
+    parts = [p.strip()[:_MAX_FORWARDED_CHARS]
+             for p in str(existing or "").split(",") if p.strip()]
+    if peer:
+        parts.append(str(peer)[:_MAX_FORWARDED_CHARS])
+    return ", ".join(parts[-_MAX_FORWARDED_ENTRIES:])
+
+
+class AdminRefused(Exception):
+    """A route that exists but must not answer on THIS bind.
+
+    Carries its own status so a refusal reads as a refusal (403 + a reason a
+    human can act on) instead of collapsing into the handler's generic 503.
+    """
+
+    def __init__(self, status: int, detail: str) -> None:
+        super().__init__(detail)
+        self.status = status
+        self.detail = detail
+
+
+# A bind that only the box itself can reach. Everything else — including the
+# launcher's default ``0.0.0.0`` and an empty host — is the public internet as
+# far as anything published on it is concerned.
+def is_loopback_host(host: str) -> bool:
+    h = (host or "").strip().lower()
+    return h in ("localhost", "::1", "[::1]") or h.startswith("127.")
+
 
 def _json_routes_handler(routes: dict, router: Optional["Router"] = None):
     """Handler class serving a ``{path: callable() -> dict}`` route table.
@@ -871,6 +920,8 @@ def _json_routes_handler(routes: dict, router: Optional["Router"] = None):
             if fn is not None:
                 try:
                     self._json(fn())
+                except AdminRefused as exc:
+                    self._json({"detail": exc.detail}, status=exc.status)
                 except Exception as exc:  # noqa: BLE001 - admin must not 500-crash
                     self._json({"error": str(exc)}, status=503)
                 return
@@ -1027,6 +1078,15 @@ class Router:
         The body is buffered (a synthesis request is small); the RESPONSE is
         streamed straight through in chunks, because that is the side that
         carries audio.
+
+        The client's address rides along in ``X-Forwarded-For`` (APPENDED to
+        any existing chain, which is the standard semantics and the only shape
+        a downstream hop-counting reader can trust). Without it every caller
+        reaching the pool through this router shares ONE bucket — the router's
+        own loopback address — and the service's per-IP budgets become a single
+        pool-wide budget for the entire internet. The service still only
+        BELIEVES the header when ``TTS_TRUST_PROXY`` is on, which is correct:
+        this header is only trustworthy when the router is the sole route in.
         """
         length = int(handler.headers.get("Content-Length") or 0)
         body = handler.rfile.read(length) if length > 0 else b""
@@ -1046,7 +1106,12 @@ class Router:
 
         url = self.backends[index] + handler.path
         headers = {k: v for k, v in handler.headers.items()
-                   if k.lower() not in _HOP_BY_HOP}
+                   if k.lower() not in _HOP_BY_HOP
+                   and k.lower() != _FORWARDED_FOR.lower()}
+        chain = forwarded_for(handler.headers.get(_FORWARDED_FOR, ""),
+                              (handler.client_address or ("",))[0])
+        if chain:
+            headers[_FORWARDED_FOR] = chain
         req = urllib.request.Request(url, data=body or None,
                                      headers=headers, method=handler.command)
         try:
@@ -1085,6 +1150,17 @@ class Router:
 # ---------------------------------------------------------------------------
 # Launcher front door: aggregated /metrics, /introspect, /pool (+ router)
 # ---------------------------------------------------------------------------
+# Capacity detail on a public bind is opt-in, by name, and off by default.
+PUBLIC_INTROSPECT_ENV = "TTS_METRICS_PUBLIC_INTROSPECT"
+
+_RESTRICTED_DETAIL = (
+    "introspection is loopback-only on this bind: per-replica permits, queue "
+    "depth, the voice->replica map and the drained set are capacity detail, "
+    f"not public metrics. Read it from the box (127.0.0.1), or set "
+    f"{PUBLIC_INTROSPECT_ENV}=1 if this port is already behind your own auth.")
+
+
+
 def make_metrics_server(host: str, metrics_port: int,
                         targets: list[tuple[int | None, str]],
                         scope: str = SCOPE_POOL_TOTAL,
@@ -1103,7 +1179,32 @@ def make_metrics_server(host: str, metrics_port: int,
 
     With a ``router`` attached, every OTHER path is proxied to the cheapest
     replica.
+
+    THE RULE THIS SERVER ENFORCES, and why it is here and not in the caller:
+    unlike ``make_admin_server``, this one binds ``--host`` — routinely
+    ``0.0.0.0``. Introspection is CAPACITY DETAIL: free permits per replica,
+    queue depth, which voices are resident where, which replicas are drained.
+    That is a map of where to aim a request to hurt most, and it was being
+    served unauthenticated to anyone who could reach the metrics port. So:
+
+      * on a LOOPBACK bind, everything is served, exactly as before;
+      * on any other bind, ``/introspect`` is REFUSED by name (403, with the
+        two ways to get it back), and ``/pool`` degrades to the parts
+        ``/metrics`` already publishes publicly — pool totals and the routing
+        mode — with no per-replica entries, no voice map, no drained set;
+      * ``TTS_METRICS_PUBLIC_INTROSPECT=1`` opts back in, for an operator who
+        has put their own auth in front of this port. It is an explicit
+        decision, which is the only form this should ever take.
+
+    Nothing is hidden from an operator: the per-replica view stays fully
+    available on the box (``curl`` it from localhost, or read the replicas'
+    own loopback admin ports directly).
     """
+    public = not is_loopback_host(host)
+    opted_in = os.environ.get(PUBLIC_INTROSPECT_ENV, "0").lower() in (
+        "1", "true", "yes", "on")
+    restricted = public and not opted_in
+
     routes: dict = {
         "/metrics": lambda: aggregate_metrics(
             targets, scope=scope, replicas_expected=replicas_expected),
@@ -1112,18 +1213,43 @@ def make_metrics_server(host: str, metrics_port: int,
         def _drained() -> tuple:
             return router.drained if router is not None else ()
 
-        routes["/introspect"] = lambda: aggregate_introspection(
-            introspect, drained=_drained(), replicas_expected=replicas_expected)
+        def _introspect() -> dict:
+            if restricted:
+                raise AdminRefused(403, _RESTRICTED_DETAIL)
+            return aggregate_introspection(
+                introspect, drained=_drained(),
+                replicas_expected=replicas_expected)
 
         def _pool() -> dict:
+            metrics = aggregate_metrics(targets, scope=scope,
+                                        replicas_expected=replicas_expected)
+            routing = "router" if router is not None else "direct"
+            if restricted:
+                # Only what /metrics already says out loud, plus how requests
+                # are being placed. No capacity map on a public bind.
+                return {
+                    "scope": scope,
+                    "replicas_expected": metrics.get("replicas_expected"),
+                    "replicas_reporting": metrics.get("replicas_reporting"),
+                    "complete": metrics.get("complete"),
+                    "metrics": metrics,
+                    "routing": routing,
+                    "restricted": True,
+                    "detail": _RESTRICTED_DETAIL,
+                }
             doc = aggregate_introspection(introspect, drained=_drained(),
                                           replicas_expected=replicas_expected)
-            doc["metrics"] = aggregate_metrics(
-                targets, scope=scope, replicas_expected=replicas_expected)
-            doc["routing"] = "router" if router is not None else "direct"
+            doc["metrics"] = metrics
+            doc["routing"] = routing
+            doc["restricted"] = False
             return doc
 
+        routes["/introspect"] = _introspect
         routes["/pool"] = _pool
+    if restricted and introspect:
+        logger.info("introspection restricted on %s: capacity detail is "
+                    "loopback-only (set %s=1 to publish it)",
+                    host, PUBLIC_INTROSPECT_ENV)
     return make_json_server(host, metrics_port, routes, router=router)
 
 

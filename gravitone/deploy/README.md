@@ -227,6 +227,83 @@ it is stateless and scales across replicas freely. The registry itself is safe
 either way: `mutate_meta` takes a cross-process file lock, so concurrent clones
 on different replicas cannot drop each other's voices.
 
+## Per-IP budgets, and who the service thinks you are
+
+Every compute route carries a per-IP budget (`service/ratelimit.py`): the
+drop-in `/v1/text-to-speech`, `/v1/speak`, `/v1/performance`, the clone route,
+public re-perform and the anonymous take upload. Each is a fixed window plus a
+1-second burst, and each is env-tunable:
+
+| Budget | Env | Default | Route |
+|---|---|---|---|
+| `demo-tts` | `TTS_BUDGET_TTS` | 60 / 60s | `POST /v1/text-to-speech/{voice}` |
+| `speak` | `TTS_BUDGET_SPEAK` | 120 / 60s | `POST /v1/speak` |
+| `performance` | `TTS_BUDGET_PERFORMANCE` | 30 / 60s | `POST /v1/performance` |
+| `demo-clone` | `TTS_BUDGET_CLONE` | 20 / 600s | the clone route |
+| `take-upload` | `TTS_BUDGET_TAKE_UPLOAD` | 60 / 600s | `POST /v1/takes` (25 MB each) |
+| `reperform` | — | 5 / 300s | `POST /v1/takes/{id}/reperform` |
+
+**These defaults assume one address is a ROOM, not a person.** The studio
+relays to the service server-side with the deployment's own key, so until you
+turn proxy trust on, every studio visitor arrives as the studio host's single
+address and shares one budget. Size them for the audience you expect at once.
+
+### `TTS_TRUST_PROXY` — read it before you scale
+
+`X-Forwarded-For` is honoured **only** when `TTS_TRUST_PROXY=1`, because any
+client can send that header: on a directly-exposed port, trusting it lets every
+caller pick their own bucket and the limiter becomes decoration. Turn it on
+when — and only when — a proxy you control is the only thing that can reach the
+service port.
+
+Two consequences worth knowing before an incident:
+
+- **With it OFF and a proxy in front** (the studio relay, or the launcher's
+  `--router`), every caller in the world budgets as one address: the proxy's.
+  The limits above become the limits for the entire internet, together.
+- **With it ON**, the entry believed is the `TTS_TRUSTED_HOPS`-th from the
+  RIGHT (default 1) — the address the last proxy you trust actually observed.
+  Proxies append, so the leftmost entry is caller-typed text. Raise the count
+  by one for each additional proxy of yours in front (a CDN, an ingress) and by
+  no more: every hop you claim is one more entry a caller can forge.
+
+`replicas.py`'s `--router` appends the caller's address to `X-Forwarded-For`, so
+`TTS_TRUST_PROXY=1` + `TTS_TRUSTED_HOPS=1` is the correct pairing when the
+router is your front door.
+
+### Budgets across replicas
+
+The pool is N processes, so an in-memory counter in one of them counts nothing
+that happened in the others. The launcher exports `TTS_REPLICAS`, and with it
+above 1 the budgets are counted **across** the processes through a small file
+under `<data>/ratelimit/` (leased a few requests at a time under the same
+cross-process lock the registry uses, so the request path touches it at most
+once per lease and never once a budget is spent). Force it either way with
+`TTS_RATELIMIT_SHARED=1|0`; point it elsewhere with `TTS_RATELIMIT_DIR`.
+
+Running replicas some other way (a k8s Deployment, several containers) and want
+one honest pool budget? Set `TTS_REPLICAS` to the replica count and give every
+replica the same `TTS_RATELIMIT_DIR` on shared storage — or leave it, accept
+per-replica budgets, and note that the 429 body will then say so out loud
+(`... PER REPLICA — with 4 replicas the pool allows up to 240`).
+
+## What the metrics port publishes
+
+`--metrics-port` binds `--host` (routinely `0.0.0.0`); the per-replica admin
+ports bind loopback and nothing else. So the launcher's front door applies one
+rule: **capacity detail is loopback-only.**
+
+- `GET /metrics` — public on any bind, unchanged: aggregated pool counters.
+- `GET /introspect` — per-replica permits, queue depth, hot voices. Served on a
+  loopback bind; **403 by name** on a public one.
+- `GET /pool` — the full fold (per-replica entries, the voice→replica map, the
+  drained set) on loopback; on a public bind it degrades to what `/metrics`
+  already says, plus the routing mode, and marks itself `"restricted": true`.
+
+Set `TTS_METRICS_PUBLIC_INTROSPECT=1` to publish it anyway — do that only when
+the port is already behind your own auth. Nothing is hidden from an operator on
+the box: `curl` it from `127.0.0.1`, or read the replicas' admin ports directly.
+
 ## Operating it
 
 ```bash

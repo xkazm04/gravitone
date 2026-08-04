@@ -90,6 +90,12 @@ class PureHelperTests(unittest.TestCase):
                     "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
             self.assertEqual(env[var], "4")
 
+    def test_replica_env_tells_the_child_how_many_share_a_budget(self) -> None:
+        # Without this the per-IP limiter counts alone in each process and the
+        # pool quietly spends N budgets (service/ratelimit.py).
+        self.assertEqual(rep.replica_env(4, 16, base={})["TTS_REPLICAS"], "4")
+        self.assertEqual(rep.replica_env(1, 4, base={})["TTS_REPLICAS"], "1")
+
     def test_replica_env_sets_onednn_bf16_fastmath(self) -> None:
         # It used to live ONLY in the Dockerfile, so a bare-metal replica run
         # silently lost the biggest Neoverse inference lever. oneDNN reads this
@@ -832,6 +838,97 @@ class PoolViewTests(unittest.TestCase):
         self.assertEqual(intro["replicas_reporting"], 1)
 
 
+class ForwardedForTests(unittest.TestCase):
+    """The router is a hop, and a hop that hides the caller collapses every
+    per-IP budget downstream into one bucket."""
+
+    def test_the_peer_is_appended_to_an_existing_chain(self) -> None:
+        self.assertEqual(rep.forwarded_for("203.0.113.7", "10.0.0.2"),
+                         "203.0.113.7, 10.0.0.2")
+
+    def test_a_first_hop_starts_the_chain(self) -> None:
+        self.assertEqual(rep.forwarded_for("", "203.0.113.7"), "203.0.113.7")
+
+    def test_an_unknown_peer_passes_the_chain_through_unchanged(self) -> None:
+        self.assertEqual(rep.forwarded_for("203.0.113.7", ""), "203.0.113.7")
+
+    def test_a_forged_chain_cannot_grow_without_bound(self) -> None:
+        chain = rep.forwarded_for(", ".join(f"1.1.1.{i}" for i in range(200)),
+                                  "10.0.0.2")
+        parts = chain.split(", ")
+        self.assertLessEqual(len(parts), rep._MAX_FORWARDED_ENTRIES)
+        # Ours is still the last entry, which is the one a hop-counting reader
+        # trusts — truncation takes from the FORGED end.
+        self.assertEqual(parts[-1], "10.0.0.2")
+
+
+class PublicBindIntrospectionTests(unittest.TestCase):
+    """Capacity detail is not a public metric.
+
+    ``make_admin_server`` refuses a host on principle; ``make_metrics_server``
+    binds ``--host`` (routinely 0.0.0.0) and was serving per-replica permits,
+    queue depth, the voice->replica map and the drained set to anyone who could
+    reach the port. On a public bind that is now refused by name.
+    """
+
+    def _front(self, host: str):
+        engine = _FakeEngine(permits=2, live=1, queued=4, in_flight=1,
+                             voices=["nova"])
+        admin = _Serving(rep.make_admin_server(0, lambda: engine, index=0))
+        self.addCleanup(admin.close)
+        base = f"http://127.0.0.1:{admin.port}"
+        front = _Serving(rep.make_metrics_server(
+            host, 0, [(0, base + "/metrics")], scope=rep.SCOPE_POOL_TOTAL,
+            replicas_expected=1, introspect=[(0, base + "/introspect")]))
+        self.addCleanup(front.close)
+        return front
+
+    def test_loopback_serves_everything_as_before(self) -> None:
+        front = self._front("127.0.0.1")
+        pool = rep._http_get_json(f"http://127.0.0.1:{front.port}/pool")
+        self.assertEqual(pool["voices"]["nova"], [0])
+        self.assertFalse(pool["restricted"])
+        intro = rep._http_get_json(f"http://127.0.0.1:{front.port}/introspect")
+        self.assertEqual(intro["replicas_reporting"], 1)
+
+    def test_a_public_bind_refuses_introspect_by_name(self) -> None:
+        front = self._front("0.0.0.0")
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            rep._http_get_json(f"http://127.0.0.1:{front.port}/introspect")
+        self.assertEqual(ctx.exception.code, 403)
+        detail = json.loads(ctx.exception.read().decode("utf-8"))["detail"]
+        self.assertIn("loopback-only", detail)
+        self.assertIn(rep.PUBLIC_INTROSPECT_ENV, detail)
+
+    def test_a_public_pool_view_keeps_only_what_metrics_already_says(self) -> None:
+        front = self._front("0.0.0.0")
+        pool = rep._http_get_json(f"http://127.0.0.1:{front.port}/pool")
+        self.assertTrue(pool["restricted"])
+        self.assertEqual(pool["metrics"]["totals"]["in_flight"], 1)
+        for leaked in ("voices", "replicas", "totals", "drained"):
+            self.assertNotIn(leaked, pool, f"{leaked} is capacity detail")
+
+    def test_metrics_itself_is_unchanged_on_a_public_bind(self) -> None:
+        front = self._front("0.0.0.0")
+        doc = rep._http_get_json(f"http://127.0.0.1:{front.port}/metrics")
+        self.assertEqual(doc["scope"], rep.SCOPE_POOL_TOTAL)
+        self.assertEqual(doc["totals"]["in_flight"], 1)
+
+    def test_an_operator_can_opt_back_in_explicitly(self) -> None:
+        import os
+        os.environ[rep.PUBLIC_INTROSPECT_ENV] = "1"
+        self.addCleanup(os.environ.pop, rep.PUBLIC_INTROSPECT_ENV, None)
+        front = self._front("0.0.0.0")
+        intro = rep._http_get_json(f"http://127.0.0.1:{front.port}/introspect")
+        self.assertEqual(intro["replicas_reporting"], 1)
+
+    def test_which_hosts_count_as_loopback(self) -> None:
+        for host in ("127.0.0.1", "127.0.0.53", "localhost", "::1"):
+            self.assertTrue(rep.is_loopback_host(host), host)
+        for host in ("0.0.0.0", "", "10.0.0.4", "example.com"):
+            self.assertFalse(rep.is_loopback_host(host), host)
+
+
 class RouterProxyTests(unittest.TestCase):
     """The router is a real HTTP hop: prove a request survives it."""
 
@@ -885,6 +982,45 @@ class RouterProxyTests(unittest.TestCase):
         self.assertEqual(body["backend"], "hot")
         self.assertEqual(body["path"], "/v1/tts")
         self.assertEqual(json.loads(body["echo"])["text"], "hello")
+
+    def test_the_caller_s_address_reaches_the_replica(self) -> None:
+        import http.server
+
+        seen: list[str] = []
+
+        class _Echo(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):  # noqa: N802
+                seen.append(self.headers.get("X-Forwarded-For", ""))
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *a):
+                pass
+
+        backend = _Serving(ThreadingHTTPServer(("127.0.0.1", 0), _Echo))
+        self.addCleanup(backend.close)
+        router = rep.Router([f"http://127.0.0.1:{backend.port}"], [(0, "a")],
+                            fetch=lambda u: {"available_permits": 1}, ttl_s=0.0)
+        front = _Serving(rep.make_metrics_server(
+            "127.0.0.1", 0, [], scope=rep.SCOPE_POOL_TOTAL,
+            introspect=[(0, "a")], router=router))
+        self.addCleanup(front.close)
+
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{front.port}/v1/tts", data=b"{}",
+            headers={"Content-Type": "application/json",
+                     "X-Forwarded-For": "203.0.113.7"}, method="POST")
+        with urllib.request.urlopen(req, timeout=10):
+            pass
+        # Appended, not replaced: the CDN's entry survives and ours is last.
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(seen[0].startswith("203.0.113.7, "), seen)
+        self.assertTrue(seen[0].endswith("127.0.0.1"), seen)
 
     def test_no_available_replica_is_a_503_not_a_hang(self) -> None:
         router = rep.Router([], [], fetch=lambda u: {}, ttl_s=0.0)

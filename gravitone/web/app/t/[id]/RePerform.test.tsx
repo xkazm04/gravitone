@@ -45,6 +45,16 @@ describe("RePerform — the publisher's consent gates the whole panel", () => {
     expect(field().value).toBe(TAKE.text);
     expect(button()).toBeEnabled();
   });
+
+  // The budget is per ADDRESS, and on a default deploy every visitor reaches
+  // the service through this studio's own server — so it is one budget for the
+  // whole audience, not "a few tries per visitor". Copy that promises what the
+  // shipped deployment cannot give is the same bug as no copy at all.
+  it("promises a SHARED budget, not a per-visitor allowance", () => {
+    render(<RePerform take={TAKE} />);
+    expect(screen.getByText(/shared with everyone else here/i)).toBeInTheDocument();
+    expect(screen.queryByText(/per visitor/i)).not.toBeInTheDocument();
+  });
 });
 
 describe("RePerform — rendering", () => {

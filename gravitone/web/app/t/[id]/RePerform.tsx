@@ -135,10 +135,18 @@ export default function RePerform({ take }: { take: SharedTake }) {
       </div>
 
       {/* The honest disclosure, always on screen: this is someone else's CPU
-          and the fork is public. */}
+          and the fork is public.
+          "per visitor" was the lie: the budget is per ADDRESS, and on a
+          default deploy every visitor arrives through this studio's own
+          server, so one address is all of us (service/ratelimit.py honours
+          X-Forwarded-For only under TTS_TRUST_PROXY — see the sibling
+          reperform/route.ts). Saying "shared" costs nothing and is true in
+          both deployments; promising "a few tries per visitor" is a promise
+          this page cannot keep. */}
       <p className="font-jetbrains mt-3 text-[11px] text-white/45">
-        Rendered on the machine hosting this page — a few tries per visitor, then it asks you to
-        wait. Your version is public and shows where it came from; it cannot be re-performed again.
+        Rendered on the machine hosting this page, out of a small budget shared with everyone else
+        here — it can ask you to wait even on a first try. Your version is public and shows where it
+        came from; it cannot be re-performed again.
       </p>
 
       {child && (
