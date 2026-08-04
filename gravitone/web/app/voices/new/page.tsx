@@ -6,6 +6,7 @@ import Link from "next/link";
 import dynamic from "next/dynamic";
 import AppFrame from "@/components/ui/AppFrame";
 import { Button, Eyebrow } from "@/components/ui/Primitives";
+import { useTransport } from "@/components/ui/useTransport";
 import EmotionArt from "@/components/ui/EmotionArt";
 import { apiJson, readDetail } from "@/lib/apiFetch";
 import { EMOTION_IDS, emotionMeta } from "@/lib/emotions";
@@ -117,18 +118,36 @@ export default function NewCharacterPage() {
   const [modeInfoFailed, setModeInfoFailed] = useState(false);
 
   const fileRef = useRef<HTMLInputElement>(null);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
   const submitting = useRef(false); // re-entrancy guard for scan/speaker/commit
   const [pending, setPending] = useState<Pending>(null); // the same fact, visible
-  const [playing, setPlaying] = useState<string | null>(null);
+  const mounted = useMounted();
+  // The one clip this screen is playing, and the transport that plays it.
+  // `playing` is DERIVED from the transport rather than set on click: a play()
+  // the browser refuses must never leave a row saying "playing".
+  const [clip, setClip] = useState<{ url: string; id: string } | null>(null);
+  const transport = useTransport({ src: clip?.url });
+  const playing = transport.playing ? clip?.id ?? null : null;
   // The service's own sentence about a clip that would not play.
   const [clipRefusal, setClipRefusal] = useState<string | null>(null);
+  // A new clip starts when the element has it — one commit later, so the <audio>
+  // is already holding the src. Deliberately not useTransport's `autoPlay`:
+  // that starts with `asked: false` (an autoplay a browser refuses is policy,
+  // not a broken take), and every one of these IS a click, so a refusal here is
+  // a real failure and must be reported as one.
+  useEffect(() => { if (clip) transport.play(); }, [clip]);   // eslint-disable-line react-hooks/exhaustive-deps
+  // …and when it is, ask the service why. The element is told nothing about a
+  // 404 body; the proxy still has the sentence.
+  useEffect(() => {
+    if (!transport.failed || !clip) return;
+    void assetRefusal(clip.url).then((detail) => {
+      if (detail && mounted.current) setClipRefusal(detail);
+    });
+  }, [transport.failed, clip, mounted]);
   // A DELETE that did NOT tear the job down. Load-bearing: while this is set,
   // the flow has not been reset, because resetting would tell the user the
   // session is gone while the backend may still be cloning into their roster.
   const [cancelFailed, setCancelFailed] = useState<string | null>(null);
   const cancelling = useRef(false); // atomic gate — Cancel is double-clickable
-  const mounted = useMounted();
   // Which ledger row has its Audition Room open. Exactly one at a time, and null
   // is the normal state: the fast path is still keep/descope then commit.
   const [auditionFor, setAuditionFor] = useState<string | null>(null);
@@ -292,7 +311,7 @@ export default function NewCharacterPage() {
 
   async function chooseSpeaker(sid: string) {
     if (submitting.current) return;
-    audioRef.current?.pause(); setPlaying(null);
+    transport.pause();
     submitting.current = true;
     setPending(`speaker:${sid}`); setBusyNotice(null);
     try {
@@ -317,23 +336,23 @@ export default function NewCharacterPage() {
     }
   }
 
+  /** Play one clip on the review screen's ONE transport.
+   *
+   *  It used to be a private `new Audio()` in a ref, which is exactly the debt
+   *  <AuditionPanel> had a comment about: the Casting Board's segments play
+   *  through the shared <TakePlayer>, this played through something the shared
+   *  transport had never heard of, and the two were not mutually exclusive — a
+   *  stem and a segment could talk over each other mid-review. Now everything
+   *  on this screen is one transport, registered with the AudioBus (so the
+   *  signal channels move with the stem the user is listening to) and exclusive
+   *  with every other player in the app. */
   function playClip(url: string, id: string) {
     setClipRefusal(null);
-    if (playing === id) { audioRef.current?.pause(); setPlaying(null); return; }
-    audioRef.current?.pause();
-    const a = audioRef.current ?? (audioRef.current = new Audio());
-    a.src = url; a.onended = () => setPlaying(null);
-    setPlaying(id);
-    // Reset on rejection (missing/expired preview, autoplay block) instead of
-    // leaving the row stuck showing "playing" — and then ASK why: a refused
-    // preview has a sentence behind it (the stem is gone, the session expired)
-    // and the element is told none of it.
-    void a.play().catch(() => {
-      setPlaying((cur) => (cur === id ? null : cur));
-      void assetRefusal(url).then((detail) => {
-        if (detail && mounted.current) setClipRefusal(detail);
-      });
-    });
+    if (clip?.id === id && transport.playing) { transport.pause(); return; }
+    // Same clip again: the element already holds it, so there is nothing to
+    // load — replaying is the transport's own job.
+    if (clip?.url === url) { transport.play(); return; }
+    setClip({ url, id });
   }
 
   /** Hear an emotion AS A VOICE — the clone of its chosen (or default) take,
@@ -436,6 +455,11 @@ export default function NewCharacterPage() {
   return (
     <AppFrame>
       <div className="py-10">
+        {/* The review screen's ONE audio element — stems, speaker samples and
+            auditions all play through it. Never shown (this page draws its own
+            play buttons per row), but it is a real element in the tree so the
+            AudioBus can tap it and the shared transport can own it. */}
+        <audio {...transport.audioProps} className="hidden" />
         <Link href="/voices" className="font-jetbrains text-[12px] text-white/45 transition hover:text-white">← characters</Link>
         <Eyebrow>new character</Eyebrow>
         <h1 className="font-instrument mt-3 text-4xl text-white">Build from a recording.</h1>

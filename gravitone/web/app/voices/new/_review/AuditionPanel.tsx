@@ -22,10 +22,12 @@ import { takeKey, type Take } from "../_state/useAudition";
  *     words (`label` / `how`) plus its measured length. Nothing is scored out of
  *     ten, and nothing is asserted that was not measured.
  *
- * Playback deliberately reuses the page's single audio element (`play`/`playing`)
- * rather than introducing another player: the Signal Layer's <TakePlayer> is the
- * one primitive this surface should eventually use, and it is swapped in at the
- * call site, not forked here.
+ * Playback goes through `play`/`playing`, which is the page's ONE transport —
+ * and that is now the shared one (components/ui/useTransport), so an audition
+ * take, a stem preview and a segment on the Casting Board are mutually
+ * exclusive and all tap the same AudioBus. This comment used to note the debt
+ * ("the one primitive this surface should eventually use"); the swap happened
+ * at the call site, exactly as it said, so nothing here changed.
  */
 export default function AuditionPanel(props: {
   emotion: string;

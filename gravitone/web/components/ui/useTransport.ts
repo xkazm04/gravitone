@@ -21,10 +21,37 @@
 //   * an <audio> error names the source as unplayable rather than freezing the
 //     transport mid-play;
 //   * a new src resets position/duration instead of leaving numbers on screen
-//     describing audio that is gone.
+//     describing audio that is gone;
+//   * and one it now ADDS, because a hook is the only place it can live: a clip
+//     that starts pauses whatever was playing (see below).
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useAudioBus } from "./AudioBus";
+
+// ── one clip at a time ───────────────────────────────────────────────────────
+// Two takes playing over each other is never what anybody asked for, and it is
+// what every surface with more than one player did: the ingest studio's private
+// `new Audio()` and the Casting Board's <TakePlayer>s were separate transports
+// that had no way to know about each other, so a stem and a segment could talk
+// over one another mid-review.
+//
+// The rule lives HERE rather than in a provider because it is a property of
+// playback itself, not of a subtree: every surface that adopts this hook gets
+// it, including ones mounted outside any bus. It is driven by the `play` EVENT,
+// not by the play() call, so it can never pause a clip on behalf of one that
+// then failed to start.
+let CURRENT: HTMLMediaElement | null = null;
+
+function claimPlayback(el: HTMLMediaElement) {
+  if (CURRENT && CURRENT !== el) {
+    try { CURRENT.pause(); } catch { /* already gone from the document */ }
+  }
+  CURRENT = el;
+}
+
+function releasePlayback(el: HTMLMediaElement | null) {
+  if (CURRENT === el) CURRENT = null;
+}
 
 export type TransportAudioProps = {
   ref: (el: HTMLAudioElement | null) => void;
@@ -86,7 +113,12 @@ export function useTransport({
   );
   useEffect(() => {
     const el = audioRef.current;
-    return () => bus.unregister(el);
+    return () => {
+      bus.unregister(el);
+      // An element that leaves the document must not stay the one everything
+      // else pauses for.
+      releasePlayback(el);
+    };
   }, [bus]);
 
   // A new src is a new take: reset rather than leaving the old duration and
@@ -161,20 +193,28 @@ export function useTransport({
       ref: attach,
       src: src ?? undefined,
       preload: "metadata",
-      onPlay: () => setPlaying(true),
-      onPause: () => setPlaying(false),
+      onPlay: () => {
+        if (audioRef.current) claimPlayback(audioRef.current);
+        setPlaying(true);
+      },
+      onPause: () => {
+        releasePlayback(audioRef.current);
+        setPlaying(false);
+      },
       onTimeUpdate: (e) => setPosition(e.currentTarget.currentTime),
       onLoadedMetadata: (e) => {
         const d = e.currentTarget.duration;
         if (Number.isFinite(d)) setDuration(d);
       },
       onEnded: () => {
+        releasePlayback(audioRef.current);
         setPlaying(false);
         setPosition(0);
         onEnded?.();
       },
       onError: () => {
         // A dead object URL used to leave the transport frozen mid-play.
+        releasePlayback(audioRef.current);
         setFailed(true);
         setPlaying(false);
       },
