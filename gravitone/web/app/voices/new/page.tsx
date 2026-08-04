@@ -3,6 +3,7 @@
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { Fragment, useCallback, useEffect, useReducer, useRef, useState } from "react";
 import Link from "next/link";
+import dynamic from "next/dynamic";
 import AppFrame from "@/components/ui/AppFrame";
 import { Button, Eyebrow } from "@/components/ui/Primitives";
 import EmotionArt from "@/components/ui/EmotionArt";
@@ -16,8 +17,26 @@ import { recordVoiceOwnership } from "@/lib/voiceVault";
 import { CONSENT_STATEMENT } from "@/lib/consent";
 import WaveformLab from "./_loaders/WaveformLab";
 import { DetectionFinding, SovereignLimits, segmentFailureNote, type LoaderData } from "./_loaders/shared";
-import AuditionPanel from "./_review/AuditionPanel";
-import SegmentBoard from "./_review/SegmentBoard";
+// The two review drill-downs are ~600 lines (plus framer-motion, through
+// _loaders/shared) reachable only from an EXPANDED ledger row — and they were
+// statically imported into a first paint that is a dropzone. Neither needs SSR:
+// this is a client page, and both mount from a click.
+const SegmentBoard = dynamic(() => import("./_review/SegmentBoard"), {
+  ssr: false, loading: () => <PanelLoading label="opening the casting board…" />,
+});
+const AuditionPanel = dynamic(() => import("./_review/AuditionPanel"), {
+  ssr: false, loading: () => <PanelLoading label="opening the audition room…" />,
+});
+
+/** The ledger's own visual language while a drill-down arrives: the same glass
+ *  panel it will become, saying what it is waiting for. */
+function PanelLoading({ label }: { label: string }) {
+  return (
+    <div className="glass-panel rounded-2xl px-4 py-6">
+      <span className="font-jetbrains text-[11px] text-white/40">{label}</span>
+    </div>
+  );
+}
 import {
   reducer, initialState, POLLING_PHASES, WATCH_PHASES,
   type CastResult, type Character, type Job, type ModeInfo, type Stem,

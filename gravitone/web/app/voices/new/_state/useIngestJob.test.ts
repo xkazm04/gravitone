@@ -7,7 +7,7 @@
 // implementation detail — the assertions are about the shape of the ladder.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, renderHook } from "@testing-library/react";
-import { WATCH_MS, useIngestJob } from "./useIngestJob";
+import { HIDDEN_MS, WATCH_MS, useIngestJob } from "./useIngestJob";
 import type { Job } from "./machine";
 
 function body(over: Partial<Job> = {}): string {
@@ -234,6 +234,108 @@ describe("useIngestJob", () => {
       const { onStalled } = mount(f, "j1", true, true);
       await act(async () => { await vi.advanceTimersByTimeAsync(WATCH_MS * 3 + 100); });
       expect(onStalled).toHaveBeenCalledWith(true);
+    });
+  });
+
+  // ── a tab nobody is looking at ─────────────────────────────────────────────
+  // It must not STOP (unlike useHealthPoll): this poller drives the terminal
+  // transition, so a backgrounded tab that stopped would sit on "cloning
+  // voices · 2/5" forever. It slows down, and comes back instantly.
+  describe("while hidden", () => {
+    function setHidden(hidden: boolean) {
+      Object.defineProperty(document, "hidden", { value: hidden, configurable: true });
+      document.dispatchEvent(new Event("visibilitychange"));
+    }
+    afterEach(() => {
+      Object.defineProperty(document, "hidden", { value: false, configurable: true });
+    });
+
+    it("keeps polling, at the slowest cadence", async () => {
+      vi.useFakeTimers();
+      Object.defineProperty(document, "hidden", { value: true, configurable: true });
+      const at: number[] = [];
+      const { fetchImpl } = mount(timedFetch(() => new Response(body()), at));
+      // The tight cadence would have fired ~4 times by now.
+      await act(async () => { await vi.advanceTimersByTimeAsync(6_000); });
+      expect(fetchImpl).not.toHaveBeenCalled();
+      await act(async () => { await vi.advanceTimersByTimeAsync(HIDDEN_MS * 2); });
+      expect(fetchImpl.mock.calls.length).toBeGreaterThanOrEqual(2);
+      expect(fetchImpl.mock.calls.length).toBeLessThan(5);
+    });
+
+    it("polls immediately when the tab comes back", async () => {
+      vi.useFakeTimers();
+      const at: number[] = [];
+      const { fetchImpl } = mount(timedFetch(() => new Response(body()), at));
+      await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+
+      act(() => setHidden(true));
+      await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+      expect(fetchImpl).toHaveBeenCalledTimes(1);      // waiting out HIDDEN_MS
+
+      act(() => setHidden(false));
+      await act(async () => { await vi.advanceTimersByTimeAsync(10); });
+      expect(fetchImpl).toHaveBeenCalledTimes(2);      // not 30s later
+    });
+
+    it("stops listening once the poll is torn down", async () => {
+      vi.useFakeTimers();
+      const at: number[] = [];
+      const { unmount, fetchImpl } = mount(timedFetch(() => new Response(body()), at));
+      await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+      unmount();
+      act(() => setHidden(true));
+      act(() => setHidden(false));
+      await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // ── conditional polling ────────────────────────────────────────────────────
+  describe("an unchanged job", () => {
+    it("sends the last ETag back and keeps what it has on a 304", async () => {
+      vi.useFakeTimers();
+      const headers = new Headers({ "Content-Type": "application/json", ETag: '"abc"' });
+      const f = vi.fn()
+        .mockResolvedValueOnce(new Response(body(), { headers }))
+        .mockResolvedValue(new Response(null, { status: 304, headers }));
+      const { onJob } = mount(f);
+      await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+      expect(onJob).toHaveBeenCalledTimes(1);
+      expect(f.mock.calls[0][1].headers).toBeUndefined();  // nothing to validate yet
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(6_000); });
+      expect(f.mock.calls.length).toBeGreaterThan(1);
+      expect(f.mock.calls[1][1].headers).toEqual({ "If-None-Match": '"abc"' });
+      // A 304 is not a new job: the page is never asked to re-adopt one.
+      expect(onJob).toHaveBeenCalledTimes(1);
+    });
+
+    it("counts a 304 as a healthy poll, not a failure", async () => {
+      vi.useFakeTimers();
+      const headers = new Headers({ ETag: '"abc"' });
+      const f = vi.fn()
+        .mockResolvedValueOnce(new Response(body(), { headers }))
+        .mockResolvedValue(new Response(null, { status: 304, headers }));
+      const { onStalled } = mount(f);
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+      expect(onStalled).not.toHaveBeenCalledWith(true);
+    });
+
+    it("takes the degraded notice back on a 304 too", async () => {
+      vi.useFakeTimers();
+      const headers = new Headers({ ETag: '"abc"' });
+      const f = vi.fn()
+        .mockResolvedValueOnce(new Response(body(), { headers }))
+        .mockRejectedValueOnce(new TypeError("network"))
+        .mockRejectedValueOnce(new TypeError("network"))
+        .mockRejectedValueOnce(new TypeError("network"))
+        .mockResolvedValue(new Response(null, { status: 304, headers }));
+      const { onStalled } = mount(f);
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+      expect(onStalled).toHaveBeenCalledWith(true);
+      expect(onStalled).toHaveBeenLastCalledWith(false);
     });
   });
 

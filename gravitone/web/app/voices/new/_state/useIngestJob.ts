@@ -21,7 +21,13 @@ import { TERMINAL_STATUSES, type Job } from "./machine";
  * Backoff: a step moves fast early and then plateaus, so we poll 1.5s for the
  * first ~20s of a step, 3s for the next ~20s, then 5s. The clock resets each
  * time the server's `step` changes, so every new stage gets tight polling
- * again.
+ * again. A hidden tab drops to HIDDEN_MS and returning to it polls immediately.
+ *
+ * Every request is CONDITIONAL (If-None-Match against the last ETag). A job's
+ * payload carries its whole result — stems, casting, and every segment with its
+ * text — and it is re-shipped, re-parsed and re-dispatched on every poll, while
+ * the committing screen reads three integers off `partial`. An unchanged job
+ * now answers 304 with no body, and the hook keeps what it has.
  *
  * WATCH MODE (`watch: true`) is the review screen's leg, and it is a different
  * job: nothing is progressing, so there is nothing to follow — but the service
@@ -47,6 +53,21 @@ const STALL_AFTER = 3; // consecutive failed polls before the UI is told
  *  plenty of resolution and costs ~2 requests a minute for an idle screen. */
 export const WATCH_MS = 30_000;
 
+/**
+ * Cadence for a tab nobody is looking at.
+ *
+ * useHealthPoll STOPS while hidden, and that is right for it: it renders a
+ * number, and a number can be refreshed on return. This poller cannot stop —
+ * it drives a TERMINAL transition, so a backgrounded tab that stopped polling
+ * would never learn its commit finished, and would sit on "cloning voices ·
+ * 2/5" until the user clicked back. So hidden slows to the slowest cadence
+ * this hook has, and becoming visible polls IMMEDIATELY rather than serving a
+ * progress bar from before the tab went away.
+ */
+export const HIDDEN_MS = WATCH_MS;
+
+const isHidden = () => typeof document !== "undefined" && document.hidden;
+
 export function useIngestJob(opts: {
   jobId: string | null;
   enabled: boolean;
@@ -71,14 +92,31 @@ export function useIngestJob(opts: {
     let stepKey: string | null | undefined;
     let stepSince = Date.now();
     let failures = 0;
+    // The last payload's ETag. The proxy hashes the upstream body, so an
+    // unchanged job answers 304 with no body at all — which is most polls of a
+    // long step, and ALL of them in watch mode.
+    let etag: string | null = null;
 
     const tick = async () => {
       try {
-        const r = await fetch(`/api/ingest/${jobId}`, { cache: "no-store" });
+        const r = await fetch(`/api/ingest/${jobId}`, {
+          cache: "no-store",
+          headers: etag ? { "If-None-Match": etag } : undefined,
+        });
         if (stopped) return;
         if (r.status === 404) { onExpired.current(); return; } // terminal: no reschedule
+        if (r.status === 304) {
+          // Nothing about the job changed. That is a SUCCESSFUL poll — the
+          // connection is fine and the state on screen is current — so it
+          // clears a stall and reschedules, and touches nothing else.
+          if (failures >= STALL_AFTER) onStalled.current?.(false);
+          failures = 0;
+          if (!stopped) schedule();
+          return;
+        }
         // A 5xx body must not be coerced into a Job — treat it as a failed poll.
         if (!r.ok) throw new Error(`poll failed (${r.status})`);
+        etag = r.headers.get("ETag");
         const job: Job = await r.json();
         if (stopped) return;
         if (failures >= STALL_AFTER) onStalled.current?.(false);
@@ -101,12 +139,40 @@ export function useIngestJob(opts: {
         failures += 1;
         if (failures === STALL_AFTER) onStalled.current?.(true);
       }
-      if (!stopped) {
-        timer = setTimeout(tick, watch ? WATCH_MS : pollDelay(Date.now() - stepSince));
-      }
+      if (!stopped) schedule();
     };
 
-    timer = setTimeout(tick, watch ? WATCH_MS : 1500);
-    return () => { stopped = true; clearTimeout(timer); };
+    /** The next wait. Hidden always wins: a backgrounded tab keeps following a
+     *  terminal transition, it just stops paying 1.5s for it. */
+    function schedule() {
+      clearTimeout(timer);
+      const delay = isHidden()
+        ? HIDDEN_MS
+        : watch ? WATCH_MS : pollDelay(Date.now() - stepSince);
+      timer = setTimeout(tick, delay);
+    }
+
+    const onVisibility = () => {
+      if (stopped) return;
+      // Going away re-arms the PENDING wait at the hidden cadence too — a tab
+      // hidden a moment after a poll should not fire again 1.5s later.
+      if (isHidden()) { schedule(); return; }
+      // Back on screen: ask NOW. Whatever is on the loader is from before the
+      // tab went away, and the answer may be that the job finished minutes ago.
+      clearTimeout(timer);
+      timer = setTimeout(tick, 0);
+    };
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", onVisibility);
+    }
+
+    timer = setTimeout(tick, isHidden() ? HIDDEN_MS : watch ? WATCH_MS : 1500);
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+      if (typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", onVisibility);
+      }
+    };
   }, [jobId, enabled, watch]);
 }
