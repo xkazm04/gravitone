@@ -153,6 +153,20 @@ export default function MigrationKit({ apiKey, keyId }: { apiKey: string; keyId:
         </p>
       )}
 
+      {/* The parameter contract, in the one place a migrating developer is
+          already standing. Not a link to a hosted page: this studio ships with
+          the deployment, so the guide it should point at is the one in the
+          checkout next to it. A dead https:// link would be worse than a path. */}
+      <p className="font-jetbrains mt-3 text-[10px] leading-relaxed text-white/50">
+        Your existing ElevenLabs request body works unchanged — nothing in it is rejected. Parameters this
+        engine has no knob for (<span className="text-white/70">similarity_boost</span>,{" "}
+        <span className="text-white/70">style</span>, <span className="text-white/70">use_speaker_boost</span>,{" "}
+        <span className="text-white/70">speed</span>, <span className="text-white/70">seed</span>, …) come back
+        named on the <span className="text-white/70">X-Ignored-Settings</span> response header, so a setting
+        never silently does nothing. Full mapping:{" "}
+        <span className="text-white/70">docs/SWITCH_FROM_ELEVENLABS.md</span>.
+      </p>
+
       {lang === "javascript" && (
         <ErrorBanner severity="warning" className="mt-3">
           This snippet runs in a browser, and the check above never exercised that path. On a default deployment

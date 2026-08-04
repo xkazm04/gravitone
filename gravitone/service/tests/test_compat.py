@@ -366,6 +366,69 @@ class UnmodifiedElevenLabsClientTests(_Base):
         self.assertIn(r.status_code, (200, 501))
 
 
+class MigrationGuideClaimsTests(_Base):
+    """Claims docs/SWITCH_FROM_ELEVENLABS.md makes, pinned to the code.
+
+    A migration guide is a promise to someone who has not run the code yet, so
+    every row of its tables has to be a fact about this build rather than an
+    aspiration. These are the claims that are not already covered above.
+    """
+
+    def test_unknown_query_params_are_ignored_not_rejected(self) -> None:
+        """"Unknown query parameters ... never fail a request"."""
+        r = self.client.post(
+            "/v1/text-to-speech/alba",
+            params={"output_format": "wav_24000",
+                    "optimize_streaming_latency": 3,
+                    "enable_logging": "true",
+                    "a_param_that_does_not_exist": "x"},
+            json={"text": "Hi."})
+        self.assertEqual(r.status_code, 200, r.text)
+
+    def test_unsupported_format_families_are_400_not_a_substitution(self) -> None:
+        """"ogg_*, ulaw_*, alaw_* -> 400, listing the supported grammar"."""
+        for bad in ("ogg_24000", "ulaw_8000", "alaw_8000", "flac"):
+            with self.subTest(output_format=bad):
+                r = self.client.post("/v1/text-to-speech/alba",
+                                     params={"output_format": bad},
+                                     json={"text": "Hi."})
+                self.assertEqual(r.status_code, 400)
+                self.assertIn("Supported", r.json()["detail"])
+
+    def test_there_is_no_credit_meter_to_read(self) -> None:
+        """"GET /v1/user, /v1/user/subscription -> 404, on purpose".
+
+        This asserts an ABSENCE, deliberately: the guide tells a migrating
+        developer to delete their quota-guard code, and that instruction is only
+        safe while these endpoints do not exist. If someone ever adds a
+        subscription surface, this test should fail and the guide should change
+        with it.
+        """
+        for path in ("/v1/user", "/v1/user/subscription"):
+            with self.subTest(path=path):
+                self.assertEqual(self.client.get(path).status_code, 404)
+
+    def test_repeatability_is_offered_by_digest_since_seed_is_inert(self) -> None:
+        """The guide sends `seed` users to X-Speech-Digest + If-None-Match."""
+        r = self.client.post("/v1/text-to-speech/alba", json={"text": "Hi."})
+        digest = r.headers["x-speech-digest"]
+        self.assertTrue(digest.startswith("sha256:"))
+        again = self.client.post("/v1/text-to-speech/alba", json={"text": "Hi."},
+                                 headers={"If-None-Match": r.headers["etag"]})
+        self.assertEqual(again.status_code, 304)
+
+    def test_the_guides_curl_and_fetch_shape_synthesizes(self) -> None:
+        """The exact shape of the curl / requests / fetch examples."""
+        r = self.client.post(
+            "/v1/text-to-speech/alba",
+            params={"output_format": "mp3_44100_128"},
+            headers={"xi-api-key": "anything", "Content-Type": "application/json"},
+            json={"text": "Same request, no per-character bill."})
+        # ffmpeg may or may not exist on this box; what the guide promises is
+        # that the REQUEST is accepted, not that this machine can encode mp3.
+        self.assertNotIn(r.status_code, (400, 422), r.text)
+
+
 class VoiceLabelsTests(_Base):
     def test_labels_are_present_and_derived_from_the_row(self) -> None:
         v = self.client.get("/v1/voices").json()["voices"][0]
