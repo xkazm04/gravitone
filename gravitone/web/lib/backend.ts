@@ -42,7 +42,42 @@ export async function backendFetch(path: string, init: BackendInit): Promise<Res
   if (credential === "operator" && key && !headers.has("xi-api-key")) {
     headers.set("xi-api-key", key);
   }
+  await forwardCallerAddress(headers);
   return fetch(`${BASE}${path}`, { ...rest, headers });
+}
+
+/** Pass the CALLER's address through to the service's per-IP limiter.
+ *
+ *  service/ratelimit.py budgets the public compute surfaces per client, and it
+ *  identifies a client as the direct peer unless `X-Forwarded-For` is present
+ *  AND `TTS_TRUST_PROXY` is on. Every request that arrives through this studio
+ *  has the same direct peer — this process — so with nothing forwarded, all
+ *  users of a deployment share ONE bucket: one busy studio user exhausts the
+ *  budget for everyone beside them, and a scripted caller is limited no more
+ *  than an honest one. Exactly one route (`/t/[id]/reperform`) forwarded the
+ *  header, so exactly one surface was actually limited per caller.
+ *
+ *  It lives HERE rather than in each route because the per-route version is the
+ *  one that gets forgotten — this is the single door every proxy leaves by.
+ *
+ *  PASSED, never trusted: the service decides whether to honour it
+ *  (`TTS_TRUST_PROXY`) and which hop of it is the caller (`TTS_TRUSTED_HOPS`,
+ *  counted from the right, because a client can forge the left). A studio with
+ *  no reverse proxy in front of it receives no such header and forwards none,
+ *  which is exactly what it did before.
+ *
+ *  `headers()` throws outside a request scope — a unit test calling a handler
+ *  directly, a build-time render. That is not an error; it is the absence of a
+ *  caller, so nothing is forwarded. */
+async function forwardCallerAddress(out: Headers): Promise<void> {
+  if (out.has("x-forwarded-for")) return; // an explicit call-site choice wins
+  try {
+    const { headers } = await import("next/headers");
+    const xff = (await headers()).get("x-forwarded-for");
+    if (xff) out.set("x-forwarded-for", xff);
+  } catch {
+    /* no request scope — there is no caller address to forward */
+  }
 }
 
 // The synthesis relays (/api/speak, /api/performance, /api/tts) are the app's
