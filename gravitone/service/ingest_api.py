@@ -92,7 +92,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
-from service import atomicio, errors, export_stems, ingest, ratelimit, voices
+from service import atomicio, errors, export_stems, ingest, observability, ratelimit, voices
 from service.config import SETTINGS
 from service.emotions import normalize_emotion
 from service.errors import job_expired
@@ -1292,7 +1292,20 @@ def _fail(job: dict, action: str, exc: BaseException) -> None:
     internals. Phase exceptions routinely wrap ffmpeg/pocket-tts stderr and
     absolute paths; `errors.sanitize_detail` logs the raw cause against a
     request id and leaves the client the id (only `errors.UserFacing` messages,
-    authored for humans, pass through)."""
+    authored for humans, pass through).
+
+    The user gets a sanitized sentence; the OPERATOR gets the exception. These
+    phases run on their own threads and catch everything, so nothing here ever
+    reaches an excepthook — before this hand-off existed, a phase that died on
+    provider call 31 of 40 left one log line and no way to know afterwards
+    whether it had happened once or forty times. The job's spend ledger rides
+    along, because "failed after 47 calls and 12 retries" and "failed on the
+    first call" are different bugs."""
+    job_id = job.get("id") or ""
+    ledger = _SPEND.get(job_id)
+    observability.capture_ingest_failure(
+        job_id, job.get("mode") or "", action, exc,
+        ledger.snapshot() if ledger is not None else None)
     _update(job, status="error", error=errors.sanitize_detail(action, exc))
 
 
@@ -1303,6 +1316,9 @@ def _analyze(job_id: str, audio: Path) -> None:
         return
     cancelled = _canceller(job)
     sovereign = job["mode"] == "sovereign"
+    # This thread belongs to one job for its whole life; tag it so anything
+    # reported from here arrives already attributed.
+    observability.bind_ingest_job(job_id, job["mode"])
     try:
         if sovereign:
             # Local-only phase: no paid calls, no fan-out. Cancellation is
@@ -1351,6 +1367,7 @@ def _label(job_id: str, target: str) -> None:
     job = _get_job(job_id)
     if job is None:  # cancelled between Thread.start() and here
         return
+    observability.bind_ingest_job(job_id, job["mode"])
     try:
         res = ingest.label_and_stem(
             Path(job["work_dir"]), target,
@@ -1388,6 +1405,16 @@ def _label(job_id: str, target: str) -> None:
                 recipe_plan=plan, casting=casting,
                 recipes={"applied": {}, "skipped": [], "unavailable": why},
                 status="done")
+        # The job is over; publish what it spent. `Spend` has counted every
+        # ElevenLabs and Gemini call the whole way through — this is that same
+        # snapshot, read once more for the operator's pipe rather than the
+        # client's. Nothing is recomputed here (see observability.spend_context).
+        # `_SPEND.get`, not `_spend_for`: reporting must never resurrect a
+        # ledger the job's own teardown has already dropped.
+        ledger = _SPEND.get(job_id)
+        observability.record_ingest_spend(
+            job_id, job["mode"], "done",
+            ledger.snapshot() if ledger is not None else None)
     except ingest.Cancelled:
         logger.info("ingest job %s: labelling abandoned (cancelled)", job_id)
     except Exception as exc:  # noqa: BLE001

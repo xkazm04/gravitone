@@ -83,6 +83,16 @@ from service import engines as engines_plane
 from service.engines import router as engines_router
 from service.gym import router as gym_router
 from service.stt import router as stt_router
+from service import observability
+
+# Error reporting, before anything else in this module runs and before the app
+# object exists — the Starlette/FastAPI integrations patch the middleware stack,
+# so an init that came later would only half-apply.
+#
+# This is a NO-OP without SENTRY_DSN, and a strict one: with the variable unset
+# `sentry_sdk` is never imported, so nothing is patched, no transport exists and
+# nothing is transmitted. See service/observability.py for the full posture.
+observability.init()
 
 ENGINE: TtsEngine | None = None
 

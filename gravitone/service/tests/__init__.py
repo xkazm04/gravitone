@@ -27,6 +27,14 @@ os.environ["TTS_API_KEY"] = ""
 # address, so a heavy suite would 429 itself on infrastructure it is not
 # testing. test_ratelimit proves the limiter on its own instances.
 os.environ["GRAVITONE_RATELIMIT_TEST_BYPASS"] = "1"
+# Same reasoning as TTS_API_KEY above, and it matters more: a dev or deploy box
+# whose ``.env`` names a real SENTRY_DSN would otherwise have `service.app`
+# initialize error reporting at import and ship ~2000 tests' worth of
+# deliberately-provoked exceptions into a live project. A real environment
+# variable beats ``.env``, so pinning it empty here forces reporting OFF for
+# every test module. test_observability turns it on explicitly, against a
+# capturing transport that never opens a socket.
+os.environ["SENTRY_DSN"] = ""
 os.environ.setdefault(
     "GRAVITONE_BUILD_STORE_DIR",
     os.path.join(tempfile.gettempdir(), "gravitone-build-store-tests"))

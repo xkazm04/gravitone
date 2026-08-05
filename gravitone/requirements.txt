@@ -37,3 +37,9 @@ numpy>=2
 psutil>=5.9
 python-multipart>=0.0.9
 httpx>=0.27
+# Error reporting (service/observability.py). Present in the image so that
+# turning it on is one environment variable rather than a rebuild — but it is
+# never imported unless SENTRY_DSN is set, and `init()` survives its absence,
+# so a slimmed-down image that drops it still runs. Errors only: no tracing, no
+# profiling, no PII, and request bodies are explicitly never captured.
+sentry-sdk>=2.0

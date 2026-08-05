@@ -125,7 +125,7 @@ jobs:
       - name: Type check
         run: npx tsc --noEmit
 
-      # Vitest, jsdom environment. 80 files / 1126 tests at time of writing.
+      # Vitest, jsdom environment. 86 files / 1200 tests at time of writing.
       - name: Unit tests
         run: npm run test
 
@@ -163,10 +163,19 @@ jobs:
       # dependency set), so it is named explicitly here. numpy is the only one
       # of these the tests import directly; the rest are what `service.app`
       # needs to import at all.
+      #
+      # sentry-sdk is the one addition that is NOT needed to import the app:
+      # service/observability.py imports it lazily and only when SENTRY_DSN is
+      # set, so the suite would pass without it — by SKIPPING every test that
+      # proves the reporting posture (no PII, no request bodies, tracing off,
+      # the ingest spend ledger's shape). A gate that skips the tests it exists
+      # to run is not a gate, so it is installed here on purpose. The
+      # no-DSN tests, which are the ones that matter most, run either way and
+      # never touch the network.
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pytest fastapi "numpy>=2" httpx python-multipart psutil
+          python -m pip install pytest fastapi "numpy>=2" httpx python-multipart psutil sentry-sdk
 
       # The suite is large (~2000 tests) and takes several minutes. Run it from
       # `gravitone/` so `import service.x` resolves.
