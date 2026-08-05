@@ -1,3 +1,13 @@
+# PARKED — the `.example` suffix means GitHub does not run this file. It was an
+# active workflow until 2026-08-05, when it was parked because it had never
+# passed: its scheduled run on `main` failed, and it cannot succeed on the
+# hosted runners this repository has. To run it for real you need ONE thing
+# that does not exist here yet: an **aarch64 Arm runner** (a self-hosted
+# Graviton box, or a GitHub-hosted `ubuntu-*-arm` runner) plus AWS credentials
+# for the scheduled matrix job. Restore it by renaming back to
+# `perf-ledger.yml` once that runner is available — and treat the first run as
+# a debugging session, per the header below, which is unchanged.
+#
 # Arm Performance Ledger - the performance claim, re-proven and gated.
 #
 # ############################################################################

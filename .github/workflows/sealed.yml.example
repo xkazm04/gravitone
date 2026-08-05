@@ -1,3 +1,13 @@
+# PARKED — the `.example` suffix means GitHub does not run this file. It was an
+# active workflow until 2026-08-05, when it was parked because it had failed
+# 100% of its runs, dying in setup after 13–18 seconds: it builds an
+# aarch64-only image (armswdev/pytorch-arm-neoverse) and no Arm runner is
+# attached to this repository. To run it for real you need an **aarch64 Arm
+# runner with Docker** (self-hosted Graviton, or a GitHub-hosted `ubuntu-*-arm`
+# runner); cross-building under QEMU would invalidate the very timings the
+# sealed tier claims, so emulation is not a substitute. Restore it by renaming
+# back to `sealed.yml` once that runner exists. The header below is unchanged.
+#
 # Sealed Appliance gate — does the artifact actually work with the cable pulled?
 #
 # ############################################################################
