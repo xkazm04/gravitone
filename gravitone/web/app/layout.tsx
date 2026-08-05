@@ -9,6 +9,7 @@ import { AuthProvider } from "@/lib/useAuth";
 import GravitoneTokens from "@/components/ui/GravitoneTokens";
 import AudioBusProvider from "@/components/ui/AudioBus";
 import NarrationDock from "@/components/ui/NarrationDock";
+import FeedbackDock from "@/components/ui/FeedbackDock";
 
 const instrument = Instrument_Serif({ weight: "400", subsets: ["latin"], variable: "--font-instrument", display: "swap" });
 const hanken = Hanken_Grotesk({ subsets: ["latin"], variable: "--font-hanken", display: "swap" });
@@ -43,7 +44,15 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             --gt-* signal channels are written on, so any surface below can react
             to real audio without building an analyser of its own. */}
         <AudioBusProvider>
-          <AuthProvider>{children}</AuthProvider>
+          <AuthProvider>
+            {children}
+            {/* The studio listens back. Renders NOTHING for a signed-out
+                visitor, a deployment without Firebase, or an embedded player —
+                so it costs the landing page and a self-host exactly nothing.
+                Inside AuthProvider because it reads the session; a sibling of
+                the narration dock, and positioned opposite it. */}
+            <FeedbackDock />
+          </AuthProvider>
           {/* Audible Docs. Renders NOTHING on a route lib/narratable has no
               entry for, and never plays without a click — mounted here (inside
               the bus) only so the narrator's voice drives the same --gt-*
