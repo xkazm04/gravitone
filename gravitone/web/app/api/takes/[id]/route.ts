@@ -4,5 +4,5 @@ import { proxyJson } from "@/lib/backend";
 
 export async function GET(_req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
-  return proxyJson(`/v1/takes/${encodeURIComponent(id)}`);
+  return proxyJson(`/v1/takes/${encodeURIComponent(id)}`, { credential: "operator" });
 }

@@ -6,6 +6,7 @@ import { proxyJson } from "@/lib/backend";
 export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
   return proxyJson(`/v1/voices/${encodeURIComponent(id)}`, {
+    credential: "operator",
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: await req.text(),
@@ -14,5 +15,5 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: strin
 
 export async function DELETE(_req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
-  return proxyJson(`/v1/voices/${encodeURIComponent(id)}`, { method: "DELETE" });
+  return proxyJson(`/v1/voices/${encodeURIComponent(id)}`, { credential: "operator", method: "DELETE" });
 }

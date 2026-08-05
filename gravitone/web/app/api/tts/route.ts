@@ -29,6 +29,7 @@ export async function POST(req: NextRequest) {
     const upstream = await backendFetch(
       `/v1/text-to-speech/${encodeURIComponent(voiceId)}?output_format=wav_24000`,
       {
+        credential: "operator",
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text, model_id: "pocket_tts" }),

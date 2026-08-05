@@ -17,6 +17,6 @@ export async function GET(req: Request) {
   // query parameter, and a validation dump is not a sentence anyone can act on.
   if (!agentId) return jsonError("agent_id is required to open a conversation", 400);
   return proxyJson(
-    `/v1/convai/conversation/get-signed-url?agent_id=${encodeURIComponent(agentId)}`,
+    `/v1/convai/conversation/get-signed-url?agent_id=${encodeURIComponent(agentId)}`, { credential: "operator" },
   );
 }

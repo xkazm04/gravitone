@@ -9,7 +9,7 @@ import ReviewPicker, { type Review } from "./ReviewPicker";
 
 async function loadReview(id: string): Promise<Review | null> {
   try {
-    const r = await backendFetch(`/v1/reviews/${encodeURIComponent(id)}`, { cache: "no-store", signal: AbortSignal.timeout(READ_TIMEOUT_MS) });
+    const r = await backendFetch(`/v1/reviews/${encodeURIComponent(id)}`, { credential: "operator", cache: "no-store", signal: AbortSignal.timeout(READ_TIMEOUT_MS) });
     return r.ok ? ((await r.json()) as Review) : null;
   } catch {
     return null;

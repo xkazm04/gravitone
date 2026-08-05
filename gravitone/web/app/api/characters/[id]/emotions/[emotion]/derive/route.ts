@@ -17,6 +17,7 @@ export async function POST(
   return proxyJson(
     `/v1/characters/${encodeURIComponent(id)}/emotions/${encodeURIComponent(emotion)}/derive`,
     {
+      credential: "operator",
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: await req.text(),

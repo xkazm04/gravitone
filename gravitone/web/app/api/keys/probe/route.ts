@@ -1,11 +1,12 @@
 // The proving route: the only place in the studio that talks to the backend
 // WITHOUT the root key.
 //
-// Every other route goes through `backendFetch`, which attaches
-// GRAVITONE_API_KEY — which is exactly why the keys page could never say
-// anything about enforcement: a keyed backend and a wide-open one look
-// identical through a proxy that always presents a valid credential. Here each
-// request is sent `bare: true`, and the sweep presents ONLY the key under test.
+// Every other route asks `backendFetch` for `credential: "operator"`, which
+// attaches GRAVITONE_API_KEY — which is exactly why the keys page could never
+// say anything about enforcement: a keyed backend and a wide-open one look
+// identical through a proxy that presents a valid credential. Here each
+// request declares `credential: "none"`, and the sweep presents ONLY the key
+// under test.
 // The browser cannot make these calls itself (CORS is default-closed), so this
 // server route is the measurement instrument.
 //
@@ -47,7 +48,8 @@ async function probeStatus(
   if (init.body !== null) headers.set("Content-Type", "application/json");
   try {
     const r = await backendFetch(path, {
-      bare: true, // NEVER the studio's root key: it would prove the root key works
+      // NEVER the studio's root key: it would prove the root key works.
+      credential: "none",
       method: init.method,
       headers,
       body: init.body === null ? undefined : JSON.stringify(init.body),

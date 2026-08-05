@@ -16,6 +16,6 @@ export async function DELETE(
   const { id, sha } = await ctx.params;
   return proxyJson(
     `/v1/characters/${encodeURIComponent(id)}/corpus/${encodeURIComponent(sha)}`,
-    { method: "DELETE" },
+    { credential: "operator", method: "DELETE" },
   );
 }

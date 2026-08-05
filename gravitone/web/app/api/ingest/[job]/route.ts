@@ -19,7 +19,7 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ job: string
   // The poller — hit every 1-5s during a job. proxyJson gives it the read
   // timeout it never had (a hung backend used to pin this handler open).
   const { job } = await ctx.params;
-  const upstream = await proxyJson(`/v1/ingest/${encodeURIComponent(job)}`);
+  const upstream = await proxyJson(`/v1/ingest/${encodeURIComponent(job)}`, { credential: "operator" });
   // Refusals, 503s and empty bodies pass through untouched: an ETag on an
   // error would let a client validate a failure as if it were the job.
   if (!upstream.ok || upstream.status === 204) return upstream;
@@ -52,5 +52,5 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ job: string
 
 export async function DELETE(_req: NextRequest, ctx: { params: Promise<{ job: string }> }) {
   const { job } = await ctx.params;
-  return proxyJson(`/v1/ingest/${encodeURIComponent(job)}`, { method: "DELETE" });
+  return proxyJson(`/v1/ingest/${encodeURIComponent(job)}`, { credential: "operator", method: "DELETE" });
 }

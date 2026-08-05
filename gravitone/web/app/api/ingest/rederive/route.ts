@@ -23,6 +23,7 @@ export async function POST(req: NextRequest) {
   const body = await readCappedText(req, MAX_BODY_BYTES);
   if (body instanceof Response) return body;
   return proxyJson(`/v1/ingest/rederive`, {
+    credential: "operator",
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body,

@@ -32,6 +32,7 @@ export async function POST(req: Request,
   // what makes turning that flag on meaningful; it is never trusted here.
   const forwarded = req.headers.get("x-forwarded-for");
   return proxyJson(`/v1/takes/${encodeURIComponent(id)}/reperform`, {
+    credential: "operator",
     method: "POST",
     headers: {
       "Content-Type": "application/json",

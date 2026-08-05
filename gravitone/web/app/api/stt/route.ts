@@ -41,6 +41,7 @@ export async function POST(req: Request) {
   if (body.byteLength > MAX_STT_BODY_BYTES) return tooLarge();
   if (body.byteLength === 0) return jsonError("no audio in the upload", 400);
   return proxyJson("/v1/speech-to-text", {
+    credential: "operator",
     method: "POST",
     headers: { "Content-Type": contentType },
     body,

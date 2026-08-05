@@ -6,6 +6,6 @@ import { streamIngestAsset } from "@/lib/backend";
 export async function GET(_req: NextRequest, ctx: { params: Promise<{ job: string; sid: string }> }) {
   const { job, sid } = await ctx.params;
   return streamIngestAsset(
-    `/v1/ingest/${encodeURIComponent(job)}/speaker-preview/${encodeURIComponent(sid)}`,
+    `/v1/ingest/${encodeURIComponent(job)}/speaker-preview/${encodeURIComponent(sid)}`, { credential: "operator" },
   );
 }

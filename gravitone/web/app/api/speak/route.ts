@@ -19,5 +19,5 @@ import { proxyWavPost } from "@/lib/backend";
 // on anything outside it (mp3 bitrates, pcm and wav at the supported rates).
 // Absent, the upstream URL is exactly what it was and the answer is wav_24000.
 export async function POST(req: NextRequest) {
-  return proxyWavPost(req, "/v1/speak", { forwardQuery: ["output_format"] });
+  return proxyWavPost(req, "/v1/speak", { credential: "operator", forwardQuery: ["output_format"] });
 }

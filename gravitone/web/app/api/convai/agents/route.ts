@@ -10,5 +10,5 @@ import { proxyJson } from "@/lib/backend";
 // Status passthrough matters here: `enabled: false` is a 200 with a body, but a
 // keyed backend answering 401 must NOT read as "no agents installed".
 export async function GET() {
-  return proxyJson(`/v1/convai/agents`);
+  return proxyJson(`/v1/convai/agents`, { credential: "operator" });
 }

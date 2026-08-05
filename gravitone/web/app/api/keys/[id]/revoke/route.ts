@@ -15,5 +15,5 @@ import { proxyJson } from "@/lib/backend";
 // unknown id; proxyJson passes both statuses and their `detail` through.
 export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
-  return proxyJson(`/v1/keys/${encodeURIComponent(id)}/revoke`, { method: "POST" });
+  return proxyJson(`/v1/keys/${encodeURIComponent(id)}/revoke`, { credential: "operator", method: "POST" });
 }

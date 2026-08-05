@@ -1,28 +1,47 @@
-// Server-side helper for calls to the Gravitone TTS backend. Attaches the
-// root API key (GRAVITONE_API_KEY in .env.local) so the key-protected
-// backend accepts the studio's proxy requests; without a key configured the
-// call goes out bare, matching an unprotected local backend.
+// Server-side helper for calls to the Gravitone TTS backend.
 // Server-only — never import from client components.
+//
+// THE CREDENTIAL IS NEVER IMPLICIT. `GRAVITONE_API_KEY` is the backend's ROOT
+// key: service/auth.py passes it for every scope check, `admin` included, so a
+// request carrying it can mint, enumerate and revoke API keys. It used to be
+// attached to EVERY outbound call automatically, which meant a route acquired
+// admin authority by existing — the `/api/keys` proxies inherited the crown
+// jewels while performing no authorization of their own, and any anonymous
+// caller who could reach the studio could mint themselves a backend key.
+//
+// So the default is now nothing, and each call site NAMES what it presents.
+// The choice is a required field, not an optional flag: a new route cannot be
+// written without answering the question, and `tsc` is what asks.
 
 import { forwardExposedHeaders } from "@/lib/serviceHeaders";
 
 const BASE = process.env.GRAVITONE_URL ?? "http://127.0.0.1:8080";
 
-/** `bare: true` sends the request with NO credential attached — not the root
- *  key, not anything. It exists for exactly one caller: the proving route
- *  (`app/api/keys/probe`), whose whole measurement is what this deployment does
- *  with a request that carries no key (or carries only the key under test). The
- *  root-key injection below is why the keys page could never state a posture,
- *  so the opt-out is spelled out at the call site rather than inferred from an
- *  absent header. Every existing call site is unchanged: no flag, same
- *  behaviour, byte for byte. */
-export type BackendInit = RequestInit & { bare?: boolean };
+/** Which credential the studio presents to the backend on ONE call.
+ *
+ *  `"operator"` — `GRAVITONE_API_KEY`, the deployment's root key. Unlimited
+ *    upstream. Correct for the studio's own proxy routes (every backend router
+ *    sits behind `require_scope(...)`, and the root key is the only credential
+ *    this process holds), but it is authority the ROUTE is then responsible
+ *    for rationing: whatever the route lets an anonymous caller ask for, it is
+ *    asking with admin rights. Routes that reach a privileged surface
+ *    (`/api/keys/**`) authorize the caller FIRST — see app/api/keys/identity.ts.
+ *
+ *  `"none"` — no credential at all. For the proving route, whose whole
+ *    measurement is what this deployment does with an unauthenticated request
+ *    (or one carrying only the key under test). A root key attached here would
+ *    prove the root key works and nothing else. */
+export type BackendCredential = "operator" | "none";
 
-export function backendFetch(path: string, init: BackendInit = {}): Promise<Response> {
-  const { bare, ...rest } = init;
+export type BackendInit = RequestInit & { credential: BackendCredential };
+
+export async function backendFetch(path: string, init: BackendInit): Promise<Response> {
+  const { credential, ...rest } = init;
   const headers = new Headers(rest.headers);
   const key = process.env.GRAVITONE_API_KEY;
-  if (!bare && key && !headers.has("xi-api-key")) headers.set("xi-api-key", key);
+  if (credential === "operator" && key && !headers.has("xi-api-key")) {
+    headers.set("xi-api-key", key);
+  }
   return fetch(`${BASE}${path}`, { ...rest, headers });
 }
 
@@ -63,7 +82,7 @@ export function jsonError(detail: string, status: number): Response {
  *  signal), and 204/no-body handling that dropped backend error details. */
 export async function proxyJson(
   path: string,
-  init: RequestInit & { timeoutMs?: number } = {},
+  init: RequestInit & { timeoutMs?: number; credential: BackendCredential },
 ): Promise<Response> {
   const { timeoutMs, ...rest } = init;
   const method = (rest.method ?? "GET").toUpperCase();
@@ -106,11 +125,13 @@ export async function proxyJson(
 export async function proxyWavPost(
   req: Request,
   backendPath: string,
-  opts: { forwardQuery?: readonly string[] } = {},
+  opts: { credential: BackendCredential; forwardQuery?: readonly string[] },
 ): Promise<Response> {
   const body = await readCappedText(req);
   if (body instanceof Response) return body;
-  return proxyAudioPost(withForwardedQuery(req.url, backendPath, opts.forwardQuery), body);
+  return proxyAudioPost(withForwardedQuery(req.url, backendPath, opts.forwardQuery), body, {
+    credential: opts.credential,
+  });
 }
 
 /** POST a JSON body to a synthesis endpoint and relay its audio, streaming.
@@ -124,11 +145,12 @@ export async function proxyWavPost(
 export async function proxyAudioPost(
   backendPath: string,
   body: string,
-  opts: { timeoutMs?: number } = {},
+  opts: { credential: BackendCredential; timeoutMs?: number },
 ): Promise<Response> {
   let upstream: Response;
   try {
     upstream = await backendFetch(backendPath, {
+      credential: opts.credential,
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body,
@@ -200,9 +222,13 @@ function withForwardedQuery(
  *  whole session is gone, and any Retry-After on the way. It was the one proxy
  *  in the app that did this.
  */
-export async function streamIngestAsset(upstreamPath: string): Promise<Response> {
+export async function streamIngestAsset(
+  upstreamPath: string,
+  opts: { credential: BackendCredential },
+): Promise<Response> {
   try {
     const r = await backendFetch(upstreamPath, {
+      credential: opts.credential,
       signal: AbortSignal.timeout(READ_TIMEOUT_MS),
     });
     if (!r.ok) {

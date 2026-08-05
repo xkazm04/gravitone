@@ -48,6 +48,7 @@ async function readKey(id: string): Promise<BackendKey | null | "unreachable"> {
   let r: Response;
   try {
     r = await backendFetch("/v1/keys", {
+      credential: "operator",
       cache: "no-store",
       signal: AbortSignal.timeout(READ_TIMEOUT_MS),
     });

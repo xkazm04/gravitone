@@ -17,6 +17,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ job: strin
   const body = await readCappedText(req, MAX_BODY_BYTES);
   if (body instanceof Response) return body;
   return proxyJson(`/v1/ingest/${encodeURIComponent(job)}/stems`, {
+    credential: "operator",
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body,

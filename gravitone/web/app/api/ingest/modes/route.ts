@@ -5,5 +5,5 @@ import { proxyJson } from "@/lib/backend";
 // ahead of [job] — and the backend declares /modes ahead of /{job_id} for the
 // same reason.
 export async function GET() {
-  return proxyJson("/v1/ingest/modes");
+  return proxyJson("/v1/ingest/modes", { credential: "operator" });
 }

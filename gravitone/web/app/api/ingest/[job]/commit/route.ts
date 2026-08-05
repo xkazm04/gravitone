@@ -6,6 +6,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ job: strin
   // Commit returns immediately (cloning runs as a background phase the poller
   // follows); the default write timeout covers the kickoff request.
   return proxyJson(`/v1/ingest/${encodeURIComponent(job)}/commit`, {
+    credential: "operator",
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: await req.text(),

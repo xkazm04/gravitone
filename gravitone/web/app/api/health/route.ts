@@ -12,6 +12,7 @@ import { backendFetch, READ_TIMEOUT_MS } from "@/lib/backend";
 export async function GET() {
   try {
     const r = await backendFetch(`/health`, {
+      credential: "operator",
       cache: "no-store",
       signal: AbortSignal.timeout(READ_TIMEOUT_MS),
     });

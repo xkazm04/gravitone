@@ -79,6 +79,6 @@ export async function POST(req: NextRequest) {
     JSON.stringify({
       text,
       ...(body.voice_settings ? { voice_settings: body.voice_settings } : {}),
-    }),
+    }), { credential: "operator" },
   );
 }

@@ -27,6 +27,7 @@ export async function requestRevision(
   let r: Response;
   try {
     r = await backendFetch(`/v1/reviews/${encodeURIComponent(reviewId)}/revise`, {
+      credential: "operator",
       method: "POST",
       cache: "no-store",
       headers: { "Content-Type": "application/json" },

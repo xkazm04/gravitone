@@ -91,6 +91,7 @@ export type TakeLineage = {
 export async function loadLineage(id: string): Promise<TakeLineage | null> {
   try {
     const r = await backendFetch(`/v1/takes/${encodeURIComponent(id)}/lineage`, {
+      credential: "operator",
       cache: "no-store",
       signal: AbortSignal.timeout(READ_TIMEOUT_MS),
     });
@@ -130,6 +131,7 @@ export async function loadTake(id: string): Promise<TakeLoad> {
   let r: Response;
   try {
     r = await backendFetch(`/v1/takes/${encodeURIComponent(id)}`, {
+      credential: "operator",
       cache: "no-store",
       signal: AbortSignal.timeout(READ_TIMEOUT_MS),
     });

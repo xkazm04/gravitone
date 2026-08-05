@@ -5,7 +5,7 @@ import { proxyJson } from "@/lib/backend";
 // rotate: POST /api/keys/{id}  (delegates to backend /v1/keys/{id}/rotate)
 export async function POST(_req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   const { id } = await ctx.params;
-  return proxyJson(`/v1/keys/${encodeURIComponent(id)}/rotate`, { method: "POST" });
+  return proxyJson(`/v1/keys/${encodeURIComponent(id)}/rotate`, { credential: "operator", method: "POST" });
 }
 
 // destroy: DELETE /api/keys/{id}  (delegates to backend DELETE /v1/keys/{id})
@@ -18,5 +18,5 @@ export async function DELETE(_req: NextRequest, ctx: { params: Promise<{ id: str
   const { id } = await ctx.params;
   // Passthrough: a non-2xx carries a `detail` body the ledger UI shows; the old
   // `new Response(null)` dropped it.
-  return proxyJson(`/v1/keys/${encodeURIComponent(id)}`, { method: "DELETE" });
+  return proxyJson(`/v1/keys/${encodeURIComponent(id)}`, { credential: "operator", method: "DELETE" });
 }

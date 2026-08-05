@@ -33,6 +33,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ job: strin
     upstream = await backendFetch(
       `/v1/ingest/${encodeURIComponent(job)}/audition`,
       {
+        credential: "operator",
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body,

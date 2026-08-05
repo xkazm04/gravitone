@@ -15,5 +15,5 @@ import { proxyWavPost } from "@/lib/backend";
 // `output_format` rides through to the service — a 64-line performance is the
 // largest thing this product makes, and it is the one most worth sending as mp3.
 export async function POST(req: NextRequest) {
-  return proxyWavPost(req, "/v1/performance", { forwardQuery: ["output_format"] });
+  return proxyWavPost(req, "/v1/performance", { credential: "operator", forwardQuery: ["output_format"] });
 }

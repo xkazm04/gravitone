@@ -6,6 +6,6 @@ export async function DELETE(_req: NextRequest, ctx: { params: Promise<{ id: str
   const { id, emotion } = await ctx.params;
   return proxyJson(
     `/v1/characters/${encodeURIComponent(id)}/emotions/${encodeURIComponent(emotion)}`,
-    { method: "DELETE" },
+    { credential: "operator", method: "DELETE" },
   );
 }
