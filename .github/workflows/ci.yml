@@ -85,27 +85,6 @@ jobs:
       run:
         working-directory: gravitone/web
 
-    env:
-      # Build-time Firebase configuration. `next build` PRERENDERS /keys, which
-      # initializes Firebase Auth at module scope; with these unset, the build
-      # fails with `FirebaseError: auth/invalid-api-key` and
-      # "Export encountered an error on /keys/page". Verified: with them set to
-      # the obvious placeholders below, the build completes and all 32 routes
-      # emit.
-      #
-      # These are PLACEHOLDERS. They are not anyone's project, they are not
-      # secrets, and they must never be replaced with live values: Firebase web
-      # config is public by design, but pasting a real project's config here
-      # would silently point CI builds at a real Firebase project. Nothing in
-      # this workflow makes a network call to Firebase — the values only have to
-      # be non-empty and well-shaped enough for `initializeApp` to accept them.
-      NEXT_PUBLIC_FIREBASE_API_KEY: AIzaSyDUMMY-ci-placeholder-not-a-real-key
-      NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN: gravitone-ci-placeholder.firebaseapp.com
-      NEXT_PUBLIC_FIREBASE_PROJECT_ID: gravitone-ci-placeholder
-      NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET: gravitone-ci-placeholder.appspot.com
-      NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID: "000000000000"
-      NEXT_PUBLIC_FIREBASE_APP_ID: "1:000000000000:web:0000000000000000000000"
-
     steps:
       - uses: actions/checkout@v4
 
@@ -161,6 +140,31 @@ jobs:
       # self-host the fonts in `gravitone/web/`, not to relax this gate.
       - name: Production build
         run: npm run build
+        # SCOPED TO THIS STEP ON PURPOSE — do not promote to job level.
+        #
+        # `next build` PRERENDERS /keys, which initializes Firebase Auth at
+        # module scope; unset, the build dies with `FirebaseError:
+        # auth/invalid-api-key` and "Export encountered an error on
+        # /keys/page". But a present NEXT_PUBLIC_FIREBASE_PROJECT_ID is also
+        # exactly how the studio decides it is in `firebase` auth mode rather
+        # than `single-user` (app/api/keys/identity.ts). Job-level, these
+        # placeholders put the TEST run in firebase mode, /api/keys answered
+        # 401 to everything, and 21 tests written against single-user mode
+        # failed with `expected 401 to be 400`. Tests must run in the posture a
+        # plain `git clone && npm test` gets.
+        #
+        # These are PLACEHOLDERS. Not anyone's project, not secrets, and never
+        # to be replaced with live values: Firebase web config is public by
+        # design, but pasting a real project's config here would silently point
+        # CI builds at a real Firebase project. Nothing here calls Firebase —
+        # the values need only be well-shaped enough for `initializeApp`.
+        env:
+          NEXT_PUBLIC_FIREBASE_API_KEY: AIzaSyDUMMY-ci-placeholder-not-a-real-key
+          NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN: gravitone-ci-placeholder.firebaseapp.com
+          NEXT_PUBLIC_FIREBASE_PROJECT_ID: gravitone-ci-placeholder
+          NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET: gravitone-ci-placeholder.appspot.com
+          NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID: "000000000000"
+          NEXT_PUBLIC_FIREBASE_APP_ID: "1:000000000000:web:0000000000000000000000"
 
   service:
     name: service (fastapi, fake-engine suite)
