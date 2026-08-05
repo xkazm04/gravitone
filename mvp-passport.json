@@ -1,0 +1,180 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-08-05",
+  "generatedBy": "personas mvp",
+  "releaseTarget": "arm-ai-optimization-challenge-track-2-submission",
+  "releaseSurfaces": ["service", "web"],
+  "verdict": "go-with-risks",
+  "phases": {
+    "P0": "partial",
+    "P1": "partial",
+    "P2": "partial",
+    "P3": "green",
+    "P4": "green",
+    "P5": "skipped",
+    "P6": "partial"
+  },
+  "items": {
+    "value-case": {
+      "level": "partial",
+      "tool": null,
+      "skippedByChoice": false,
+      "acceptedPartial": true,
+      "note": "Three pillars documented in web/lib/content.ts with claim discipline; every perf claim audited and several corrected this run. The 'proof it works live today' leg is still open because nothing is deployed."
+    },
+    "monetization": {
+      "level": "missing",
+      "tool": null,
+      "skippedByChoice": true,
+      "acceptedPartial": false,
+      "note": "Skipped by choice: hackathon submission, MIT/self-host posture, no revenue path encoded."
+    },
+    "artifacts": {
+      "level": "partial",
+      "tool": "context-map",
+      "skippedByChoice": false,
+      "acceptedPartial": true,
+      "note": "context-map.json repaired from 20/93 to 83/83 paths resolving. Feature inventory and KPI triage not run (project-populate not invoked)."
+    },
+    "milestone": {
+      "level": "missing",
+      "tool": null,
+      "skippedByChoice": true,
+      "acceptedPartial": false,
+      "note": "Skipped by choice: tracked in this passport rather than a Personas Ship milestone widget."
+    },
+    "notes": {
+      "level": "met",
+      "tool": "perfect-vault + architect + personas-outbox",
+      "skippedByChoice": false,
+      "acceptedPartial": false,
+      "note": "141-file .perfect vault and 20 .architect ADRs already current; .personas/memory-outbox.jsonl added so decisions reach the app."
+    },
+    "fleet": {
+      "level": "partial",
+      "tool": "personas",
+      "skippedByChoice": false,
+      "acceptedPartial": true,
+      "note": ".personas marker added. Registration and a dispatched session not verified; skills remain split between root .claude/skills (lowercase skill.md) and web/.claude/skills."
+    },
+    "cicd": {
+      "level": "met",
+      "tool": "github-actions",
+      "skippedByChoice": false,
+      "acceptedPartial": false,
+      "note": "ci.yml gates PRs and pushes to main with no path filter; both jobs green twice consecutively (first green CI in repo history). main protected, both checks required, strict, force-push and deletion blocked, enforce_admins false. Two never-green workflows parked as .example. No test-env deploy or prod-promotion job because nothing is deployed."
+    },
+    "deploy": {
+      "level": "missing",
+      "tool": "aws-cloudformation + helm",
+      "skippedByChoice": false,
+      "acceptedPartial": false,
+      "note": "BLOCKED on expired AWS credentials — rehearsal could not launch. Running the documented one-click path found six defects (fixed: a script that could not fail, a leaked root key file, an instance-id concatenation bug). Three left as operator policy calls: no SSH key or SSM instance profile on either launch path, iam-policy grants Egress where the code calls Ingress so 8080 never opens, and the CloudFormation path needs cloudformation:* the profile lacks. rollback.sh written, tested against a stubbed CLI, never against live AWS."
+    },
+    "observability": {
+      "level": "partial",
+      "tool": "sentry",
+      "skippedByChoice": false,
+      "acceptedPartial": true,
+      "note": "Sentry wired into both halves, strictly opt-in and verified no-op with no DSN (measured: zero non-loopback connects, SDK never imported, browser chunks unreachable from any page entry). send_default_pii false and max_request_body_size never, so audio and transcripts cannot ride along. The existing per-job Spend ledger is emitted as context plus one event per ingest job. Not certified against a live production error because nothing is deployed."
+    },
+    "code-quality": {
+      "level": "partial",
+      "tool": "tsc + vitest + pytest",
+      "skippedByChoice": false,
+      "acceptedPartial": true,
+      "note": "Green in CI: tsc clean, 86 files / 1200 vitest tests, next build, and 2018 pytest tests. Two known debts: lint is unconfigured (measured at 1 error / 4 warnings if wired; eslint-config-next@15 is not flat-config compatible), and 28 shipped components exceed 200 LOC (worst: PlaygroundConsole 1780, voices/new 1314)."
+    },
+    "auth": {
+      "level": "met",
+      "tool": "firebase",
+      "skippedByChoice": false,
+      "acceptedPartial": false,
+      "note": "Google-only recorded as the deliberate posture (password reset and email verification are N/A by design). 12h max session age enforced from last sign-in, checked on token refresh, tab-visible and a 5-minute interval, failing open on an unparseable timestamp. x-forwarded-for now forwarded so the per-IP limiter counts callers rather than the studio."
+    },
+    "security": {
+      "level": "met",
+      "tool": null,
+      "skippedByChoice": false,
+      "acceptedPartial": false,
+      "note": "Launch blocker closed: backendFetch no longer attaches the root key by default (credential is now a required per-call-site field, so tsc forces the question), and /api/keys requires a server-verified Firebase ID token scoped to the uid, answering 401 without contacting the backend. Other users' key ids answer 404 not 403 so the ledger cannot be probed. Security headers added (HSTS, nosniff, referrer policy, permissions policy) with a path-aware CSP that keeps the /t/{id}/embed surface embeddable and Google's redirect sign-in working. npm audit 3 high to 0. .env was never committed."
+    },
+    "design-system": {
+      "level": "met",
+      "tool": "tailwind-4 + tokens.ts",
+      "skippedByChoice": false,
+      "acceptedPartial": false,
+      "note": "Token-based with only 11 raw hex values across all shipped tsx. Global :focus-visible rule added in @layer base plus a ring on the shared Button, measured at 13.7:1 against the ink background; the 18 bespoke rings keep their own geometry."
+    },
+    "i18n": {
+      "level": "met",
+      "tool": null,
+      "skippedByChoice": false,
+      "acceptedPartial": false,
+      "note": "English-only recorded as a deliberate first-release decision. No framework, no catalogs, no Intl usage. Note the engine synthesizes more languages than the UI speaks."
+    },
+    "onboarding": {
+      "level": "met",
+      "tool": null,
+      "skippedByChoice": false,
+      "acceptedPartial": false,
+      "note": "The landing's primary CTA used to link into a gated route that bounced signed-out visitors straight back. It now signs in and lands on /playground, which arrives with a built-in character selected and a sample line; the API key became a dismissible aside rather than the first screen. The ?text= handoff the landing had always sent was inert and is now wired. Browser-speech fallback is labelled at the point of playback, not only in a banner. Walked in code, not against a live judge."
+    },
+    "feedback": {
+      "level": "partial",
+      "tool": "firestore",
+      "skippedByChoice": false,
+      "acceptedPartial": true,
+      "note": "Widget and /api/feedback route shipped; identity established server-side from an ID token via Google's Identity Toolkit with no new dependency and no privileged credential. Requires a Firestore create rule on feedback/{id} deployed out-of-band, otherwise the route answers 503 and the widget stays hidden."
+    },
+    "landing": {
+      "level": "met",
+      "tool": null,
+      "skippedByChoice": false,
+      "acceptedPartial": false,
+      "note": "Three positions stated under the hero from PILLARS; CTA resolves into the app. Competitor price table is now date-stamped and source-cited on both the landing calculator and /benchmarks."
+    },
+    "seo": {
+      "level": "missing",
+      "tool": null,
+      "skippedByChoice": true,
+      "acceptedPartial": false,
+      "note": "Skipped by choice (nothing deployed, no acquisition channel). One real bug fixed: NEXT_PUBLIC_SITE_URL is read for metadataBase but was undocumented, so a deployed build would resolve every share card against localhost. Now declared in web/.env.example. Sitemap, robots and an OG image remain absent."
+    },
+    "legal": {
+      "level": "missing",
+      "tool": null,
+      "skippedByChoice": true,
+      "acceptedPartial": false,
+      "note": "Skipped by choice: no public instance, so no third-party data is collected. REVISIT BEFORE ANY PUBLIC LAUNCH — the /s/{voiceId} sign-off flow ingests third-party voice recordings, which are special-category biometric data under GDPR Art. 9 and BIPA analogues, with no privacy policy or ToS today."
+    },
+    "analytics": {
+      "level": "missing",
+      "tool": null,
+      "skippedByChoice": true,
+      "acceptedPartial": false,
+      "note": "Skipped by choice: no funnel to measure without a public instance. Operational metrics (/ops, /api/metrics) exist and are unrelated to behavior."
+    },
+    "launch-gate": {
+      "level": "partial",
+      "tool": "github-actions",
+      "skippedByChoice": false,
+      "acceptedPartial": true,
+      "note": "CI green twice consecutively across both halves is the automated evidence. There is no production URL to smoke and no E2E journey harness (vitest is unit/component only), so the critical path has not been walked end to end against a running deployment."
+    }
+  },
+  "acceptedRisks": [
+    "sharp pinned forward to ^0.35.0 via an npm override to clear libvips CVEs without taking next@16; a 0.x minor bump verified only by the suite and a production build.",
+    "The published t4g realtime factor of 1.33x remains uncertified — docs/certifications/ledger.json is empty by design and no run has been appended. Any single-shot t4g figure is optimistic because burstable CPU credits deplete.",
+    "Two perf claims have no artifact in the repo (+8% single-stream on N1, hosted convai $/min); both are kept but explicitly labelled as unlogged observations rather than measurements.",
+    "CI installs with npm install rather than npm ci, because the Windows-generated lockfile is rejected on Linux over pruned transitive deps of optional wasm32 packages. Dependency versions are therefore not pinned byte-for-byte in CI.",
+    "service/tests/test_ratelimit_shared.py::test_four_processes_share_one_budget flaked once under CI load (80 claims allowed against a 40 budget) and passed on re-run; it is a multi-process timing test and is not currently quarantined."
+  ],
+  "operatorFollowUps": [
+    "Re-authenticate AWS and run the deploy rehearsal; the corrected sequence is in gravitone/docs/DEPLOY_REHEARSAL.md. Credits expire 2026-08-09.",
+    "Run deploy/rollback.sh verify once with working credentials — the rehearsal's teardown assertion rests on the transcript, not a clean describe.",
+    "Decide the three deploy policy calls: SSH key or SSM instance profile, the Ingress/Egress mismatch in aws/iam-policy.json, and cloudformation:* in the documented profile.",
+    "Deploy the Firestore security rule for feedback/{id} or the feedback widget stays inert.",
+    "Regenerate package-lock.json on Linux and restore npm ci in the CI gate."
+  ]
+}
