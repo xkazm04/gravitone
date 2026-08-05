@@ -1,6 +1,8 @@
 "use client";
 
+import { useEffect, useRef } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
 import { BRAND, HERO, STATS, FEATURES, PILLARS, VOICES, SAMPLE_TEXT, API_DOCS_URL } from "@/lib/content";
 import { useAuth } from "@/lib/useAuth";
@@ -19,8 +21,35 @@ import HeroMicDemo from "./HeroMicDemo";
 const rise = makeRise({ y: 24, duration: 0.7, stagger: 0.08 });
 
 export default function StudioDark() {
-  const { user } = useAuth();
+  const { user, signIn } = useAuth();
+  const router = useRouter();
   const aurora = usePauseOffscreen<HTMLDivElement>();
+
+  // Where the visitor was actually trying to go when they pressed a CTA.
+  //
+  // Both landing CTAs used to be plain <Link href="/playground">, and every
+  // module route is wrapped by AppFrame, which router.replace("/")s anyone who
+  // is not signed in. So the page's primary button returned the visitor to the
+  // page they were already on, by way of a "redirecting…" flash — the front
+  // door turning people around. Signed out, a CTA now opens sign-in and the
+  // destination waits here until auth actually lands (a click handler that
+  // navigated straight after `await signIn()` would race AppFrame's gate,
+  // which reads React state, not Firebase's).
+  const pending = useRef<string | null>(null);
+  useEffect(() => {
+    if (!user || !pending.current) return;
+    const to = pending.current;
+    pending.current = null;
+    router.push(to);
+  }, [user, router]);
+
+  const enter = (href: string) => {
+    if (user) { router.push(href); return; }
+    pending.current = href;
+    // signIn() reports its own failures through the auth context's banner; all
+    // this needs is to stop holding a destination nobody is travelling to.
+    void signIn().catch(() => { pending.current = null; });
+  };
   return (
     <div className="font-hanken relative min-h-screen overflow-hidden bg-[var(--gt-ink)] text-slate-200 grain">
       {/* atmosphere — aurora drift pauses once scrolled past */}
@@ -77,9 +106,14 @@ export default function StudioDark() {
             </motion.p>
 
             <motion.div variants={rise} initial="hidden" animate="show" custom={3} className="mt-8 flex flex-wrap items-center gap-3">
-              <Link href="/playground" className="cta-glow rounded-full bg-gradient-to-r from-cyan-300 to-cyan-200 px-6 py-3 text-sm font-semibold text-slate-950 transition hover:brightness-110">
-                {HERO.primaryCta} →
-              </Link>
+              <button
+                onClick={() => enter("/playground")}
+                className="cta-glow cursor-pointer rounded-full bg-gradient-to-r from-cyan-300 to-cyan-200 px-6 py-3 text-sm font-semibold text-slate-950 transition hover:brightness-110"
+              >
+                {/* Signed out, this button opens Google sign-in — so it says so.
+                    The playground is one step behind it either way. */}
+                {user ? `${HERO.primaryCta} →` : `Sign in — ${HERO.primaryCta.toLowerCase()} →`}
+              </button>
               <a href={API_DOCS_URL} target="_blank" rel="noreferrer" className="font-jetbrains rounded-full border border-white/15 px-6 py-3 text-sm text-white/85 transition hover:bg-white/5">
                 {HERO.secondaryCta}
               </a>
@@ -182,12 +216,12 @@ export default function StudioDark() {
                   <p className="text-sm text-white/80">{SAMPLE_TEXT}</p>
                   <div className="mt-4 flex items-center justify-between">
                     <Equalizer bars={20} className="h-8" />
-                    <Link
-                      href={`/playground?text=${encodeURIComponent(SAMPLE_TEXT)}`}
-                      className="cta-glow rounded-full bg-cyan-300 px-5 py-2 text-sm font-semibold text-slate-950 transition hover:brightness-110"
+                    <button
+                      onClick={() => enter(`/playground?text=${encodeURIComponent(SAMPLE_TEXT)}`)}
+                      className="cta-glow cursor-pointer rounded-full bg-cyan-300 px-5 py-2 text-sm font-semibold text-slate-950 transition hover:brightness-110"
                     >
-                      Generate
-                    </Link>
+                      {user ? "Generate" : "Sign in to generate"}
+                    </button>
                   </div>
                 </div>
               </div>

@@ -13,6 +13,7 @@ import { apiJson } from "@/lib/apiFetch";
 import { useCopyFeedback } from "@/lib/useCopyFeedback";
 import { useHealthPoll } from "@/lib/useHealthPoll";
 import { useMounted } from "@/lib/useMounted";
+import { NEW_KEY_SLOT } from "@/lib/useAuth";
 import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { AnimatePresence, motion } from "framer-motion";
@@ -222,6 +223,15 @@ function RenderStatus({ startedAt, etaSec, estAudioSec, etaBasisLabel, noEtaLabe
 
 export default function PlaygroundConsole() {
   const [text, setText] = useState(DEFAULT_TEXT);
+  // The landing's teaser CTA links here with ?text=… . Nothing read it, so the
+  // "Type it. Hear it." button dropped the visitor into the default composer
+  // line and quietly lost the sentence it had just shown them. An explicit deep
+  // link outranks the stored session (see the composer restore below).
+  const seeded = useRef(false);
+  // The prefix of an API key auto-minted during this session's first sign-in.
+  // Announced HERE, as a secondary aside, rather than by making a credentials
+  // panel the first screen of a speech product (lib/useAuth::NEW_KEY_SLOT).
+  const [newKeyPrefix, setNewKeyPrefix] = useState<string | null>(null);
   const [characters, setCharacters] = useState<Character[]>([]);
   const [charId, setCharId] = useState<string>("");
   const [expr, setExpr] = useState<Expression>(DEFAULT_EXPRESSION);
@@ -408,6 +418,34 @@ export default function PlaygroundConsole() {
   // The take log has survived a refresh since an earlier round; the WORK that
   // produced it did not. Same mechanism (lib/playgroundDb), one store each.
 
+  // ?text=… from the landing's teaser, consumed once. The param is stripped
+  // afterwards so a refresh restores the user's own session instead of
+  // re-seeding the marketing line over it (same move as CharacterVoices'
+  // ?record= handoff).
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const url = new URL(window.location.href);
+    const wanted = url.searchParams.get("text");
+    if (!wanted) return;
+    seeded.current = true;
+    setText(wanted.slice(0, MAX_TEXT_CHARS));
+    url.searchParams.delete("text");
+    window.history.replaceState({}, "", url.toString());
+  }, []);
+
+  // First sign-in minted an API key. This is the ONLY thing the studio says
+  // about it — one dismissible line, on the screen the user actually wanted.
+  useEffect(() => {
+    try {
+      const p = sessionStorage.getItem(NEW_KEY_SLOT);
+      if (!p) return;
+      sessionStorage.removeItem(NEW_KEY_SLOT);
+      setNewKeyPrefix(p);
+    } catch {
+      /* storage unavailable — the key still exists, it just goes unannounced */
+    }
+  }, []);
+
   // A live mirror of the composer, so the restore below can tell whether the
   // user got here first without re-running on every keystroke.
   const live = useRef({ text, script, mode, expr });
@@ -421,7 +459,11 @@ export default function PlaygroundConsole() {
         const cur = live.current;
         // Typing (or switching mode) before the restore landed means the user
         // is already working — their input wins over the stored session.
-        const pristine = cur.text === DEFAULT_TEXT && cur.script.length === 0
+        // `seeded` is checked explicitly rather than leaning on the mirror: a
+        // deep link's setText may not have been rendered yet when this promise
+        // settles, and the stored session would then win the race.
+        const pristine = !seeded.current
+          && cur.text === DEFAULT_TEXT && cur.script.length === 0
           && cur.mode === "solo" && cur.expr === DEFAULT_EXPRESSION;
         if (!pristine) return;
         setText(s.text);
@@ -1136,6 +1178,22 @@ export default function PlaygroundConsole() {
         <span className="text-white">Voices</span> mid-sentence. A missing emotion uses the nearest
         recorded one, and only then baseline.
       </p>
+
+      {/* First sign-in also provisioned an API key. It is an aside — the
+          Character and the line above are already loaded and the point of this
+          screen is to press Generate. */}
+      {newKeyPrefix && (
+        <p className="font-jetbrains mt-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-cyan-400/25 bg-cyan-400/5 px-4 py-2 text-[11px] text-cyan-200/90">
+          <span>
+            Welcome. You also got an API key (<span className="text-white/85">{newKeyPrefix}…</span>) for the
+            ElevenLabs-compatible endpoints — it is on your profile whenever you want it.
+          </span>
+          <span className="flex shrink-0 items-center gap-3">
+            <Link href="/profile" className="underline underline-offset-2 transition hover:text-cyan-100">profile →</Link>
+            <button onClick={() => setNewKeyPrefix(null)} aria-label="Dismiss" className="cursor-pointer text-cyan-200/60 transition hover:text-cyan-100">✕</button>
+          </span>
+        </p>
+      )}
 
       {rosterErr && <ErrorBanner>{rosterErr}</ErrorBanner>}
 

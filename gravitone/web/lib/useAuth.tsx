@@ -54,6 +54,18 @@ type AuthState = {
 
 const Ctx = createContext<AuthState | null>(null);
 
+/**
+ * sessionStorage slot: an API key was auto-minted during this browser session's
+ * first sign-in, and nothing has told the user yet.
+ *
+ * First sign-in used to mint the key and then `window.location.assign("/profile")`,
+ * so a brand-new user's first screen in a SPEECH product was a credentials panel
+ * and a migration snippet. The key still gets minted — it is just announced as a
+ * secondary step by whichever surface reads (and clears) this slot, while the
+ * user lands in the playground.
+ */
+export const NEW_KEY_SLOT = "gravitone.newKey";
+
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
@@ -93,13 +105,27 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             await setDoc(ref, { ...base, plan: "free", createdAt: serverTimestamp(), lastLogin: serverTimestamp() }, { merge: true });
             setProfile({ ...base, plan: "free" });
             // First sign-in: auto-provision a tts-scoped API key and land the
-            // user on the profile panel with a ready-to-run migration snippet.
-            // Best-effort — a down backend must never break sign-in.
-            void mintDefaultKey(u.uid, u.email).then((k) => {
-              if (!k) return;
-              void updateDoc(ref, { keyId: k.id, keyPrefix: k.prefix }).catch(() => {});
-              if (window.location.pathname !== "/profile") window.location.assign("/profile");
-            });
+            // user in the STUDIO. The playground opens with a built-in
+            // Character selected and a sample line already in the composer, so
+            // the first screen of a speech product is speech — the profile
+            // panel (credentials + migration snippet) is a second step the
+            // NEW_KEY notice points at, not the front door.
+            //
+            // Best-effort — a down backend must never break sign-in. The
+            // navigation waits for the mint to settle (assign() would unload
+            // the page out from under an in-flight request) but does NOT depend
+            // on it succeeding: a backend that is down costs the user a
+            // credential, never the door into the product.
+            void mintDefaultKey(u.uid, u.email)
+              .then((k) => {
+                if (!k) return;
+                void updateDoc(ref, { keyId: k.id, keyPrefix: k.prefix }).catch(() => {});
+                try { sessionStorage.setItem(NEW_KEY_SLOT, k.prefix); }
+                catch { /* storage off — the notice is a nicety, not the key */ }
+              })
+              .finally(() => {
+                if (window.location.pathname !== "/playground") window.location.assign("/playground");
+              });
           }
         } else {
           setProfile(null);
