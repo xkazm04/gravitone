@@ -114,7 +114,13 @@ jobs:
       # 15.5 wants 20+. 22.x clears both with room to spare.
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          # 24, not 22, and the difference is not cosmetic. On Node 22 this
+          # suite fails 33 tests that pass on 24 — starting with
+          # `expected Blob { size: 44 } to be an instance of Blob`, a dual-realm
+          # identity mismatch between jsdom's `Blob` and the one Node exposes
+          # globally. The suite is developed and verified on 24; pinning the
+          # gate to anything else tests a runtime nobody runs.
+          node-version: "24"
           cache: npm
           cache-dependency-path: gravitone/web/package-lock.json
 
