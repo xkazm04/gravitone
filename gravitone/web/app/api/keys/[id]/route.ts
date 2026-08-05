@@ -1,8 +1,7 @@
 import { NextRequest } from "next/server";
 
 import { proxyJson } from "@/lib/backend";
-import { identify, modeHeaders, ownedKey } from "../identity";
-import { mint } from "../route";
+import { identify, mint, modeHeaders, ownedKey } from "../identity";
 
 // rotate: POST /api/keys/{id}  (delegates to backend /v1/keys/{id}/rotate)
 //

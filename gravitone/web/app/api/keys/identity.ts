@@ -42,7 +42,7 @@
 // — the safe direction, and they remain fully manageable by an operator holding
 // the root key directly against the service.
 
-import { backendFetch, jsonError, READ_TIMEOUT_MS } from "@/lib/backend";
+import { backendFetch, jsonError, READ_TIMEOUT_MS, WRITE_TIMEOUT_MS } from "@/lib/backend";
 import { firebaseProjectId, UID_SHAPE, verifyIdToken } from "@/lib/idToken";
 
 export type AuthMode = "firebase" | "single-user";
@@ -198,4 +198,41 @@ export async function ownedKey(id: string, caller: Caller): Promise<LedgerKey | 
 /** The public shape of a key: the ownership tag never leaves the server. */
 export function publicKey<T extends { name?: unknown }>(key: T): T {
   return { ...key, name: displayName(key.name) };
+}
+
+/** POST a key-minting call and return the created/rotated key with its stored
+ *  name translated back to the one the user typed. Shared with the rotate
+ *  route, which returns the same shape. */
+export async function mint(
+  path: string,
+  payload: unknown,
+  caller: Caller,
+): Promise<Response> {
+  let r: Response;
+  try {
+    r = await backendFetch(path, {
+      credential: "operator",
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: payload === undefined ? undefined : JSON.stringify(payload),
+      signal: AbortSignal.timeout(WRITE_TIMEOUT_MS),
+    });
+  } catch {
+    return jsonError("backend unreachable", 503);
+  }
+  const headers = new Headers({ "Content-Type": "application/json", ...modeHeaders(caller.mode) });
+  const retryAfter = r.headers.get("Retry-After");
+  if (retryAfter) headers.set("Retry-After", retryAfter);
+  const text = await r.text();
+  if (!r.ok) return new Response(text, { status: r.status, headers });
+  try {
+    return new Response(JSON.stringify(publicKey(JSON.parse(text) as { name?: unknown })), {
+      status: r.status,
+      headers,
+    });
+  } catch {
+    // A 2xx we could not parse is still the backend's answer; passing it
+    // through beats inventing an error for a key that WAS created.
+    return new Response(text, { status: r.status, headers });
+  }
 }

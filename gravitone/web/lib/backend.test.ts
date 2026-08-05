@@ -16,7 +16,7 @@ vi.mock("next/headers", () => ({ headers: async () => incoming.value }));
 const savedKey = process.env.GRAVITONE_API_KEY;
 
 function stub() {
-  const fn = vi.fn(async () => new Response("{}", {
+  const fn = vi.fn(async (..._args: unknown[]) => new Response("{}", {
     status: 200, headers: { "Content-Type": "application/json" },
   }));
   vi.stubGlobal("fetch", fn);
@@ -24,8 +24,10 @@ function stub() {
 }
 
 /** The headers the backend would actually receive. */
-const sent = (fn: ReturnType<typeof stub>) =>
-  new Headers((fn.mock.calls[0][1] as RequestInit).headers as HeadersInit);
+const sent = (fn: ReturnType<typeof stub>) => {
+  const [, init] = fn.mock.calls[0] as [string, RequestInit];
+  return new Headers(init.headers as HeadersInit);
+};
 
 beforeEach(() => {
   process.env.GRAVITONE_API_KEY = "root-secret";
