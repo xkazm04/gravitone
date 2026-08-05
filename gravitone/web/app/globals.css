@@ -11,6 +11,34 @@ html { scroll-behavior: smooth; }
 body { margin: 0; }
 
 /* ---------------------------------------------------------------------------
+   KEYBOARD FOCUS — the studio's default ring
+
+   The app is dense with raw <button>s and none of them declared a focus ring,
+   so a keyboard user navigating the near-black studio (--gt-ink #080a10) had
+   nothing to follow. This is the floor: every focusable element gets the accent
+   ring unless it asks for something else.
+
+   Deliberately inside `@layer base`, NOT unlayered like the .aurora/.glass-panel
+   rules below. Tailwind utilities live in `@layer utilities`, which outranks
+   base — so the ~18 places that already declare their own
+   `focus-visible:outline-*` (Region, Track, TakePlayer, NarrationDock,
+   FeedbackDock, ScriptScore, TakeTimeline, voices/new) keep their bespoke width
+   and offset. They only inherit `outline-color` from here, since `outline-2`
+   sets width alone and would otherwise fall back to currentColor.
+
+   Contrast: #67e8f9 on #080a10 is ~13.7:1 — far past the 3:1 WCAG 2.2 (1.4.11 /
+   2.4.11) floor for a non-text focus indicator, and it holds on the glass
+   panels too (white/0.05 over the same ink barely moves the backdrop). The 2px
+   offset keeps the ring clear of the primary button's own cyan glow.
+--------------------------------------------------------------------------- */
+@layer base {
+  :focus-visible {
+    outline: 2px solid var(--gt-accent-cyan);
+    outline-offset: 2px;
+  }
+}
+
+/* ---------------------------------------------------------------------------
    A · OBSIDIAN STUDIO — dark cinematic
 
    Every colour/motion literal below now comes from `components/ui/tokens.ts`,
