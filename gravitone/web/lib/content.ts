@@ -16,7 +16,8 @@ export const STATS = [
   { value: "1.9×", label: "faster than real-time on Arm" },
   { value: "16s", label: "audio to clone a voice" },
   { value: "$0", label: "GPU cost — runs on CPU" },
-  { value: "27", label: "built-in voices" },
+  // 26 = len(BUILTIN) in service/voices.py. Keep the two in step.
+  { value: "26", label: "built-in voices" },
 ];
 
 export const FEATURES = [

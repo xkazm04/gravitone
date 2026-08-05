@@ -169,7 +169,7 @@ export default function StudioDark() {
         <section id="voices" className="border-t border-white/5 py-14">
           <div className="mb-6 flex items-end justify-between">
             <h2 className="font-instrument text-3xl text-white">A voice for every line.</h2>
-            <span className="font-jetbrains text-[11px] uppercase tracking-widest text-white/60">27 built-in · ∞ cloned</span>
+            <span className="font-jetbrains text-[11px] uppercase tracking-widest text-white/60">26 built-in · ∞ cloned</span>
           </div>
           <div className="flex flex-wrap gap-3">
             {VOICES.map((v) => (
