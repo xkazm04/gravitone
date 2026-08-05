@@ -118,8 +118,26 @@ jobs:
           cache: npm
           cache-dependency-path: gravitone/web/package-lock.json
 
+      # `npm install`, not `npm ci`, and that is a deliberate trade.
+      #
+      # `npm ci` refuses this lockfile on Linux: it was generated on Windows,
+      # where npm prunes the transitive dependencies of optional
+      # platform-specific packages it will never install. `@img/sharp-wasm32`
+      # declares `@emnapi/runtime` and `@tailwindcss/oxide-wasm32-wasi`
+      # declares `@emnapi/core`, and neither lands in the tree at the version a
+      # Linux resolve hoists — so `npm ci` exits EUSAGE on "Missing:
+      # @emnapi/runtime@1.11.3 from lock file" before running a single test.
+      # Regenerating the lockfile on Windows does not fix it (verified: pristine
+      # resolves, and `--os=linux --cpu=x64`, both still nest `@emnapi/core`);
+      # producing a Linux-correct lockfile requires a Linux machine.
+      #
+      # What this costs: dependency versions are resolved fresh rather than
+      # pinned byte-for-byte, so an upstream release inside an existing semver
+      # range can turn this gate red without a commit. What it buys: the gate
+      # runs at all. FOLLOW-UP — regenerate `package-lock.json` on Linux (or in
+      # this container) and restore `npm ci`, which is strictly better.
       - name: Install dependencies
-        run: npm ci
+        run: npm install --no-audit --no-fund
 
       # Type check before tests: a type error is the cheapest failure to read.
       - name: Type check
@@ -172,6 +190,18 @@ jobs:
       # to run is not a gate, so it is installed here on purpose. The
       # no-DSN tests, which are the ones that matter most, run either way and
       # never touch the network.
+      # ffmpeg is a real runtime dependency, not a test convenience: the service
+      # shells out to it to transcode synthesis output (`mp3_44100_128` and the
+      # other non-WAV `output_format`s) and to normalise ingest audio to 24 kHz
+      # mono. The fake engine replaces the MODEL, not the encoder, so these
+      # paths run for real. GitHub's ubuntu image does not ship it — without
+      # this step two tests fail on `FileNotFoundError: 'ffmpeg'`.
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -version | head -1
+
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip

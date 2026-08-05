@@ -228,10 +228,22 @@ def captured(monkeypatch):
     import sentry_sdk
 
     # Re-init with the capturing transport, keeping the options under test.
+    #
+    # `client.options` is the RESOLVED option set, which is a superset of what
+    # `init()` accepts: newer sentry-sdk releases put derived entries in there
+    # (2.66 added `data_collection`) that raise `TypeError: Unknown option` on
+    # the way back in. Filtering to the keys `init()` actually declares keeps
+    # this fixture working across SDK versions instead of pinning the gate to
+    # whichever one happened to be installed when it was written.
+    from sentry_sdk.consts import DEFAULT_OPTIONS
+
     client = sentry_sdk.get_client()
-    options = dict(client.options)
+    options = {
+        k: v for k, v in client.options.items()
+        if k in DEFAULT_OPTIONS and not k.startswith("_")
+    }
     options["transport"] = sink.make()
-    sentry_sdk.init(**{k: v for k, v in options.items() if not k.startswith("_")})
+    sentry_sdk.init(**options)
     yield sink
 
 
