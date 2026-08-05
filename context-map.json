@@ -125,10 +125,10 @@
           "businessFeature": "Auth & Profile",
           "category": "ui",
           "filePaths": [
-            "gravitone-web/app/profile/page.tsx",
-            "gravitone-web/lib/useAuth.tsx",
-            "gravitone-web/lib/firebase.ts",
-            "gravitone-web/components/ui/UserMenu.tsx"
+            "gravitone/web/app/profile/page.tsx",
+            "gravitone/web/lib/useAuth.tsx",
+            "gravitone/web/lib/firebase.ts",
+            "gravitone/web/components/ui/UserMenu.tsx"
           ],
           "target": null,
           "apiRoutes": []
@@ -139,12 +139,12 @@
           "businessFeature": "API Key Management",
           "category": "ui",
           "filePaths": [
-            "gravitone-web/app/keys/page.tsx",
-            "gravitone-web/app/keys/_variants/KeysLedger.tsx",
-            "gravitone-web/app/keys/_variants/SecretReveal.tsx",
-            "gravitone-web/app/keys/_variants/data.ts",
-            "gravitone-web/app/api/keys/route.ts",
-            "gravitone-web/app/api/keys/[id]/route.ts"
+            "gravitone/web/app/keys/page.tsx",
+            "gravitone/web/app/keys/_variants/KeysLedger.tsx",
+            "gravitone/web/app/keys/_variants/SecretReveal.tsx",
+            "gravitone/web/app/keys/_variants/data.ts",
+            "gravitone/web/app/api/keys/route.ts",
+            "gravitone/web/app/api/keys/[id]/route.ts"
           ],
           "target": null,
           "apiRoutes": [
@@ -157,15 +157,15 @@
           "businessFeature": "Voice Creation Studio",
           "category": "ui",
           "filePaths": [
-            "gravitone-web/app/voices/new/page.tsx",
-            "gravitone-web/app/voices/new/_loaders/WaveformLab.tsx",
-            "gravitone-web/app/voices/new/_loaders/shared.tsx",
-            "gravitone-web/app/api/ingest/scan/route.ts",
-            "gravitone-web/app/api/ingest/[job]/route.ts",
-            "gravitone-web/app/api/ingest/[job]/commit/route.ts",
-            "gravitone-web/app/api/ingest/[job]/speaker/route.ts",
-            "gravitone-web/app/api/ingest/[job]/speaker-preview/[sid]/route.ts",
-            "gravitone-web/app/api/ingest/[job]/preview/[emotion]/route.ts"
+            "gravitone/web/app/voices/new/page.tsx",
+            "gravitone/web/app/voices/new/_loaders/WaveformLab.tsx",
+            "gravitone/web/app/voices/new/_loaders/shared.tsx",
+            "gravitone/web/app/api/ingest/scan/route.ts",
+            "gravitone/web/app/api/ingest/[job]/route.ts",
+            "gravitone/web/app/api/ingest/[job]/commit/route.ts",
+            "gravitone/web/app/api/ingest/[job]/speaker/route.ts",
+            "gravitone/web/app/api/ingest/[job]/speaker-preview/[sid]/route.ts",
+            "gravitone/web/app/api/ingest/[job]/preview/[emotion]/route.ts"
           ],
           "target": null,
           "apiRoutes": [
@@ -178,22 +178,22 @@
           "businessFeature": "Character & Voice Management",
           "category": "ui",
           "filePaths": [
-            "gravitone-web/app/voices/page.tsx",
-            "gravitone-web/app/voices/_variants/CharacterTable.tsx",
-            "gravitone-web/app/voices/_variants/TagEditor.tsx",
-            "gravitone-web/app/voices/_variants/data.ts",
-            "gravitone-web/app/voices/[characterId]/page.tsx",
-            "gravitone-web/app/voices/[characterId]/CharacterVoices.tsx",
-            "gravitone-web/app/voices/[characterId]/_variants/EmotionRack.tsx",
-            "gravitone-web/app/voices/[characterId]/_variants/CastExport.tsx",
-            "gravitone-web/app/voices/_data/cast.ts",
-            "gravitone-web/app/voices/[characterId]/_variants/EmotionAudition.tsx",
-            "gravitone-web/app/voices/[characterId]/_variants/audition.ts",
-            "gravitone-web/app/api/characters/route.ts",
-            "gravitone-web/app/api/characters/[id]/route.ts",
-            "gravitone-web/app/api/voices/route.ts",
-            "gravitone-web/app/api/voices/[id]/route.ts",
-            "gravitone-web/app/voices/_data/characters.ts"
+            "gravitone/web/app/voices/page.tsx",
+            "gravitone/web/app/voices/_variants/CharacterTable.tsx",
+            "gravitone/web/app/voices/_variants/TagEditor.tsx",
+            "gravitone/web/app/voices/_variants/data.ts",
+            "gravitone/web/app/voices/[characterId]/page.tsx",
+            "gravitone/web/app/voices/[characterId]/CharacterVoices.tsx",
+            "gravitone/web/app/voices/[characterId]/_variants/EmotionRack.tsx",
+            "gravitone/web/app/voices/[characterId]/_variants/CastExport.tsx",
+            "gravitone/web/app/voices/_data/cast.ts",
+            "gravitone/web/app/voices/[characterId]/_variants/EmotionAudition.tsx",
+            "gravitone/web/app/voices/[characterId]/_variants/audition.ts",
+            "gravitone/web/app/api/characters/route.ts",
+            "gravitone/web/app/api/characters/[id]/route.ts",
+            "gravitone/web/app/api/voices/route.ts",
+            "gravitone/web/app/api/voices/[id]/route.ts",
+            "gravitone/web/app/voices/_data/characters.ts"
           ],
           "target": null,
           "apiRoutes": [
@@ -207,10 +207,10 @@
           "businessFeature": "Ops Transparency",
           "category": "ui",
           "filePaths": [
-            "gravitone-web/app/ops/page.tsx",
-            "gravitone-web/app/ops/OpsView.tsx",
-            "gravitone-web/app/api/metrics/route.ts",
-            "gravitone-web/lib/useMetricsPoll.ts"
+            "gravitone/web/app/ops/page.tsx",
+            "gravitone/web/app/ops/OpsView.tsx",
+            "gravitone/web/app/api/metrics/route.ts",
+            "gravitone/web/lib/useMetricsPoll.ts"
           ],
           "target": null,
           "apiRoutes": [
@@ -223,15 +223,15 @@
           "businessFeature": "TTS Playground",
           "category": "ui",
           "filePaths": [
-            "gravitone-web/app/playground/page.tsx",
-            "gravitone-web/app/playground/_variants/PlaygroundConsole.tsx",
-            "gravitone-web/app/playground/_variants/EmotionPicker.tsx",
-            "gravitone-web/app/playground/_variants/EmotionAB.tsx",
-            "gravitone-web/app/playground/_variants/engine.ts",
-            "gravitone-web/app/playground/_variants/useAudioPlayer.ts",
-            "gravitone-web/app/playground/_variants/shared.ts",
-            "gravitone-web/app/api/tts/route.ts",
-            "gravitone-web/app/api/speak/route.ts"
+            "gravitone/web/app/playground/page.tsx",
+            "gravitone/web/app/playground/_variants/PlaygroundConsole.tsx",
+            "gravitone/web/app/playground/_variants/EmotionPicker.tsx",
+            "gravitone/web/app/playground/_variants/EmotionAB.tsx",
+            "gravitone/web/app/playground/_variants/engine.ts",
+            "gravitone/web/app/playground/_variants/useAudioPlayer.ts",
+            "gravitone/web/app/playground/_variants/shared.ts",
+            "gravitone/web/app/api/tts/route.ts",
+            "gravitone/web/app/api/speak/route.ts"
           ],
           "target": null,
           "apiRoutes": [
@@ -254,12 +254,12 @@
           "businessFeature": "App Shell & Landing",
           "category": "ui",
           "filePaths": [
-            "gravitone-web/app/page.tsx",
-            "gravitone-web/app/layout.tsx",
-            "gravitone-web/app/globals.css",
-            "gravitone-web/lib/content.ts",
-            "gravitone-web/next.config.mjs",
-            "gravitone-web/package.json"
+            "gravitone/web/app/page.tsx",
+            "gravitone/web/app/layout.tsx",
+            "gravitone/web/app/globals.css",
+            "gravitone/web/lib/content.ts",
+            "gravitone/web/next.config.mjs",
+            "gravitone/web/package.json"
           ],
           "target": null,
           "apiRoutes": []
@@ -270,18 +270,9 @@
           "businessFeature": "Emotion Glyph Art",
           "category": "lib",
           "filePaths": [
-            "gravitone-web/lib/glyphs/index.ts",
-            "gravitone-web/lib/glyphs/baseline.ts",
-            "gravitone-web/lib/glyphs/happy.ts",
-            "gravitone-web/lib/glyphs/sad.ts",
-            "gravitone-web/lib/glyphs/angry.ts",
-            "gravitone-web/lib/glyphs/calm.ts",
-            "gravitone-web/lib/glyphs/excited.ts",
-            "gravitone-web/lib/glyphs/confused.ts",
-            "gravitone-web/lib/glyphs/whisper.ts",
-            "gravitone-web/components/ui/EmotionGlyph.tsx",
-            "gravitone-web/components/ui/EmotionArt.tsx",
-            "gravitone-web/lib/emotions.ts"
+            "gravitone/web/lib/glyphs/index.ts",
+            "gravitone/web/components/ui/EmotionArt.tsx",
+            "gravitone/web/lib/emotions.ts"
           ],
           "target": null,
           "apiRoutes": []
@@ -292,13 +283,12 @@
           "businessFeature": "UI Design System",
           "category": "ui",
           "filePaths": [
-            "gravitone-web/components/ui/AppFrame.tsx",
-            "gravitone-web/components/ui/Primitives.tsx",
-            "gravitone-web/components/ui/tokens.ts",
-            "gravitone-web/components/ui/PrototypeTabs.tsx",
-            "gravitone-web/components/variants/StudioDark.tsx",
-            "gravitone-web/components/ui/MobileNav.tsx",
-            "gravitone-web/components/ui/Equalizer.tsx"
+            "gravitone/web/components/ui/AppFrame.tsx",
+            "gravitone/web/components/ui/Primitives.tsx",
+            "gravitone/web/components/ui/tokens.ts",
+            "gravitone/web/components/variants/StudioDark.tsx",
+            "gravitone/web/components/ui/MobileNav.tsx",
+            "gravitone/web/components/ui/Equalizer.tsx"
           ],
           "target": null,
           "apiRoutes": []
@@ -338,13 +328,13 @@
     "Web Studio › Ops Transparency [ui] — 4 files",
     "Web Studio › TTS Playground [ui] — 9 files",
     "Design System & Brand › App Shell & Landing [ui] — 6 files",
-    "Design System & Brand › Emotion Glyph Art [lib] — 12 files",
-    "Design System & Brand › UI Design System [ui] — 7 files"
+    "Design System & Brand › Emotion Glyph Art [lib] — 3 files",
+    "Design System & Brand › UI Design System [ui] — 6 files"
   ],
   "summary": {
     "totalGroups": 4,
     "totalContexts": 15,
-    "totalFiles": 93,
+    "totalFiles": 83,
     "categories": {
       "lib": 3,
       "api": 2,
