@@ -15,6 +15,7 @@ import { useCallback, useEffect, useState } from "react";
 
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { readDetail } from "@/lib/apiFetch";
+import { authedFetch } from "@/lib/authedFetch";
 import { useCopyFeedback } from "@/lib/useCopyFeedback";
 import { useMounted } from "@/lib/useMounted";
 import { readAttestation } from "./attestation";
@@ -51,7 +52,7 @@ export default function AgentBlocks({ keyId, secret }: { keyId: string; secret?:
     let cancelled = false;
     (async () => {
       try {
-        const r = await fetch(`/api/keys/${encodeURIComponent(keyId)}/manifest`, { cache: "no-store" });
+        const r = await authedFetch(`/api/keys/${encodeURIComponent(keyId)}/manifest`, { cache: "no-store" });
         if (!r.ok) {
           // The route's own detail ("no such key", "backend unreachable") is
           // the diagnostic; a generic failure line would throw it away.

@@ -25,52 +25,33 @@
 
 import { NextRequest } from "next/server";
 
-import { backendFetch, jsonError, READ_TIMEOUT_MS } from "@/lib/backend";
+import { jsonError } from "@/lib/backend";
 import { AUTH, baseUrl } from "../../deployment";
+import { displayName, identify, modeHeaders, ownedKey } from "../../identity";
 import {
   capabilitiesFor,
   scopesWithoutCapabilities,
   type KeyManifest,
 } from "@/app/keys/_variants/capabilities";
 
-type BackendKey = {
-  id: string;
-  name: string;
-  prefix: string;
-  scopes: string[];
-  revoked?: boolean;
-};
-
-/** The service has no GET /v1/keys/{id} — the ledger is a list. Read it and
- *  pick, rather than inventing an endpoint the drift test would (correctly)
- *  reject. */
-async function readKey(id: string): Promise<BackendKey | null | "unreachable"> {
-  let r: Response;
-  try {
-    r = await backendFetch("/v1/keys", {
-      credential: "operator",
-      cache: "no-store",
-      signal: AbortSignal.timeout(READ_TIMEOUT_MS),
-    });
-  } catch {
-    return "unreachable";
-  }
-  if (!r.ok) return "unreachable";
-  let list: BackendKey[];
-  try {
-    list = (await r.json()) as BackendKey[];
-  } catch {
-    return "unreachable";
-  }
-  if (!Array.isArray(list)) return "unreachable";
-  return list.find((k) => k.id === id) ?? null;
-}
-
-export async function GET(_req: NextRequest, ctx: { params: Promise<{ id: string }> }): Promise<Response> {
+// A manifest describes what ONE credential opens, which is a statement about
+// that credential — so it is answerable only to the person who holds it.
+// `ownedKey` (../../identity) reads the ledger, finds the id, and refuses one
+// the caller does not own with the same 404 an unknown id gets.
+export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string }> }): Promise<Response> {
+  const caller = await identify(req);
+  if (caller instanceof Response) return caller;
   const { id } = await ctx.params;
-  const key = await readKey(id);
-  if (key === "unreachable") return jsonError("backend unreachable — no manifest can be derived", 503);
-  if (key === null) return jsonError("no such key", 404);
+  const key = await ownedKey(id, caller);
+  if (key instanceof Response) {
+    // "no such key" and "not signed in" are answers. Anything else means the
+    // ledger could not be READ, and this surface has always said so in one
+    // sentence rather than leaking a backend status into a document about a
+    // credential — an unreadable ledger is not an empty toolbox.
+    return key.status === 404 || key.status === 401
+      ? key
+      : jsonError("backend unreachable — no manifest can be derived", 503);
+  }
 
   const scopes = Array.isArray(key.scopes) ? key.scopes : [];
   const revoked = key.revoked === true;
@@ -81,7 +62,9 @@ export async function GET(_req: NextRequest, ctx: { params: Promise<{ id: string
     generated_at: new Date().toISOString(),
     base_url: base.url,
     auth: { ...AUTH },
-    key: { id: key.id, name: key.name, prefix: key.prefix, scopes, revoked },
+    // `displayName`: the stored name carries the ownership tag, which is
+    // server bookkeeping and not part of anyone's credential.
+    key: { id: key.id, name: displayName(key.name), prefix: key.prefix, scopes, revoked },
     // Revoked: the toolbox is empty because the credential is dead, and the
     // `boundary` line below says so in the same breath.
     tools: revoked ? [] : capabilitiesFor(scopes).map((c) => ({ ...c, proven: "unknown" as const })),
@@ -107,6 +90,6 @@ export async function GET(_req: NextRequest, ctx: { params: Promise<{ id: string
   return Response.json(manifest, {
     // A manifest is derived from a key that can be rotated or revoked at any
     // moment; a cached one describes access that may already be gone.
-    headers: { "Cache-Control": "no-store" },
+    headers: { "Cache-Control": "no-store", ...modeHeaders(caller.mode) },
   });
 }

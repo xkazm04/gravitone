@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 
+import { authedFetch } from "@/lib/authedFetch";
 import { throwDetail } from "@/lib/apiFetch";
 import { useMounted } from "@/lib/useMounted";
 import { forgetAttestation } from "./attestation";
@@ -50,7 +51,7 @@ export function useKeys() {
 
   const refresh = useCallback(async () => {
     try {
-      const r = await fetch("/api/keys", { cache: "no-store" });
+      const r = await authedFetch("/api/keys", { cache: "no-store" });
       if (!r.ok) return await throwDetail(r, "failed to load keys");
       const list = (await r.json()) as ApiKey[];
       if (!mounted.current) return;
@@ -91,7 +92,7 @@ export function useKeys() {
   useEffect(() => { void provePosture(); }, [provePosture]);
 
   const createKey = useCallback(async (name: string, scopes: string[]) => {
-    const r = await fetch("/api/keys", {
+    const r = await authedFetch("/api/keys", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name, scopes }),
     });
@@ -104,7 +105,7 @@ export function useKeys() {
   const rotateKey = useCallback(async (id: string) => {
     // The backend's detail matters here: "cannot rotate a revoked key" is a
     // different user action than a transport failure.
-    const r = await fetch(`/api/keys/${encodeURIComponent(id)}`, { method: "POST" });
+    const r = await authedFetch(`/api/keys/${encodeURIComponent(id)}`, { method: "POST" });
     if (!r.ok) return throwDetail(r, `rotate failed (${r.status})`);
     const body = (await r.json()) as ApiKeyWithSecret;
     await refresh();
@@ -125,7 +126,7 @@ export function useKeys() {
     const snapshot = keys;
     setKeys((ks) => ks.map((k) => (k.id === id ? { ...k, revoked: true } : k)));
     try {
-      const r = await fetch(`/api/keys/${encodeURIComponent(id)}/revoke`, { method: "POST" });
+      const r = await authedFetch(`/api/keys/${encodeURIComponent(id)}/revoke`, { method: "POST" });
       if (!mounted.current) return;
       if (!r.ok) {
         setKeys(snapshot);
@@ -148,7 +149,7 @@ export function useKeys() {
     const snapshot = keys;
     setKeys((ks) => ks.filter((k) => k.id !== id));
     try {
-      const r = await fetch(`/api/keys/${encodeURIComponent(id)}`, { method: "DELETE" });
+      const r = await authedFetch(`/api/keys/${encodeURIComponent(id)}`, { method: "DELETE" });
       if (!mounted.current) return;
       if (!r.ok && r.status !== 404) {
         setKeys(snapshot);

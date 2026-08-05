@@ -16,6 +16,7 @@
 //        strictly one at a time, and the secret is never logged.
 
 import { backendFetch, jsonError } from "@/lib/backend";
+import { identify } from "../identity";
 import {
   MAX_PROBES,
   POSTURE_PROBE,
@@ -86,7 +87,16 @@ export async function GET(): Promise<Response> {
   return Response.json(body);
 }
 
+// SIGNED IN ONLY, unlike the GET above. The sweep runs six upstream requests,
+// one of which is a real synthesis that occupies a synth slot on a small Arm
+// box — an anonymous caller must not be able to spend that on demand. The GET
+// stays open because it is a single unauthenticated read whose whole answer is
+// a status code, and because a deployment's posture is exactly the thing an
+// operator should never have to authenticate to see.
 export async function POST(req: Request): Promise<Response> {
+  const caller = await identify(req);
+  if (caller instanceof Response) return caller;
+
   let payload: { secret?: unknown; granted?: unknown; voice?: unknown };
   try {
     payload = (await req.json()) as typeof payload;

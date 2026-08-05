@@ -20,6 +20,7 @@
 
 import { useCallback, useState } from "react";
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
+import { authedFetch } from "@/lib/authedFetch";
 import { writeAttestation } from "./attestation";
 import { PROBE_PLAN, servedScopesThatShouldNotBe, type ProbeResult, type Sweep } from "./probes";
 
@@ -55,7 +56,7 @@ export default function ProvingSweep({
   const run = useCallback(async () => {
     setState({ phase: "running" });
     try {
-      const r = await fetch("/api/keys/probe", {
+      const r = await authedFetch("/api/keys/probe", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ secret, granted: scopes }),

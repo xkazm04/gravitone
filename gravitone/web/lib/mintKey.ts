@@ -17,6 +17,8 @@
 // `isStoredSecret` below lets a surface ask, so the copy can tell the truth
 // instead of the storage being reversed in silence.
 
+import { authedFetch } from "./authedFetch";
+
 export type MintedKey = {
   id: string;
   name: string;
@@ -77,7 +79,7 @@ export function clearStoredKey(uid: string): void {
 
 export async function mintDefaultKey(uid: string, email: string | null): Promise<MintedKey | null> {
   try {
-    const r = await fetch("/api/keys", {
+    const r = await authedFetch("/api/keys", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: `default — ${email ?? uid.slice(0, 8)}`, scopes: ["tts"] }),
