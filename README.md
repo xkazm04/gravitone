@@ -70,20 +70,26 @@ actually does.
 | Graviton2 · `t4g.small` (Neoverse N1) | 1.33× | — | — | 2 vCPU, free-tier, burstable |
 | **Graviton4 · `c8g.2xlarge` (Neoverse V2)** | **4.26×** | **~6.0 aud/s** | **~10.9 aud/s** | 8 vCPU, ~46% CPU at in-process ceiling |
 
-Graviton4 is **~2.3× faster single-stream than the dev box and ~3.2× the N1** — a
-3-second sentence renders in ~0.7 s. One `c8g.2xlarge` (~$0.29/hr) sustains
-**~10.9 audio-seconds/second ≈ ~650 audio-minutes/hour**, at **~$0.0004 per
-audio-minute** of compute.
+Graviton4 is **~2.2× faster single-stream than the dev box (4.26 ÷ 1.9) and
+~3.2× the N1 (4.26 ÷ 1.33)** — a 3-second sentence renders in ~0.7 s. One
+`c8g.2xlarge` sustains **~10.9 audio-seconds/second ≈ ~650 audio-minutes/hour**,
+which at its **$0.2903/hr** on-demand list price works out to **~$0.00044 per
+audio-minute** (~$0.027 per audio-hour) of compute. Both inputs to that figure
+are stated so the arithmetic can be checked; the per-tier comparison against
+hosted TTS list prices is in the [project README](gravitone/README.md).
 
 Every row is reproducible: `bash gravitone/benchmark_arm.sh` characterizes the
-box, and `python -m service.certify` emits the certificate the
-[hardware matrix](gravitone/docs/SUPPORTED_HARDWARE.md) rows are compiled from.
+box and `python -m service.certify` emits a certificate. The three rows above
+were **measured, not certified-into-the-ledger** —
+`gravitone/docs/certifications/ledger.json` is deliberately empty until a run
+goes through `--append-ledger`, and the
+[hardware matrix](gravitone/docs/SUPPORTED_HARDWARE.md) says so on its face.
 
 ### Arm optimizations applied
 
 | Lever | How | Effect |
 |---|---|---|
-| **CPU-index torch** | `pip install torch --index-url https://download.pytorch.org/whl/cpu` | avoids PyPI's aarch64 CUDA (GH200) wheel whose CPU fallback bypasses ACL; **+8%** single-stream on N1 |
+| **CPU-index torch** | `pip install torch --index-url https://download.pytorch.org/whl/cpu` | avoids PyPI's aarch64 CUDA (GH200) wheel whose CPU fallback bypasses ACL; **~8%** single-stream on `t4g.small` — one unlogged observation, not a certified row |
 | **oneDNN + Arm Compute Library** | default in the CPU-index aarch64 wheel / `armswdev/pytorch-arm-neoverse` | ACL GEMM kernels for fp32/bf16 |
 | **BF16 fast-math** | `ONEDNN_DEFAULT_FPMATH_MODE=bf16` | fp32 matmuls dispatched to BF16 kernels on Neoverse (BF16/I8MM hardware) |
 | **KleidiAI** | Kleidi-enabled aarch64 PyTorch wheel | automatic inference uplift, no code change |
@@ -102,8 +108,9 @@ believe is the one your own box produced.
    (separate GILs) roughly doubles throughput versus one N-worker process.
 2. **Install torch from the CPU index.** On aarch64, PyPI's default `torch` is a
    CUDA (GH200) build whose CPU fallback bypasses the oneDNN + Arm Compute
-   Library path. The CPU-index wheel restores ACL and lifted single-stream ~8%
-   on Neoverse N1.
+   Library path. The CPU-index wheel restores ACL; on `t4g.small` we saw ~8%
+   single-stream from it — a one-off observation with no A/B artifact checked
+   in, so the mechanism is the finding and the percentage is directional.
 
 ## Architecture
 

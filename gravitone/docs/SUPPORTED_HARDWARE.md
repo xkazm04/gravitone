@@ -1,14 +1,22 @@
 # Supported hardware matrix
 
-Boxes with a passing Gravitone certification (`python -m service.certify`).
-Every row is reproducible: run the benchmark on the same instance type and
-you get the same certificate.
+Boxes this project has measured with `benchmark_arm.sh` → `service/loadtest.py`.
+Every row is reproducible: run the benchmark on the same instance type and you
+can re-derive it.
+
+**Read the Status column precisely.** "measured" means we ran the harness on
+that box and typed the result here. It does **not** mean a signed certificate
+for it is checked in — `docs/certifications/ledger.json` is still empty, on
+purpose, and [`docs/certifications/README.md`](certifications/README.md)
+explains why (no run has gone through `--append-ledger` yet). This table is a
+table someone typed; the ledger is what will make it falsifiable. The gap is
+stated rather than papered over.
 
 | Platform | CPU | Cores | Single-stream RTF | Cap | ~audio-min/hour | Plan | Status |
 |---|---|---|---:|---:|---:|---|---|
-| AWS Graviton4 `c8g.2xlarge` | Neoverse V2 | 8 | 4.26× | 4 | ~650 | compile from the row's certificate | ✅ certified (2026-07, project benchmarks) |
-| AWS Graviton2 `t4g.small` | Neoverse N1 | 2 | 1.33× | 1 | ~80 | compile from the row's certificate | ✅ certified (2026-07, project benchmarks) |
-| Windows-ARM64 dev box | Snapdragon-class | 12 | 1.9× | 4 | ~250 | compile from the row's certificate | ✅ certified (2026-07, unoptimized reference) |
+| AWS Graviton4 `c8g.2xlarge` | Neoverse V2 | 8 | 4.26× | 4 | ~650 | compile from the row's certificate | ✅ measured (2026-07, project benchmarks; no certificate checked in) |
+| AWS Graviton2 `t4g.small` | Neoverse N1 | 2 | 1.33× | 1 | ~80 | compile from the row's certificate | ✅ measured (2026-07, project benchmarks; no certificate checked in) |
+| Windows-ARM64 dev box | Snapdragon-class | 12 | 1.9× | 4 | ~250 | compile from the row's certificate | ✅ measured (2026-07, unoptimized reference; no certificate checked in) |
 | GCP Axion | Neoverse V2 | — | — | — | — | — | ⬜ wanted — run certify and PR your row |
 | Azure Cobalt | Neoverse N2 | — | — | — | — | — | ⬜ wanted |
 | Ampere Altra | Neoverse N1 | — | — | — | — | — | ⬜ wanted |

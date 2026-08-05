@@ -21,7 +21,9 @@ billing.
 - **Voice cloning as a product feature, not a demo.** A 16-second reference
   clip produces a reusable 10 MB voice embedding; the API serves it like any
   built-in voice. Self-hosted cloning on commodity Arm CPUs undercuts hosted
-  TTS by **100–1000×** on cost per hour of audio.
+  TTS by **100–1000×** on cost per hour of audio — the arithmetic, with both of
+  its inputs (instance list price, measured throughput), is under "Measured
+  performance" below.
 - **We measured the limits, we didn't guess them.** A bundled load-test
   harness ramps parallel requests and reports the degradation knee, throughput
   ceiling, and host CPU/RAM — and the data drove the architecture (scale by
@@ -66,7 +68,10 @@ study**:
    repoints by changing **one base URL** — the browser SDK needs no changes.
 
 **A conversation costs nothing per minute.** Hosted conversational AI bills by
-the minute (~$0.09–0.15/min at the time of writing), which is what makes
+the minute (published rates were around $0.10/min when this was written; unlike
+the TTS list prices in `web/lib/switchkit.ts`, this repo carries **no dated
+receipt** for that figure — treat it as an order-of-magnitude estimate, and the
+$0.00 side as the only number here we measured), which is what makes
 *automated* spoken testing — run the same interview a hundred times, measure
 word error rate and turn latency — a line item instead of a habit. The whole
 loop here is local: 3-second turn latency budget on this class of hardware,
@@ -91,11 +96,25 @@ clone poorly, so they are skipped and reported rather than turned into a bad Voi
 | Graviton2 · `t4g.small` (Neoverse N1) | 1.33× | — | — | 2 vCPU, free-tier, burstable |
 | **Graviton4 · `c8g.2xlarge` (Neoverse V2)** | **4.26×** | **~6.0 aud/s** | **~10.9 aud/s** | 8 vCPU, ~46% CPU at in-process ceiling |
 
-**Graviton4 is ~2.3× faster single-stream than the dev box and ~3.2× the N1** — a
-3-second sentence renders in ~0.7s. One `c8g.2xlarge` (~$0.29/hr) sustains
-**~10.9 audio-seconds/second ≈ ~650 audio-minutes/hour ≈ ~98 two-sentence
-requests/minute**, at **~$0.0004 per audio-minute** of compute (1000×+ under
-hosted TTS).
+Source for every row: [`docs/SUPPORTED_HARDWARE.md`](docs/SUPPORTED_HARDWARE.md),
+measured 2026-07 with `benchmark_arm.sh` → `service/loadtest.py`. The same three
+rows drive the web dataset (`web/lib/benchmarks.ts`).
+
+**Graviton4 is ~2.2× faster single-stream than the dev box (4.26 ÷ 1.9) and ~3.2×
+the N1 (4.26 ÷ 1.33)** — a 3-second sentence renders in ~0.7 s. One
+`c8g.2xlarge` sustains **~10.9 audio-seconds/second ≈ ~650 audio-minutes/hour**
+(10.9 × 3600 ÷ 60), which at a **$0.2903/hr** on-demand list price (us-east-1,
+the figure in `web/lib/benchmarks.ts`) is **~$0.00044 per audio-minute** of
+compute — about **$0.027 per audio-hour**. At ~6.7 s of audio per two-sentence
+request that is ~98 requests/minute.
+
+Against ElevenLabs list pricing as captured in `web/lib/switchkit.ts`
+(`asOf` 2026-07-10, $7.20–$13.20 per audio-hour depending on tier), the same
+audio costs **~270–500× less on `c8g.2xlarge`** and **~600–1000× less on the
+free-tier-eligible `t4g.small`** ($0.0168/hr ÷ 1.33× ≈ $0.013 per audio-hour) —
+which is where the "100–1000×" headline above comes from. Both inputs to every
+figure (instance list price, measured throughput) are named so the arithmetic
+can be checked.
 
 **Two findings that generalise:**
 1. **Scale by process/replica, not in-process workers.** On *every* box CPU tops
@@ -105,8 +124,12 @@ hosted TTS).
    pinned per replica.
 2. **Install torch from the CPU index.** On aarch64, PyPI's default `torch` is a
    **CUDA (GH200) build** whose CPU fallback bypasses the oneDNN + Arm Compute
-   Library path; the CPU-index wheel (`--index-url .../whl/cpu`) restores ACL and
-   lifted single-stream ~8% on N1.
+   Library path; the CPU-index wheel (`--index-url .../whl/cpu`) restores ACL.
+   The uplift we saw was **~8% single-stream on `t4g.small`** — a one-off
+   observation from the July 2026 run, *not* a certified row: no A/B artifact
+   for it is checked in, so treat it as directional and re-measure with
+   `benchmark_arm_ab.sh` on your own box. The mechanism (CUDA wheel → no ACL) is
+   the durable finding; the percentage is not.
 
 ### Which instance to run
 
@@ -618,11 +641,11 @@ stateless per request, so it can also sit behind the same box.
 
 | Lever | How | Effect |
 |---|---|---|
-| **CPU-index torch** | `pip install torch --index-url https://download.pytorch.org/whl/cpu` | avoids PyPI's aarch64 CUDA (GH200) wheel whose CPU fallback bypasses ACL; **+8%** single-stream on N1 |
+| **CPU-index torch** | `pip install torch --index-url https://download.pytorch.org/whl/cpu` | avoids PyPI's aarch64 CUDA (GH200) wheel whose CPU fallback bypasses ACL; **~8%** single-stream on `t4g.small` — one unlogged observation, not a certified row (see "Two findings that generalise") |
 | **oneDNN + Arm Compute Library** | default in the CPU-index aarch64 wheel / `armswdev/pytorch-arm-neoverse` | ACL GEMM kernels for fp32/bf16 |
 | **BF16 fast-math** | `ONEDNN_DEFAULT_FPMATH_MODE=bf16` | fp32 matmuls dispatched to BF16 kernels on Neoverse (BF16/I8MM HW) |
 | **KleidiAI** | Kleidi-enabled aarch64 PyTorch wheel | automatic inference uplift, no code change |
-| **int8 quantization** | `TTS_QUANTIZE=true` | ~27% faster / ~48% less memory (validate quality on Arm qengine) |
+| **int8 quantization** | `TTS_QUANTIZE=true` — **off by default** | **no Arm measurement exists**, so this repo quotes no figure. On aarch64 int8 comes from a different backend (qnnpack/XNNPACK) than the fp32 path (oneDNN + ACL), so the x86 (fbgemm) numbers this repo once quoted do not transfer. `benchmark_arm_ab.sh` has a `quantize` row — flip it on for a box only once that row shows a win. Rationale: `service/config.py` |
 | **Process-level scaling** | N single-worker replicas, `WORKERS≈vCPU/THREADS` | bypasses the GIL ceiling to use all cores |
 
 ## Architecture
