@@ -17,6 +17,31 @@ export const CHARS_PER_AUDIO_MINUTE = 1000;
 
 export type ElTier = { name: string; usdPerMonth: number; charsPerMonth: number };
 
+// ── the one competitor-numeric claim we make, and its receipt ────────────────
+//
+// lib/content.ts states the house rule: nothing about anyone else's pricing or
+// quality is ours to state. The tier table below is the DELIBERATE EXCEPTION —
+// a bill calculator cannot exist without the other bill. The exception is only
+// defensible while it stays a citation rather than an assertion, so the table
+// travels with a date and a source and every surface that renders a number
+// derived from it renders the attribution too (SwitchKit's footnote, the
+// /benchmarks methodology list).
+//
+// IF YOU TOUCH THE NUMBERS, RE-VERIFY THEM AGAINST THE SOURCE AND MOVE `asOf`.
+// A stale date is worse than none: it turns "here is when we looked" into a
+// claim we never checked. `asOf` is the date the table was first captured
+// (commit 96a2bd3, 2026-07-10) and the values have not changed since.
+export const ELEVENLABS_PRICING = {
+  asOf: "2026-07-10",
+  asOfLabel: "10 Jul 2026",
+  sourceUrl: "https://elevenlabs.io/pricing",
+  sourceLabel: "elevenlabs.io/pricing",
+} as const;
+
+/** The attribution line rendered wherever an ElevenLabs price is shown. */
+export const ELEVENLABS_PRICING_NOTE =
+  `ElevenLabs list prices as published ${ELEVENLABS_PRICING.asOfLabel}`;
+
 export const ELEVENLABS_TIERS: ElTier[] = [
   { name: "Free", usdPerMonth: 0, charsPerMonth: 10_000 },
   { name: "Starter", usdPerMonth: 5, charsPerMonth: 30_000 },

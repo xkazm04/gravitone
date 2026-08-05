@@ -20,7 +20,12 @@ import {
   planCapacity,
   planEnvBlock,
 } from "@/lib/benchmarks";
-import { ELEVENLABS_TIERS, fmtUsd } from "@/lib/switchkit";
+import {
+  ELEVENLABS_PRICING,
+  ELEVENLABS_PRICING_NOTE,
+  ELEVENLABS_TIERS,
+  fmtUsd,
+} from "@/lib/switchkit";
 import LocalEnginePanel from "./LocalEnginePanel";
 
 const ease = [0.22, 1, 0.36, 1] as const;
@@ -102,7 +107,8 @@ export default function BenchmarksView() {
           </h1>
           <p className="mt-4 max-w-2xl text-[16px] leading-relaxed text-slate-300/90">
             Every Gravitone number below comes from the open benchmark harness in the repo — run it on any
-            Arm box and get your own row. ElevenLabs numbers are their public list prices.
+            Arm box and get your own row. ElevenLabs numbers are their public list prices, as published{" "}
+            {ELEVENLABS_PRICING.asOfLabel}.
           </p>
         </motion.header>
 
@@ -223,7 +229,18 @@ export default function BenchmarksView() {
               <li><span className="font-jetbrains text-cyan-300">harness</span> — {HARNESS.method}</li>
               <li><span className="font-jetbrains text-cyan-300">runtime</span> — {HARNESS.torch}</li>
               <li><span className="font-jetbrains text-cyan-300">measured</span> — {HARNESS.measured}</li>
-              <li><span className="font-jetbrains text-cyan-300">pricing</span> — AWS on-demand list; ElevenLabs public tiers, ~1,000 chars ≈ 1 audio-minute</li>
+              <li>
+                <span className="font-jetbrains text-cyan-300">pricing</span> — AWS on-demand list;
+                ~1,000 chars ≈ 1 audio-minute. {ELEVENLABS_PRICING_NOTE} — source:{" "}
+                <a
+                  href={ELEVENLABS_PRICING.sourceUrl}
+                  target="_blank"
+                  rel="noreferrer noopener"
+                  className="underline-offset-2 transition hover:text-cyan-200 hover:underline"
+                >
+                  {ELEVENLABS_PRICING.sourceLabel}
+                </a>
+              </li>
             </ul>
             <pre className="font-jetbrains mt-4 overflow-x-auto rounded-2xl border border-white/8 bg-black/40 p-4 text-[12px] leading-relaxed text-cyan-100/90">
 {`# any Arm64 Linux box — Graviton, Axion, Ampere, or your laptop

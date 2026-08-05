@@ -91,6 +91,13 @@ export const FEATURES = [
 // fact about our API surface; anything about their pricing or quality is not
 // ours to state on this page. Measured performance has its own page
 // (/benchmarks) where the method is shown.
+//
+// The ONE sanctioned exception is the bill calculator's price table
+// (lib/switchkit.ts::ELEVENLABS_TIERS) — a savings estimate cannot exist
+// without the other bill. It is allowed because it is a CITATION, not a
+// characterisation: it carries an as-published date and a source URL
+// (ELEVENLABS_PRICING) which every surface rendering it must display. Nothing
+// here on this page inherits that licence.
 export const PILLARS = [
   {
     key: "audition",

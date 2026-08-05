@@ -12,6 +12,8 @@ import {
   ARM_BOXES,
   breakEvenChars,
   CHARS_PER_AUDIO_MINUTE,
+  ELEVENLABS_PRICING,
+  ELEVENLABS_PRICING_NOTE,
   estimateMonthly,
   fmtUsd,
   migrationSnippet,
@@ -107,10 +109,23 @@ export default function SwitchKit() {
             )}
             <p className="font-jetbrains mt-3 text-[11px] leading-relaxed text-white/45">
               Arm box priced 24/7 on-demand; it serves up to {Math.round(est.boxCapacityMinutes).toLocaleString("en-US")} audio-min/mo.
-              ElevenLabs list prices, ~{CHARS_PER_AUDIO_MINUTE.toLocaleString("en-US")} chars per audio minute.{" "}
+              ~{CHARS_PER_AUDIO_MINUTE.toLocaleString("en-US")} chars per audio minute.{" "}
               <Link href="/benchmarks" className="text-cyan-300/80 underline-offset-2 transition hover:text-cyan-200 hover:underline">
                 See the measured benchmarks →
               </Link>
+            </p>
+            {/* The competitor number is the one claim here we did not measure —
+                it carries its date and its source rather than standing alone. */}
+            <p className="font-jetbrains mt-1.5 text-[11px] leading-relaxed text-white/35">
+              {ELEVENLABS_PRICING_NOTE} — source:{" "}
+              <a
+                href={ELEVENLABS_PRICING.sourceUrl}
+                target="_blank"
+                rel="noreferrer noopener"
+                className="underline-offset-2 transition hover:text-white/60 hover:underline"
+              >
+                {ELEVENLABS_PRICING.sourceLabel}
+              </a>
             </p>
           </div>
 
