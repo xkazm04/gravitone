@@ -89,13 +89,21 @@ const RAIL_PREVIEW = 10;
 
 // What to tell the user when a take came from the browser voice. Each string
 // names the ACTUAL cause; "unreachable" is no longer the catch-all.
+//
+// Each one ends by naming what was actually heard. The fallback is a genuine
+// demo aid — a studio that goes mute the moment the engine is down is worse —
+// but someone evaluating this product with no service running will hear their
+// OPERATING SYSTEM's voice, and every one of these sentences has to make it
+// impossible to mistake that for Gravitone's output.
+const NOT_GRAVITONE = " What you just heard is your operating system's built-in speech, NOT Gravitone.";
+
 const FALLBACK_COPY: Record<"unreachable" | "draining" | "failed", string> = {
   unreachable:
-    "Gravitone backend unreachable — speaking with your browser voice (metatags ignored).",
+    "Gravitone backend unreachable — speaking with your browser voice (metatags ignored)." + NOT_GRAVITONE,
   draining:
-    "Gravitone is restarting — spoke with your browser voice (metatags ignored). Try again in a moment.",
+    "Gravitone is restarting — spoke with your browser voice (metatags ignored). Try again in a moment." + NOT_GRAVITONE,
   failed:
-    "Gravitone is reachable but synthesis failed — spoke with your browser voice (metatags ignored).",
+    "Gravitone is reachable but synthesis failed — spoke with your browser voice (metatags ignored)." + NOT_GRAVITONE,
 };
 
 /** Human duration for the render clock: sub-minute renders read in tenths,
@@ -372,11 +380,19 @@ export default function PlaygroundConsole() {
   // null = nothing worth saying. Every string states the CONSEQUENCE of
   // generating right now, which is what the user is about to decide.
   const engineNotice =
-    !health ? null
+    // No snapshot AND the poll is failing: the studio cannot even reach its own
+    // /api/health route, so it knows nothing — and silence there reads exactly
+    // like a healthy engine.
+    !health ? (healthStale
+      ? "The studio cannot reach its backend — generating now plays your operating system's built-in speech, not Gravitone."
+      : null)
     : engineStatus === "ready" ? null
-    : engineStatus === "loading" ? "Gravitone is still loading its model — generating now falls back to your browser voice."
-    : engineStatus === "draining" ? "Gravitone is restarting — generating now falls back to your browser voice."
-    : "Gravitone backend unreachable — generating now uses your browser voice (metatags ignored).";
+    // Stated BEFORE the click, and stated as what will actually come out of the
+    // speakers — "falls back to your browser voice" reads as a Gravitone mode
+    // to anyone who has not read the source.
+    : engineStatus === "loading" ? "Gravitone is still loading its model — generating now plays your operating system's built-in speech, not Gravitone."
+    : engineStatus === "draining" ? "Gravitone is restarting — generating now plays your operating system's built-in speech, not Gravitone."
+    : "Backend not reachable — the studio is playing your operating system's built-in speech, not Gravitone (metatags ignored). Start the service to hear the real engine.";
 
   const [preferred, setPreferred] = useState<{ character_id: string | null; picks: number }>({ character_id: null, picks: 0 });
 
@@ -1650,6 +1666,21 @@ export default function PlaygroundConsole() {
                   </button>
                   <button onClick={stop} disabled={!isCurrent} aria-label="Stop"
                     className="grid h-9 w-9 shrink-0 place-items-center rounded-full border border-white/15 text-white/70 transition enabled:hover:bg-white/5 disabled:opacity-25">■</button>
+
+                  {/* At the PLAY BUTTON, not only in a banner. A banner reports
+                      the last render; this log outlives it, and a take a judge
+                      presses ▶ on ten minutes later must still say what it is.
+                      Everything else browser-mode does here is a DISABLED
+                      control with a tooltip — invisible to anyone who does not
+                      go hunting, and absent entirely on touch. */}
+                  {t.mode === "browser" && (
+                    <span
+                      title="Rendered by your browser's built-in speech synthesis because Gravitone could not be reached — this is not the model's output"
+                      className="font-jetbrains shrink-0 rounded-full border border-amber-400/40 bg-amber-400/10 px-2 py-0.5 text-[10px] text-amber-200"
+                    >
+                      browser speech · not Gravitone
+                    </span>
+                  )}
 
                   <LiveProgress source={playhead} active={isCurrent}>
                     {(at) => <Bars peaks={t.peaks} progress={at} active={isCurrent} className="h-9 min-w-0 flex-1" />}
