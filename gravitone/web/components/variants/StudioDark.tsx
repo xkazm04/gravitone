@@ -8,15 +8,10 @@ import UserMenu from "@/components/ui/UserMenu";
 import MobileNav from "@/components/ui/MobileNav";
 import Equalizer, { usePauseOffscreen } from "@/components/ui/Equalizer";
 import { EYEBROW_CLASS } from "@/components/ui/Primitives";
+import { MODULES } from "@/components/ui/AppFrame";
 import { makeRise } from "@/components/ui/tokens";
 import SwitchKit from "./SwitchKit";
 import HeroMicDemo from "./HeroMicDemo";
-
-const APP_ROUTES = [
-  { label: "Playground", href: "/playground" },
-  { label: "Voices", href: "/voices" },
-  { label: "API keys", href: "/keys" },
-];
 
 // The landing rises further and slower than a dense module panel — but the
 // curve comes from the design system, not a local copy of it (this file used to
@@ -45,12 +40,12 @@ export default function StudioDark() {
               (the marketing section anchors are removed for them). */}
           <div className="font-jetbrains hidden items-center gap-7 text-[13px] text-white/70 md:flex">
             {user &&
-              APP_ROUTES.map((r) => (
+              MODULES.map((r) => (
                 <Link key={r.href} href={r.href} className="transition hover:text-white">{r.label}</Link>
               ))}
           </div>
           <div className="flex items-center gap-3">
-            {user && <MobileNav links={APP_ROUTES} />}
+            {user && <MobileNav links={MODULES} />}
             <UserMenu />
           </div>
         </nav>

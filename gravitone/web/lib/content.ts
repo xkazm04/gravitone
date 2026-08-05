@@ -43,12 +43,22 @@ export const FEATURES = [
   {
     key: "api",
     title: "ElevenLabs drop-in",
-    body: "Same paths, same xi-api-key, same output_format grammar. Point existing client code at your own endpoint — swap a base URL.",
+    body: "Same paths, same xi-api-key, same output_format grammar — swap a base URL and existing client code works. A parameter we accept but do not act on is named in a response header, never silently dropped.",
   },
   {
     key: "scale",
     title: "Arm-native replica scaling",
     body: "Run N single-worker replicas with one command — python -m service.replicas — using every Arm core you pay for. No GPU. No per-character bill.",
+  },
+  {
+    key: "audition",
+    title: "The audition matrix",
+    body: "One click renders every emotion a Character has on the same neutral line, so range and consistency are something you hear, not something we claim. Takes are cached; a busy engine counts down its own retry in the open.",
+  },
+  {
+    key: "ops",
+    title: "Ops in the open",
+    body: "The Ops page renders the engine's own live counters: in-flight, queue depth, latency percentiles, real-time factor. A number that has not been measured yet shows as a dash, never as a zero.",
   },
 ];
 
@@ -61,14 +71,20 @@ export const FEATURES = [
 //   audition   — the ingest review ledger's "as a voice" button synthesizes each
 //                proposed emotion BEFORE commit (app/voices/new/page.tsx
 //                ::hearAsVoice), and the Audition Room compares alternative
-//                splices of the same emotion.
+//                splices of the same emotion. After commit, the audition matrix
+//                (app/voices/[characterId]/_variants/audition.ts) renders every
+//                emotion on one identical line, and the playground's compare
+//                mode (playground/_variants/EmotionAB.tsx) A/Bs any two.
 //   own it     — MIT (LICENSE), self-hosted, CPU-only; the compat surface is
 //                real (service/app.py: /v1/text-to-speech/{voice_id},
-//                xi-api-key, output_format).
+//                xi-api-key, output_format; inert params are named on
+//                X-Ignored-Settings — app.py::_ignored_headers). Live engine
+//                counters render at /ops (lib/useMetricsPoll.ts).
 //   characters — Characters group Voices by emotion with tags and a rack; a
 //                request for a missing emotion falls back to baseline and says
 //                so in the response headers; guided capture is a ~30s read per
-//                emotion (lib/emotionScripts.ts).
+//                emotion (lib/emotionScripts.ts); the cast exports as JSON
+//                (app/voices/_data/cast.ts).
 //
 // NO comparison numbers, no benchmark claims, and no characterisation of anyone
 // else's product live here. "Works with your existing ElevenLabs client" is a
@@ -87,6 +103,7 @@ export const PILLARS = [
     points: [
       "Play the source stem or the clone of it, side by side, at review time.",
       "Compare alternative takes of the same emotion and pick with your ear.",
+      "After commit, line up the whole scale: the audition matrix speaks every emotion on one identical line.",
       "Each emotion is its own embedding — the same voice, consistently, on every call.",
     ],
   },
@@ -100,8 +117,9 @@ export const PILLARS = [
       + "is no per-character meter to watch.",
     points: [
       "Works with your existing ElevenLabs client: swap the base URL, keep xi-api-key.",
-      "Same request shape, same output_format grammar, wav / mp3 / pcm.",
+      "Same request shape, wav / mp3 / pcm — and a parameter we don't act on is named in a response header, never silently dropped.",
       "Nothing leaves the box in sovereign mode — the recording is processed locally.",
+      "The engine's live queue, latencies and real-time factor are on your own Ops page — the numbers the scheduler reads.",
     ],
   },
   {
@@ -113,8 +131,9 @@ export const PILLARS = [
       + "Character owns a rack of emotion Voices, carries its own tags, and is addressed "
       + "by name and mood — sarah:excited.",
     points: [
-      "Clone a Character from one short recording, then extend it from the same page.",
+      "Clone a Character from one short recording, then extend it from its own page.",
       "Fill any missing emotion with a guided 30-second read — the script is written for you.",
+      "Export the cast as JSON — ids, addresses and emotion vocabulary, shaped for the API call.",
       "An emotion a Character lacks falls back to its baseline, reported in the response headers.",
     ],
   },

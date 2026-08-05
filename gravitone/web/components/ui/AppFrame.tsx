@@ -9,7 +9,10 @@ import UserMenu from "./UserMenu";
 import MobileNav from "./MobileNav";
 import { useAuth } from "@/lib/useAuth";
 
-const MODULES = [
+// The one module list. The landing page's signed-in nav (StudioDark) renders
+// this same array — two lists drifted once (the landing never learned /ops
+// existed), which is why this is exported rather than copied.
+export const MODULES = [
   { label: "Playground", href: "/playground" },
   { label: "Voices", href: "/voices" },
   { label: "API keys", href: "/keys" },
