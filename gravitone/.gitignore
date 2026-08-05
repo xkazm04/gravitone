@@ -11,6 +11,10 @@ voices/*.safetensors
 service/loadtest_result.json
 .research-cache/
 .env
+# deploy/aws-oneclick.sh mints the deployment's ROOT API key into the directory
+# it is run from — which the README tells you is the repo. Untracked-but-not-
+# ignored, it was one `git add -A` away from being published.
+.gravitone-deploy-key
 api_keys.json
 emotion_demand.json
 # Anchored: these are the runtime take/review stores at this directory's root.

@@ -4,6 +4,15 @@ Three ways to get a running, key-protected, ElevenLabs-compatible TTS
 endpoint on an Arm box. All of them end the same way: a base URL + an
 `xi-api-key`, and any existing ElevenLabs client migrates with one env change.
 
+> **Before you trust this page:** it has been walked verbatim once, on
+> 2026-08-05, and the walk found six defects — including a `up` command that
+> printed a success banner after every one of its AWS calls failed. Those are
+> fixed; the write-up is
+> [`docs/DEPLOY_REHEARSAL.md`](../docs/DEPLOY_REHEARSAL.md). What that rehearsal
+> did **not** do is reach a running service (credentials expired), so the
+> `1.33×` below is still an uncertified observation and the "4-8 min" first boot
+> is still unverified. Both are flagged there.
+
 Instance presets come from the measured benchmarks (`/benchmarks` in the
 studio, or README "Measured performance"):
 
@@ -331,3 +340,36 @@ journalctl -u gravitone -f                      # service logs (on the box)
 sudo systemctl restart gravitone                # restart
 curl -sL .../bootstrap.sh | sudo -E bash        # upgrade to latest main
 ```
+
+## 6. Rollback / teardown
+
+Every path above creates things that outlive the thing you notice. `deploy/rollback.sh`
+is the complete undo — **and it is the only one**: `aws-oneclick.sh terminate`
+kills the instance and leaves the security group, orphaned volumes and your root
+key file behind.
+
+```bash
+deploy/rollback.sh verify           # read-only: what exists, and what it costs you
+deploy/rollback.sh cloud  --yes     # undo aws-oneclick.sh: instance + SG + volumes + key file
+deploy/rollback.sh stack  --yes     # undo cloudformation.yaml: delete + wait for DELETE_COMPLETE
+sudo deploy/rollback.sh box  --yes  # undo bootstrap.sh ON the box: unit, container, image, /etc, /opt
+```
+
+**Nothing is destroyed without `--yes`.** Bare, it prints the plan and exits —
+so you can see the blast radius before you accept it.
+
+| | |
+|---|---|
+| **Cloned voices survive** | `box` keeps the `gravitone-voices` / `gravitone-ingest` volumes so a bad upgrade can be re-bootstrapped without re-cloning. `--purge-voices` destroys them; that is not recoverable. |
+| **Secrets are shredded** | `cloud` removes `.gravitone-deploy-key`; `box` removes `/etc/gravitone.env`. Both hold the root API key. |
+| **It verifies itself** | Every `--yes` run ends by re-listing resources, so teardown is confirmed rather than assumed. |
+| **It refuses to guess** | If AWS is unreachable it exits `2` instead of reporting an empty account — an unreachable account and a clean one look identical to a failed `describe`, and confusing the two is how a live instance gets recorded as gone. |
+
+Order matters when rolling back by hand: **terminate and wait for the instance
+before deleting the security group**, or the delete fails on a dependency
+violation while an ENI still holds it. `rollback.sh` waits.
+
+Rollback procedure for a bad *upgrade* (as opposed to a full teardown): on the
+box, `sudo deploy/rollback.sh box --yes` (voices survive), then re-run
+`bootstrap.sh` pinned to the last good commit with
+`REPO=... git -C /opt/gravitone checkout <sha>` before the build step.
