@@ -28,6 +28,8 @@ import EmotionArt from "@/components/ui/EmotionArt";
 import Region from "@/components/ui/Region";
 import Track from "@/components/ui/Track";
 import { emotionMeta } from "@/lib/emotions";
+import { useCopyFeedback } from "@/lib/useCopyFeedback";
+import ScoreText from "./ScoreText";
 import {
   applyEmotion, DEFAULT_EXPRESSION, editPlainText, parseTags, regionProblem, scoreRegion, toTags,
   type Expression, type ScoreRegion,
@@ -86,8 +88,9 @@ export default function ScoreEditor({
   const [busy, setBusy] = useState(false);
   const [sel, setSel] = useState<{ start: number; end: number }>({ start: 0, end: 0 });
   const [pending, setPending] = useState<string>("");
+  const [showRaw, setShowRaw] = useState(false);
+  const { copied, failed, copy } = useCopyFeedback();
 
-  const areaRef = useRef<HTMLTextAreaElement>(null);
   const railRef = useRef<HTMLDivElement>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -125,12 +128,6 @@ export default function ScoreEditor({
     if (message) setSelected(null);
     setNotice(message);
     onChange(next);
-  }
-
-  function readSelection() {
-    const el = areaRef.current;
-    if (!el) return;
-    setSel({ start: el.selectionStart ?? 0, end: el.selectionEnd ?? 0 });
   }
 
   // ── regions ────────────────────────────────────────────────────────────────
@@ -281,47 +278,59 @@ export default function ScoreEditor({
         <span className="font-jetbrains text-[11px] uppercase tracking-widest text-white/60">
           score · {regions.length} region{regions.length === 1 ? "" : "s"}
         </span>
-        <span className="font-jetbrains text-[10px] text-white/40">
-          {text.length} characters · direction is written back as [tags]
-        </span>
+        <div className="flex items-center gap-2">
+          <span className="font-jetbrains text-[10px] text-white/40">
+            {text.length} characters · direction is written back as [tags]
+          </span>
+          <button
+            type="button"
+            onClick={() => setShowRaw((v) => !v)}
+            aria-pressed={showRaw}
+            className={`font-jetbrains rounded-full border px-2.5 py-0.5 text-[10px] transition ${showRaw ? "border-cyan-400/30 bg-cyan-400/5 text-cyan-200" : "border-white/12 text-white/50 hover:border-white/25 hover:text-white/75"}`}
+          >
+            markup
+          </button>
+        </div>
       </div>
 
-      {/* The text as the axis: editable, and the same characters the offsets
-          below are counted in. */}
-      <textarea
-        ref={areaRef}
-        value={text}
-        disabled={disabled}
-        onChange={(e) => editText(e.target.value)}
-        onSelect={readSelection}
-        onKeyUp={readSelection}
-        onMouseUp={readSelection}
+      {/* The text as the axis — and as the READING. The direction is painted
+          under the words themselves (ScoreText's mirror), so a paragraph that
+          combines three emotions looks like one; the lane below is now the
+          place you GRAB a span, not the only place you can see one.
+
+          `showRaw` is the power-user escape hatch: the `[tags]` string is the
+          contract and an author who thinks in it should be able to read it —
+          read-only, because the caret must never sit inside markup again. */}
+      <ScoreText
+        text={text}
+        regions={regions}
+        selection={sel}
+        onChangeText={editText}
+        onSelectionChange={setSel}
         onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") onSubmit?.(); }}
-        rows={3}
-        aria-label="Score text"
+        disabled={disabled}
+        label="Score text"
         placeholder="Type the line, select the words you want to direct, then add a region."
-        className="font-hanken w-full resize-none rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm leading-relaxed text-white placeholder:text-white/40 focus:border-cyan-400/40 focus:outline-none disabled:opacity-50"
       />
 
-      {/* The reading line — the text with its direction shown IN it. This is the
-          part that makes the grammar visible without teaching it. */}
-      {text.length > 0 && (
-        <p className="font-hanken rounded-xl border border-white/8 bg-black/20 px-3 py-2 text-sm leading-relaxed text-white/80">
-          {spans(text, regions).map((s, i) =>
-            s.value ? (
-              <mark
-                key={i}
-                title={`${emotionMeta(s.value).label} — characters ${s.start} to ${s.end}`}
-                className="rounded px-0.5 text-white"
-                style={{ background: `hsl(${emotionMeta(s.value).hue} 82% 55% / 0.28)` }}
-              >
-                {text.slice(s.start, s.end)}
-              </mark>
-            ) : (
-              <span key={i}>{text.slice(s.start, s.end)}</span>
-            ),
-          )}
-        </p>
+      {showRaw && (
+        <div className="space-y-1">
+          <div className="flex items-center justify-between gap-2">
+            <span className="font-jetbrains text-[10px] uppercase tracking-widest text-white/45">
+              what the engine receives
+            </span>
+            <button
+              type="button"
+              onClick={() => void copy(value)}
+              className="font-jetbrains rounded-full border border-white/15 px-2.5 py-0.5 text-[10px] text-white/60 transition hover:border-cyan-400/40 hover:text-cyan-200"
+            >
+              {failed ? "copy blocked" : copied ? "✓ copied" : "copy"}
+            </button>
+          </div>
+          <pre className="font-jetbrains overflow-x-auto rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-[11px] leading-relaxed whitespace-pre-wrap break-words text-cyan-100/80">
+            {value || "(empty)"}
+          </pre>
+        </div>
       )}
 
       {/* The lane. Regions are placed proportionally over the character range,
@@ -479,16 +488,7 @@ export default function ScoreEditor({
   );
 }
 
-/** The text broken into alternating undirected / directed runs, for the reading
- *  line. Pure, and derived from the same regions the lane draws. */
-function spans(text: string, regions: ScoreRegion[]): Array<{ start: number; end: number; value?: string }> {
-  const out: Array<{ start: number; end: number; value?: string }> = [];
-  let at = 0;
-  for (const r of regions) {
-    if (r.start > at) out.push({ start: at, end: r.start });
-    out.push({ start: r.start, end: r.end, value: r.value });
-    at = r.end;
-  }
-  if (at < text.length) out.push({ start: at, end: text.length });
-  return out;
-}
+// `spans()` used to live here and drove a SEPARATE reading line under the
+// textarea — the same words a second time, highlighted, because the editing
+// surface itself could not be. ScoreText's mirror paints the real one, so the
+// duplicate is gone rather than kept in step with it.

@@ -47,7 +47,10 @@ const mount = (initial: string, rest: Partial<React.ComponentProps<typeof ScoreE
 
 const wire = () => screen.getByTestId("wire").textContent;
 const area = () => screen.getByRole("textbox", { name: "Score text" }) as HTMLTextAreaElement;
-const notice = () => screen.getByRole("textbox", { name: "Score text" }).parentElement?.querySelector("[aria-live]")?.textContent ?? "";
+// Scoped to the score SECTION, not to the textarea's immediate parent: the text
+// surface is now a wrapper (mirror + textarea, ScoreText) rather than a bare
+// element, so `parentElement` stopped being the section that holds the notice.
+const notice = () => screen.getByRole("textbox", { name: "Score text" }).closest("section")?.querySelector("[aria-live]")?.textContent ?? "";
 
 /** Select characters [a, b) in the score's text area. */
 function select(a: number, b: number) {

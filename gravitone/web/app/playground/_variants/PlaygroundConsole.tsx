@@ -49,6 +49,7 @@ import EmotionAB from "./EmotionAB";
 import TakeCode from "./TakeCode";
 import LiveStage from "../_live/LiveStage";
 import ScoreEditor, { type ScoreEditorHandle } from "./ScoreEditor";
+import ScoreText from "./ScoreText";
 import ScriptScore from "./ScriptScore";
 // Punch-in: the take log's editing drill-down. Deliberately a separate module —
 // the take card stays exactly what it was until the user asks for the timeline.
@@ -644,7 +645,15 @@ export default function PlaygroundConsole() {
   // regions ride alongside — the raw tagged string stays the stored/sent unit,
   // it is just never the thing a keystroke lands in (ScriptScore's rule:
   // "regions are DERIVED, never held").
-  const scriptPlain = useMemo(() => script.map((l) => parseTags(l.text).text), [script]);
+  const scriptParsed = useMemo(() => script.map((l) => parseTags(l.text)), [script]);
+  const scriptPlain = useMemo(() => scriptParsed.map((p) => p.text), [scriptParsed]);
+
+  // The selection to keep VISIBLE on the line being directed. The wheel is a
+  // portal dialog, so opening it blurs the line and the native highlight goes
+  // with it — one range, for the active line, mirrored under the words so the
+  // user can still see what they are about to wrap. Only the active line needs
+  // one: `insertEmotion` acts on that line and no other.
+  const [lineSel, setLineSel] = useState<{ start: number; end: number }>({ start: 0, end: 0 });
 
   // The server's limits, stated BEFORE the request (service/app.py's 8000-char
   // and 64-line caps, the proxy's 128 KB body). One pure function so the rule
@@ -1471,16 +1480,23 @@ export default function PlaygroundConsole() {
                         className="grid h-6 w-6 place-items-center rounded-md border border-white/12 text-[11px] text-white/60 transition enabled:hover:border-rose-400/40 enabled:hover:text-rose-200 disabled:opacity-25">✕</button>
                     </div>
                   </div>
-                  <textarea
-                    ref={(el) => { lineRefs.current[i] = el; }}
-                    value={scriptPlain[i] ?? ""}
+                  {/* Same painted surface as the solo composer: the direction on
+                      this line is visible IN the line, not only in the lane
+                      under the scene. */}
+                  <ScoreText
+                    text={scriptPlain[i] ?? ""}
+                    regions={scriptParsed[i]?.regions ?? []}
+                    selection={activeLine === i ? lineSel : null}
+                    textareaRef={(el) => { lineRefs.current[i] = el; }}
                     onFocus={() => setActiveLine(i)}
-                    onChange={(e) => editLineText(i, e.target.value)}
+                    onChangeText={(next) => editLineText(i, next)}
+                    onSelectionChange={setLineSel}
                     onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") generate(); }}
                     rows={2}
-                    aria-invalid={line.text.length > MAX_TEXT_CHARS}
-                    placeholder="Line text… select words and pick an emotion to switch this Character's Voices"
-                    className="font-hanken w-full resize-none bg-transparent text-sm leading-relaxed text-white placeholder:text-white/40 focus:outline-none" />
+                    invalid={line.text.length > MAX_TEXT_CHARS}
+                    label={`Line ${i + 1} text`}
+                    className="!border-transparent !bg-transparent"
+                    placeholder="Line text… select words and pick an emotion to switch this Character's Voices" />
                   {line.text.length > MAX_TEXT_CHARS && (
                     <p className="font-jetbrains mt-1 text-[11px] text-rose-300">
                       {line.text.length.toLocaleString()}/{MAX_TEXT_CHARS.toLocaleString()} characters — this line is too long to render.
