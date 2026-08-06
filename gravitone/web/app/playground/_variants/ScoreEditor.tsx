@@ -23,15 +23,21 @@
 //    changes the words under a region the region is CLEARED and the notice says
 //    which one and why (shared.transformRegions).
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import EmotionArt from "@/components/ui/EmotionArt";
 import Region from "@/components/ui/Region";
 import Track from "@/components/ui/Track";
 import { emotionMeta } from "@/lib/emotions";
 import {
-  DEFAULT_EXPRESSION, parseTags, regionProblem, scoreRegion, toTags, transformRegions,
+  applyEmotion, DEFAULT_EXPRESSION, editPlainText, parseTags, regionProblem, scoreRegion, toTags,
   type Expression, type ScoreRegion,
 } from "./shared";
+
+/** What the console can ask of the score from OUTSIDE it — the emotion chips
+ *  and the wheel live up there, but the selection they act on lives down here.
+ *  One method, so the picker paths and the "+ add region" button are literally
+ *  the same operation (shared.applyEmotion). */
+export type ScoreEditorHandle = { applyEmotion: (emotion: string) => void };
 
 /** How the lane is drawn. Tall enough for a badge + a label, short enough that
  *  the score does not dominate the composer it hangs under. */
@@ -46,6 +52,8 @@ type PreviewState = { index: number; url: string } | null;
 export default function ScoreEditor({
   value,
   onChange,
+  onSubmit,
+  ref,
   characterId,
   available = [],
   scale,
@@ -56,6 +64,9 @@ export default function ScoreEditor({
   /** The composer's raw text — metatags included. This is the contract. */
   value: string;
   onChange: (next: string) => void;
+  /** ⌘↵ in the text area. Absent → the shortcut simply does nothing here. */
+  onSubmit?: () => void;
+  ref?: React.Ref<ScoreEditorHandle>;
   /** Who previews a region. Absent → preview is offered but explained as off. */
   characterId?: string;
   /** Emotions this Character has actually recorded (for the honest badge). */
@@ -110,17 +121,10 @@ export default function ScoreEditor({
 
   // ── text edits ─────────────────────────────────────────────────────────────
   function editText(nextText: string) {
-    const { regions: kept, cleared } = transformRegions(regions, text, nextText);
-    if (cleared.length > 0) {
-      const names = [...new Set(cleared.map((c) => emotionMeta(c.value).label))].join(", ");
-      setNotice(
-        `Cleared ${cleared.length} region${cleared.length === 1 ? "" : "s"} (${names}) — the words underneath ${cleared.length === 1 ? "it was" : "they were"} directing changed, so the direction was dropped rather than moved onto different words.`,
-      );
-      setSelected(null);
-    } else {
-      setNotice(null);
-    }
-    emit(kept, nextText);
+    const { next, message } = editPlainText(value, nextText);
+    if (message) setSelected(null);
+    setNotice(message);
+    onChange(next);
   }
 
   function readSelection() {
@@ -130,17 +134,25 @@ export default function ScoreEditor({
   }
 
   // ── regions ────────────────────────────────────────────────────────────────
+  /** Direct the current selection as `value` — or, for `baseline`, clear it.
+   *  The single entry point for the "+ add region" button, the emotion chips and
+   *  the wheel, so all three refuse for the same reasons in the same words. */
+  function place(chosen: string) {
+    const { next, message } = applyEmotion(value, sel.start, sel.end, chosen);
+    setNotice(message);
+    if (next === null) return;
+    // Open the inspector on what was just placed. The index is read back off
+    // the NEW string rather than guessed, because regions are always re-derived.
+    const from = Math.min(sel.start, sel.end);
+    const placed = parseTags(next).regions.findIndex((r) => r.start === from && r.value === chosen);
+    setSelected(placed >= 0 ? placed : null);
+    onChange(next);
+  }
+
+  useImperativeHandle(ref, () => ({ applyEmotion: place }));
+
   function addRegion() {
-    const candidate = scoreRegion(Math.min(sel.start, sel.end), Math.max(sel.start, sel.end), emotion);
-    const why = regionProblem(text, candidate, regions);
-    if (why) {
-      setNotice(why);
-      return;
-    }
-    setNotice(null);
-    const next = [...regions, candidate].sort((a, b) => a.start - b.start);
-    setSelected(next.indexOf(candidate));
-    emit(next);
+    place(emotion);
   }
 
   function resize(i: number, edge: "start" | "end", to: number) {
@@ -284,6 +296,7 @@ export default function ScoreEditor({
         onSelect={readSelection}
         onKeyUp={readSelection}
         onMouseUp={readSelection}
+        onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") onSubmit?.(); }}
         rows={3}
         aria-label="Score text"
         placeholder="Type the line, select the words you want to direct, then add a region."

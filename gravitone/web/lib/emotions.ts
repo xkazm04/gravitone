@@ -47,12 +47,9 @@ export function emotionMeta(id: string): EmotionMeta {
   };
 }
 
-/** Wrap a selection (or insert an empty pair) with an emotion metatag. */
-export function wrapWithTag(text: string, start: number, end: number, emotion: string) {
-  const sel = text.slice(start, end);
-  const open = `[${emotion}]`;
-  const close = `[/${emotion}]`;
-  const next = text.slice(0, start) + open + sel + close + text.slice(end);
-  const caret = sel ? start + open.length + sel.length + close.length : start + open.length;
-  return { next, caret };
-}
+// `wrapWithTag` used to live here and spliced `[x]…[/x]` literals straight into
+// the composer's string, parking the caret INSIDE an empty pair — one backspace
+// left `[x[/x]`, which the engine's tag regex does not match and therefore
+// speaks out loud. Emotions are now applied as REGIONS over plain text
+// (app/playground/_variants/shared.ts::applyEmotion), and the tagged string is
+// derived on the way out. Do not reintroduce a literal-splicing helper.

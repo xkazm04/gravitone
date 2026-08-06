@@ -1,8 +1,10 @@
 "use client";
 
 // Emotion Wheel — reborn as a Playground helper. A radial picker (the Wheel
-// direction from the voices round) that inserts an [emotion]…[/emotion] metatag
-// into the composer. Each spoke is the emotion's generated art; emotions the
+// direction from the voices round) that DIRECTS the composer's current selection
+// — it hands the id to `onPick`, which places a region in the one emotion model
+// (shared.applyEmotion); nothing here writes markup. Each spoke is the emotion's
+// generated art; emotions the
 // active Character lacks are dimmed and marked as substituted (the backend
 // picks the nearest recorded emotion first, and only then baseline).
 
@@ -182,7 +184,8 @@ export default function EmotionPicker({
             </div>
 
             <p className="font-jetbrains mt-3 text-center text-[12px] text-white/60">
-              Wraps your selected text in <span className="text-cyan-300">[emotion]…[/emotion]</span>
+              Directs your selected words — <span className="text-cyan-300">Baseline</span> clears the
+              direction instead
             </p>
           </motion.div>
         </motion.div>

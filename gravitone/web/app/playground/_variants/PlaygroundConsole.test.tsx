@@ -507,3 +507,112 @@ describe("PlaygroundConsole — a failed publish is reported and cleans up after
     expect(vi.getTimerCount()).toBe(0);
   });
 });
+
+// ── direction 4: one emotion model, and no markup a keystroke can break ───────
+//
+// Every insertion path used to splice a `[tag]` literal into the composer's
+// string (lib/emotions::wrapWithTag, now deleted). These assert on the string
+// that reaches the ENGINE, because that is the only place the difference
+// between "directed" and "spoken out loud" shows up.
+
+describe("PlaygroundConsole — emotions are placed as regions, never typed as tags", () => {
+  const scoreArea = () => screen.getByRole("textbox", { name: "Score text" }) as HTMLTextAreaElement;
+  /** An emotion chip, by its accessible name. */
+  const chip = (name: string) => screen.getByRole("button", { name });
+
+  /** Put `value` in the solo composer and select characters [a, b) of it. */
+  function compose(value: string, a: number, b: number) {
+    const el = scoreArea();
+    fireEvent.change(el, { target: { value } });
+    el.setSelectionRange(a, b);
+    fireEvent.select(el);
+    return el;
+  }
+
+  /** The text the solo path actually sent. */
+  function sentSolo(): string {
+    return String(engineMocks.speak.mock.calls.at(-1)?.[0]);
+  }
+
+  it("sends the selection wrapped in tags it wrote itself", async () => {
+    await mountConsole();
+    compose("one two three", 4, 7);
+    fireEvent.click(chip("Excited"));
+    await generateOnce();
+    expect(sentSolo()).toBe("one [excited]two[/excited] three");
+  });
+
+  it("shows the composer the WORDS, with the direction beside them", async () => {
+    await mountConsole();
+    fireEvent.change(scoreArea(), { target: { value: "one two three" } });
+    scoreArea().setSelectionRange(4, 7);
+    fireEvent.select(scoreArea());
+    fireEvent.click(chip("Excited"));
+    // No markup is ever put in front of the user…
+    expect(scoreArea().value).toBe("one two three");
+    // …but the span is there, named, and covering the words that were selected.
+    expect(screen.getByRole("button", { name: /Region 1 of 1/ })).toHaveAccessibleName(/text: two/);
+  });
+
+  it("cannot be corrupted by a backspace inside a directed span", async () => {
+    // The bug this replaces: wrapWithTag parked the caret between `[x]` and
+    // `[/x]`, so one backspace produced `[x[/x]` — unmatched by the service's
+    // tag regex and therefore SPOKEN. Deleting inside a region now clears the
+    // region by name and leaves an intact string.
+    await mountConsole();
+    compose("one two three", 4, 7);
+    fireEvent.click(chip("Excited"));
+    fireEvent.change(scoreArea(), { target: { value: "one to three" } });
+    await generateOnce();
+    expect(sentSolo()).toBe("one to three");
+    expect(screen.getByText(/Cleared 1 region \(Excited\)/)).toBeInTheDocument();
+  });
+
+  it("refuses an empty selection with a sentence rather than an empty tag pair", async () => {
+    await mountConsole();
+    compose("one two three", 5, 5);
+    fireEvent.click(chip("Excited"));
+    expect(screen.getByText(/at least one character to direct/)).toBeInTheDocument();
+    await generateOnce();
+    expect(sentSolo()).toBe("one two three");
+  });
+
+  it("makes the baseline chip an eraser instead of a tag the grammar refuses", async () => {
+    await mountConsole();
+    compose("one two three", 4, 7);
+    fireEvent.click(chip("Excited"));
+    compose("one two three", 4, 7);
+    fireEvent.click(chip("Clear region"));
+    await generateOnce();
+    expect(sentSolo()).toBe("one two three");
+    expect(sentSolo()).not.toMatch(/\[baseline\]/);
+  });
+
+  it("directs a script line the same way, through the same model", async () => {
+    await mountConsole();
+    // An empty solo composer switches to the canned two-line demo.
+    fireEvent.change(scoreArea(), { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: "script" }));
+    const lines = screen.getAllByRole("textbox") as HTMLTextAreaElement[];
+    // The demo's second line ships tagged; the composer shows only its words.
+    expect(lines[1].value).toBe("Great to finally meet you!");
+
+    fireEvent.focus(lines[0]);
+    lines[0].setSelectionRange(0, 5);
+    fireEvent.select(lines[0]);
+    fireEvent.click(chip("Sad"));
+
+    engineMocks.perform.mockResolvedValue({
+      mode: "gravitone", url: "blob:new", blob: new Blob(["wav"]), peaks: [0.4],
+      seconds: 2, kb: 10, rtf: 0.3, synthSeconds: 6, queueSeconds: 0,
+      synthSegments: 2, format: "wav_24000", ignoredSettings: [], segments: [],
+      reportCorrupt: false,
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Generate/ }));
+    });
+    const sent = engineMocks.perform.mock.calls.at(-1)?.[0] as Array<{ text: string }>;
+    expect(sent[0].text).toBe("[sad]Hello[/sad] there.");
+    expect(sent[1].text).toBe("[excited]Great to finally meet you![/excited]");
+  });
+});

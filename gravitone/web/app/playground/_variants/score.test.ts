@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
-  normalizeRegions, parseTags, regionProblem, scoreRegion, toTags, transformRegions,
-  type ScoreRegion,
+  applyEmotion, editPlainText, normalizeRegions, parseTags, regionProblem, scoreRegion, toTags,
+  transformRegions, type ScoreRegion,
 } from "./shared";
 
 // The score model's whole job is to be a LOSSLESS view of a string the engine
@@ -300,6 +300,101 @@ describe("transformRegions — regions survive an edit or are cleared by name", 
         expect(got.end).toBeLessThanOrEqual(after.length);
         expect(got.end).toBeGreaterThan(got.start);
       }
+    }
+  });
+});
+
+// ── the one emotion-application model ───────────────────────────────────────
+// Every picker in the studio goes through applyEmotion/editPlainText. Before
+// this existed, each surface spliced `[tag]` literals into the string the user
+// was typing in — `wrapWithTag` even parked the caret INSIDE an empty pair, so
+// one backspace produced `[x[/x]`, which the engine does not read as a tag and
+// therefore SPEAKS. These tests are about what can no longer be produced.
+
+describe("applyEmotion — directing a selection, never splicing markup", () => {
+  it("directs the selected words and returns the wire string", () => {
+    expect(applyEmotion("one two three", 4, 7, "excited"))
+      .toEqual({ next: "one [excited]two[/excited] three", message: null });
+  });
+
+  it("reads a backwards selection the same as a forwards one", () => {
+    expect(applyEmotion("one two three", 7, 4, "excited").next)
+      .toBe("one [excited]two[/excited] three");
+  });
+
+  it("counts offsets in PLAIN text, not in the tagged string", () => {
+    // "one [calm]two[/calm] three" is 13 plain characters; 8..13 is "three".
+    expect(applyEmotion("one [calm]two[/calm] three", 8, 13, "sad").next)
+      .toBe("one [calm]two[/calm] [sad]three[/sad]");
+  });
+
+  it("refuses an empty selection with a sentence instead of an empty tag pair", () => {
+    const got = applyEmotion("one two three", 5, 5, "excited");
+    expect(got.next).toBeNull();
+    expect(got.message).toMatch(/at least one character/);
+  });
+
+  it("refuses an overlap in regionProblem's own words — one rule, not two", () => {
+    const got = applyEmotion("one [excited]two[/excited] three", 5, 9, "sad");
+    expect(got.next).toBeNull();
+    expect(got.message).toMatch(/overlaps the excited region/);
+  });
+
+  it("clamps a selection that runs past the end of the words", () => {
+    expect(applyEmotion("hi", 0, 999, "sad").next).toBe("[sad]hi[/sad]");
+  });
+});
+
+describe("applyEmotion — baseline is the eraser, not a tag", () => {
+  const tagged = "one [excited]two[/excited] three";
+
+  it("clears the region the selection touches", () => {
+    expect(applyEmotion(tagged, 4, 7, "baseline"))
+      .toEqual({ next: "one two three", message: "Cleared the Excited region — those words return to baseline." });
+  });
+
+  it("clears the region a bare caret sits inside", () => {
+    expect(applyEmotion(tagged, 5, 5, "baseline").next).toBe("one two three");
+  });
+
+  it("clears every region a wide selection covers, and names them all", () => {
+    const got = applyEmotion("[calm]one[/calm] [excited]two[/excited] three", 0, 13, "baseline");
+    expect(got.next).toBe("one two three");
+    expect(got.message).toMatch(/Calm, Excited/);
+  });
+
+  it("says there is nothing to clear rather than writing a [baseline] tag", () => {
+    const got = applyEmotion("one two three", 0, 3, "baseline");
+    expect(got.next).toBeNull();
+    expect(got.message).toMatch(/Nothing to clear/);
+    // The spelling regionProblem forbids must never reach the wire.
+    expect(applyEmotion(tagged, 4, 7, "baseline").next).not.toMatch(/\[baseline\]/);
+  });
+});
+
+describe("editPlainText — free typing can never break the markup", () => {
+  const tagged = "one [excited]two[/excited] three";
+
+  it("carries a region across an edit before it", () => {
+    expect(editPlainText(tagged, "zero one two three"))
+      .toEqual({ next: "zero one [excited]two[/excited] three", message: null });
+  });
+
+  it("CLEARS a region whose own words changed, and names it", () => {
+    const got = editPlainText(tagged, "one to three");
+    expect(got.next).toBe("one to three");
+    expect(got.message).toMatch(/Cleared 1 region \(Excited\)/);
+  });
+
+  it("cannot produce a string the service's tag grammar would mis-read", () => {
+    // Every single-character deletion — the exact keystroke wrapWithTag turned
+    // into `[x[/x]` — leaves a string that still round-trips through the model.
+    const plain = parseTags(tagged).text;
+    for (let i = 0; i < plain.length; i += 1) {
+      const { next } = editPlainText(tagged, plain.slice(0, i) + plain.slice(i + 1));
+      expect(rebuild(next)).toBe(next);
+      // No half-open bracket survives anywhere in the wire string.
+      expect(next.replace(/\[\/?[a-zA-Z_]*\]/g, "")).not.toContain("[");
     }
   });
 });

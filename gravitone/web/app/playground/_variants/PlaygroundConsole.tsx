@@ -19,11 +19,12 @@ import Link from "next/link";
 import { AnimatePresence, motion } from "framer-motion";
 import { Button, Eyebrow } from "@/components/ui/Primitives";
 import { EASE } from "@/components/ui/tokens";
-import { EMOTION_IDS, emotionMeta, wrapWithTag } from "@/lib/emotions";
+import { EMOTION_IDS, emotionMeta } from "@/lib/emotions";
 import EmotionArt from "@/components/ui/EmotionArt";
 import {
-  appendEdit, composerLimit, DEFAULT_EXPRESSION, DEFAULT_TEXT, isTimingBasis, MAX_SCRIPT_LINES,
-  MAX_TEXT_CHARS, readEdits, stripTags, TAKE_TIMING_VERSION,
+  appendEdit, applyEmotion, composerLimit, DEFAULT_EXPRESSION, DEFAULT_TEXT, editPlainText,
+  isTimingBasis, MAX_SCRIPT_LINES, MAX_TEXT_CHARS, parseTags, readEdits, SCORE_BASELINE, stripTags,
+  TAKE_TIMING_VERSION,
   type Expression, type PerfLine, type ScriptLine, type Segment, type Take,
 } from "./shared";
 // Composer durability — the same IndexedDB mechanism the take log uses.
@@ -47,7 +48,7 @@ import EmotionPicker from "./EmotionPicker";
 import EmotionAB from "./EmotionAB";
 import TakeCode from "./TakeCode";
 import LiveStage from "../_live/LiveStage";
-import ScoreEditor from "./ScoreEditor";
+import ScoreEditor, { type ScoreEditorHandle } from "./ScoreEditor";
 import ScriptScore from "./ScriptScore";
 // Punch-in: the take log's editing drill-down. Deliberately a separate module —
 // the take card stays exactly what it was until the user asks for the timeline.
@@ -253,8 +254,15 @@ export default function PlaygroundConsole() {
   // about how the voice sounds.
   const [format, setFormat] = useState<OutputFormat>(DEFAULT_OUTPUT_FORMAT);
   const [script, setScript] = useState<ScriptLine[]>([]);
-  const [activeLine, setActiveLine] = useState(0); // emotion tags target this line
+  const [activeLine, setActiveLine] = useState(0); // emotion regions target this line
   const lineRefs = useRef<Array<HTMLTextAreaElement | null>>([]);
+  // The score owns the solo selection (its text area IS the solo composer), so
+  // the chips and the wheel ask it to place a region rather than editing a
+  // string behind its back.
+  const scoreRef = useRef<ScoreEditorHandle>(null);
+  // What the last emotion/text edit did or refused to do, in a sentence. Script
+  // mode only — in solo the score states it in its own live region.
+  const [scriptNotice, setScriptNotice] = useState<string | null>(null);
   const scriptSeq = useRef(0);
   const [busy, setBusy] = useState(false);
   // Backpressure (429): engine is up but busy — offer a retry, never fall to
@@ -323,7 +331,6 @@ export default function PlaygroundConsole() {
   const [reviewUrl, setReviewUrl] = useState<string | null>(null);
   const [reviewErr, setReviewErr] = useState<string | null>(null);
   const seq = useRef(0);
-  const areaRef = useRef<HTMLTextAreaElement>(null);
   const composerRef = useRef<HTMLDivElement>(null); // scroll target for "reuse"
   // The character rail showed the first ten Characters and stopped, with no
   // affordance at all — clone an eleventh voice and it was simply unreachable
@@ -633,6 +640,11 @@ export default function PlaygroundConsole() {
     [script],
   );
   const scriptChars = scriptLines.reduce((n, l) => n + stripTags(l.text).length, 0);
+  // Each line's WORDS, without its direction. The composer edits this and the
+  // regions ride alongside — the raw tagged string stays the stored/sent unit,
+  // it is just never the thing a keystroke lands in (ScriptScore's rule:
+  // "regions are DERIVED, never held").
+  const scriptPlain = useMemo(() => script.map((l) => parseTags(l.text).text), [script]);
 
   // The server's limits, stated BEFORE the request (service/app.py's 8000-char
   // and 64-line caps, the proxy's 128 KB body). One pure function so the rule
@@ -678,25 +690,44 @@ export default function PlaygroundConsole() {
       : FALLBACK_COPY[fallback.reason]
   );
 
+  /**
+   * Direct the current selection as `emotion` — the chips, the wheel and the
+   * score's own control all land here.
+   *
+   * No path writes a tag literal any more. The selection is read in PLAIN-text
+   * offsets (both composers show plain text; the `[tags]` are derived on the way
+   * out), a REGION is placed through the one shared model, and `baseline` is the
+   * eraser rather than a tag the grammar cannot carry.
+   */
   function insertEmotion(emotion: string) {
-    if (mode === "script") {
-      const idx = activeLine;
-      const cur = script[idx];
-      if (!cur) return;
-      const el = lineRefs.current[idx];
-      const start = el?.selectionStart ?? cur.text.length;
-      const end = el?.selectionEnd ?? cur.text.length;
-      const { next, caret } = wrapWithTag(cur.text, start, end, emotion);
-      updateLine(idx, { text: next });
-      requestAnimationFrame(() => { el?.focus(); el?.setSelectionRange(caret, caret); });
+    if (mode !== "script") {
+      scoreRef.current?.applyEmotion(emotion);
       return;
     }
-    const el = areaRef.current;
-    const start = el?.selectionStart ?? text.length;
-    const end = el?.selectionEnd ?? text.length;
-    const { next, caret } = wrapWithTag(text, start, end, emotion);
-    setText(next);
-    requestAnimationFrame(() => { el?.focus(); el?.setSelectionRange(caret, caret); });
+    const idx = activeLine;
+    const cur = script[idx];
+    if (!cur) return;
+    const el = lineRefs.current[idx];
+    const plainLen = parseTags(cur.text).text.length;
+    const start = el?.selectionStart ?? plainLen;
+    const end = el?.selectionEnd ?? plainLen;
+    const { next, message } = applyEmotion(cur.text, start, end, emotion);
+    setScriptNotice(message);
+    if (next === null) return;
+    updateLine(idx, { text: next });
+    // The plain text is unchanged by a region edit, so the caret goes back
+    // exactly where the user left it.
+    requestAnimationFrame(() => { el?.focus(); el?.setSelectionRange(start, end); });
+  }
+
+  /** A free typing edit on one script line: the regions shift, grow or are
+   *  CLEARED BY NAME (shared.editPlainText) — never silently re-aimed. */
+  function editLineText(idx: number, nextText: string) {
+    const cur = script[idx];
+    if (!cur) return;
+    const { next, message } = editPlainText(cur.text, nextText);
+    setScriptNotice(message);
+    updateLine(idx, { text: next });
   }
 
   // --- Script composer helpers ---------------------------------------------
@@ -1189,10 +1220,11 @@ export default function PlaygroundConsole() {
       <Eyebrow>free playground</Eyebrow>
       <h1 className="font-instrument mt-4 text-4xl text-white">Compose a take.</h1>
       <p className="mt-2 max-w-2xl text-base text-white/70">
-        Pick a <span className="text-white">Character</span>, then use{" "}
-        <span className="font-jetbrains text-cyan-300">[emotion]…[/emotion]</span> to switch its{" "}
-        <span className="text-white">Voices</span> mid-sentence. A missing emotion uses the nearest
-        recorded one, and only then baseline.
+        Pick a <span className="text-white">Character</span>, then select words and give them an{" "}
+        <span className="text-white">emotion</span> to switch its <span className="text-white">Voices</span>{" "}
+        mid-sentence. Direction is kept as spans beside your words and written out as{" "}
+        <span className="font-jetbrains text-cyan-300">[emotion]…[/emotion]</span> for the engine. A
+        missing emotion uses the nearest recorded one, and only then baseline.
       </p>
 
       {/* First sign-in also provisioned an API key. It is an aside — the
@@ -1382,12 +1414,16 @@ export default function PlaygroundConsole() {
             </span>
           </div>
 
+          {/* SOLO — the score IS the composer. It shows the plain words and
+              keeps the direction beside them as regions; the `[tags]` are
+              derived on the way to the engine, so there is no markup here for a
+              stray keystroke to break. */}
           {mode === "solo" ? (
-            <textarea ref={areaRef} value={text} onChange={(e) => setText(e.target.value)}
-              aria-invalid={text.length > MAX_TEXT_CHARS}
-              onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") generate(); }}
-              rows={5} placeholder="Type something. Select words, then click an emotion to tag them…"
-              className="font-hanken w-full resize-none bg-transparent px-5 py-4 text-base leading-relaxed text-white placeholder:text-white/55 focus:outline-none" />
+            <div className="px-5 py-4">
+              <ScoreEditor ref={scoreRef} value={text} onChange={setText} onSubmit={generate}
+                characterId={charId} expr={expr}
+                available={character?.emotions ?? []} scale={scale} />
+            </div>
           ) : (
             <div className="space-y-2 px-5 py-4">
               {script.map((line, i) => (
@@ -1415,13 +1451,13 @@ export default function PlaygroundConsole() {
                   </div>
                   <textarea
                     ref={(el) => { lineRefs.current[i] = el; }}
-                    value={line.text}
+                    value={scriptPlain[i] ?? ""}
                     onFocus={() => setActiveLine(i)}
-                    onChange={(e) => updateLine(i, { text: e.target.value })}
+                    onChange={(e) => editLineText(i, e.target.value)}
                     onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") generate(); }}
                     rows={2}
                     aria-invalid={line.text.length > MAX_TEXT_CHARS}
-                    placeholder="Line text… tag with [emotion]…[/emotion] to switch this Character's Voices"
+                    placeholder="Line text… select words and pick an emotion to switch this Character's Voices"
                     className="font-hanken w-full resize-none bg-transparent text-sm leading-relaxed text-white placeholder:text-white/40 focus:outline-none" />
                   {line.text.length > MAX_TEXT_CHARS && (
                     <p className="font-jetbrains mt-1 text-[11px] text-rose-300">
@@ -1440,29 +1476,32 @@ export default function PlaygroundConsole() {
             </div>
           )}
 
-          {mode === "solo" && (
-            <details className="border-t border-white/8 px-5 py-3">
-              <summary className="font-jetbrains cursor-pointer text-[11px] uppercase tracking-widest text-white/60">score — direct emotion by dragging spans</summary>
-              <ScoreEditor value={text} onChange={setText} characterId={charId} expr={expr}
-                available={character?.emotions ?? []} scale={scale} className="mt-3" />
-            </details>
-          )}
-
+          {/* SCRIPT — the scene, always visible. The score is the emotion
+              surface, not an option hidden behind a disclosure triangle. */}
           {mode === "script" && script.length > 0 && (
-            <details className="border-t border-white/8 px-5 py-3">
-              <summary className="font-jetbrains cursor-pointer text-[11px] uppercase tracking-widest text-white/60">score — the scene as stacked lanes</summary>
+            <div className="border-t border-white/8 px-5 py-3">
+              <span className="font-jetbrains text-[11px] uppercase tracking-widest text-white/60">score — the scene as stacked lanes</span>
               <ScriptScore lines={script} activeLineId={script[activeLine]?.id} scale={scale} className="mt-3"
                 onChangeLine={(id, next) => updateLine(script.findIndex((l) => l.id === id), { text: next })}
                 characterName={charName}
                 availableFor={(id) => characters.find((c) => c.character_id === id)?.emotions ?? []}
                 onFocusLine={(_id, i) => { setActiveLine(i); lineRefs.current[i]?.focus(); }} />
-            </details>
+            </div>
+          )}
+
+          {/* What the last chip/wheel press or typing edit did — a refusal, or
+              the regions it cleared. Solo says it in the score's own live
+              region; this is script mode's. */}
+          {mode === "script" && scriptNotice && (
+            <p aria-live="polite" className="font-jetbrains border-t border-white/8 px-5 py-2 text-[11px] leading-relaxed text-amber-200/90">
+              {scriptNotice}
+            </p>
           )}
 
           {/* emotion chips + wheel */}
           <div className="border-t border-white/8 px-5 py-4">
             <div className="mb-2 flex items-center justify-between">
-              <span className="font-jetbrains text-[11px] uppercase tracking-widest text-white/60">tag selection with an emotion</span>
+              <span className="font-jetbrains text-[11px] uppercase tracking-widest text-white/60">direct the selected words</span>
               <button
                 onClick={() => setPickerOpen(true)}
                 className="font-jetbrains inline-flex items-center gap-1.5 rounded-full border border-cyan-400/30 bg-cyan-400/5 px-3 py-1 text-[11px] text-cyan-200 transition hover:bg-cyan-400/10"
@@ -1475,16 +1514,25 @@ export default function PlaygroundConsole() {
                 const e = emotionMeta(id);
                 const has = character?.emotions.includes(id) ?? false;
                 const custom = !EMOTION_IDS.includes(id);
+                // Baseline is the ABSENCE of a region, not a region worth that
+                // name — `regionProblem` refuses the spelling outright — so the
+                // baseline chip is the eraser rather than a tag nothing accepts.
+                const clears = id === SCORE_BASELINE;
                 return (
                   <button key={id} onClick={() => insertEmotion(id)}
-                    title={has ? `${e.label} — available` : `${e.label} — not recorded: the nearest recorded emotion is used, then baseline`}
+                    // Without this the accessible name is the art's alt text
+                    // followed by the label ("Excited emotion Excited").
+                    aria-label={clears ? "Clear region" : e.label}
+                    title={clears
+                      ? "Clear direction — the selected words go back to this Character's baseline Voice"
+                      : has ? `${e.label} — available` : `${e.label} — not recorded: the nearest recorded emotion is used, then baseline`}
                     className={`font-jetbrains inline-flex items-center gap-1.5 rounded-full py-1 pl-1 pr-2.5 text-[11px] transition ${
                       has ? `border bg-white/5 text-white/85 ${custom ? "border-violet-400/30 hover:border-violet-400/60" : "border-white/15 hover:border-cyan-400/40"}`
                           : `border border-dashed text-white/60 ${custom ? "border-violet-400/20" : "border-white/12"}`}`}>
                     <span className="grid h-5 w-5 place-items-center overflow-hidden rounded-full bg-black/50">
                       <EmotionArt emotion={id} size={20} dim={!has} />
                     </span>
-                    {e.label}
+                    {clears ? "Clear region" : e.label}
                   </button>
                 );
               })}

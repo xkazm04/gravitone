@@ -3,6 +3,7 @@
 // nearest recorded one, and only then baseline (service/emotions.py::resolve).
 
 import { hueFor } from "@/lib/glyphs/generate";
+import { emotionMeta } from "@/lib/emotions";
 import type { OutputFormat } from "@/lib/audioFormats";
 
 export type Segment = {
@@ -485,6 +486,81 @@ export function transformRegions(regions: ScoreRegion[], before: string, after: 
     }
   }
   return { regions: normalizeRegions(after, kept), cleared };
+}
+
+// ── the ONE way an emotion is applied ───────────────────────────────────────
+//
+// Every emotion-insertion path in the studio — the chip row, the emotion wheel,
+// the score's own placement control, the script lanes — goes through the two
+// functions below, so there is exactly one emotion model: regions over plain
+// text, serialised to `[tags]` on the way out.
+//
+// Nothing splices a tag LITERAL into a string the user is holding a caret in,
+// and that is the whole point. The old `wrapWithTag` parked the caret between
+// `[x]` and `[/x]`; one backspace produced `[x[/x]`, which the engine's tag
+// regex (service/emotions.py::_TAG_RE) no longer matches — so the broken markup
+// was SPOKEN OUT LOUD. A user cannot corrupt markup they never hand-edit.
+
+/** The outcome of an emotion edit: a new tagged string, or a refusal to read.
+ *  `next === null` means nothing changed and `message` says why; a non-null
+ *  `next` with a `message` is an edit that happened AND has something to say
+ *  about it (which regions it cleared). */
+export type EmotionEdit = { next: string | null; message: string | null };
+
+/** The sentence for regions an edit dropped. Named, never silent — a direction
+ *  that quietly moved onto different words is the bug this prevents. */
+export function clearedMessage(cleared: ScoreRegion[]): string | null {
+  if (cleared.length === 0) return null;
+  const names = [...new Set(cleared.map((c) => emotionMeta(c.value).label))].join(", ");
+  const one = cleared.length === 1;
+  return `Cleared ${cleared.length} region${one ? "" : "s"} (${names}) — the words underneath ${one ? "it was" : "they were"} directing changed, so the direction was dropped rather than moved onto different words.`;
+}
+
+/** Rewrite the PLAIN text behind a tagged string, carrying the regions across
+ *  (shift / grow / clear-by-name — see transformRegions). This is what a free
+ *  typing edit in any composer runs through. */
+export function editPlainText(tagged: string, nextText: string): { next: string; message: string | null } {
+  const { text, regions } = parseTags(tagged);
+  const { regions: kept, cleared } = transformRegions(regions, text, nextText);
+  return { next: toTags(nextText, kept), message: clearedMessage(cleared) };
+}
+
+/**
+ * Direct characters [start, end) of the plain text behind `tagged` as `emotion`
+ * — or, for `baseline`, CLEAR the direction there.
+ *
+ * `baseline` is the absence of a region, not a region whose value is baseline
+ * (regionProblem refuses that spelling outright), so the baseline chip is the
+ * eraser. Every other refusal is regionProblem's own sentence, so the picker
+ * and the score cannot disagree about what is allowed.
+ */
+export function applyEmotion(tagged: string, start: number, end: number, emotion: string): EmotionEdit {
+  const { text, regions } = parseTags(tagged);
+  const from = Math.max(0, Math.min(start, end));
+  const to = Math.min(text.length, Math.max(start, end));
+
+  if (emotion === SCORE_BASELINE) {
+    // With a selection: everything it touches. With a bare caret: the region it
+    // sits inside — the only unambiguous reading of "clear here".
+    const hit = regions.filter((r) =>
+      to > from ? r.start < to && from < r.end : r.start <= from && from < r.end);
+    if (hit.length === 0) {
+      return {
+        next: null,
+        message: "Nothing to clear here — baseline is the absence of direction, so select words that already carry a region.",
+      };
+    }
+    const names = [...new Set(hit.map((r) => emotionMeta(r.value).label))].join(", ");
+    return {
+      next: toTags(text, regions.filter((r) => !hit.includes(r))),
+      message: `Cleared the ${names} region${hit.length === 1 ? "" : "s"} — those words return to baseline.`,
+    };
+  }
+
+  const candidate = scoreRegion(from, to, emotion);
+  const why = regionProblem(text, candidate, regions);
+  if (why) return { next: null, message: why };
+  return { next: toTags(text, [...regions, candidate]), message: null };
 }
 
 // ── the limits the SERVER actually enforces ─────────────────────────────────
