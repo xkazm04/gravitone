@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useState } from "react";
 import ScoreEditor from "./ScoreEditor";
+import { parseTags } from "./shared";
 
 // The score is a VIEW of a string the engine already understands, so every test
 // here asserts on the string that comes back out. If the editor's picture and
@@ -292,5 +293,135 @@ describe("ScoreEditor — the markup is available, not imposed", () => {
     fireEvent.click(screen.getByRole("button", { name: "markup" }));
     // A <pre>, not an input: the caret must never sit inside markup again.
     expect(screen.getByText(raw, { selector: "pre" })).toBeInTheDocument();
+  });
+});
+
+// The scale the Host offers is ["excited","whisper","sad"] plus the recorded
+// ones, so `confused` is NOT addressable — which is exactly the constraint the
+// director has to respect.
+const DIRECTABLE = "Hello there. This part is amazing! It ended quietly (or so they said)...";
+
+const ghosts = () => [...screen.getByTestId("score-mirror").querySelectorAll("[data-suggested]")];
+const rows = () => screen.getAllByRole("listitem");
+
+describe("ScoreEditor — the director proposes, it never applies", () => {
+  it("changes NOTHING about the string when it proposes", () => {
+    mount(DIRECTABLE);
+    fireEvent.click(screen.getByRole("button", { name: /direct this text/ }));
+    expect(wire()).toBe(DIRECTABLE);
+    expect(rows().length).toBeGreaterThan(0);
+  });
+
+  it("draws suggestions as ghosts, visibly distinct from a placed region", () => {
+    mount(DIRECTABLE);
+    fireEvent.click(screen.getByRole("button", { name: /direct this text/ }));
+    const ghost = ghosts()[0] as HTMLElement;
+    expect(ghost).toBeTruthy();
+    // Dashed underline, not the solid inset rule a real region carries — a
+    // difference of SHAPE, so it survives a reader who cannot compare tints.
+    expect(ghost.style.textDecorationStyle).toBe("dashed");
+    expect(ghost.style.boxShadow).toBe("");
+    expect(screen.getByTestId("score-mirror").querySelectorAll("[data-emotion]")).toHaveLength(0);
+  });
+
+  it("states the method rather than implying it understood the words", () => {
+    mount(DIRECTABLE);
+    fireEvent.click(screen.getByRole("button", { name: /direct this text/ }));
+    expect(screen.getByText(/from punctuation and phrasing/)).toBeInTheDocument();
+    expect(screen.getByText(/not a reading/)).toBeInTheDocument();
+  });
+
+  it("shows the RULE behind each suggestion", () => {
+    mount(DIRECTABLE);
+    fireEvent.click(screen.getByRole("button", { name: /direct this text/ }));
+    expect(screen.getByText("ends in an exclamation")).toBeInTheDocument();
+    expect(screen.getByText("a bracketed aside")).toBeInTheDocument();
+  });
+
+  it("accepts ONE suggestion into the string and drops its row", () => {
+    mount(DIRECTABLE);
+    fireEvent.click(screen.getByRole("button", { name: /direct this text/ }));
+    const before = rows().length;
+    fireEvent.click(screen.getAllByRole("button", { name: /^Accept / })[0]);
+    expect(wire()).toContain("[excited]This part is amazing![/excited]");
+    expect(rows()).toHaveLength(before - 1);
+  });
+
+  it("rejects one without touching the string", () => {
+    mount(DIRECTABLE);
+    fireEvent.click(screen.getByRole("button", { name: /direct this text/ }));
+    const before = rows().length;
+    fireEvent.click(screen.getAllByRole("button", { name: /^Reject / })[0]);
+    expect(wire()).toBe(DIRECTABLE);
+    expect(rows()).toHaveLength(before - 1);
+  });
+
+  it("re-aims a suggestion and applies the emotion the USER chose", () => {
+    mount(DIRECTABLE);
+    fireEvent.click(screen.getByRole("button", { name: /direct this text/ }));
+    fireEvent.change(screen.getAllByRole("combobox", { name: /Emotion for the suggestion/ })[0], {
+      target: { value: "sad" },
+    });
+    fireEvent.click(screen.getAllByRole("button", { name: /^Accept / })[0]);
+    expect(wire()).toContain("[sad]This part is amazing![/sad]");
+  });
+
+  it("accepts all of them at once, and announces how many landed", () => {
+    mount(DIRECTABLE);
+    fireEvent.click(screen.getByRole("button", { name: /direct this text/ }));
+    const n = rows().length;
+    fireEvent.click(screen.getByRole("button", { name: "accept all" }));
+    expect(screen.queryAllByRole("listitem")).toHaveLength(0);
+    expect(applied()).toBe(`Accepted ${n} suggestions.`);
+    expect(parseTags(wire() ?? "").text).toBe(DIRECTABLE);
+  });
+
+  it("dismisses all of them and says nothing was changed", () => {
+    mount(DIRECTABLE);
+    fireEvent.click(screen.getByRole("button", { name: /direct this text/ }));
+    fireEvent.click(screen.getByRole("button", { name: "dismiss all" }));
+    expect(screen.queryAllByRole("listitem")).toHaveLength(0);
+    expect(wire()).toBe(DIRECTABLE);
+    expect(screen.getByText(/nothing was changed/)).toBeInTheDocument();
+  });
+
+  it("DROPS the proposal when the words under it change, and says why", () => {
+    mount(DIRECTABLE);
+    fireEvent.click(screen.getByRole("button", { name: /direct this text/ }));
+    fireEvent.change(area(), { target: { value: `${DIRECTABLE} More.` } });
+    expect(screen.queryAllByRole("listitem")).toHaveLength(0);
+    expect(screen.getByText(/you changed the words they were made for/)).toBeInTheDocument();
+  });
+
+  it("withdraws a suggestion the user has just directed themselves", () => {
+    mount(DIRECTABLE);
+    fireEvent.click(screen.getByRole("button", { name: /direct this text/ }));
+    const before = rows().length;
+    select(13, 34); // "This part is amazing!" — the same words one suggestion covers
+    fireEvent.click(screen.getByRole("button", { name: "+ add region" }));
+    expect(rows()).toHaveLength(before - 1);
+  });
+
+  it("marks the fallback consequence for an emotion this Character has not recorded", () => {
+    // `sad` is on the scale offered but is not in `available`, so it renders
+    // through the fallback chain — said in composerWarnings' own words.
+    mount(DIRECTABLE);
+    fireEvent.click(screen.getByRole("button", { name: /direct this text/ }));
+    fireEvent.change(screen.getAllByRole("combobox", { name: /Emotion for the suggestion/ })[0], {
+      target: { value: "sad" },
+    });
+    expect(screen.getByText(/Sad is not recorded for this Character/)).toBeInTheDocument();
+  });
+
+  it("says plainly when the rules found nothing, rather than pretending to think", () => {
+    mount("The report landed on Tuesday. It was thorough and dull.");
+    fireEvent.click(screen.getByRole("button", { name: /direct this text/ }));
+    expect(screen.queryAllByRole("listitem")).toHaveLength(0);
+    expect(screen.getByText(/punctuation, capitals and brackets, and found none/)).toBeInTheDocument();
+  });
+
+  it("offers nothing to direct when there is nothing written", () => {
+    mount("");
+    expect(screen.getByRole("button", { name: /direct this text/ })).toBeDisabled();
   });
 });

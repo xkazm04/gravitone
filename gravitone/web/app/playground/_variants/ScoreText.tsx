@@ -34,8 +34,11 @@ import { emotionMeta } from "@/lib/emotions";
 import type { ScoreRegion } from "./shared";
 
 /** One painted run of the surface: a slice of the text that is uniformly
- *  directed (or not) and uniformly selected (or not). */
-export type TextRun = { start: number; end: number; value?: string; selected: boolean };
+ *  directed (or not), uniformly PROPOSED (or not), and uniformly selected (or
+ *  not). `value` and `suggested` are mutually exclusive by construction — a
+ *  suggestion over words the user already directed is dropped before it ever
+ *  reaches here (suggest.ts::propose). */
+export type TextRun = { start: number; end: number; value?: string; suggested?: string; selected: boolean };
 
 /**
  * Slice `text` at every region edge AND every selection edge.
@@ -53,6 +56,7 @@ export function runs(
   text: string,
   regions: ScoreRegion[],
   selection?: { start: number; end: number } | null,
+  suggestions: ScoreRegion[] = [],
 ): TextRun[] {
   const len = text.length;
   if (len === 0) return [];
@@ -61,7 +65,7 @@ export function runs(
   const hasSel = !!selection && selTo > selFrom;
 
   const cuts = new Set<number>([0, len]);
-  for (const r of regions) {
+  for (const r of [...regions, ...suggestions]) {
     if (r.start > 0 && r.start < len) cuts.add(r.start);
     if (r.end > 0 && r.end < len) cuts.add(r.end);
   }
@@ -77,10 +81,12 @@ export function runs(
     const end = edges[i + 1];
     if (end <= start) continue;
     const region = regions.find((r) => r.start <= start && end <= r.end);
+    const ghost = region ? undefined : suggestions.find((r) => r.start <= start && end <= r.end);
     out.push({
       start,
       end,
       value: region?.value,
+      suggested: ghost?.value,
       selected: hasSel && selFrom <= start && end <= selTo,
     });
   }
@@ -99,6 +105,23 @@ export function runs(
 function runStyle(run: TextRun): React.CSSProperties {
   const shadows: string[] = [];
   let background: string | undefined;
+  let decoration: React.CSSProperties = {};
+  if (run.suggested) {
+    // A PROPOSAL, drawn as one: a fainter wash and a DASHED rule rather than
+    // the solid one a placed region gets. The difference is a shape, not an
+    // opacity, so "the machine guessed this" and "I decided this" stay distinct
+    // for a reader who cannot compare two tints. `text-decoration` is used
+    // rather than a fourth box-shadow because box-shadows cannot be dashed —
+    // and, like them, it costs no layout, so the mirror stays in step.
+    const { hue } = emotionMeta(run.suggested);
+    background = `hsl(${hue} 82% 55% / 0.10)`;
+    decoration = {
+      textDecorationLine: "underline",
+      textDecorationStyle: "dashed",
+      textDecorationColor: `hsl(${hue} 88% 68% / 0.9)`,
+      textUnderlineOffset: "3px",
+    };
+  }
   if (run.value) {
     const { hue } = emotionMeta(run.value);
     background = `hsl(${hue} 82% 55% / 0.26)`;
@@ -116,7 +139,7 @@ function runStyle(run: TextRun): React.CSSProperties {
     background = run.value ? background : "rgba(148,180,255,0.22)";
     shadows.push("inset 0 0 0 1px rgba(190,214,255,0.7)");
   }
-  return { background, boxShadow: shadows.length ? shadows.join(", ") : undefined };
+  return { ...decoration, background, boxShadow: shadows.length ? shadows.join(", ") : undefined };
 }
 
 /** Typography and box shared, character for character, by the two layers. The
@@ -127,6 +150,7 @@ const SHELL = "font-hanken block w-full px-3 py-2 text-sm leading-relaxed";
 export default function ScoreText({
   text,
   regions,
+  suggestions = [],
   selection,
   onChangeText,
   onSelectionChange,
@@ -143,6 +167,9 @@ export default function ScoreText({
   /** PLAIN text — the same characters the regions' offsets are counted in. */
   text: string;
   regions: ScoreRegion[];
+  /** Spans the director has PROPOSED and the user has not accepted. Drawn as
+   *  ghosts; never part of the string until accepted. */
+  suggestions?: ScoreRegion[];
   /** The range to keep visible while focus is elsewhere. */
   selection?: { start: number; end: number } | null;
   onChangeText: (next: string) => void;
@@ -210,7 +237,7 @@ export default function ScoreText({
   // The mirror always holds the CHARACTERS — it is the thing being measured, and
   // an emptied mirror could never be measured back into agreement, so switching
   // the overlay off would latch forever. Only the PAINT is withdrawn.
-  const parts = runs(text, regions, selection);
+  const parts = runs(text, regions, selection, suggestions);
 
   return (
     <div
@@ -230,6 +257,7 @@ export default function ScoreText({
           <span
             key={run.start}
             data-emotion={aligned ? run.value ?? undefined : undefined}
+            data-suggested={aligned ? run.suggested ?? undefined : undefined}
             style={aligned ? runStyle(run) : undefined}
           >
             {text.slice(run.start, run.end)}

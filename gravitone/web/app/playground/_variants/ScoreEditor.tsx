@@ -31,6 +31,14 @@ import { emotionMeta } from "@/lib/emotions";
 import { useCopyFeedback } from "@/lib/useCopyFeedback";
 import ScoreText from "./ScoreText";
 import {
+  accept, asRegion, fallbackNote, propose, proposalSummary, REASONS,
+  // Aliased: `retag` is already this component's word for re-aiming a PLACED
+  // region, and the two must not be confused — one edits the string, the other
+  // edits a proposal that is not in the string yet.
+  reject as rejectSuggestion, retag as retagSuggestion,
+  type Suggestion,
+} from "./suggest";
+import {
   applyEmotion, DEFAULT_EXPRESSION, editPlainText, parseTags, regionProblem, scoreRegion, toTags,
   wrappedAnnouncement, type Expression, type ScoreRegion,
 } from "./shared";
@@ -90,6 +98,11 @@ export default function ScoreEditor({
   const [pending, setPending] = useState<string>("");
   const [showRaw, setShowRaw] = useState(false);
   const [applied, setApplied] = useState<string | null>(null);
+  // The director's open proposal. Never part of `value` — a suggestion the user
+  // has not accepted must not reach the engine, and this state is the whole
+  // reason it cannot.
+  const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
+  const [directorNote, setDirectorNote] = useState<string | null>(null);
   const { copied, failed, copy } = useCopyFeedback();
 
   const railRef = useRef<HTMLDivElement>(null);
@@ -128,7 +141,53 @@ export default function ScoreEditor({
     const { next, message } = editPlainText(value, nextText);
     if (message) setSelected(null);
     setNotice(message);
+    // Suggestions are offsets into the text that produced them. Rather than
+    // carrying them across an edit — which would land a proposal the user never
+    // saw on words it was not made for — the proposal is DROPPED and says so.
+    // `transformRegions` exists for direction the user chose; a guess has not
+    // earned that benefit of the doubt.
+    if (suggestions.length > 0) {
+      setSuggestions([]);
+      setDirectorNote("Suggestions dropped — you changed the words they were made for. Direct the text again for a fresh pass.");
+    }
     onChange(next);
+  }
+
+  // ── the director ───────────────────────────────────────────────────────────
+  /** Propose spans over the current text. Synchronous and local — there is no
+   *  request to gate, cancel or fail, because there is no model: see suggest.ts
+   *  for why this is rules rather than the narrate endpoint the idea assumed. */
+  function direct() {
+    const found = propose(text, choices, regions);
+    setSuggestions(found);
+    setDirectorNote(proposalSummary(found.length));
+    setNotice(null);
+  }
+
+  /** Accept some of the proposal. One fold through `applyEmotion`, so an
+   *  accepted suggestion is exactly a hand-placed region — and a refusal is
+   *  reported in the composer's own words rather than counted as a success. */
+  function take(indexes: number[]) {
+    const result = accept(value, suggestions, indexes);
+    const survivors = suggestions.filter(
+      (s, i) => !indexes.includes(i) || result.refused.some((r) => r.suggestion === s),
+    );
+    setSuggestions(survivors);
+    if (result.applied > 0) {
+      onChange(result.next);
+      setApplied(`Accepted ${result.applied} suggestion${result.applied === 1 ? "" : "s"}.`);
+    }
+    setNotice(result.refused[0]?.why ?? null);
+    setDirectorNote(
+      survivors.length > 0
+        ? `${survivors.length} suggestion${survivors.length === 1 ? "" : "s"} left to review.`
+        : null,
+    );
+  }
+
+  function dismissAll() {
+    setSuggestions([]);
+    setDirectorNote("Suggestions dismissed — nothing was changed.");
   }
 
   // ── regions ────────────────────────────────────────────────────────────────
@@ -147,9 +206,14 @@ export default function ScoreEditor({
     // A clearance names itself in the notice; only the ordinary success — the
     // one that used to be completely silent — needs saying here.
     setApplied(message ? null : wrappedAnnouncement(text, sel.start, sel.end, chosen));
+    // A suggestion over words the user has now directed themselves is no longer
+    // acceptable (the grammar cannot nest, so `applyEmotion` would refuse it)
+    // and no longer wanted. Drop it silently — the user answered the question.
+    const from = Math.min(sel.start, sel.end);
+    const to = Math.max(sel.start, sel.end);
+    setSuggestions((list) => list.filter((s) => !(s.start < to && from < s.end)));
     // Open the inspector on what was just placed. The index is read back off
     // the NEW string rather than guessed, because regions are always re-derived.
-    const from = Math.min(sel.start, sel.end);
     const placed = parseTags(next).regions.findIndex((r) => r.start === from && r.value === chosen);
     setSelected(placed >= 0 ? placed : null);
     onChange(next);
@@ -313,6 +377,7 @@ export default function ScoreEditor({
       <ScoreText
         text={text}
         regions={regions}
+        suggestions={suggestions.map(asRegion)}
         selection={sel}
         onChangeText={editText}
         onSelectionChange={setSel}
@@ -340,6 +405,97 @@ export default function ScoreEditor({
             {value || "(empty)"}
           </pre>
         </div>
+      )}
+
+      {/* The director. Deliberately below the text and above the lane: it acts
+          on what is written and produces things you then review. */}
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          onClick={direct}
+          disabled={disabled || text.trim().length === 0}
+          className="font-jetbrains rounded-full border border-violet-400/30 bg-violet-400/5 px-3 py-1 text-[11px] text-violet-200 transition enabled:hover:bg-violet-400/10 disabled:opacity-40"
+        >
+          ✎ direct this text
+        </button>
+        {suggestions.length > 0 && (
+          <>
+            <button
+              type="button"
+              onClick={() => take(suggestions.map((_, i) => i))}
+              disabled={disabled}
+              className="font-jetbrains rounded-full border border-white/15 px-3 py-1 text-[11px] text-white/75 transition enabled:hover:border-emerald-400/40 enabled:hover:text-emerald-200 disabled:opacity-40"
+            >
+              accept all
+            </button>
+            <button
+              type="button"
+              onClick={dismissAll}
+              className="font-jetbrains rounded-full border border-white/15 px-3 py-1 text-[11px] text-white/60 transition hover:border-white/30 hover:text-white/80"
+            >
+              dismiss all
+            </button>
+          </>
+        )}
+        {directorNote && (
+          <span className="font-jetbrains text-[10px] leading-relaxed text-white/50">{directorNote}</span>
+        )}
+      </div>
+
+      {/* The review. Every row states the RULE that produced it, because the
+          rule is the whole explanation — this pass reads punctuation, capitals
+          and brackets, and a user who is shown that can forgive a weak call.
+          A confident, unexplained guess is the thing to avoid: it would be
+          claiming a comprehension nothing here has. */}
+      {suggestions.length > 0 && (
+        <ul className="space-y-1.5 rounded-xl border border-dashed border-violet-300/25 bg-violet-400/[0.03] px-3 py-2">
+          {suggestions.map((s, i) => {
+            const m = emotionMeta(s.value);
+            const note = fallbackNote(s.value, available);
+            return (
+              <li key={`${s.start}-${s.reason}`} className="flex flex-wrap items-center gap-2">
+                <span
+                  aria-hidden
+                  className="h-2.5 w-2.5 shrink-0 rounded-full border border-dashed"
+                  style={{ borderColor: `hsl(${m.hue} 88% 68%)`, background: `hsl(${m.hue} 82% 55% / 0.2)` }}
+                />
+                <span className="font-hanken min-w-0 flex-1 truncate text-[12px] text-white/80">
+                  &ldquo;{text.slice(s.start, s.end)}&rdquo;
+                </span>
+                <select
+                  value={s.value}
+                  disabled={disabled}
+                  onChange={(e) => setSuggestions((list) => retagSuggestion(list, i, e.target.value))}
+                  aria-label={`Emotion for the suggestion at characters ${s.start} to ${s.end}`}
+                  className="font-jetbrains rounded-lg border border-white/15 bg-black/40 px-2 py-0.5 text-[11px] text-white/85 focus:border-cyan-400/40 focus:outline-none"
+                >
+                  {[...new Set([s.value, ...choices])].map((id) => (
+                    <option key={id} value={id} className="bg-slate-900 text-white">{emotionMeta(id).label}</option>
+                  ))}
+                </select>
+                <span className="font-jetbrains text-[10px] text-white/45">{REASONS[s.reason]}</span>
+                <button
+                  type="button"
+                  onClick={() => take([i])}
+                  disabled={disabled}
+                  aria-label={`Accept ${m.label} for "${text.slice(s.start, s.end)}"`}
+                  className="font-jetbrains rounded-full border border-white/15 px-2.5 py-0.5 text-[11px] text-white/75 transition enabled:hover:border-emerald-400/40 enabled:hover:text-emerald-200 disabled:opacity-40"
+                >
+                  accept
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSuggestions((list) => rejectSuggestion(list, i))}
+                  aria-label={`Reject ${m.label} for "${text.slice(s.start, s.end)}"`}
+                  className="font-jetbrains rounded-full border border-white/15 px-2.5 py-0.5 text-[11px] text-white/55 transition hover:border-rose-400/40 hover:text-rose-200"
+                >
+                  reject
+                </button>
+                {note && <span className="font-jetbrains w-full text-[10px] text-amber-200/80">{note}</span>}
+              </li>
+            );
+          })}
+        </ul>
       )}
 
       {/* The lane. Regions are placed proportionally over the character range,
