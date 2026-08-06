@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   appendEdit, composerLimit, composerWarnings, DEFAULT_EXPRESSION, MAX_SCRIPT_LINES, MAX_TEXT_CHARS, readEdits,
-  scaleSegmentSeconds, segmentRegions, stripTags, type Segment, type Take,
+  scaleSegmentSeconds, segmentRegions, stripTags, wrappedAnnouncement, type Segment, type Take,
 } from "./shared";
 
 const line = (text: string) => ({ text });
@@ -256,5 +256,28 @@ describe("composerWarnings — named outcomes before the render", () => {
     expect(asSolo).not.toMatch(/alsobogus/);
     expect(composerWarnings({ mode: "script", ...both }).map((w) => w.message).join())
       .toMatch(/alsobogus/);
+  });
+});
+
+describe("wrappedAnnouncement — the success nobody was told about", () => {
+  it("counts words, not characters, and names the emotion by its label", () => {
+    expect(wrappedAnnouncement("one two three", 4, 13, "excited")).toBe("Wrapped 2 words in Excited.");
+  });
+
+  it("says 'word' for one word", () => {
+    expect(wrappedAnnouncement("one two three", 4, 7, "sad")).toBe("Wrapped 1 word in Sad.");
+  });
+
+  it("reads a backwards range the same as a forwards one", () => {
+    expect(wrappedAnnouncement("one two three", 13, 4, "excited"))
+      .toBe(wrappedAnnouncement("one two three", 4, 13, "excited"));
+  });
+
+  it("does not count surrounding whitespace as a word", () => {
+    expect(wrappedAnnouncement("one   two", 3, 9, "calm")).toBe("Wrapped 1 word in Calm.");
+  });
+
+  it("labels a custom slot the way every other surface does", () => {
+    expect(wrappedAnnouncement("a b", 0, 3, "wry_aside")).toBe("Wrapped 2 words in Wry Aside.");
   });
 });

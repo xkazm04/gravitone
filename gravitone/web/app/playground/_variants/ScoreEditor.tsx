@@ -32,7 +32,7 @@ import { useCopyFeedback } from "@/lib/useCopyFeedback";
 import ScoreText from "./ScoreText";
 import {
   applyEmotion, DEFAULT_EXPRESSION, editPlainText, parseTags, regionProblem, scoreRegion, toTags,
-  type Expression, type ScoreRegion,
+  wrappedAnnouncement, type Expression, type ScoreRegion,
 } from "./shared";
 
 /** What the console can ask of the score from OUTSIDE it — the emotion chips
@@ -89,6 +89,7 @@ export default function ScoreEditor({
   const [sel, setSel] = useState<{ start: number; end: number }>({ start: 0, end: 0 });
   const [pending, setPending] = useState<string>("");
   const [showRaw, setShowRaw] = useState(false);
+  const [applied, setApplied] = useState<string | null>(null);
   const { copied, failed, copy } = useCopyFeedback();
 
   const railRef = useRef<HTMLDivElement>(null);
@@ -137,7 +138,15 @@ export default function ScoreEditor({
   function place(chosen: string) {
     const { next, message } = applyEmotion(value, sel.start, sel.end, chosen);
     setNotice(message);
-    if (next === null) return;
+    if (next === null) {
+      // The refusal is already in the notice, which IS a live region. Clearing
+      // this one keeps it from re-announcing a stale success on top of it.
+      setApplied(null);
+      return;
+    }
+    // A clearance names itself in the notice; only the ordinary success — the
+    // one that used to be completely silent — needs saying here.
+    setApplied(message ? null : wrappedAnnouncement(text, sel.start, sel.end, chosen));
     // Open the inspector on what was just placed. The index is read back off
     // the NEW string rather than guessed, because regions are always re-derived.
     const from = Math.min(sel.start, sel.end);
@@ -484,6 +493,10 @@ export default function ScoreEditor({
       <p aria-live="polite" className="font-jetbrains min-h-[1rem] text-[11px] leading-relaxed text-amber-200/90">
         {notice}
       </p>
+      {/* …and one for the case that WORKS. The notice is amber and advisory, so
+          a confirmation does not belong in it; sighted users see the span light
+          up, and this is the same event for everyone else. */}
+      <p aria-live="polite" data-testid="score-applied" className="sr-only">{applied}</p>
     </section>
   );
 }

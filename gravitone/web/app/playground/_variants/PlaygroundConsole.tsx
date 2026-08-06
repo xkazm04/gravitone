@@ -24,7 +24,7 @@ import EmotionArt from "@/components/ui/EmotionArt";
 import {
   appendEdit, applyEmotion, composerLimit, composerWarnings, DEFAULT_EXPRESSION, DEFAULT_TEXT,
   editPlainText, isTimingBasis, MAX_SCRIPT_LINES, MAX_TEXT_CHARS, parseTags, readEdits,
-  SCORE_BASELINE, stripTags, TAKE_TIMING_VERSION,
+  SCORE_BASELINE, stripTags, TAKE_TIMING_VERSION, wrappedAnnouncement,
   type Expression, type PerfLine, type ScriptLine, type Segment, type Take,
 } from "./shared";
 // Composer durability — the same IndexedDB mechanism the take log uses.
@@ -264,6 +264,9 @@ export default function PlaygroundConsole() {
   // What the last emotion/text edit did or refused to do, in a sentence. Script
   // mode only — in solo the score states it in its own live region.
   const [scriptNotice, setScriptNotice] = useState<string | null>(null);
+  /** The script composer's "that worked" announcement. Separate from the amber
+   *  notice above, which is advisory copy and the wrong voice for a success. */
+  const [scriptApplied, setScriptApplied] = useState<string | null>(null);
   const scriptSeq = useRef(0);
   const [busy, setBusy] = useState(false);
   // Backpressure (429): engine is up but busy — offer a retry, never fall to
@@ -744,7 +747,11 @@ export default function PlaygroundConsole() {
     const end = el?.selectionEnd ?? plainLen;
     const { next, message } = applyEmotion(cur.text, start, end, emotion);
     setScriptNotice(message);
-    if (next === null) return;
+    if (next === null) { setScriptApplied(null); return; }
+    // Solo says this in the score's own status region; this is script mode's.
+    // A clearance names itself in the notice above, so only the plain success —
+    // the case that used to announce nothing at all — is repeated here.
+    setScriptApplied(message ? null : wrappedAnnouncement(parseTags(cur.text).text, start, end, emotion));
     updateLine(idx, { text: next });
     // The plain text is unchanged by a region edit, so the caret goes back
     // exactly where the user left it.
@@ -1239,6 +1246,13 @@ export default function PlaygroundConsole() {
           a new card slides into a log that is not a live region — so this is
           the only thing that tells a screen-reader user their render finished. */}
       <p role="status" aria-live="polite" className="sr-only">{announcement}</p>
+      {/* Pressing a chip or a wheel spoke in SCRIPT mode was a visual-only
+          event too: the words lit up and nothing was said. `aria-live` without
+          `role="status"` announces just the same, and leaves the take-completion
+          region above as the ONE status role on this page — two of them are two
+          things a test (and a screen-reader user's mental model) has to tell
+          apart by nothing. */}
+      <p aria-live="polite" data-testid="script-applied" className="sr-only">{scriptApplied}</p>
       <EmotionPicker
         open={pickerOpen}
         onClose={() => setPickerOpen(false)}

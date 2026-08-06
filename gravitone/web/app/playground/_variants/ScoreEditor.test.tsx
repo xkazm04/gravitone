@@ -245,3 +245,52 @@ describe("ScoreEditor — honest about what the Character can actually do", () =
     expect(screen.getAllByRole("option").length).toBeGreaterThan(0);
   });
 });
+
+/** The "that worked" region — deliberately NOT the amber notice, which is
+ *  advisory copy and the wrong voice for a success. */
+const applied = () => screen.getByTestId("score-applied").textContent ?? "";
+
+describe("ScoreEditor — applying an emotion is not a visual-only event", () => {
+  it("announces what was wrapped, in words", () => {
+    // The refusals were all announced; the case that WORKS said nothing at all,
+    // so a screen-reader user pressed a chip and was told precisely nothing.
+    mount(TEXT);
+    select(4, 13);
+    fireEvent.click(screen.getByRole("button", { name: "+ add region" }));
+    expect(applied()).toBe("Wrapped 2 words in Excited.");
+  });
+
+  it("counts one word as one word", () => {
+    mount(TEXT);
+    select(4, 7);
+    fireEvent.click(screen.getByRole("button", { name: "+ add region" }));
+    expect(applied()).toBe("Wrapped 1 word in Excited.");
+  });
+
+  it("stays silent about success when the edit was REFUSED", () => {
+    mount(TEXT);
+    select(5, 5);
+    fireEvent.click(screen.getByRole("button", { name: "+ add region" }));
+    expect(applied()).toBe("");
+    expect(notice()).toMatch(/at least one character/);
+  });
+
+  it("does not repeat a clearance that the notice already names", () => {
+    mount("one [excited]two[/excited] three");
+    fireEvent.click(screen.getByRole("button", { name: /Region 1 of 1/ }));
+    fireEvent.click(screen.getByRole("button", { name: "delete" }));
+    expect(notice()).toMatch(/return to baseline/);
+    expect(applied()).toBe("");
+  });
+});
+
+describe("ScoreEditor — the markup is available, not imposed", () => {
+  it("hides the tagged string until asked, then shows it read-only", () => {
+    const raw = "one [excited]two[/excited] three";
+    mount(raw);
+    expect(screen.queryByText(raw, { selector: "pre" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "markup" }));
+    // A <pre>, not an input: the caret must never sit inside markup again.
+    expect(screen.getByText(raw, { selector: "pre" })).toBeInTheDocument();
+  });
+});

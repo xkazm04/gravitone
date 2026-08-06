@@ -527,6 +527,25 @@ export function editPlainText(tagged: string, nextText: string): { next: string;
 }
 
 /**
+ * What a SUCCESSFUL emotion edit did, in words, for a live region.
+ *
+ * Every refusal already reaches a screen reader (the composers' notices are
+ * `aria-live`), and `baseline` says what it cleared — but the ordinary case,
+ * the one that happens every time the thing works, produced no message at all.
+ * A sighted user sees a span light up; a screen-reader user pressed a button
+ * in the emotion wheel and was told nothing whatsoever.
+ *
+ * Counted in WORDS rather than characters because that is the unit the author
+ * selected in, and the emotion is named by its LABEL for the same reason the
+ * chips are.
+ */
+export function wrappedAnnouncement(plain: string, start: number, end: number, emotion: string): string {
+  const slice = plain.slice(Math.max(0, Math.min(start, end)), Math.max(start, end));
+  const words = slice.trim().split(/\s+/).filter(Boolean).length;
+  return `Wrapped ${words} word${words === 1 ? "" : "s"} in ${emotionMeta(emotion).label}.`;
+}
+
+/**
  * Direct characters [start, end) of the plain text behind `tagged` as `emotion`
  * — or, for `baseline`, CLEAR the direction there.
  *
