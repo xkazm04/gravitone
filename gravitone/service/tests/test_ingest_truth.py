@@ -5,7 +5,7 @@ the mode's own limits, the speech-detection outcome, and the levels that
 outcome was decided on — and every one of them died at the API boundary: they
 were never written into the job dict, and `_PUBLIC_KEYS` had no slot for them
 even if they had been. The visible consequence was a studio that kept its own
-hand-typed copy of SOVEREIGN_LIMITS (free to drift) and a user whose `auto`
+hand-typed copy of the sovereign limits (free to drift) and a user whose `auto`
 scan resolved to sovereign being told nothing about it.
 
 No audio and no ffmpeg here: the pipeline call is mocked, because what is under
@@ -65,19 +65,19 @@ class IngestTruthTests(unittest.TestCase):
         res = {"duration": 12.0, "transcript": "", "note": NOTE,
                "speakers": [{"id": "speaker_0", "utterances": 1, "seconds": 12.0,
                              "sample_text": "sovereign mode — one take"}],
-               "limits": list(ingest.SOVEREIGN_LIMITS), "detection": DETECTION}
+               "limits": list(ingest.sovereign_limits()), "detection": DETECTION}
         with mock.patch.object(ingest, "sovereign_analyze", return_value=res):
             ingest_api._analyze("sovereign", audio)
 
         self.assertEqual(job["status"], "awaiting_speaker")
         # persisted in job state …
         self.assertEqual(job["note"], NOTE)
-        self.assertEqual(job["limits"], list(ingest.SOVEREIGN_LIMITS))
+        self.assertEqual(job["limits"], list(ingest.sovereign_limits()))
         self.assertEqual(job["detection"], DETECTION)
         # … AND served (a key the job holds but _PUBLIC_KEYS omits is thrown away)
         body = self.client.get("/v1/ingest/sovereign").json()
         self.assertEqual(body["note"], NOTE)
-        self.assertEqual(body["limits"], list(ingest.SOVEREIGN_LIMITS))
+        self.assertEqual(body["limits"], list(ingest.sovereign_limits()))
         self.assertEqual(body["detection"], DETECTION)
         self.assertEqual(body["detection"]["outcome"], "unbroken")
 
@@ -105,9 +105,9 @@ class IngestTruthTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         body = r.json()
         # Equality with the live constant is the anti-drift test: the studio
-        # renders exactly this, so a change to SOVEREIGN_LIMITS reaches the UI
+        # renders exactly this, so a change to sovereign_limits() reaches the UI
         # without anyone re-typing it.
-        self.assertEqual(body["sovereign"]["limits"], list(ingest.SOVEREIGN_LIMITS))
+        self.assertEqual(body["sovereign"]["limits"], list(ingest.sovereign_limits()))
         self.assertEqual(body["sovereign"]["note"], ingest.sovereign_note())
 
     def test_modes_is_not_swallowed_by_the_job_route(self) -> None:

@@ -11,7 +11,7 @@
 // and its verdict is the one that counts.
 //
 // WHY A COPY AT ALL: nothing serves these numbers. GET /v1/ingest/modes serves
-// SOVEREIGN_LIMITS and resolve_mode() but not the caps, and putting them there
+// sovereign_limits() and resolve_mode() but not the caps, and putting them there
 // is a service/ change this wave cannot make. Until it does, this module — not
 // a scattering of consts next to the validator and a hand-typed sentence in the
 // dropzone — is the single web-side copy. The previous arrangement is exactly

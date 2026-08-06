@@ -1806,11 +1806,31 @@ def modes() -> dict:
     swallow this path and answer "job expired". The studio used to hand-write
     sovereign's limits into its upload panel, one copy per side of the API with
     nothing to catch a drift; `resolve_mode` is served with them so a user whose
-    `auto` will resolve to sovereign is told before they upload, not after."""
+    `auto` will resolve to sovereign is told before they upload, not after.
+
+    Sovereign's limits are probed, not fixed: the offline diarizer is an
+    optional ~34 MB download, so what the mode can promise differs BY MACHINE.
+    `diarization.available` says which of the two answers this box is giving,
+    and `enable` is the exact command that changes it."""
+    have_diarizer = ingest.diarization_available()
     return {
         "resolved_auto": ingest.resolve_mode("auto"),
-        "sovereign": {"limits": list(ingest.SOVEREIGN_LIMITS),
-                      "note": ingest.sovereign_note()},
+        "sovereign": {"limits": list(ingest.sovereign_limits(have_diarizer)),
+                      "note": ingest.sovereign_note(have_diarizer),
+                      "diarization": {
+                          "available": have_diarizer,
+                          "enable": "python -m service.diarize --download",
+                          # Restated everywhere this travels, on purpose.
+                          "speaker_count_is_a_hypothesis": True,
+                          "detail": (
+                              "speakers are separated on this machine; the count "
+                              "skews high and is unreliable on synthetic speech, "
+                              "so check the previews before picking"
+                              if have_diarizer else
+                              "sovereign scans treat the whole recording as one "
+                              "speaker until the local diarizer is downloaded "
+                              "(~34 MB, once, no account); nothing leaves the "
+                              "machine either way")}},
     }
 
 

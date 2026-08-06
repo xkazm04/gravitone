@@ -616,6 +616,24 @@ GEMINI_API_KEY=…        # emotion classification (gemini-3.5-flash → 3.1-pro
 HF_TOKEN=…              # first-run only: gated pocket-tts voice-cloning weights
 ```
 
+Without those keys ingestion runs in **sovereign mode** — ffmpeg only, nothing
+leaves the machine. It separates speakers too, if the optional offline diarizer
+has been fetched:
+
+```bash
+python -m service.diarize --download        # ~34 MB, once, no account
+```
+
+With it, a two-voice recording produces one preview per speaker and the same
+speaker-pick screen the cloud path uses, at $0.00. Without it, the whole
+recording is treated as one speaker, exactly as before — never an error. Either
+way the speaker **count is a hypothesis**: it skews high (one person can come
+back as two) and it is unreliable on synthetic/TTS speech, so listen to the
+previews before picking. `DIARIZE_THRESHOLD` is the dial. `GET /v1/ingest/modes`
+reports which of the two answers this box is currently giving, and sovereign
+mode's stated limits change with it rather than being a constant that would be
+false half the time.
+
 **Product 2 — web studio (`web/`).** Next.js 15 app (playground, voice &
 Character management, API keys, Firebase Google-auth + Firestore profiles, and the
 recording-ingestion flow). It talks to the backend via **`GRAVITONE_URL`**:

@@ -14,12 +14,19 @@ covered here:
   * the degenerate outcomes — silent, unbroken, too short — each of which used
     to collapse into the same wordless fallback ("use the whole file").
   * `clean_local` and `sovereign_analyze` end to end (ffmpeg required).
+  * the speaker overlay — `assign_speakers` / `diarize_segments`, which put the
+    optional offline diarizer's turns on top of those spans. The diarizer is a
+    ~34 MB download and is STUBBED here: no model, no sherpa-onnx, no network,
+    so CI exercises the mapping and every fallback without fetching anything.
+    The stub is the seam the real one plugs into (`DiarizationResult`/`Turn`
+    from service/diarize.py), not a parallel invention.
 
 Nothing here touches the network; that is the point of the mode.
 """
 from __future__ import annotations
 
 import array
+import contextlib
 import json
 import math
 import shutil
@@ -30,6 +37,7 @@ from tempfile import TemporaryDirectory
 from unittest import mock
 
 from service import ingest
+from service.diarize import DiarizationResult, Turn
 from service.emotions import BASELINE
 from service.errors import UserFacing
 
@@ -129,6 +137,35 @@ def legacy_detect(wav: Path, noise_db: float = -35.0, min_silence: float = 0.5,
                          "end": round(chunk_end, 3), "text": ""})
             cur = chunk_end
     return segs
+
+
+# ── the diarizer, stubbed ────────────────────────────────────────────────────
+# The real one is sherpa-onnx plus ~34 MB of models fetched on demand — neither
+# of which CI has or should acquire. What IS exercised here is every line
+# ingest.py owns: the overlay, the fallbacks, and the copy each one produces.
+@contextlib.contextmanager
+def _stub_diarizer(result):
+    """`result` None → not installed; a DiarizationResult → that answer; an
+    Exception instance → the diarizer broke mid-scan."""
+    from service import diarize as real
+
+    if result is None:
+        with mock.patch.object(real, "available", return_value=False):
+            yield
+        return
+
+    def _run(audio, **kw):
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    with mock.patch.object(real, "available", return_value=True),          mock.patch.object(real, "diarize", side_effect=_run):
+        yield
+
+
+def _turns(*spec: tuple[float, float, str]) -> DiarizationResult:
+    return DiarizationResult(turns=[Turn(a, b, who) for a, b, who in spec],
+                             diarize_s=0.01)
 
 
 class ResolveModeTests(unittest.TestCase):
@@ -376,16 +413,20 @@ class CleanLocalTests(unittest.TestCase):
 class SovereignAnalyzeTests(unittest.TestCase):
     """End to end, with no network available to it by construction."""
 
-    def _run(self, pattern, amp=0.4, floor_amp=0.0005):
+    def _run(self, pattern, amp=0.4, floor_amp=0.0005, diarizer=None):
+        """`diarizer` is a stub result, or None for "not installed" — which is
+        pinned rather than inherited from the machine, because a developer who
+        HAS the models would otherwise get different assertions than CI."""
         td = TemporaryDirectory()
         wd = Path(td.name)
         src = wd / "src.wav"
         _clip(src, pattern, amp=amp, floor_amp=floor_amp)
         steps: list[tuple[str, str]] = []
         parts: list[dict] = []
-        res = ingest.sovereign_analyze(
-            src, wd / "work", progress=lambda k, s: steps.append((k, s)),
-            partial=parts.append)
+        with _stub_diarizer(diarizer):
+            res = ingest.sovereign_analyze(
+                src, wd / "work", progress=lambda k, s: steps.append((k, s)),
+                partial=parts.append)
         return td, wd / "work", res, steps, parts
 
     def test_end_to_end_shape_and_artifacts(self) -> None:
@@ -410,7 +451,7 @@ class SovereignAnalyzeTests(unittest.TestCase):
         td, work, res, steps, parts = self._run(TALK)
         with td:
             blob = " ".join(res["limits"]).lower()
-            for must in ("baseline", "diarization", "transcri"):
+            for must in ("baseline", "diariz", "transcri"):
                 self.assertIn(must, blob)
             self.assertEqual(res["detection"]["outcome"], "spans")
             self.assertTrue(res["detection"]["adaptive"])
@@ -469,6 +510,198 @@ class SovereignAnalyzeTests(unittest.TestCase):
             self.assertTrue(base["eligible"])
             self.assertTrue((work / "stem_baseline.wav").is_file())
             self.assertEqual(out["spend"]["total_calls"], 0)   # nothing left the box
+
+
+# ── the speaker overlay ──────────────────────────────────────────────────────
+class AssignSpeakersTests(unittest.TestCase):
+    """Turns onto spans. Pure arithmetic — no audio, no ffmpeg, no models.
+
+    The invariant under every one of these: the spans decide what is speech and
+    the overlay may only decide WHO. So the total labelled duration equals the
+    span duration in every case, including the ones where the diarizer is wrong.
+    """
+
+    def _total(self, pieces) -> float:
+        return round(sum(b - a for a, b, _ in pieces), 6)
+
+    def test_span_inside_one_turn_is_left_whole(self) -> None:
+        out = ingest.assign_speakers([(2.0, 5.0)], _turns((0.0, 10.0, "speaker_0")))
+        self.assertEqual(out, [(2.0, 5.0, "speaker_0")])
+
+    def test_span_straddling_a_change_is_cut_at_the_boundary(self) -> None:
+        out = ingest.assign_speakers(
+            [(2.0, 8.0)], _turns((0.0, 5.0, "speaker_0"), (5.0, 12.0, "speaker_1")))
+        self.assertEqual(out, [(2.0, 5.0, "speaker_0"), (5.0, 8.0, "speaker_1")])
+        self.assertEqual(self._total(out), 6.0)
+
+    def test_uncovered_audio_keeps_a_neighbours_label_never_dropped(self) -> None:
+        """The diarizer's VAD is stricter than the level detector's. Audio it
+        skipped is still speech — the level detector measured it — so it is
+        labelled from the surrounding turns rather than deleted."""
+        out = ingest.assign_speakers(
+            [(0.0, 10.0)], _turns((3.0, 4.0, "speaker_0"), (6.0, 7.0, "speaker_1")))
+        self.assertEqual(self._total(out), 10.0)
+        self.assertEqual(out[0][0], 0.0)
+        self.assertEqual(out[-1][1], 10.0)
+        self.assertEqual([who for _, _, who in out], ["speaker_0", "speaker_1"])
+
+    def test_span_with_no_turn_at_all_goes_to_the_nearest_voice(self) -> None:
+        out = ingest.assign_speakers(
+            [(20.0, 24.0)], _turns((0.0, 5.0, "speaker_0"), (6.0, 9.0, "speaker_1")))
+        self.assertEqual(out, [(20.0, 24.0, "speaker_1")])
+
+    def test_no_turns_at_all_is_one_speaker(self) -> None:
+        out = ingest.assign_speakers([(0.0, 4.0)], DiarizationResult())
+        self.assertEqual(out, [(0.0, 4.0, "speaker_0")])
+
+    def test_same_speaker_either_side_of_a_pause_does_not_fragment(self) -> None:
+        """A turn boundary that lands in a pause must not split one person's
+        span into two segments that later fail the min-duration test."""
+        out = ingest.assign_speakers(
+            [(0.0, 3.0), (4.0, 7.0)],
+            _turns((0.0, 3.5, "speaker_0"), (3.5, 8.0, "speaker_0")))
+        self.assertEqual(out, [(0.0, 3.0, "speaker_0"), (4.0, 7.0, "speaker_0")])
+
+
+class SovereignLimitsCopyTests(unittest.TestCase):
+    """Stale capability copy is the known bug class here. The limits are
+    probed per machine, so BOTH answers have to be true when they are given."""
+
+    def test_absent_diarizer_names_the_command_that_enables_speakers(self) -> None:
+        blob = " ".join(ingest.sovereign_limits(False))
+        self.assertIn("single speaker", blob)
+        self.assertIn("service.diarize --download", blob)
+        # the old copy claimed the capability did not exist; it does
+        self.assertNotIn("there is no local diarization", blob)
+        self.assertIn("no diarization", ingest.sovereign_note(False))
+
+    def test_present_diarizer_states_the_caveats_not_a_promise(self) -> None:
+        blob = " ".join(ingest.sovereign_limits(True))
+        self.assertIn("hypothesis", blob)
+        self.assertIn("skews HIGH", blob)
+        self.assertIn("synthetic", blob)
+        self.assertIn("DIARIZE_THRESHOLD", blob)
+        # …and it must not still be telling the user to download what they have
+        self.assertNotIn("--download", blob)
+        self.assertIn("hypothesis", ingest.sovereign_note(True))
+
+    def test_the_other_two_limits_are_unchanged_by_the_diarizer(self) -> None:
+        for have in (True, False):
+            blob = " ".join(ingest.sovereign_limits(have))
+            self.assertIn("one emotion only", blob)
+            self.assertIn("no transcript", blob)
+
+    def test_an_unprobeable_diarizer_promises_less_rather_than_raising(self) -> None:
+        with mock.patch("service.diarize.available", side_effect=OSError("boom")):
+            self.assertFalse(ingest.diarization_available())
+            self.assertIn("--download", " ".join(ingest.sovereign_limits()))
+
+
+@unittest.skipUnless(HAVE_FFMPEG, "ffmpeg not available")
+class SovereignDiarizationTests(unittest.TestCase):
+    """Sovereign mode with the diarizer in each of its states. Borrows `_run`
+    (not by subclassing, which would re-run the whole class above), and that
+    helper pins the stub — nothing here reaches sherpa-onnx or the network."""
+
+    _run = SovereignAnalyzeTests._run
+
+    def _segments(self, work: Path) -> list[dict]:
+        return json.loads((work / "segments.json").read_text("utf-8"))
+
+    def test_two_speakers_get_segments_previews_and_the_pick_flow(self) -> None:
+        td, work, res, steps, parts = self._run(
+            TALK, diarizer=_turns((0.0, 6.7, "speaker_0"), (6.7, 13.0, "speaker_1")))
+        with td:
+            self.assertEqual(sorted(s["id"] for s in res["speakers"]),
+                             ["speaker_0", "speaker_1"])
+            # exactly what the cloud path produces, so the pick screen and
+            # POST /{job}/speaker need to know nothing about the mode
+            for sid in ("speaker_0", "speaker_1"):
+                self.assertTrue((work / f"speaker_{sid}.wav").is_file())
+            segs = self._segments(work)
+            self.assertEqual({s["speaker"] for s in segs}, {"speaker_0", "speaker_1"})
+            self.assertEqual(segs, sorted(segs, key=lambda s: s["start"]))
+            d = res["detection"]["diarization"]
+            self.assertTrue(d["applied"])
+            self.assertEqual(d["speakers_found"], 2)
+            self.assertTrue(d["speaker_count_is_a_hypothesis"])
+            # the loader line and the pick line both stop claiming one speaker
+            self.assertEqual(sorted(parts[0]["speakers"]), ["speaker_0", "speaker_1"])
+            self.assertIn("hypothesis", res["speakers"][0]["sample_text"])
+
+    def test_the_chosen_speaker_still_stems(self) -> None:
+        """The point of separating them: one speaker's audio, alone."""
+        td, work, res, steps, parts = self._run(
+            TALK, diarizer=_turns((0.0, 6.7, "speaker_0"), (6.7, 13.0, "speaker_1")))
+        with td:
+            mine = [s for s in self._segments(work) if s["speaker"] == "speaker_1"]
+            self.assertTrue(mine)
+            out = ingest.label_and_stem(work, "speaker_1", mode="sovereign")
+            # Only the picked speaker's spans reach the stem — that IS the
+            # separation, and every one of them starts after the turn boundary.
+            self.assertEqual(len(out["segments"]), len(mine))
+            self.assertTrue(all(s["start"] >= 6.0 for s in mine),
+                            "the other speaker's audio leaked into the stem")
+            self.assertEqual([s["emotion"] for s in out["stems"]], [BASELINE])
+            self.assertEqual(out["spend"]["total_calls"], 0)
+
+    def test_one_speaker_found_is_byte_for_byte_the_undiarized_path(self) -> None:
+        """No regression is not a wish here — the two runs are compared."""
+        td_a, work_a, res_a, _, _ = self._run(TALK)                    # absent
+        td_b, work_b, res_b, _, _ = self._run(
+            TALK, diarizer=_turns((0.0, 13.0, "speaker_0")))           # 1 speaker
+        with td_a, td_b:
+            self.assertEqual(self._segments(work_a), self._segments(work_b))
+            self.assertEqual(res_a["speakers"], res_b["speakers"])
+            self.assertEqual(res_a["detection"]["outcome"],
+                             res_b["detection"]["outcome"])
+            self.assertEqual((work_a / "speaker_speaker_0.wav").read_bytes(),
+                             (work_b / "speaker_speaker_0.wav").read_bytes())
+            # …and the payload still says WHICH of the two it was
+            self.assertEqual(res_b["detection"]["diarization"]["reason"],
+                             "single_speaker")
+            self.assertFalse(res_a["detection"]["diarization"]["attempted"])
+
+    def test_absent_model_is_the_old_behaviour_and_says_how_to_change_it(self) -> None:
+        td, work, res, steps, parts = self._run(TALK)
+        with td:
+            self.assertEqual([s["id"] for s in res["speakers"]], ["speaker_0"])
+            d = res["detection"]["diarization"]
+            self.assertFalse(d["attempted"])
+            self.assertFalse(d["applied"])
+            self.assertEqual(d["reason"], "unavailable")
+            self.assertIn("--download", d["detail"])
+            self.assertIn("service.diarize --download", " ".join(res["limits"]))
+
+    def test_a_broken_diarizer_is_reported_not_fatal(self) -> None:
+        """An enrichment that fails must not cost the user their scan."""
+        td, work, res, steps, parts = self._run(
+            TALK, diarizer=RuntimeError("onnxruntime fell over"))
+        with td:
+            self.assertEqual([s["id"] for s in res["speakers"]], ["speaker_0"])
+            d = res["detection"]["diarization"]
+            self.assertEqual(d["reason"], "failed")
+            self.assertIn("single speaker", d["detail"])
+            # the raw cause is logged, not handed to the client
+            self.assertNotIn("onnxruntime", d["detail"])
+
+    def test_a_second_speaker_too_short_to_survive_chunking_is_not_adopted(self) -> None:
+        """0.4s of a second voice cannot become a segment, so adopting the
+        re-cut would lose audio and separate nothing. The spans stand."""
+        td_a, work_a, res_a, _, _ = self._run(TALK)
+        td_b, work_b, res_b, _, _ = self._run(
+            TALK, diarizer=_turns((0.0, 12.6, "speaker_0"), (12.6, 13.0, "speaker_1")))
+        with td_a, td_b:
+            self.assertEqual(self._segments(work_a), self._segments(work_b))
+            self.assertEqual(res_b["detection"]["diarization"]["reason"],
+                             "too_fragmented")
+            self.assertEqual(res_b["detection"]["diarization"]["speakers_found"], 2)
+
+    def test_result_stays_json_serialisable_with_diarization(self) -> None:
+        td, work, res, steps, parts = self._run(
+            TALK, diarizer=_turns((0.0, 6.7, "speaker_0"), (6.7, 13.0, "speaker_1")))
+        with td:
+            json.loads(json.dumps(res))
 
 
 if __name__ == "__main__":

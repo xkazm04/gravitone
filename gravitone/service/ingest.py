@@ -24,10 +24,15 @@ SOVEREIGN (audio NEVER leaves the machine — ffmpeg only, no API keys):
   1. CLEAN    ffmpeg highpass + afftdn denoise + loudnorm → clean.wav.
   2. DETECT   the clip's own noise floor is MEASURED (20 ms frame RMS) and the
               silence threshold derived from it, then ffmpeg silencedetect
-              (inverted) → speech spans. Single-speaker assumption; no
-              diarization. Every degenerate outcome — silent, unbroken, too
-              short — is named and explained rather than falling through to
-              "use the whole file". See `SpeechScan` / `SOVEREIGN_LIMITS`.
+              (inverted) → speech spans. Every degenerate outcome — silent,
+              unbroken, too short — is named and explained rather than falling
+              through to "use the whole file". See `SpeechScan`.
+  2b. WHO     if the optional offline diarizer is installed (service/diarize.py,
+              a ~34 MB one-time download, no account), its turns are overlaid on
+              those spans — intersect and assign, spans authoritative — so a
+              two-voice recording separates with nothing leaving the machine.
+              Without it, one speaker, exactly as before. The speaker COUNT is
+              always a hypothesis. See `diarize_segments` / `sovereign_limits`.
   3. LABEL    everything is baseline (no cloud classifier); emotions are added
               afterwards via the studio's guided per-emotion recorder.
   4. STEM     one baseline stem, same review/commit flow as cloud mode.
@@ -646,20 +651,68 @@ def label_emotions(wavs: list[Path], spend: "Spend | None" = None,
 # What sovereign mode CANNOT do. These are not caveats to bury: the mode is
 # offered next to the cloud path as an equal choice, and a user who picks it
 # gets a materially different result. Stated wherever the mode speaks.
-SOVEREIGN_LIMITS = (
+#
+# TWO of these three are fixed; the speaker line depends on THIS machine. The
+# offline diarizer (service/diarize.py) is a ~34 MB optional download, so the
+# mode's honest limits are different before and after an operator runs it —
+# and a constant that could only say one of those would be false half the time.
+# Hence a function, not a tuple: `sovereign_limits()` probes and then speaks.
+_LIMIT_EMOTION = (
     "one emotion only — there is no local emotion classifier, so every segment "
     "becomes the baseline (neutral) voice; the other emotions are recorded "
-    "afterwards with the guided per-emotion capture",
-    "single speaker — there is no local diarization, so every detected span is "
-    "treated as the same person; anyone else audible in the recording is cloned "
-    "into the same voice",
+    "afterwards with the guided per-emotion capture")
+_LIMIT_TRANSCRIPT = (
     "no transcript — speech is found by level, not by words, so nothing is "
-    "transcribed and no text ever leaves (or is written on) this machine",
-)
+    "transcribed and no text ever leaves (or is written on) this machine")
+_LIMIT_NO_DIARIZER = (
+    "single speaker — the local diarizer is not installed, so every detected "
+    "span is treated as the same person and anyone else audible in the "
+    "recording is cloned into the same voice. `python -m service.diarize "
+    "--download` (~34 MB, once, no account) turns on multi-speaker separation, "
+    "still entirely on this machine")
+# Present, and therefore about to be USED — so the caveat has to be the real
+# one from service/diarize.py, not a reassurance. `count_is_certain` is
+# permanently False there for these reasons; repeating them here is the point.
+_LIMIT_DIARIZER = (
+    "the speaker count is a hypothesis — voices are separated locally and "
+    "offline, but the count skews HIGH (one person can come back as two) and "
+    "the split is unreliable on synthetic/TTS speech. The boundaries are "
+    "dependable; the identities are not, so listen to the previews before you "
+    "pick. DIARIZE_THRESHOLD is the dial (lower splits more)")
 
 
-def sovereign_note() -> str:
+def diarization_available() -> bool:
+    """Whether the local diarizer could run right now, on this machine.
+
+    Never raises: this is asked on a copy path (`/v1/ingest/modes`) and inside
+    a scan, and neither has any business dying because an optional import
+    misbehaved. Unknown counts as absent — the mode then promises less.
+    """
+    try:
+        from service import diarize as diarizer
+        return diarizer.available()
+    except Exception as exc:  # noqa: BLE001 - an optional capability, probed
+        _log(f"sovereign: diarizer availability probe failed ({exc!r})")
+        return False
+
+
+def sovereign_limits(diarization: bool | None = None) -> tuple[str, ...]:
+    """The mode's limits as they stand on THIS machine. One source of truth for
+    the payload, `/v1/ingest/modes` and the studio panel that renders them."""
+    have = diarization_available() if diarization is None else diarization
+    return (_LIMIT_EMOTION,
+            _LIMIT_DIARIZER if have else _LIMIT_NO_DIARIZER,
+            _LIMIT_TRANSCRIPT)
+
+
+def sovereign_note(diarization: bool | None = None) -> str:
     """The one-line honest summary of the above, for a progress/partial slot."""
+    have = diarization_available() if diarization is None else diarization
+    if have:
+        return ("sovereign mode — audio stayed on this machine. No transcription "
+                "and no emotion classifier, so this scan produces the baseline "
+                "voice only; speakers are separated locally, and the count is a "
+                "hypothesis you correct at the next screen.")
     return ("sovereign mode — audio stayed on this machine. No transcription, "
             "no diarization (single speaker assumed) and no emotion classifier: "
             "this scan produces the baseline voice only.")
@@ -735,6 +788,11 @@ class SpeechScan(NamedTuple):
       "silent"    — nothing above the silence level; there is no speech here
       "too_short" — real audio, but shorter than one usable span
     `note` is a sentence for the user (empty only for "spans").
+
+    `span_ranges` is the UNCHUNKED speech, kept because the diarizer overlay
+    needs the spans themselves — cutting a span at a speaker change and cutting
+    it at `max_dur` are different operations, and doing the second one first
+    would put arbitrary boundaries in the way of the real ones.
     """
     segments: list[dict]
     outcome: str
@@ -743,6 +801,7 @@ class SpeechScan(NamedTuple):
     spans: int
     speech_seconds: float
     total_seconds: float
+    span_ranges: tuple[tuple[float, float], ...] = ()
 
 
 def _frame_levels(wav: Path) -> "np.ndarray":
@@ -781,15 +840,17 @@ def measure_levels(wav: Path) -> Levels:
 
 
 def _chunk_spans(spans: list[tuple[float, float]], min_dur: float,
-                 max_dur: float) -> list[dict]:
+                 max_dur: float, speaker: str = "speaker_0") -> list[dict]:
     """Cut speech spans into segments no longer than max_dur, so stem
-    concatenation stays balanced. Single speaker by construction."""
+    concatenation stays balanced. All one speaker — the caller decides who,
+    which is "speaker_0" for the level detector and a diarized label for the
+    speaker overlay below."""
     segs: list[dict] = []
     for a, b in spans:
         cur = a
         while b - cur >= min_dur:
             chunk_end = min(cur + max_dur, b)
-            segs.append({"speaker": "speaker_0", "start": round(cur, 3),
+            segs.append({"speaker": speaker, "start": round(cur, 3),
                          "end": round(chunk_end, 3), "text": ""})
             cur = chunk_end
     return segs
@@ -813,7 +874,8 @@ def detect_speech(wav: Path, noise_db: float | None = None, min_silence: float =
     def scan(outcome: str, note: str | None, spans: list[tuple[float, float]]) -> SpeechScan:
         segs = _chunk_spans(spans, min_dur, max_dur)
         return SpeechScan(segs, outcome, note, lv, len(spans),
-                          round(sum(b - a for a, b in spans), 2), round(total, 2))
+                          round(sum(b - a for a, b in spans), 2), round(total, 2),
+                          tuple((round(a, 3), round(b, 3)) for a, b in spans))
 
     if lv.measured and lv.speech_db <= _SILENT_DBFS:
         return scan("silent", (
@@ -870,6 +932,167 @@ def detect_speech(wav: Path, noise_db: float | None = None, min_silence: float =
     return scan("spans", None, spans)
 
 
+# ── who spoke: the offline diarizer, overlaid on the spans above ─────────────
+# The two detectors answer DIFFERENT questions and neither replaces the other:
+#
+#   * `detect_speech` decides WHAT audio is speech, from this clip's own
+#     measured noise floor. That decision is the one the whole sovereign path
+#     is built on and it stays authoritative.
+#   * `service.diarize` decides WHO is talking. Its own VAD is stricter and its
+#     boundaries are the good part of it (~100 ms, measured); its speaker COUNT
+#     skews high and it is unreliable on synthetic speech.
+#
+# So the overlay is an INTERSECT-AND-ASSIGN, in that order of authority: each
+# level-detected span is cut at the diarizer turn boundaries that fall inside
+# it, each piece takes the speaker of the turn covering it, and audio the
+# diarizer did not cover keeps its neighbour's label rather than being dropped —
+# the level detector already called it speech and the diarizer is not allowed to
+# veto that. Only then is each labelled piece chunked at `max_dur` as before.
+def _mono16k(wav: Path) -> "np.ndarray":
+    """Decode `wav` to the float32 mono 16 kHz the diarizer expects.
+
+    ffmpeg to stdout — the binary this module already depends on everywhere,
+    rather than pulling faster_whisper/av in for a resample (stt.py can afford
+    `decode_audio` because it has already loaded a Whisper model; ingest has not).
+    """
+    r = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(wav), "-ac", "1", "-ar", "16000",
+         "-f", "s16le", "-"], capture_output=True)
+    if r.returncode != 0 or not r.stdout:
+        raise RuntimeError(
+            f"ffmpeg could not decode for diarization: "
+            f"{r.stderr.decode(errors='ignore')[-200:]}")
+    return np.frombuffer(r.stdout, dtype="<i2").astype(np.float32) / 32768.0
+
+
+def assign_speakers(spans: "list[tuple[float, float]] | tuple",
+                    result) -> list[tuple[float, float, str]]:
+    """Cut `spans` at `result`'s speaker changes. Returns (start, end, speaker).
+
+    Total duration is preserved exactly: every input span comes back as one or
+    more contiguous labelled pieces covering the same interval. A span the
+    diarizer never touched takes the label of the nearest turn (it is speech —
+    somebody said it), and adjacent pieces with the same label are merged so a
+    turn boundary that fell in a pause does not fragment anything.
+    """
+    turns = sorted(result.turns, key=lambda t: t.start)
+    out: list[tuple[float, float, str]] = []
+    for a, b in spans:
+        if b <= a:
+            continue
+        inside = [t for t in turns if min(b, t.end) - max(a, t.start) > 0]
+        if not inside:
+            # Nothing overlaps. Whoever is talking closest in time owns it;
+            # with no turns at all there is one speaker by definition.
+            nearest = min(turns, key=lambda t: min(abs(t.start - b), abs(a - t.end)),
+                          default=None)
+            out.append((a, b, nearest.speaker if nearest else "speaker_0"))
+            continue
+        cuts = sorted({a, b} | {t.start for t in inside if a < t.start < b})
+        pieces: list[list] = []
+        for i in range(len(cuts) - 1):
+            p0, p1 = cuts[i], cuts[i + 1]
+            pieces.append([p0, p1, result.speaker_at(p0, p1)])
+        # Uncovered pieces (before the first turn, or in a diarizer gap) inherit
+        # forwards first, then backwards — never dropped.
+        for i, piece in enumerate(pieces):
+            if piece[2] is not None:
+                continue
+            nxt = next((p[2] for p in pieces[i + 1:] if p[2] is not None), None)
+            piece[2] = nxt or next((p[2] for p in reversed(pieces[:i])
+                                    if p[2] is not None), None) or inside[0].speaker
+        for p0, p1, who in pieces:
+            if out and out[-1][2] == who and abs(out[-1][1] - p0) < 1e-6:
+                out[-1] = (out[-1][0], p1, who)
+            else:
+                out.append((p0, p1, who))
+    return out
+
+
+def _renumber(segs: list[dict]) -> list[dict]:
+    """Relabel speakers speaker_0..N by order of first appearance.
+
+    Chunking drops pieces under `min_dur`, which can retire a diarizer label
+    entirely — and a segment list labelled 0 and 2 reads to the speaker-pick
+    screen like a speaker went missing. Same reasoning as diarize.py's own
+    renumbering of the clusterer's sparse ids.
+    """
+    order: dict[str, str] = {}
+    for s in segs:
+        if s["speaker"] not in order:
+            order[s["speaker"]] = f"speaker_{len(order)}"
+    for s in segs:
+        s["speaker"] = order[s["speaker"]]
+    return segs
+
+
+def diarize_segments(clean: Path, scan: SpeechScan, min_dur: float = 1.2,
+                     max_dur: float = 15.0) -> tuple[list[dict], dict]:
+    """The sovereign speaker pass. Returns (segments, what happened).
+
+    NEVER raises and never degrades the scan: on any failure — no models, no
+    sherpa-onnx, a decode error, a diarizer that found one speaker — the
+    level-detected segments are returned UNCHANGED, byte for byte what this
+    path produced before the diarizer existed. The second element always says
+    which of those it was, because "one speaker" and "the diarizer is not
+    installed" look identical in the output and are not the same fact.
+    """
+    def report(**kw) -> dict:
+        return {"attempted": True, "speakers_found": None,
+                "speaker_count_is_a_hypothesis": True, **kw}
+
+    from service import diarize as diarizer
+
+    if not diarizer.available():
+        return list(scan.segments), {
+            "attempted": False, "applied": False, "reason": "unavailable",
+            "detail": ("the local diarizer is not installed — run `python -m "
+                       "service.diarize --download` (~34 MB, once, no account) "
+                       "to separate speakers offline"),
+            "speakers_found": None, "speaker_count_is_a_hypothesis": True}
+    if not scan.span_ranges:
+        return list(scan.segments), report(applied=False, reason="no_spans")
+
+    t0 = time.perf_counter()
+    try:
+        found = diarizer.diarize(_mono16k(clean))
+    except diarizer.DiarizationUnavailable as exc:
+        return list(scan.segments), report(applied=False, reason="unavailable",
+                                           detail=str(exc))
+    except Exception as exc:  # noqa: BLE001 - an enrichment, reported not fatal
+        _log(f"sovereign: diarization failed ({type(exc).__name__}: {exc})")
+        return list(scan.segments), report(
+            applied=False, reason="failed",
+            detail=f"speaker separation failed ({type(exc).__name__}); "
+                   "this scan was treated as a single speaker")
+
+    took = round(time.perf_counter() - t0, 3)
+    if len(found.speakers) < 2:
+        # One voice (or none found). The current path IS the right answer here,
+        # so it is returned untouched — re-cutting on turn boundaries could only
+        # lose audio to `min_dur` for no separation in return.
+        return list(scan.segments), report(applied=False, reason="single_speaker",
+                                           speakers_found=len(found.speakers),
+                                           diarize_s=took)
+
+    segs: list[dict] = []
+    for a, b, who in assign_speakers(list(scan.span_ranges), found):
+        segs.extend(_chunk_spans([(a, b)], min_dur, max_dur, speaker=who))
+    segs.sort(key=lambda s: s["start"])
+    if len({s["speaker"] for s in segs}) < 2:
+        # Every piece of the second voice was shorter than one usable segment.
+        # Adopting this would trade real audio for a distinction that no longer
+        # exists in the output, so the spans stand.
+        return list(scan.segments), report(applied=False, reason="too_fragmented",
+                                           speakers_found=len(found.speakers),
+                                           diarize_s=took)
+    _renumber(segs)
+    return segs, report(applied=True, reason="diarized",
+                        speakers_found=len({s["speaker"] for s in segs}),
+                        turns=len(found.turns), diarize_s=took,
+                        threshold=SETTINGS.diarize_threshold)
+
+
 def sovereign_analyze(audio: Path, work_dir: Path,
                       progress: Callable[[str, str], None] | None = None,
                       partial: Callable[[dict], None] | None = None) -> dict:
@@ -879,6 +1102,12 @@ def sovereign_analyze(audio: Path, work_dir: Path,
     to be silent — a silent or unusable recording produced zero speakers and the
     caller said "no speech detected in the clip" for every cause alike; the
     scan now says WHICH thing went wrong and what to do about it.
+
+    Multi-speaker when the optional local diarizer is installed (see
+    `diarize_segments`): the speakers, previews and pick flow are then exactly
+    the cloud path's, produced without a byte leaving the machine. Without it
+    — and on any diarizer failure — this is the single-speaker path it has
+    always been, and the payload says which.
     """
     work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -895,31 +1124,63 @@ def sovereign_analyze(audio: Path, work_dir: Path,
     scan = detect_speech(clean)
     with wave.open(str(clean), "rb") as w:
         duration = round(w.getnframes() / w.getframerate(), 2)
-    if partial:
-        partial({"words": 0, "speakers": ["speaker_0"], "transcript": sovereign_note()})
-    prog("transcribe", "done")
 
     if not scan.segments:
+        # Nothing to diarize, and the sentence detection authored is the whole
+        # answer — raised before the diarizer so a silent recording never pays
+        # for a speaker pass it has no speech for.
+        prog("transcribe", "done")
         raise UserFacing(scan.note or "no speech detected in the clip")
 
-    (work_dir / "segments.json").write_text(json.dumps(scan.segments), "utf-8")
-    segs = scan.segments
-    secs = round(sum(s["end"] - s["start"] for s in segs), 1)
-    longest = max(segs, key=lambda s: s["end"] - s["start"])
-    pv = work_dir / "speaker_speaker_0.wav"
-    to_wav(clean, pv, longest["start"], min(longest["end"], longest["start"] + 6))
-    # `sample_text` is the one line the speaker-pick screen renders per speaker.
-    # In sovereign mode there is no transcript to put there, so it carries the
-    # thing the user actually needs to know at that moment instead of a shrug.
-    sample = (f"sovereign mode — {len(segs)} speech segment(s), single speaker assumed "
-              "(no diarization); baseline voice only")
-    if scan.outcome == "unbroken":
-        sample = "sovereign mode — no pauses found, the whole recording is one take"
-    speakers = [{"id": "speaker_0", "utterances": len(segs), "seconds": secs,
-                 "sample_text": sample}]
+    # WHO, after WHAT. Runs inside the same reported step: the sovereign step
+    # keys are fixed (ingest_api.STEPS_BY_MODE) and a step that exists only on
+    # machines with an optional download would make the loader lie elsewhere.
+    segs, diarization = diarize_segments(clean, scan)
+    ids = sorted({s["speaker"] for s in segs})
+    # The LIMITS describe what this machine can do, not what this clip needed —
+    # a diarizer that ran and found one speaker has not stopped existing, and
+    # telling that user to go and download it would be the false-copy bug the
+    # dynamic limits exist to prevent.
+    have_diarizer = diarization["attempted"]
+    if partial:
+        partial({"words": 0, "speakers": ids,
+                 "transcript": sovereign_note(have_diarizer)})
+    prog("transcribe", "done")
+
+    (work_dir / "segments.json").write_text(json.dumps(segs), "utf-8")
+    # Per-speaker stats + a preview clip (their longest utterance, capped) —
+    # deliberately the same shape as analyze()'s, because the speaker-pick flow
+    # downstream is mode-agnostic and must stay that way.
+    speakers: list[dict] = []
+    for sid in ids:
+        ss = [s for s in segs if s["speaker"] == sid]
+        secs = round(sum(s["end"] - s["start"] for s in ss), 1)
+        longest = max(ss, key=lambda s: s["end"] - s["start"])
+        pv = work_dir / f"speaker_{sid}.wav"
+        to_wav(clean, pv, longest["start"], min(longest["end"], longest["start"] + 6))
+        # `sample_text` is the one line the speaker-pick screen renders per
+        # speaker. In sovereign mode there is no transcript to put there, so it
+        # carries the thing the user actually needs to know at that moment.
+        if diarization["applied"]:
+            sample = (f"sovereign mode — {len(ss)} segment(s), {secs:.0f}s; separated "
+                      "locally. The speaker count is a hypothesis and skews high — "
+                      "listen before you pick")
+        elif scan.outcome == "unbroken":
+            sample = "sovereign mode — no pauses found, the whole recording is one take"
+        else:
+            sample = (f"sovereign mode — {len(ss)} speech segment(s), single speaker "
+                      "assumed (no diarization); baseline voice only")
+        speakers.append({"id": sid, "utterances": len(ss), "seconds": secs,
+                         "sample_text": sample})
+    speakers.sort(key=lambda s: -s["seconds"])
     return {"duration": duration, "transcript": "", "speakers": speakers,
-            "note": scan.note, "limits": list(SOVEREIGN_LIMITS),
+            "note": scan.note,
+            "limits": list(sovereign_limits(have_diarizer)),
             "detection": {"outcome": scan.outcome, "spans": scan.spans,
+                          # Who spoke, and how much to trust that — carried in
+                          # `detection` (which is already persisted and served)
+                          # rather than a new job field nothing would render.
+                          "diarization": diarization,
                           "speech_seconds": scan.speech_seconds,
                           # NaN is not JSON — an unmeasured level is None, and
                           # this dict is persisted to job state and served.

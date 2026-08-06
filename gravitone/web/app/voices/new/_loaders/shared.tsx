@@ -95,8 +95,8 @@ export function DetectionFinding({ detection, note }: { detection: Detection; no
 }
 
 /**
- * Sovereign mode's limits, straight from the backend constant
- * (service/ingest.py::SOVEREIGN_LIMITS) — served, never re-typed here, so the
+ * Sovereign mode's limits, straight from the backend
+ * (service/ingest.py::sovereign_limits) — served, never re-typed here, so the
  * two cannot drift. Rendered for every sovereign job, including one that `auto`
  * RESOLVED to sovereign without the user ever pressing the pill.
  */

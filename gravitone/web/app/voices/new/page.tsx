@@ -630,7 +630,7 @@ export default function NewCharacterPage() {
                 </button>
               </div>
               {/* Everything below is the BACKEND's description of the modes.
-                  This panel used to re-type SOVEREIGN_LIMITS by hand, so the
+                  This panel used to re-type the sovereign limits by hand, so the
                   two could drift with nothing to catch it, and `auto` never
                   said which mode it would actually resolve to. */}
               <div className="mt-3 space-y-2">
@@ -739,9 +739,14 @@ export default function NewCharacterPage() {
             <div className="font-jetbrains flex flex-wrap gap-4 text-[12px] text-white/60">
               <span>{result.duration}s audio</span>
               <span>
-                {result.mode === "sovereign"
-                  ? "single speaker assumed (no local diarization)"
-                  : `${result.speakers.length} speaker${result.speakers.length === 1 ? "" : "s"}`}
+                {/* Sovereign mode used to say "single speaker assumed (no local
+                    diarization)" unconditionally. It can now separate speakers
+                    offline (service/ingest.py::diarize_segments), so that was
+                    about to become false — and the count it reports is a
+                    hypothesis in that mode either way (assumed without the
+                    diarizer, clustered with it). Say the count, and say that. */}
+                {`${result.speakers.length} speaker${result.speakers.length === 1 ? "" : "s"}`}
+                {result.mode === "sovereign" && " · local scan, the count is not certain"}
                 {" · "}target <span className="text-white">{result.target}</span>
               </span>
               <span>{result.utterances} utterances</span>

@@ -12,7 +12,7 @@ const base: Detection = {
 
 describe("SovereignLimits", () => {
   it("renders the limits it is GIVEN — the backend constant is the only source", () => {
-    // The studio used to keep a hand-typed copy of SOVEREIGN_LIMITS, free to
+    // The studio used to keep a hand-typed copy of the sovereign limits, free to
     // drift from service/ingest.py. Nothing in this component authors a limit.
     const { container } = render(
       <SovereignLimits limits={["one emotion only — …", "single speaker — …"]} />);

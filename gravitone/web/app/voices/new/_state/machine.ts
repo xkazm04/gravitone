@@ -111,7 +111,7 @@ export type Job = {
   // What the analyze phase learned about THIS recording, served from the job
   // once analyze finishes (sovereign only, today; null in cloud mode):
   //   note      — the backend's sentence about the detection outcome
-  //   limits    — SOVEREIGN_LIMITS as the backend holds them, so the studio
+  //   limits    — sovereign_limits() as the backend derives them, so the studio
   //               states them instead of keeping its own copy
   //   detection — the outcome plus the levels it was decided on
   note?: string | null;
