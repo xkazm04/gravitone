@@ -13,6 +13,7 @@ pin the claim that makes casting N defensible and the honesty it owes:
     Characters (no all-or-nothing lie, no silent drop);
   * every Character carries the same consent receipt + provenance a
     single-speaker commit writes, including the link-sourced attestation rule;
+  * the scene hand-off maps the transcript's lines onto what was cast.
 
 Everything below runs with ffmpeg, the classifier and the export child mocked.
 """
@@ -499,6 +500,93 @@ class ReconcileTests(unittest.TestCase):
             ]})
         self.assertEqual(job["status"], "committed")
         self.assertEqual(removed, [])
+
+
+# ── the scene hand-off ────────────────────────────────────────────────────────
+class SceneTests(unittest.TestCase):
+    def test_consecutive_same_speaker_segments_become_one_line(self) -> None:
+        segs = [{"speaker": "s0", "text": "Hello there."},
+                {"speaker": "s0", "text": "How are you?"},
+                {"speaker": "s1", "text": "Fine."},
+                {"speaker": "s0", "text": "Good."}]
+        out = ingest_api.build_scene(segs, {"s0": "ada", "s1": "bo"})
+        self.assertEqual([l["text"] for l in out["lines"]],
+                         ["Hello there. How are you?", "Fine.", "Good."])
+        self.assertEqual([l["character_id"] for l in out["lines"]],
+                         ["ada", "bo", "ada"])
+        self.assertFalse(out["truncated"])
+        self.assertEqual(out["omitted"], [])
+
+    def test_uncast_speakers_are_omitted_and_counted(self) -> None:
+        segs = [{"speaker": "s0", "text": "a"}, {"speaker": "s2", "text": "b"},
+                {"speaker": "s2", "text": "c"}, {"speaker": "s0", "text": "d"}]
+        out = ingest_api.build_scene(segs, {"s0": "ada"})
+        # The omitted speaker does not merge the lines around it either.
+        self.assertEqual([l["text"] for l in out["lines"]], ["a", "d"])
+        self.assertEqual(out["omitted"], [{"speaker": "s2", "segments": 2}])
+
+    def test_the_line_cap_truncates_and_says_so(self) -> None:
+        segs = [{"speaker": "s0" if i % 2 else "s1", "text": f"l{i}"}
+                for i in range(ingest_api.MAX_SCENE_LINES * 2)]
+        out = ingest_api.build_scene(segs, {"s0": "ada", "s1": "bo"})
+        self.assertEqual(len(out["lines"]), ingest_api.MAX_SCENE_LINES)
+        self.assertTrue(out["truncated"])
+        self.assertEqual(out["total_lines"], ingest_api.MAX_SCENE_LINES * 2)
+
+    def test_empty_text_segments_produce_nothing(self) -> None:
+        out = ingest_api.build_scene(
+            [{"speaker": "s0", "text": ""}, {"speaker": "s0", "text": "   "}],
+            {"s0": "ada"})
+        self.assertEqual(out["lines"], [])
+
+
+class SceneRouteTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._jobs = dict(ingest_api.JOBS)
+        ingest_api.JOBS.clear()
+        self._td = TemporaryDirectory()
+        self.wd = _analyzed(Path(self._td.name))
+        self.job = _job(self.wd, "j1", status="committed")
+        self.job["cast"] = {"members": [
+            {"speaker_id": "speaker_0", "character": "Ada", "character_id": "ada",
+             "status": "done", "voices": [{"voice_id": "v1", "emotion": "baseline"}]},
+            {"speaker_id": "speaker_1", "character": "Bo", "character_id": "bo",
+             "status": "error", "error": "too short", "voices": []},
+        ], "done": 1, "failed": 1}
+        ingest_api.JOBS["j1"] = self.job
+
+    def tearDown(self) -> None:
+        self._td.cleanup()
+        ingest_api.JOBS.clear()
+        ingest_api.JOBS.update(self._jobs)
+
+    def test_only_speakers_that_became_characters_get_lines(self) -> None:
+        out = ingest_api.scene("j1")
+        self.assertTrue(out["available"])
+        self.assertTrue(out["lines"])
+        self.assertEqual({l["character_id"] for l in out["lines"]}, {"ada"})
+        self.assertEqual(out["omitted"], [{"speaker": "speaker_1", "segments": 6}])
+        self.assertEqual(out["names"], {"ada": "Ada"})
+
+    def test_a_transcriptless_scan_explains_itself(self) -> None:
+        segs = [dict(s, text="") for s in _segments()]
+        (self.wd / "segments.json").write_text(json.dumps(segs), "utf-8")
+        self.job["mode"] = "sovereign"
+        out = ingest_api.scene("j1")
+        self.assertFalse(out["available"])
+        self.assertIn("sovereign", out["reason"])
+
+    def test_a_swept_workdir_explains_itself(self) -> None:
+        (self.wd / "segments.json").unlink()
+        out = ingest_api.scene("j1")
+        self.assertFalse(out["available"])
+        self.assertIn("cleaned up", out["reason"])
+
+    def test_a_job_that_was_never_cast_has_no_scene(self) -> None:
+        self.job["cast"] = None
+        out = ingest_api.scene("j1")
+        self.assertFalse(out["available"])
+        self.assertIn("no character was cast", out["reason"])
 
 
 if __name__ == "__main__":

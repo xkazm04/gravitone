@@ -5,6 +5,7 @@
   GET  /v1/ingest/{job}/speaker-preview/{id}→ per-speaker sample wav
   POST /v1/ingest/{job}/speaker             { speaker_id }  [start label+stem for that speaker]
   POST /v1/ingest/{job}/cast                { members[{speaker_id, character}] } → N Characters
+  GET  /v1/ingest/{job}/scene               → the diarized dialogue, cast to Characters
   GET  /v1/ingest/{job}/preview/{emotion}   → stem wav (the SPEAKER's own audio)
   GET  /v1/ingest/{job}/segment/{i}         → ONE labelled segment's wav
   POST /v1/ingest/{job}/stems               { assignments, reset? } → re-spliced stems
@@ -39,6 +40,8 @@ escalation budgets bound the cast, not each speaker (`_cast_budget_note` says so
 when the cap is reached). Per-speaker outcome is published on `job["cast"]`,
 which the studio already polls: a speaker that fails is rolled back and NAMED
 while its siblings keep their Characters.
+`GET /{job}/scene` is what that makes possible: the diarized transcript, merged
+into lines and addressed to the Characters the cast just created.
 
 Durability: every job owns a subdir under INGEST_WORK_DIR holding its files and a
 `state.json` mirror of the job dict. All JOBS mutations happen under a single
@@ -2494,6 +2497,109 @@ def cast(job_id: str, req: CastReq) -> dict:
         _persist(job)
     _spawn(_do_cast, (job_id, statement), f"ingest-cast-{job_id}")
     return {"status": "casting", "members": len(members)}
+
+
+# ── the scene: the dialogue, in the voices it just made ───────────────────────
+#: How many lines one hand-off carries. The engine renders at most this many in
+#: one performance (web/app/playground/_variants/shared.ts, MAX_SCRIPT_LINES),
+#: so a scene that arrived longer would be a script the studio refuses to
+#: render — the truncation happens HERE, where it can be counted and stated.
+MAX_SCENE_LINES = 64
+
+
+def build_scene(segments: list[dict], cast_map: dict[str, str],
+                max_lines: int = MAX_SCENE_LINES) -> dict:
+    """Diarized segments → a script addressed to the cast Characters.
+
+    Two joins, both of which have to be explicit or the result is quietly wrong:
+
+      * CONSECUTIVE segments of the same speaker are ONE line. `build_segments`
+        already cuts on a 0.6s gap, so a person's paragraph arrives as four
+        rows; four `ScriptLine`s of the same Character in a row is a rendering
+        of the diarization, not of the dialogue.
+      * Speakers nobody cast are OMITTED, and counted, so the hand-off can say
+        that this scene is missing a voice rather than dropping their lines
+        silently or attributing them to whoever happened to be first.
+    """
+    lines: list[dict] = []
+    omitted: dict[str, int] = {}
+    # Somebody ELSE spoke in between. Merging across that would invent one
+    # continuous utterance out of two turns that had an answer between them —
+    # even (especially) when the answer belongs to a speaker nobody cast.
+    interrupted = False
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        text = " ".join(str(seg.get("text") or "").split())
+        if not text:
+            continue
+        sid = str(seg.get("speaker") or "")
+        cid = cast_map.get(sid)
+        if not cid:
+            omitted[sid] = omitted.get(sid, 0) + 1
+            interrupted = True
+            continue
+        if lines and lines[-1]["speaker"] == sid and not interrupted:
+            lines[-1]["text"] = f"{lines[-1]['text']} {text}"
+            continue
+        lines.append({"speaker": sid, "character_id": cid, "text": text})
+        interrupted = False
+    total = len(lines)
+    return {"lines": lines[:max_lines], "total_lines": total,
+            "truncated": total > max_lines, "max_lines": max_lines,
+            "omitted": [{"speaker": s, "segments": n}
+                        for s, n in sorted(omitted.items())]}
+
+
+@router.get(INGEST + "/{job_id}/scene")
+def scene(job_id: str):
+    """The recording's own dialogue, cast into the Characters it just created.
+
+    Answers with `available: false` and a REASON far more often than it 404s,
+    because every way this can be unavailable is a fact the studio has to put on
+    screen next to the affordance: a sovereign scan transcribes nothing (its
+    segments carry empty text by design), a cast where no member finished has
+    nobody to address lines to, and a workdir that has aged out no longer holds
+    the transcript. A dead button would say none of those.
+    """
+    job = _get_job(job_id)
+    if not job:
+        return job_expired()
+    members = [m for m in ((job.get("cast") or {}).get("members") or [])
+               if isinstance(m, dict) and m.get("status") == "done"
+               and m.get("character_id")]
+    if not members:
+        return {"available": False, "reason": (
+            "no character was cast from this recording, so there is nobody to "
+            "give its lines to")}
+    try:
+        segments = json.loads((Path(job["work_dir"]) / "segments.json").read_text("utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"available": False, "reason": (
+            "this recording's transcript is no longer on the box — scan sessions "
+            "and everything cut from them are cleaned up after a while")}
+    if not isinstance(segments, list):
+        segments = []
+    if not any(str(s.get("text") or "").strip() for s in segments
+               if isinstance(s, dict)):
+        return {"available": False, "reason": (
+            "this scan produced no transcript, so there are no lines to re-perform"
+            + (" — sovereign mode finds speech by level and transcribes nothing"
+               if job.get("mode") == "sovereign" else ""))}
+    cast_map = {str(m["speaker_id"]): str(m["character_id"]) for m in members}
+    scene = build_scene(segments, cast_map)
+    if not scene["lines"]:
+        return {"available": False, "reason": (
+            "none of the transcribed lines belong to a speaker you cast")}
+    names = {str(m["character_id"]): str(m.get("character") or "") for m in members}
+    return {"available": True, "reason": None, **scene,
+            "characters": [{"speaker_id": m["speaker_id"],
+                            "character_id": m["character_id"],
+                            "character": m.get("character")} for m in members],
+            # The name is carried per line too: the studio renders the script
+            # before its roster has necessarily answered, and a line labelled
+            # with a slug is a line the user cannot check.
+            "names": names}
 
 
 class AuditionReq(BaseModel):

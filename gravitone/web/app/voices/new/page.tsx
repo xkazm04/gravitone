@@ -28,6 +28,11 @@ const SegmentBoard = dynamic(() => import("./_review/SegmentBoard"), {
 const AuditionPanel = dynamic(() => import("./_review/AuditionPanel"), {
   ssr: false, loading: () => <PanelLoading label="opening the audition room…" />,
 });
+// Reachable only from a finished CAST, and it fetches the transcript on mount —
+// neither belongs in the first paint of a dropzone.
+const OpenAsScene = dynamic(() => import("./_review/OpenAsScene"), {
+  ssr: false, loading: () => <PanelLoading label="reading this recording’s dialogue…" />,
+});
 
 /** The ledger's own visual language while a drill-down arrives: the same glass
  *  panel it will become, saying what it is waiting for. */
@@ -1551,6 +1556,13 @@ export default function NewCharacterPage() {
                     re-record ownership.
                   </p>
                 )}
+
+                {/* From a video to a scene: the dialogue this recording already
+                    contains, re-performed by the Characters it just made. Only
+                    offered when the recording actually holds a transcript — the
+                    panel says why when it does not, rather than rendering a
+                    dead button. */}
+                {jobId && outcome.made.length > 0 && <OpenAsScene jobId={jobId} />}
 
                 <div className="mt-6 flex flex-wrap gap-3">
                   <Link href="/voices" className="rounded-full bg-cyan-300 px-5 py-2.5 text-sm font-semibold text-slate-950 transition hover:brightness-110">
