@@ -298,23 +298,24 @@ export const SCORE_BASELINE = "baseline";
 
 /**
  * The tag grammar, character for character as the service compiles it
- * (`_TAG_RE = re.compile(r"\[(/?)([a-zA-Z_]*)\]")`). Built fresh per call —
- * a shared /g regex carries `lastIndex` between calls.
+ * (`_TAG_RE = re.compile(r"\[(/?)([a-zA-Z_][a-zA-Z0-9_]*|)\]")`). Built fresh
+ * per call — a shared /g regex carries `lastIndex` between calls.
  */
 function tagRe(): RegExp {
-  return /\[(\/?)([a-zA-Z_]*)\]/g;
+  return /\[(\/?)([a-zA-Z_][a-zA-Z0-9_]*|)\]/g;
 }
 
 /**
  * Which emotion names the grammar can actually carry.
  *
- * NOTE the asymmetry, because it is a real one: `normalize_emotion` accepts
- * DIGITS in a custom emotion (`[a-z][a-z0-9_]{1,23}`) but the tag regex does
- * not, so an emotion named `mode2` is a legal slot that no inline tag can
- * address. A region for it therefore cannot be serialised — `regionProblem`
- * says so out loud rather than letting `toTags` drop it silently.
+ * This used to be letters and underscores only, which did NOT match
+ * `normalize_emotion`'s slug shape (`[a-z][a-z0-9_]{1,23}`): an emotion named
+ * `mode2` was a legal slot that no inline tag could address, so a region for it
+ * could not be serialised at all. Both sides now agree — digits are allowed
+ * after the first character, and `regionProblem` only refuses names the engine
+ * genuinely cannot be told about.
  */
-const TAGGABLE = /^[a-zA-Z_]+$/;
+const TAGGABLE = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 
 /** One directed span of the text: characters [start, end) spoken as `value`. */
 export type ScoreRegion = {
@@ -586,6 +587,95 @@ export const DEFAULT_TEXT =
  * The character caps count the RAW text (metatags included), because that is
  * what the backend receives and measures.
  */
+// ── what the tags in this composer will actually DO ─────────────────────────
+//
+// `composerLimit` below checks length, bytes and line count — the things the
+// server refuses outright. Everything the server ACCEPTS and then does
+// something unwanted with was silent:
+//
+//   * a malformed tag (`[excited`, `[x[/x]`, `[2fast]`) does not match the
+//     service's `_TAG_RE` at all, so it is not an error — it is CONTENT, and
+//     the engine reads it out loud;
+//   * an unclosed tag runs to the end of the text rather than to the end of
+//     the sentence the author meant;
+//   * a well-shaped but unknown name (`[excitedd]`) resolves quietly down the
+//     fallback chain, so a typo sounds like a slightly-off performance;
+//   * `[baseline]` is the ABSENCE of direction spelled as a direction.
+//
+// Each warning below names the OUTCOME, not the rule. One implementation
+// serves solo and script — a lint that only worked in one composer would be a
+// second truth about the same grammar.
+
+/** One pre-submit warning. `key` is stable, for React and for de-duping. */
+export type ComposerWarning = { key: string; message: string };
+
+/** A whole `[...]` bracket token — the unit a malformed tag is judged as. */
+const BRACKET_TOKEN = /\[[^[\]]*\]/g;
+/** The same grammar as `tagRe`, anchored: does this token parse as a tag? */
+const WHOLE_TAG = /^\[(\/?)([a-zA-Z_][a-zA-Z0-9_]*|)\]$/;
+
+/** The warnings for ONE piece of tagged text. `where` prefixes each message
+ *  (script mode names the line; solo has nothing to name). */
+function tagWarnings(tagged: string, known: Set<string>, where: string): ComposerWarning[] {
+  const out: ComposerWarning[] = [];
+  const say = (key: string, message: string) => out.push({ key: `${where}${key}`, message: where ? `${where} — ${message}` : message });
+
+  // 1. Tokens the grammar cannot read. These are spoken, which is the loudest
+  //    failure the composer has and the only one with no signal at all today.
+  const tokens = tagged.match(BRACKET_TOKEN) ?? [];
+  const broken = [...new Set(tokens.filter((t) => !WHOLE_TAG.test(t)))];
+  // A bracket with no partner is not a token at all — count it too, because
+  // `[excited` reads exactly as wrong to the listener.
+  const orphan = tagged.replace(BRACKET_TOKEN, "");
+  if (orphan.includes("[") || orphan.includes("]")) broken.push("[");
+  for (const t of broken) {
+    say(`malformed:${t}`, `${t === "[" ? "An unmatched [" : `"${t}"`} is not a tag the engine can read — it will be spoken out loud.`);
+  }
+
+  // 2/3/4. What the tags that DO parse will be taken to mean.
+  let open: string | null = null;
+  for (const m of tagged.matchAll(tagRe())) {
+    const name = m[2].toLowerCase();
+    open = m[1] === "/" || !name ? null : name;
+    if (!name) continue;
+    if (name === SCORE_BASELINE) {
+      say("baseline", "[baseline] is the absence of direction spelled as a direction — that span is spoken in the baseline Voice, exactly as it would be with no tag at all.");
+    } else if (known.size > 0 && !known.has(name)) {
+      say(`unknown:${name}`, `[${name}] is not an emotion on this Character's scale — it is not recorded, so the nearest match will be used instead.`);
+    }
+  }
+  if (open) {
+    say(`unclosed:${open}`, `[${open}] is never closed — it runs to the end of the text rather than stopping where you meant it to.`);
+  }
+  // The same mistake made twice is one thing to fix, not two lines of banner.
+  return [...new Map(out.map((w) => [w.key, w])).values()];
+}
+
+/**
+ * Everything this composer's tags will do that its author probably did not ask
+ * for. Advisory: the caller shows these and still lets Generate through, unlike
+ * `composerLimit`, which is a refusal.
+ *
+ * `known` is the emotion vocabulary that EXISTS (the Character's scale, custom
+ * slots included) — not the slots it has recorded. An unrecorded slot already
+ * says so on its own chip; a name that is on no scale at all is a typo nothing
+ * else in the studio can catch.
+ */
+export function composerWarnings(input: {
+  mode: "solo" | "script";
+  text: string;
+  script: Array<{ text: string }>;
+  known?: string[];
+}): ComposerWarning[] {
+  const known = new Set((input.known ?? []).map((e) => e.toLowerCase()));
+  if (input.mode === "solo") return tagWarnings(input.text, known, "");
+  const out: ComposerWarning[] = [];
+  input.script.forEach((line, i) => {
+    if (line.text.trim()) out.push(...tagWarnings(line.text, known, `Line ${i + 1}`));
+  });
+  return out;
+}
+
 export function composerLimit(input: {
   mode: "solo" | "script";
   text: string;

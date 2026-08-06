@@ -63,7 +63,21 @@ def normalize_emotion(name: str) -> str:
         )
     return slug
 
-_TAG_RE = re.compile(r"\[(/?)([a-zA-Z_]*)\]")
+# The tag grammar, kept in step with ``normalize_emotion`` above.
+#
+# It used to be ``[a-zA-Z_]*`` — letters and underscores only — while
+# ``normalize_emotion`` has always accepted DIGITS after the first character
+# (``[a-z][a-z0-9_]{1,23}``). So an emotion named ``mode2`` was a legal slot to
+# create, record and address by API, and no inline tag could reach it: ``[mode2]``
+# simply did not match, fell through as ordinary text, and was SPOKEN OUT LOUD.
+# The name now follows the same shape the slug does (leading letter/underscore,
+# then letters, digits and underscores), and the empty alternative keeps ``[]``
+# and ``[/]`` reading as a return to baseline. Every string the old pattern
+# matched still matches.
+#
+# Mirrored in web/app/playground/_variants/shared.ts (``tagRe``/``TAGGABLE``);
+# score.test.ts pins the two together.
+_TAG_RE = re.compile(r"\[(/?)([a-zA-Z_][a-zA-Z0-9_]*|)\]")
 
 
 @dataclass

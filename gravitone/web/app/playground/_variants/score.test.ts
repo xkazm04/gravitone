@@ -69,6 +69,17 @@ describe("parseTags — the grammar, exactly as the service reads it", () => {
     expect(parseTags("[EXCITED]hi[/EXCITED]").regions).toEqual([r(0, 2, "excited")]);
   });
 
+  it("reads a digit-bearing emotion name, exactly as normalize_emotion spells it", () => {
+    expect(parseTags("[mode2]hi[/mode2]")).toEqual({ text: "hi", regions: [r(0, 2, "mode2")] });
+  });
+
+  it("leaves a name neither grammar accepts as ordinary text", () => {
+    // A tag may not open with a digit on either side, so this is spoken, not
+    // parsed — and the score must show it as the words it is.
+    expect(parseTags("[2fast]hi[/2fast]"))
+      .toEqual({ text: "[2fast]hi[/2fast]", regions: [] });
+  });
+
   it("keeps whitespace the text actually has (only stripTags collapses it)", () => {
     expect(parseTags("  [sad]a  b[/sad]  ").text).toBe("  a  b  ");
   });
@@ -111,9 +122,17 @@ describe("toTags — back to the wire format", () => {
     expect(toTags("abcdef", [r(0, 4, "sad"), r(2, 6, "happy")])).toBe("[sad]abcd[/sad]ef");
   });
 
+  it("writes a DIGIT-bearing emotion, because the engine can now be told about one", () => {
+    // `normalize_emotion` has always accepted `[a-z][a-z0-9_]{1,23}`; the tag
+    // regex on both sides accepted letters and underscores only, so `mode2` was
+    // a slot you could record and never address inline.
+    expect(toTags("abc", [r(0, 3, "mode2")])).toBe("[mode2]abc[/mode2]");
+  });
+
   it("drops a region the tag grammar cannot carry instead of emitting a broken tag", () => {
-    // `mode2` is a legal emotion slug and an illegal tag name — see TAGGABLE.
-    expect(toTags("abc", [r(0, 3, "mode2")])).toBe("abc");
+    // A name the SLUG rule refuses too: a tag may not open with a digit.
+    expect(toTags("abc", [r(0, 3, "2fast")])).toBe("abc");
+    expect(toTags("abc", [r(0, 3, "battle-cry")])).toBe("abc");
     expect(toTags("abc", [r(0, 3, "baseline")])).toBe("abc");
   });
 });
@@ -130,6 +149,11 @@ describe("round-trip — both directions, because a drift here rewrites the prom
     ["[sad][/sad]hello", "hello"],
     ["[baseline]hello[/baseline]", "hello"],
     ["[EXCITED]hi[/EXCITED]", "[excited]hi[/excited]"],
+    // digits, both directions — the parity the two grammars used to lack
+    ["[mode2]hi[/mode2]", "[mode2]hi[/mode2]"],
+    ["a[v2]b[/v2]c", "a[v2]b[/v2]c"],
+    // …and a name neither grammar accepts stays ordinary text on both sides
+    ["[2fast]hi[/2fast]", "[2fast]hi[/2fast]"],
     ["", ""],
   ];
 
@@ -167,7 +191,10 @@ describe("regionProblem — a refusal the user can read", () => {
     expect(regionProblem(text, r(0, 5, "baseline"))).toMatch(/delete the region/);
   });
   it("names an emotion the tag grammar cannot carry", () => {
-    expect(regionProblem(text, r(0, 5, "mode2"))).toMatch(/cannot be written as an inline tag/);
+    expect(regionProblem(text, r(0, 5, "2fast"))).toMatch(/cannot be written as an inline tag/);
+  });
+  it("no longer refuses a legal slug that merely contains a digit", () => {
+    expect(regionProblem(text, r(0, 5, "mode2"))).toBeNull();
   });
   it("names the region it would overlap", () => {
     const others = [r(0, 5, "sad")];

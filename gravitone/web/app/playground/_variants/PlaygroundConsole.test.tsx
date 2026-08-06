@@ -616,3 +616,42 @@ describe("PlaygroundConsole — emotions are placed as regions, never typed as t
     expect(sent[1].text).toBe("[excited]Great to finally meet you![/excited]");
   });
 });
+
+// ── direction 5: the composer says what its tags will do ─────────────────────
+
+describe("PlaygroundConsole — malformed and surprising tags are named before Generate", () => {
+  const scoreArea = () => screen.getByRole("textbox", { name: "Score text" }) as HTMLTextAreaElement;
+  const compose = (value: string) => fireEvent.change(scoreArea(), { target: { value } });
+  const alerts = () => screen.queryAllByRole("alert").map((a) => a.textContent ?? "").join(" | ");
+
+  it("says a malformed tag will be SPOKEN rather than obeyed", async () => {
+    // The service's tag regex simply does not match `[excited`, so it is not an
+    // error — it is content, and the engine reads it out.
+    await mountConsole();
+    compose("say [excited this");
+    expect(alerts()).toMatch(/spoken out loud/);
+    // Advisory, not a refusal: the render is still allowed.
+    expect(screen.getByRole("button", { name: /Generate/ })).toBeEnabled();
+  });
+
+  it("says an unclosed tag runs to the end of the text", async () => {
+    await mountConsole();
+    compose("Calm. [sad]then everything went wrong.");
+    expect(alerts()).toMatch(/runs to the end of the text/);
+  });
+
+  it("says an unknown emotion will be substituted, not honoured", async () => {
+    await mountConsole();
+    compose("[excitedd]hi[/excitedd]");
+    expect(alerts()).toMatch(/nearest match will be used/);
+  });
+
+  it("says nothing at all about a take the picker composed", async () => {
+    await mountConsole();
+    compose("one two three");
+    scoreArea().setSelectionRange(4, 7);
+    fireEvent.select(scoreArea());
+    fireEvent.click(screen.getByRole("button", { name: "Excited" }));
+    expect(alerts()).not.toMatch(/spoken out loud|never closed|nearest match/);
+  });
+});

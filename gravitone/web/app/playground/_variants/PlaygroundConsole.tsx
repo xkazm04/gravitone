@@ -22,9 +22,9 @@ import { EASE } from "@/components/ui/tokens";
 import { EMOTION_IDS, emotionMeta } from "@/lib/emotions";
 import EmotionArt from "@/components/ui/EmotionArt";
 import {
-  appendEdit, applyEmotion, composerLimit, DEFAULT_EXPRESSION, DEFAULT_TEXT, editPlainText,
-  isTimingBasis, MAX_SCRIPT_LINES, MAX_TEXT_CHARS, parseTags, readEdits, SCORE_BASELINE, stripTags,
-  TAKE_TIMING_VERSION,
+  appendEdit, applyEmotion, composerLimit, composerWarnings, DEFAULT_EXPRESSION, DEFAULT_TEXT,
+  editPlainText, isTimingBasis, MAX_SCRIPT_LINES, MAX_TEXT_CHARS, parseTags, readEdits,
+  SCORE_BASELINE, stripTags, TAKE_TIMING_VERSION,
   type Expression, type PerfLine, type ScriptLine, type Segment, type Take,
 } from "./shared";
 // Composer durability — the same IndexedDB mechanism the take log uses.
@@ -650,6 +650,28 @@ export default function PlaygroundConsole() {
   // and 64-line caps, the proxy's 128 KB body). One pure function so the rule
   // is testable and lives next to the constants it enforces.
   const blocked = useMemo(() => composerLimit({ mode, text, script }), [mode, text, script]);
+
+  // …and what the tags in it will DO. Advisory, not a refusal: a malformed tag
+  // is accepted by the engine and spoken out loud, which is a worse outcome
+  // than a rejection and had no signal at all before this.
+  //
+  // The vocabulary is what EXISTS on the relevant Character's scale — in a
+  // scene, the union of the scales of the Characters actually cast in it, so a
+  // tag legal for one speaker is not reported as a typo because of another.
+  const knownEmotions = useMemo(() => {
+    if (mode === "solo") return scale;
+    const cast = new Set(script.map((l) => l.characterId));
+    const seen = new Set<string>();
+    for (const c of characters) {
+      if (!cast.has(c.character_id)) continue;
+      for (const e of (c.scale?.length ? c.scale : EMOTION_IDS)) seen.add(e);
+    }
+    return seen.size > 0 ? [...seen] : EMOTION_IDS;
+  }, [mode, scale, script, characters]);
+  const warnings = useMemo(
+    () => composerWarnings({ mode, text, script, known: knownEmotions }),
+    [mode, text, script, knownEmotions],
+  );
 
   const canGenerate = !blocked && (mode === "script" ? scriptLines.length > 0 : (!!plain && !!character));
   // The LAST run decides the notice: a 500 and an unplugged backend both drop
@@ -1538,6 +1560,17 @@ export default function PlaygroundConsole() {
               })}
             </div>
           </div>
+
+          {/* What the tags in this composer will do, BEFORE the render. Amber:
+              the take will be produced, it just will not say what its author
+              meant. One banner per distinct mistake, each naming the outcome. */}
+          {warnings.length > 0 && (
+            <div className="border-t border-white/8 px-5 pt-3">
+              {warnings.map((w) => (
+                <ErrorBanner key={w.key} severity="warning" className="mb-2">{w.message}</ErrorBanner>
+              ))}
+            </div>
+          )}
 
           <div className="flex items-center justify-between border-t border-white/8 px-5 py-3">
             <span className={`font-jetbrains text-[11px] ${blocked ? "text-rose-300" : "text-white/60"}`}>
