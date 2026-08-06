@@ -15,7 +15,7 @@ import { useMounted } from "@/lib/useMounted";
 import { characterSlug } from "@/lib/slugs";
 import { loadRoster } from "@/app/voices/_data/characters";
 import { recordVoiceOwnership } from "@/lib/voiceVault";
-import { CONSENT_STATEMENT } from "@/lib/consent";
+import { CONSENT_STATEMENT, EXTERNAL_CONSENT_STATEMENT } from "@/lib/consent";
 import WaveformLab from "./_loaders/WaveformLab";
 import { DetectionFinding, SovereignLimits, segmentFailureNote, type LoaderData } from "./_loaders/shared";
 // The two review drill-downs are ~600 lines (plus framer-motion, through
@@ -62,6 +62,11 @@ const SCAN_PHASES: ReadonlySet<string> = new Set(["processing", "speaker", "revi
 // button into a pending state, and the scan kickoff is allowed 120 seconds.
 type Pending = null | "scan" | "commit" | `speaker:${string}`;
 
+// Which door the recording comes through. The link tab is a second WAY IN and
+// nothing more: it produces the same job id, so every screen after this one is
+// untouched by it.
+type SourceTab = "file" | "link";
+
 // Backpressure, not failure: /scan, /speaker and /commit all pass through the
 // ingest admission gate (service/ingest_api.py::_admit), which answers 429 when
 // too many recordings are already being processed. Same shape the playground
@@ -71,7 +76,7 @@ type Backpressure = {
   detail: string;
   retryAfterSec: number;
   stated: boolean;   // did the response actually carry a Retry-After?
-  action: { kind: "scan" } | { kind: "speaker"; sid: string } | { kind: "commit" };
+  action: { kind: "scan" } | { kind: "link" } | { kind: "speaker"; sid: string } | { kind: "commit" };
 };
 
 /** Retry-After (delta-seconds form) → a number; 1s when it is absent/bad. */
@@ -102,8 +107,17 @@ export default function NewCharacterPage() {
   // So the scan sends nothing (service default: off) and every commit sends an
   // EXPLICIT true/false — the job's outcome then names what this checkbox said.
   const [keepCorpus, setKeepCorpus] = useState(false);
+  // Where THIS job's audio came from, as the backend recorded it — never from
+  // which tab the user happened to click, which a reload would forget.
+  const externalSource = job?.source?.kind === "url";
+  const consentStatement = externalSource ? EXTERNAL_CONSENT_STATEMENT : CONSENT_STATEMENT;
   const [file, setFile] = useState<File | null>(null);
   const [dragging, setDragging] = useState(false);
+  // The link door. `linkTab` is which input is on screen; `link` is the pasted
+  // URL. Both are ephemeral input state — the moment a scan starts, the flow's
+  // state graph knows only that a job exists, exactly as with a file.
+  const [srcTab, setSrcTab] = useState<SourceTab>("file");
+  const [link, setLink] = useState("");
   // auto = cloud quality when the backend has API keys, else local.
   // sovereign = force local-only: the recording never leaves the machine.
   const [ingestMode, setIngestMode] = useState<"auto" | "sovereign">("auto");
@@ -308,6 +322,7 @@ export default function NewCharacterPage() {
     setBusyNotice(null);
     if (!b) return;
     if (b.action.kind === "scan") void startScan();
+    else if (b.action.kind === "link") void startLinkScan();
     else if (b.action.kind === "speaker") void chooseSpeaker(b.action.sid);
     else void commit();
   }
@@ -336,6 +351,37 @@ export default function NewCharacterPage() {
       dispatch({ type: "SCAN_STARTED", jobId: j.job_id });
     } catch (e) {
       dispatch({ type: "SET_ERROR", error: e instanceof Error ? e.message : "scan failed" });
+    } finally {
+      submitting.current = false;
+      if (mounted.current) setPending(null);
+    }
+  }
+
+  /** The link door. Same dispatch, same job, same everything downstream — the
+   *  ONLY difference from `startScan` is that the bytes are fetched by the
+   *  backend instead of uploaded by the browser.
+   *
+   *  Failure here is loud on purpose: extraction is the brittle part of this
+   *  feature (a private video, an age gate, a pinned yt-dlp that has aged out),
+   *  and the backend answers those by name. The banner prints the backend's own
+   *  sentence — each of which ends in the file-drop fallback — rather than a
+   *  spinner that never resolves. */
+  async function startLinkScan() {
+    if (!link.trim() || submitting.current) return; // same double-click gate
+    submitting.current = true;
+    setPending("scan"); setBusyNotice(null);
+    try {
+      const r = await fetch("/api/ingest/scan-url", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: link.trim(), mode: ingestMode }),
+      });
+      // Backpressure, not a bad link: the queue is full and the URL is fine.
+      if (r.status === 429) { await backpressure(r, { kind: "link" }); return; }
+      if (!r.ok) throw new Error((await readDetail(r)) ?? "couldn't start from that link");
+      const j = await r.json();
+      dispatch({ type: "SCAN_STARTED", jobId: j.job_id });
+    } catch (e) {
+      dispatch({ type: "SET_ERROR", error: e instanceof Error ? e.message : "couldn't start from that link" });
     } finally {
       submitting.current = false;
       if (mounted.current) setPending(null);
@@ -417,7 +463,7 @@ export default function NewCharacterPage() {
       // `recipes` is present ONLY when an audition actually changed something —
       // the fast path sends exactly the body it always sent.
       const recipes = commitRecipes(auditions, selected, result?.stems ?? []);
-      const r = await fetch(`/api/ingest/${jobId}/commit`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ character, emotions: [...selected], character_id, attested: consented, statement: CONSENT_STATEMENT, corpus: keepCorpus, ...(recipes ? { recipes } : {}) }) });
+      const r = await fetch(`/api/ingest/${jobId}/commit`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ character, emotions: [...selected], character_id, attested: consented, statement: consentStatement, corpus: keepCorpus, ...(recipes ? { recipes } : {}) }) });
       // Refused before any cloning started: the ledger is intact, so go back to
       // it with NO error — the amber notice carries the whole truth.
       if (r.status === 429) {
@@ -568,6 +614,45 @@ export default function NewCharacterPage() {
         {/* UPLOAD */}
         {phase === "upload" && (
           <div className="mt-8 max-w-2xl">
+            {/* Two doors into the same flow. A tab rather than a second page:
+                whichever one is used, what comes back is a job id and every
+                screen after this is identical. */}
+            <div role="tablist" aria-label="Where the recording comes from"
+              className="mb-4 flex gap-2">
+              {([["file", "Drop a file"], ["link", "Paste a link"]] as const).map(([id, label]) => (
+                <button key={id} role="tab" aria-selected={srcTab === id}
+                  onClick={() => { setSrcTab(id); dispatch({ type: "SET_ERROR", error: null }); }}
+                  className={`font-jetbrains cursor-pointer rounded-full border px-3 py-1.5 text-[12px] transition ${srcTab === id ? "border-cyan-400/40 bg-cyan-400/10 text-cyan-200" : "border-white/12 text-white/60 hover:text-white"}`}>
+                  {label}
+                </button>
+              ))}
+            </div>
+
+            {srcTab === "link" && (
+              <div className="glass-panel rounded-2xl p-4">
+                <label htmlFor="ingest-link" className="text-sm text-white">
+                  Paste a YouTube link
+                </label>
+                <input id="ingest-link" type="url" inputMode="url" value={link} spellCheck={false}
+                  placeholder="https://www.youtube.com/watch?v=…"
+                  onChange={(e) => { setLink(e.target.value); dispatch({ type: "SET_ERROR", error: null }); }}
+                  onKeyDown={(e) => { if (e.key === "Enter" && link.trim() && pending === null) { e.preventDefault(); void startLinkScan(); } }}
+                  className="font-jetbrains mt-2 w-full rounded-xl border border-white/12 bg-black/30 px-3 py-2 text-[13px] text-white outline-none transition placeholder:text-white/25 focus:border-cyan-400/50" />
+                {/* Said before the paste, not after the failure: this box
+                    fetches from YouTube only, and what it fetches is subject to
+                    the same caps a file is. */}
+                <p className="font-jetbrains mt-2 text-[11px] leading-relaxed text-white/45">
+                  youtube.com or youtu.be, one video (not a playlist or a live stream).
+                  The audio is fetched by the Gravitone box — {LIMITS_HINT}.
+                </p>
+                <p className="font-jetbrains mt-1 text-[11px] leading-relaxed text-white/35">
+                  You will be asked to attest that you have the right to use the recording
+                  before anything is cloned.
+                </p>
+              </div>
+            )}
+
+            {srcTab === "file" && (
             <div
               role="button" tabIndex={0} aria-label="Choose or drop an audio recording"
               onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
@@ -588,6 +673,7 @@ export default function NewCharacterPage() {
                 <div className="font-jetbrains mt-1 text-[11px] text-white/35">{LIMITS_HINT}</div>
               </div>
             </div>
+            )}
             {/* Driven by what this flow will actually DO (extend mode, armed
                 with a character) rather than by "a commit happened once" —
                 which RESET used to leave behind for a brand-new flow to read. */}
@@ -667,9 +753,18 @@ export default function NewCharacterPage() {
 
             {/* The kickoff uploads the whole file and is allowed 120s by the
                 proxy — without a pending state the page looked inert. */}
-            <Button onClick={startScan} disabled={!file || pending !== null} className="mt-5 cursor-pointer">
-              {pending === "scan" ? "Uploading & starting…" : "Scan recording →"}
-            </Button>
+            {srcTab === "file" ? (
+              <Button onClick={startScan} disabled={!file || pending !== null} className="mt-5 cursor-pointer">
+                {pending === "scan" ? "Uploading & starting…" : "Scan recording →"}
+              </Button>
+            ) : (
+              // The fetch happens on the box and is allowed 240s by the proxy;
+              // without a pending state the page would look inert for the whole
+              // download.
+              <Button onClick={startLinkScan} disabled={!link.trim() || pending !== null} className="mt-5 cursor-pointer">
+                {pending === "scan" ? "Fetching audio…" : "Scan this link →"}
+              </Button>
+            )}
           </div>
         )}
 
@@ -1007,16 +1102,30 @@ export default function NewCharacterPage() {
                 className="font-jetbrains mt-3 cursor-pointer text-[11px] text-white/45 underline decoration-dotted underline-offset-4 transition hover:text-white">
                 start over with a different recording
               </button>
+              {/* The attestation says what is TRUE of this recording. For a
+                  pasted link, "I own this voice" is a sentence the user cannot
+                  honestly tick — the video is someone else's — so a different
+                  one is shown, and it is the one the backend requires verbatim
+                  for a link-sourced job. Neither is optional; the checkbox
+                  still gates the commit either way. */}
               <label className="mt-4 flex cursor-pointer items-start gap-2 text-[13px] text-white/70">
                 <input type="checkbox" checked={consented} onChange={(e) => setConsented(e.target.checked)}
                   className="mt-0.5 accent-cyan-300" />
                 <span>
-                  I own this voice or have the speaker&apos;s explicit consent to clone it.{" "}
+                  {externalSource ? EXTERNAL_CONSENT_STATEMENT : CONSENT_STATEMENT}{" "}
                   <span className="font-jetbrains text-[11px] text-white/45">
-                    (attestation stored with the voices — Voice Vault)
+                    (attestation stored with the voices — Voice Vault
+                    {externalSource ? ", together with the link it came from" : ""})
                   </span>
                 </span>
               </label>
+              {externalSource && (
+                <p className="font-jetbrains mt-2 text-[11px] leading-relaxed text-white/45">
+                  This recording was fetched from a link, not recorded by you. Cloning a
+                  voice from someone else&apos;s published audio may need their permission
+                  — this attestation is stored with the voices and names the source video.
+                </p>
+              )}
               {/* Retention, opt-IN, and asked here because this is the consent
                   moment. Off means the recording is used to clone and then
                   discarded with the rest of the scan workdir; on means this box

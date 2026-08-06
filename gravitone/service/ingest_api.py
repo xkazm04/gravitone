@@ -92,7 +92,8 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
-from service import atomicio, errors, export_stems, ingest, observability, ratelimit, voices
+from service import (atomicio, errors, export_stems, ingest, ingest_url,
+                     observability, ratelimit, voices)
 from service.config import SETTINGS
 from service.emotions import normalize_emotion
 from service.errors import job_expired
@@ -1742,13 +1743,38 @@ def start_scan(file: UploadFile = File(...), mode: str = Form("auto"),
         shutil.rmtree(work_dir, ignore_errors=True)
         raise HTTPException(400, bad)
 
-    job = {
+    job = _new_job(job_id, work_dir, resolved, hashlib.sha256(data).hexdigest(),
+                   corpus, UPLOAD_SOURCE)
+    with _LOCK:
+        JOBS[job_id] = job
+        _persist(job)
+    _spawn(_analyze, (job_id, src), f"ingest-analyze-{job_id}")
+    return {"job_id": job_id, "mode": resolved}
+
+
+#: Where a job's audio came from. ALWAYS present, including the ordinary case:
+#: a job whose provenance is absent is indistinguishable from one whose
+#: provenance was never recorded, and the whole point of the marker is that the
+#: consent attestation is a different sentence for a link than for a file.
+UPLOAD_SOURCE = {"kind": "upload"}
+
+
+def _new_job(job_id: str, work_dir: Path, resolved: str, clip_sha256: str,
+             corpus: bool, source: dict) -> dict:
+    """The job dict every scan starts from — one shape for both front doors.
+
+    Extracted when `scan-url` arrived: two hand-written copies of a 15-key
+    dict is exactly how a field ends up present on uploads and missing on
+    links, which the state machine and `_PUBLIC_KEYS` would then have to guess
+    about.
+    """
+    return {
         "id": job_id, "status": "running", "step": None, "mode": resolved,
         "steps": [{**s, "state": "pending"} for s in STEPS_BY_MODE[resolved]],
         "partial": {}, "speakers": None, "duration": 0, "result": None, "error": None,
         "note": None, "limits": None, "detection": None,
         "work_dir": str(work_dir), "created": time.time(),
-        "clip_sha256": hashlib.sha256(data).hexdigest(), "cancel": False,
+        "clip_sha256": clip_sha256, "cancel": False,
         "committed": None,
         # Audition Room state: `recipes` is public (choices + named outcomes),
         # `recipe_plan` is the server-side index map behind them.
@@ -1757,6 +1783,8 @@ def start_scan(file: UploadFile = File(...), mode: str = Form("auto"),
         # means "the stems are exactly what the pipeline proposed", which is a
         # different fact from an assignment map that happens to match it.
         "casting": None,
+        # Provenance. See UPLOAD_SOURCE.
+        "source": dict(source),
         # Corpus state. `requested` is what the caller asked for at upload time
         # (the commit may still change its mind); everything else is filled in
         # after a successful commit and always NAMES the outcome, including
@@ -1764,11 +1792,81 @@ def start_scan(file: UploadFile = File(...), mode: str = Form("auto"),
         # capture that failed.
         "corpus": {"requested": bool(corpus), "captured": False,
                    "reason": None if corpus else "corpus capture was not requested"}}
+
+
+class ScanUrlReq(BaseModel):
+    url: str
+    mode: str = "auto"
+    corpus: bool = False
+
+
+@router.post(f"{INGEST}/scan-url", dependencies=[Depends(SCAN_BUDGET)])
+def start_scan_url(req: ScanUrlReq) -> dict:
+    """Paste a YouTube link; get the job an upload would have given you.
+
+    NOT async, for the same reason `start_scan` is not: this handler runs a
+    download subprocess, hashes up to 50 MB and shells out to ffprobe before it
+    hands off to the phase thread. On the event loop that would stall every
+    concurrent synthesis in the process (see test_handler_modes).
+
+    It shares `SCAN_BUDGET` with the upload door rather than getting its own,
+    on purpose: the budget exists to bound what one IP can make this box SPEND
+    downstream, and a link scan spends exactly what an upload scan does. A
+    second budget would have doubled the ceiling by accident.
+
+    Everything after the download is the upload path, unchanged — same
+    validation, same `_analyze`, same speaker board, same commit.
+    """
+    if req.mode not in SCAN_MODES:
+        raise HTTPException(400, "mode must be auto, cloud or sovereign")
+    try:
+        url = ingest_url.guard_link(req.url)
+    except ingest_url.LinkRefusal as refusal:
+        # Refused before a permit is taken and before a byte moves: a bad link
+        # must cost this box nothing.
+        raise HTTPException(refusal.status, refusal.message)
+
+    _admit()
+    resolved = ingest.resolve_mode(req.mode)
+    job_id = uuid.uuid4().hex[:12]
+    work_dir = WORK_ROOT / job_id
+    work_dir.mkdir(parents=True, exist_ok=True)
+    _write_owner(work_dir)
+    try:
+        src = ingest_url.download(url, work_dir, max_bytes=MAX_UPLOAD_BYTES)
+    except ingest_url.LinkRefusal as refusal:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        raise HTTPException(refusal.status, refusal.message)
+    except Exception as exc:  # noqa: BLE001
+        # Anything the extractor did that we did not anticipate. The cause is
+        # logged against a request id; the caller gets the id and nothing else,
+        # because yt-dlp's own text carries paths and network detail.
+        shutil.rmtree(work_dir, ignore_errors=True)
+        raise errors.sanitized_500("link extraction", exc)
+
+    bad = check_duration(probe_duration(src))
+    if bad:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        raise HTTPException(400, bad)
+
+    job = _new_job(job_id, work_dir, resolved, _sha256_file(src), req.corpus,
+                   {"kind": "url", "url": url, "title": None, "trimmed": False})
     with _LOCK:
         JOBS[job_id] = job
         _persist(job)
     _spawn(_analyze, (job_id, src), f"ingest-analyze-{job_id}")
-    return {"job_id": job_id, "mode": resolved}
+    return {"job_id": job_id, "mode": resolved, "source": job["source"]}
+
+
+def _sha256_file(path: Path) -> str:
+    """Streamed, because the downloaded file is not already in memory the way
+    an upload's bytes are — and a 50 MB `read_bytes()` per scan is a peak this
+    process does not need to take."""
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 _PUBLIC_KEYS = ("id", "status", "step", "steps", "partial", "speakers",
@@ -1787,6 +1885,12 @@ _PUBLIC_KEYS = ("id", "status", "step", "steps", "partial", "speakers",
                 "casting",
                 # Whether this job's audio was kept, and — always — why not.
                 "corpus",
+                # Where the audio came from. The studio reads this to decide
+                # WHICH attestation to put in front of the user, so it is not
+                # optional decoration: a link-sourced job that arrives at the
+                # consent step looking like an upload would show a sentence
+                # ("I own this recording") that is false.
+                "source",
                 # A re-derivation's outcome: which voices it replaced, and that
                 # they are KEPT. Present on the job while it runs and on the
                 # durable receipt after it is gone (see "durable receipts").
@@ -2367,6 +2471,20 @@ def commit(job_id: str, req: CommitReq):
         statement = req.statement.strip()
         if not req.attested or not statement:
             raise HTTPException(422, "ownership attestation required to clone a voice")
+        # A link-sourced job attests something DIFFERENT, and the difference is
+        # the whole point: "I own this voice" is false for a video someone else
+        # published, and a receipt that stores a false sentence launders the
+        # claim instead of recording it. The requirement is not weakened for
+        # these jobs — it is replaced by the true one, verbatim, so the stored
+        # receipt says what the user actually agreed to.
+        if (job.get("source") or {}).get("kind") == "url":
+            if statement != ingest_url.EXTERNAL_STATEMENT:
+                raise HTTPException(422, (
+                    "this recording came from a link, not from you — the "
+                    f'attestation must read exactly: "{ingest_url.EXTERNAL_STATEMENT}"'))
+            # The source belongs IN the receipt: an attestation about a
+            # recording is only checkable if the record names the recording.
+            statement = f"{statement} Source: {(job['source'] or {}).get('url')}"
         want_corpus = ((job.get("corpus") or {}).get("requested", False)
                        if req.corpus is None else bool(req.corpus))
         job["status"] = "committing"

@@ -245,6 +245,35 @@ it is stateless and scales across replicas freely. The registry itself is safe
 either way: `mutate_meta` takes a cross-process file lock, so concurrent clones
 on different replicas cannot drop each other's voices.
 
+## Link ingest is brittle by design
+
+`POST /v1/ingest/scan-url` fetches the audio behind a pasted YouTube link
+(`service/ingest_url.py`) and then joins the ordinary upload path. Two things
+an operator should know before relying on it:
+
+- **The extractor is pinned and it ages.** `yt-dlp==2026.7.4` in
+  `requirements.txt`. yt-dlp tracks a site that changes its player weekly, and
+  the project ships releases at roughly that cadence in response. A pin that is
+  a few months old will eventually start answering "couldn't get audio from
+  that link" for videos that are perfectly fine — that is the pin expiring, not
+  a bug in the service. **Bump the pin and rebuild.** The pin is deliberate:
+  the alternative is a service whose behaviour changes without a deploy.
+- **YouTube may demand a JS runtime.** Some player variants are only solvable
+  with a JavaScript interpreter; when yt-dlp needs one and cannot find Deno or
+  Node on the box, extraction fails for those videos. The image does not ship
+  one today. If link ingest fails broadly while file upload is healthy, check
+  the service log for yt-dlp's own message (it is logged in full there and
+  deliberately never returned to the client) before suspecting the network.
+
+Neither failure is a dead end for the user: every refusal on this path names
+the file-drop fallback, which needs no network at all. Link ingest is a
+convenience on top of the upload flow, and nothing downstream depends on it.
+
+Deployments that must not fetch anything from the internet can simply not use
+the route — it is the only outbound-from-the-box path in ingest, and it is
+allowlisted to `youtube.com`/`youtu.be` with every resolved address checked to
+be publicly routable (`service/narrate.check_public_ip`, reused).
+
 ## Per-IP budgets, and who the service thinks you are
 
 Every compute route carries a per-IP budget (`service/ratelimit.py`): the

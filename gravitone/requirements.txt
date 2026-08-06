@@ -43,3 +43,12 @@ httpx>=0.27
 # so a slimmed-down image that drops it still runs. Errors only: no tracing, no
 # profiling, no PII, and request bodies are explicitly never captured.
 sentry-sdk>=2.0
+# Link ingest (service/ingest_url.py): a pasted YouTube URL becomes the same
+# audio file a drop would have been. Invoked as `python -m yt_dlp` with NO
+# postprocessors — one audio-only itag, written as-is — so it adds no decoder
+# and never calls ffmpeg on our behalf (the pipeline's own ffmpeg pass is
+# unchanged). PINNED, not floored: yt-dlp tracks a site that changes weekly, so
+# a floating version is a service whose behaviour changes without a deploy. The
+# flip side is that a pin ages out — when links start failing, bump this line
+# first (see deploy/README.md, "Link ingest is brittle by design").
+yt-dlp==2026.7.4

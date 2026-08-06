@@ -29,6 +29,8 @@ class BlockingHandlersRunOffLoopTests(unittest.TestCase):
     BLOCKING = [
         (voices.create_voice, "clone: ffmpeg + pocket_tts export-voice subprocess"),
         (ingest_api.start_scan, "ingest scan: 50MB write + ffprobe + sha256"),
+        (ingest_api.start_scan_url,
+         "ingest scan-url: yt-dlp subprocess + 50MB write + ffprobe + sha256"),
         (takes.create_take, "take create: 25MB write + 500-file evict"),
         (packs.import_pack, "pack import: zip decompress + per-blob sha256"),
     ]

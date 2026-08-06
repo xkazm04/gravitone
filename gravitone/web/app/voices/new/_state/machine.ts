@@ -129,6 +129,23 @@ export type Job = {
   // always — why not. Optional here only because an older service would not
   // send it; when it is present the complete screen states it.
   corpus?: CorpusOutcome | null;
+  // Where this job's audio came from (service/ingest_api.py, `_PUBLIC_KEYS`).
+  // The consent step reads it to decide WHICH attestation to show: "I own this
+  // voice" is false for a video someone else published, and the backend
+  // refuses that sentence for a link-sourced job. Optional only because an
+  // older service would not send it — treat absent as an upload.
+  source?: JobSource | null;
+};
+
+/** service/ingest_url.py — the marker every scan carries. */
+export type JobSource = {
+  kind: "upload" | "url";
+  url?: string | null;
+  title?: string | null;
+  /** True when the video was longer than we clone and only its head was taken. */
+  trimmed?: boolean;
+  /** Seconds of the source that were actually fetched, when it was trimmed. */
+  clip_seconds?: number | null;
 };
 
 /**
