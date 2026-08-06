@@ -720,6 +720,15 @@ SCAN_BUDGET = ratelimit.per_ip_budget(
 AUDITION_BUDGET = ratelimit.per_ip_budget(
     "ingest-audition", limit=_budget_limit("TTS_BUDGET_INGEST_AUDITION", 40),
     window_s=600, burst=6, methods=("POST",))
+#   link     30 per 10 minutes, burst 8 — the paste-time metadata probe. It
+#            transfers no media and spends nothing downstream, so rationing it
+#            like a scan would punish the honest case (paste, read the verdict,
+#            paste a different link). It still needs A budget: it makes this box
+#            open an outbound connection, and an unbudgeted route that does that
+#            is a proxy.
+LINK_BUDGET = ratelimit.per_ip_budget(
+    "ingest-link", limit=_budget_limit("TTS_BUDGET_INGEST_LINK", 30),
+    window_s=600, burst=8, methods=("POST",))
 
 
 # ── upload validation ─────────────────────────────────────────────────────────
@@ -1794,10 +1803,90 @@ def _new_job(job_id: str, work_dir: Path, resolved: str, clip_sha256: str,
                    "reason": None if corpus else "corpus capture was not requested"}}
 
 
+#: What a trimmed link is cut down to. Deliberately UNDER `MAX_CLIP_SECONDS`
+#: rather than exactly on it: both cutting paths (yt-dlp's `--download-sections`
+#: and an ffmpeg stream copy) land on container boundaries, so a cut aimed
+#: exactly at the ceiling can deliver a file a fraction of a second over it —
+#: and `check_duration` would then refuse, after the download, the very file
+#: this feature exists to produce.
+TRIM_TARGET_SECONDS = max(MIN_CLIP_SECONDS, MAX_CLIP_SECONDS - 5)
+
+
 class ScanUrlReq(BaseModel):
     url: str
     mode: str = "auto"
     corpus: bool = False
+
+
+class LinkProbeReq(BaseModel):
+    url: str
+
+
+def _link_verdict(url: str) -> ingest_url.Verdict:
+    """Metadata only: what will happen to this link, before anything moves."""
+    info = ingest_url.probe(url)
+    return ingest_url.verdict(info, min_seconds=MIN_CLIP_SECONDS,
+                              max_seconds=MAX_CLIP_SECONDS)
+
+
+@router.post(f"{INGEST}/link/probe", dependencies=[Depends(LINK_BUDGET)])
+def probe_link(req: LinkProbeReq) -> dict:
+    """The answer at PASTE time: does this link fit, and what will be cut.
+
+    The caps (50 MB, `MAX_CLIP_SECONDS`) were sized for a clip a user chose to
+    upload, and the studio's browser-side pre-check cannot run on a URL — so
+    without this route a two-hour podcast is refused only AFTER the wait. This
+    turns that into one metadata call and a sentence.
+
+    NOT async, like every other route here: it shells out to the extractor.
+    Its own budget, looser than the scan's, because a probe transfers no media
+    and a user comparing two links should not spend a scan to do it.
+
+    The shape is one object rather than a status code because BOTH answers are
+    information the paste box prints: `ok: false` carries the reason, `ok: true`
+    with `trimmed` carries what will be cut. Only a link that cannot be READ is
+    an error status — that is a different fact from one we read and refused.
+    """
+    try:
+        url = ingest_url.guard_link(req.url)
+        plan = _link_verdict(url)
+    except ingest_url.LinkRefusal as refusal:
+        raise HTTPException(refusal.status, refusal.message)
+    except Exception as exc:  # noqa: BLE001
+        raise errors.sanitized_500("link probe", exc)
+    return {"ok": plan.ok, "title": plan.title, "duration": plan.duration,
+            "clip_seconds": plan.clip_seconds, "trimmed": plan.trimmed,
+            "message": plan.message,
+            # The attestation this job will demand, sent from the ONE place it
+            # is defined so the studio cannot show a sentence the commit will
+            # then refuse (see ingest_url.EXTERNAL_STATEMENT).
+            "attestation": ingest_url.EXTERNAL_STATEMENT}
+
+
+def _enforce_trim(src: Path, plan: ingest_url.Verdict) -> Path:
+    """Make the trim a fact about the FILE, not a hope about a flag.
+
+    `--download-sections` normally means the tail was never transferred, so
+    this is usually a no-op probe. It exists because "over-cap never reaches
+    analyze" cannot rest on an extractor honouring an option: a version bump,
+    an extractor that ignores sections, or a keyframe landing late all end with
+    a longer file than we asked for, and the next thing that file meets is two
+    duration-billed cloud calls.
+    """
+    if not plan.trimmed:
+        return src
+    got = probe_duration(src)
+    if got is None or got <= MAX_CLIP_SECONDS:
+        return src
+    logger.info("link ingest: delivered %.0fs despite a %.0fs section request "
+                "— cutting locally", got, TRIM_TARGET_SECONDS)
+    cut = ingest_url.trim_to(src, TRIM_TARGET_SECONDS)
+    after = probe_duration(cut)
+    if after is None or after > MAX_CLIP_SECONDS:
+        raise ingest_url.LinkRefusal(422, (
+            "that video could not be cut down to a clonable length — "
+            f"{ingest_url.DROP_INSTEAD}."))
+    return cut
 
 
 @router.post(f"{INGEST}/scan-url", dependencies=[Depends(SCAN_BUDGET)])
@@ -1826,6 +1915,20 @@ def start_scan_url(req: ScanUrlReq) -> dict:
         # must cost this box nothing.
         raise HTTPException(refusal.status, refusal.message)
 
+    # The verdict comes BEFORE the media, always — and it is taken here, not
+    # believed from the client. The paste box has usually asked the same
+    # question already (POST /v1/ingest/link/probe); this is what makes the
+    # answer binding, and it costs one metadata call.
+    try:
+        plan = _link_verdict(url)
+    except ingest_url.LinkRefusal as refusal:
+        # A link we could not READ is a named refusal, not a 500 — and it must
+        # be one HERE too, not only on the probe route: a client that skipped
+        # the probe deserves the same sentence the paste box would have shown.
+        raise HTTPException(refusal.status, refusal.message)
+    if not plan.ok:
+        raise HTTPException(400, plan.message)
+
     _admit()
     resolved = ingest.resolve_mode(req.mode)
     job_id = uuid.uuid4().hex[:12]
@@ -1833,7 +1936,13 @@ def start_scan_url(req: ScanUrlReq) -> dict:
     work_dir.mkdir(parents=True, exist_ok=True)
     _write_owner(work_dir)
     try:
-        src = ingest_url.download(url, work_dir, max_bytes=MAX_UPLOAD_BYTES)
+        src = ingest_url.download(
+            url, work_dir, max_bytes=MAX_UPLOAD_BYTES,
+            # Only when it is actually longer than we clone: asking for a
+            # section engages ffmpeg, and there is no reason to on a 4-minute
+            # video that fits whole.
+            trim_seconds=TRIM_TARGET_SECONDS if plan.trimmed else None)
+        src = _enforce_trim(src, plan)
     except ingest_url.LinkRefusal as refusal:
         shutil.rmtree(work_dir, ignore_errors=True)
         raise HTTPException(refusal.status, refusal.message)
@@ -1850,7 +1959,8 @@ def start_scan_url(req: ScanUrlReq) -> dict:
         raise HTTPException(400, bad)
 
     job = _new_job(job_id, work_dir, resolved, _sha256_file(src), req.corpus,
-                   {"kind": "url", "url": url, "title": None, "trimmed": False})
+                   {"kind": "url", "url": url, "title": plan.title,
+                    "trimmed": plan.trimmed, "clip_seconds": plan.clip_seconds})
     with _LOCK:
         JOBS[job_id] = job
         _persist(job)

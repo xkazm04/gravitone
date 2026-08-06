@@ -52,6 +52,7 @@ import {
 } from "./_state/uploadLimits";
 import { useIngestJob } from "./_state/useIngestJob";
 import { takeKey, useAudition } from "./_state/useAudition";
+import { useLinkProbe } from "./_state/useLinkProbe";
 
 // Phases where a scanned recording is on screen and the mode that produced it
 // is still load-bearing for what the user is reading.
@@ -118,6 +119,11 @@ export default function NewCharacterPage() {
   // state graph knows only that a job exists, exactly as with a file.
   const [srcTab, setSrcTab] = useState<SourceTab>("file");
   const [link, setLink] = useState("");
+  // The paste-time verdict — metadata only, no media moves. It is what makes
+  // "47-minute video, we'll clone the first 15 minutes" a sentence the user
+  // reads BEFORE the download rather than a surprise after it.
+  const linkProbe = useLinkProbe(link, phase === "upload" && srcTab === "link");
+  const linkUsable = linkProbe.status === "done" && linkProbe.verdict.ok;
   // auto = cloud quality when the backend has API keys, else local.
   // sovereign = force local-only: the recording never leaves the machine.
   const [ingestMode, setIngestMode] = useState<"auto" | "sovereign">("auto");
@@ -636,8 +642,40 @@ export default function NewCharacterPage() {
                 <input id="ingest-link" type="url" inputMode="url" value={link} spellCheck={false}
                   placeholder="https://www.youtube.com/watch?v=…"
                   onChange={(e) => { setLink(e.target.value); dispatch({ type: "SET_ERROR", error: null }); }}
-                  onKeyDown={(e) => { if (e.key === "Enter" && link.trim() && pending === null) { e.preventDefault(); void startLinkScan(); } }}
+                  onKeyDown={(e) => { if (e.key === "Enter" && linkUsable && pending === null) { e.preventDefault(); void startLinkScan(); } }}
                   className="font-jetbrains mt-2 w-full rounded-xl border border-white/12 bg-black/30 px-3 py-2 text-[13px] text-white outline-none transition placeholder:text-white/25 focus:border-cyan-400/50" />
+
+                {/* THE VERDICT, before any media moves. Four states and not one
+                    of them is a spinner that ends nowhere:
+                      checking — we are asking, and say so
+                      done/ok  — what fits, and what will be cut if anything
+                      done/!ok — a link we read and refused, with the reason
+                      failed   — a link we could not read, with the fallback */}
+                {linkProbe.status === "checking" && (
+                  <p className="font-jetbrains mt-3 text-[12px] text-white/50" aria-live="polite">
+                    checking that link…
+                  </p>
+                )}
+                {linkProbe.status === "done" && linkProbe.verdict.ok && (
+                  <div className={`mt-3 rounded-xl border px-3 py-2 ${linkProbe.verdict.trimmed ? "border-amber-400/30 bg-amber-400/5" : "border-emerald-400/25 bg-emerald-400/5"}`}
+                    aria-live="polite">
+                    <div className="text-[13px] text-white">{linkProbe.verdict.title}</div>
+                    <div className={`font-jetbrains mt-0.5 text-[12px] ${linkProbe.verdict.trimmed ? "text-amber-200" : "text-emerald-200"}`}>
+                      {linkProbe.verdict.message}
+                    </div>
+                  </div>
+                )}
+                {linkProbe.status === "done" && !linkProbe.verdict.ok && (
+                  <div className="mt-3">
+                    <ErrorBanner>{linkProbe.verdict.message}</ErrorBanner>
+                  </div>
+                )}
+                {linkProbe.status === "failed" && (
+                  <div className="mt-3">
+                    <ErrorBanner>{linkProbe.detail}</ErrorBanner>
+                  </div>
+                )}
+
                 {/* Said before the paste, not after the failure: this box
                     fetches from YouTube only, and what it fetches is subject to
                     the same caps a file is. */}
@@ -761,8 +799,16 @@ export default function NewCharacterPage() {
               // The fetch happens on the box and is allowed 240s by the proxy;
               // without a pending state the page would look inert for the whole
               // download.
-              <Button onClick={startLinkScan} disabled={!link.trim() || pending !== null} className="mt-5 cursor-pointer">
-                {pending === "scan" ? "Fetching audio…" : "Scan this link →"}
+              // The button states what it will DO — including that it will take
+              // only the head of a long video — and it stays disabled until the
+              // verdict is in, because "scan" on an unchecked link is exactly
+              // the two-minute wait this direction removes.
+              <Button onClick={startLinkScan} disabled={!linkUsable || pending !== null} className="mt-5 cursor-pointer">
+                {pending === "scan"
+                  ? "Fetching audio…"
+                  : linkProbe.status === "done" && linkProbe.verdict.trimmed
+                    ? `Scan the first ${Math.round((linkProbe.verdict.clip_seconds ?? 0) / 60)} minutes →`
+                    : "Scan this link →"}
               </Button>
             )}
           </div>

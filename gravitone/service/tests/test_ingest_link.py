@@ -40,6 +40,21 @@ def _public_dns(*_a, **_k):
     return [(2, 1, 6, "", ("93.184.216.34", 443))]
 
 
+class _FakeRun:
+    """`yt-dlp -J` (the metadata probe): answers one video's JSON."""
+
+    def __init__(self, duration: float = 120.0, title: str = "A talk",
+                 returncode: int = 0, stderr: str = "", **extra) -> None:
+        import json as _json
+        self.returncode = returncode
+        self.stdout = _json.dumps({"title": title, "duration": duration,
+                                   "uploader": "Someone", **extra}).encode()
+        self.stderr = stderr.encode()
+
+    def __call__(self, cmd, **kwargs):
+        return self
+
+
 class _FakeProc:
     """A yt-dlp that writes `written` bytes to the output file and exits."""
 
@@ -228,6 +243,15 @@ class ScanUrlRouteTests(unittest.TestCase):
     def _post(self, url: str = URL, **body):
         return self.client.post("/v1/ingest/scan-url", json={"url": url, **body})
 
+    def _fetching(self, duration: float = 120.0):
+        """The whole extractor, stood in for: metadata probe + download."""
+        return (mock.patch("socket.getaddrinfo", _public_dns),
+                mock.patch.object(ingest_url, "_run", _FakeRun(duration=duration)),
+                mock.patch.object(ingest_url, "_popen",
+                                  lambda cmd, stdout=None, stderr=None: _FakeProc(
+                                      Path(cmd[cmd.index("-o") + 1]).parent)(
+                                          cmd, stdout, stderr)))
+
     def test_a_bad_host_is_refused_without_admitting_or_fetching(self) -> None:
         with mock.patch.object(ingest_api, "_admit",
                                side_effect=AssertionError("admitted!")), \
@@ -239,14 +263,11 @@ class ScanUrlRouteTests(unittest.TestCase):
 
     def test_the_happy_path_starts_the_same_analyze_an_upload_would(self) -> None:
         started: list = []
-        with mock.patch("socket.getaddrinfo", _public_dns), \
+        dns, meta, dl = self._fetching()
+        with dns, meta, dl, \
              mock.patch.object(ingest_api, "_spawn",
                                side_effect=lambda fn, args, name: started.append((fn, args))), \
-             mock.patch.object(ingest_api, "probe_duration", return_value=42.0), \
-             mock.patch.object(ingest_url, "_popen",
-                               lambda cmd, stdout=None, stderr=None: _FakeProc(
-                                   Path(cmd[cmd.index("-o") + 1]).parent)(
-                                       cmd, stdout, stderr)):
+             mock.patch.object(ingest_api, "probe_duration", return_value=42.0):
             r = self._post()
         self.assertEqual(r.status_code, 200, r.text)
         body = r.json()
@@ -259,13 +280,9 @@ class ScanUrlRouteTests(unittest.TestCase):
         self.assertTrue(job["clip_sha256"])
 
     def test_the_source_marker_is_served_to_the_studio(self) -> None:
-        with mock.patch("socket.getaddrinfo", _public_dns), \
-             mock.patch.object(ingest_api, "_spawn"), \
-             mock.patch.object(ingest_api, "probe_duration", return_value=42.0), \
-             mock.patch.object(ingest_url, "_popen",
-                               lambda cmd, stdout=None, stderr=None: _FakeProc(
-                                   Path(cmd[cmd.index("-o") + 1]).parent)(
-                                       cmd, stdout, stderr)):
+        dns, meta, dl = self._fetching()
+        with dns, meta, dl, mock.patch.object(ingest_api, "_spawn"), \
+             mock.patch.object(ingest_api, "probe_duration", return_value=42.0):
             job_id = self._post().json()["job_id"]
         served = self.client.get(f"/v1/ingest/{job_id}").json()
         self.assertEqual(served["source"]["kind"], "url")
@@ -275,19 +292,20 @@ class ScanUrlRouteTests(unittest.TestCase):
                                   ingest_api.UPLOAD_SOURCE)
         self.assertEqual(job["source"], {"kind": "upload"})
 
-    def test_a_too_long_video_is_refused_and_the_workdir_is_removed(self) -> None:
+    def test_a_video_with_no_speech_to_clone_is_refused_before_any_transfer(self) -> None:
+        # Under MIN_CLIP_SECONDS: the metadata settles it, so no media moves
+        # and no work dir is left behind.
         with mock.patch("socket.getaddrinfo", _public_dns), \
-             mock.patch.object(ingest_api, "probe_duration", return_value=9999.0), \
+             mock.patch.object(ingest_url, "_run", _FakeRun(duration=1.0)), \
              mock.patch.object(ingest_url, "_popen",
-                               lambda cmd, stdout=None, stderr=None: _FakeProc(
-                                   Path(cmd[cmd.index("-o") + 1]).parent)(
-                                       cmd, stdout, stderr)):
+                               side_effect=AssertionError("fetched!")):
             r = self._post()
         self.assertEqual(r.status_code, 400)
         self.assertEqual(list(ingest_api.WORK_ROOT.iterdir()), [])
 
     def test_an_unexpected_failure_is_sanitized(self) -> None:
         with mock.patch("socket.getaddrinfo", _public_dns), \
+             mock.patch.object(ingest_url, "_run", _FakeRun()), \
              mock.patch.object(ingest_url, "download",
                                side_effect=RuntimeError(
                                    "yt-dlp exploded: /home/op/cookies.txt")):

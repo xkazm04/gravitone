@@ -14,7 +14,8 @@ adds a second copy of a media library to the image. (ffmpeg itself is already a
 hard runtime dependency — `ingest.clean_audio`, `ingest.to_wav` and
 `ingest_api.probe_duration` all shell out to it — so *using* it is free; adding
 a decoder would not be. See `build_download_cmd` for the flags that keep the
-downloader out of ffmpeg's way.)
+downloader out of ffmpeg's way, and `trim_to` for the one place we call it on
+purpose.)
 
 **SSRF is not optional.** A URL the user pastes makes THIS box open a
 connection. The security primitives are `narrate`'s — `host_allowed` (exact or
@@ -38,12 +39,14 @@ file-drop fallback. Raw yt-dlp stderr is logged, never returned — see
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import socket
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -69,8 +72,10 @@ YOUTUBE_HOSTS = ["youtube.com", ".youtube.com", "youtu.be", ".youtu.be"]
 EXTERNAL_STATEMENT = (
     "I have the right to use this recording and to clone the voice in it.")
 
-#: Wall-clock ceiling: a stalled connection must not hold an admission permit
-#: (and a phase thread) forever.
+#: Wall-clock ceilings. The probe is metadata-only and must feel like typing;
+#: the download is bounded so a stalled connection cannot hold an admission
+#: permit (and a phase thread) forever.
+PROBE_TIMEOUT_S = float(os.environ.get("INGEST_LINK_PROBE_TIMEOUT", "") or 25)
 DOWNLOAD_TIMEOUT_S = float(os.environ.get("INGEST_LINK_TIMEOUT", "") or 180)
 
 #: How often the download watchdog weighs what has landed on disk.
@@ -159,7 +164,8 @@ def _ytdlp_base() -> list[str]:
             "--no-progress", "--socket-timeout", "20"]
 
 
-def build_download_cmd(url: str, dest: Path, *, max_bytes: int) -> list[str]:
+def build_download_cmd(url: str, dest: Path, *, max_bytes: int,
+                       trim_seconds: float | None = None) -> list[str]:
     """The download argv, built where a test can read it.
 
     What is deliberately ABSENT is the contract: no `-x`/`--extract-audio`, no
@@ -180,11 +186,77 @@ def build_download_cmd(url: str, dest: Path, *, max_bytes: int) -> list[str]:
         "--no-part", "--no-continue", "--no-mtime",
         "-o", str(dest / f"{STEM}.%(ext)s"),
     ]
+    if trim_seconds is not None:
+        cmd += ["--download-sections", f"*0-{int(trim_seconds)}"]
     cmd.append(url)
     return cmd
 
 
+@dataclass(frozen=True)
+class LinkInfo:
+    """What the metadata probe learned. `duration` is None when the extractor
+    did not state one — which is a REFUSAL upstream, not a shrug: an unknown
+    length is exactly the case the duration cap exists for."""
+    title: str
+    duration: float | None
+    uploader: str | None
+    is_live: bool
+
+
+def probe(url: str, *, timeout: float | None = None) -> LinkInfo:
+    """Metadata only — `--skip-download`, no media transferred.
+
+    This is the whole of Direction 2's "honest limits at the door": the verdict
+    (fits / will be trimmed / cannot be read) is reachable at paste time, for
+    the cost of one JSON call, instead of after a two-minute download.
+    """
+    cmd = _ytdlp_base() + ["-J", "--skip-download", url]
+    try:
+        r = _run(cmd, capture_output=True, timeout=timeout or PROBE_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        raise LinkRefusal(504, (
+            "that link took too long to read — try again, or "
+            f"{DROP_INSTEAD}."))
+    except OSError as exc:
+        logger.error("link probe could not start yt-dlp: %s", exc)
+        raise LinkRefusal(503, (
+            "this deployment cannot read links right now (the extractor is "
+            f"missing). {DROP_INSTEAD.capitalize()}."))
+    if r.returncode != 0:
+        _log_ytdlp("probe", url, r.stderr)
+        raise LinkRefusal(422, _extractor_message(r.stderr))
+    try:
+        meta = json.loads((r.stdout or b"").decode("utf-8", "replace")
+                          if isinstance(r.stdout, bytes) else (r.stdout or ""))
+    except (ValueError, AttributeError):
+        _log_ytdlp("probe-parse", url, r.stdout)
+        raise LinkRefusal(422, (
+            f"couldn't read that link's details. {DROP_INSTEAD.capitalize()}."))
+    if not isinstance(meta, dict):
+        raise LinkRefusal(422, f"couldn't read that link. {DROP_INSTEAD.capitalize()}.")
+    # NON-GOAL, stated rather than half-handled: playlists and live streams.
+    if meta.get("_type") == "playlist" or "entries" in meta:
+        raise LinkRefusal(422, (
+            "that link is a playlist — paste a single video's link."))
+    live = bool(meta.get("is_live")) or meta.get("live_status") in ("is_live", "post_live")
+    if live:
+        raise LinkRefusal(422, (
+            "that is a live stream — it has no fixed length to clone from. "
+            "Paste a finished video."))
+    dur = meta.get("duration")
+    try:
+        duration = float(dur) if dur is not None else None
+    except (TypeError, ValueError):
+        duration = None
+    return LinkInfo(title=str(meta.get("title") or "").strip() or "this video",
+                    duration=duration,
+                    uploader=(str(meta.get("uploader")).strip()
+                              if meta.get("uploader") else None),
+                    is_live=False)
+
+
 def download(url: str, dest: Path, *, max_bytes: int,
+             trim_seconds: float | None = None,
              timeout: float | None = None) -> Path:
     """Fetch the audio stream into `dest`; return the file written.
 
@@ -196,7 +268,8 @@ def download(url: str, dest: Path, *, max_bytes: int,
     second of disk — the same stance as narrate's read of one byte past the cap.
     """
     dest.mkdir(parents=True, exist_ok=True)
-    cmd = build_download_cmd(url, dest, max_bytes=max_bytes)
+    cmd = build_download_cmd(url, dest, max_bytes=max_bytes,
+                             trim_seconds=trim_seconds)
     errfile = dest / "ytdlp.stderr"
     deadline = time.monotonic() + (timeout or DOWNLOAD_TIMEOUT_S)
     try:
@@ -249,6 +322,101 @@ def download(url: str, dest: Path, *, max_bytes: int,
         raise LinkRefusal(422, (
             f"that link produced an empty file. {DROP_INSTEAD.capitalize()}."))
     return src
+
+
+def trim_to(src: Path, seconds: float) -> Path:
+    """Cut `src` down to its first `seconds` with the ffmpeg already on PATH.
+
+    The BACKSTOP, not the plan: `--download-sections` normally means the long
+    tail is never transferred at all. This runs when the delivered file is
+    still over the ceiling anyway (an extractor that ignored the section, a
+    keyframe landing late), because "the trimmed duration is what analyze
+    receives" has to be a fact about the file, not a hope about a flag.
+
+    Stream copy first — no re-encode, no quality loss, and no decoder beyond
+    the ffmpeg the pipeline already requires. A container that refuses a copy
+    cut falls back to a re-encode into WAV, which ingest converts to anyway.
+    """
+    cut = src.with_name(f"{src.stem}-trimmed{src.suffix}")
+    copy_cmd = ["ffmpeg", "-y", "-v", "error", "-t", f"{seconds:.3f}",
+                "-i", str(src), "-c", "copy", str(cut)]
+    try:
+        r = _run(copy_cmd, capture_output=True, timeout=120)
+        if r.returncode != 0 or not cut.exists() or cut.stat().st_size == 0:
+            cut.unlink(missing_ok=True)
+            cut = src.with_name(f"{src.stem}-trimmed.wav")
+            r = _run(["ffmpeg", "-y", "-v", "error", "-t", f"{seconds:.3f}",
+                      "-i", str(src), "-ac", "1", str(cut)],
+                     capture_output=True, timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        cut.unlink(missing_ok=True)
+        logger.error("link trim failed for %s: %s", src.name, exc)
+        raise LinkRefusal(500, (
+            "couldn't trim that recording to a clonable length — "
+            f"{DROP_INSTEAD}."))
+    if r.returncode != 0 or not cut.exists() or cut.stat().st_size == 0:
+        cut.unlink(missing_ok=True)
+        _log_ytdlp("trim", str(src), getattr(r, "stderr", b""))
+        raise LinkRefusal(500, (
+            "couldn't trim that recording to a clonable length — "
+            f"{DROP_INSTEAD}."))
+    src.unlink(missing_ok=True)
+    return cut
+
+
+# ── verdicts ──────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class Verdict:
+    """What we will do with this link, decided BEFORE any media moves."""
+    ok: bool
+    title: str
+    duration: float | None
+    #: seconds we will actually clone from (== duration when nothing is cut)
+    clip_seconds: float | None
+    trimmed: bool
+    #: one sentence, written for the paste box
+    message: str
+
+
+def verdict(info: LinkInfo, *, min_seconds: float, max_seconds: float) -> Verdict:
+    """Turn probe metadata into the sentence the paste box shows.
+
+    TRIM, not reject, for a long video: a 47-minute interview is a perfectly
+    good source of one voice, and the first quarter-hour of it is more than the
+    pipeline needs. Rejecting would be defensible for a file the user chose to
+    upload — they can trim that themselves — but a link is not something the
+    user can edit, so "we'll clone the first 15 minutes" is the only answer
+    that leaves them with a voice. The cut is stated at paste time; it never
+    happens silently.
+
+    A video too SHORT is still a refusal: there is no honest way to invent
+    speech that is not there.
+    """
+    if info.duration is None:
+        return Verdict(False, info.title, None, None, False, (
+            f"couldn't read how long that video is, so it can't be cloned "
+            f"safely. {DROP_INSTEAD.capitalize()}."))
+    if info.duration < min_seconds:
+        return Verdict(False, info.title, info.duration, None, False, (
+            f"that video is {_human(info.duration)} long — a clone needs at "
+            f"least {min_seconds:.0f} seconds of speech."))
+    if info.duration > max_seconds:
+        return Verdict(True, info.title, info.duration, max_seconds, True, (
+            f"{_human(info.duration)} video — we'll clone the first "
+            f"{_human(max_seconds)}."))
+    return Verdict(True, info.title, info.duration, info.duration, False, (
+        f"{_human(info.duration)} of audio — that fits, nothing will be cut."))
+
+
+def _human(seconds: float) -> str:
+    """Durations as a person says them: seconds, then minutes, then hours."""
+    if seconds < 90:
+        return f"{seconds:.0f} seconds"
+    mins = seconds / 60
+    if mins < 90:
+        return f"{mins:.0f} minutes"
+    return f"{mins / 60:.1f} hours"
 
 
 # ── plumbing ──────────────────────────────────────────────────────────────────

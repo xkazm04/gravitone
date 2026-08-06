@@ -265,6 +265,16 @@ an operator should know before relying on it:
   the service log for yt-dlp's own message (it is logged in full there and
   deliberately never returned to the client) before suspecting the network.
 
+- **A long video is trimmed, not refused.** `POST /v1/ingest/link/probe` reads
+  the metadata BEFORE any media moves and answers what will happen; anything
+  over `INGEST_MAX_CLIP_SECONDS` (default 900s) is fetched head-first with
+  yt-dlp's `--download-sections`, which uses the ffmpeg already required by the
+  pipeline — no new dependency — and the delivered file's length is re-checked
+  and cut locally if the extractor did not honour the section. Over-cap audio
+  never reaches the paid analyze calls. The probe carries its own per-IP budget
+  (`ingest-link`, `TTS_BUDGET_INGEST_LINK`, default 30 per 10 min); the scan
+  itself shares the scan budget.
+
 Neither failure is a dead end for the user: every refusal on this path names
 the file-drop fallback, which needs no network at all. Link ingest is a
 convenience on top of the upload flow, and nothing downstream depends on it.
