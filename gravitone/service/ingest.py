@@ -1710,22 +1710,36 @@ def label_and_stem(work_dir: Path, target: str, min_stem: float = MIN_STEM_SECON
                    partial: Callable[[dict], None] | None = None,
                    mode: str = "cloud",
                    should_cancel: Callable[[], bool] | None = None,
-                   spend: "Spend | None" = None) -> dict:
+                   spend: "Spend | None" = None,
+                   source_dir: Path | None = None) -> dict:
     """Classify each segment of `target`, then splice one stem per emotion.
 
     `should_cancel` is polled on entry, by every pooled task before it does any
     work, and once the pool drains — so a cancel stops the labelling fan-out
     (up to `limit` ffmpeg extracts and paid classifier calls) within one
     in-flight segment per worker instead of running the batch to completion
-    against a workdir that has already been torn down."""
+    against a workdir that has already been torn down.
+
+    `source_dir` splits WHERE THE ANALYZED AUDIO IS from WHERE THIS SPEAKER'S
+    WORK GOES. Analyze produces exactly two durable artifacts — `clean.wav` and
+    `segments.json` — and both describe the whole recording, every speaker in
+    it. Labelling a second speaker therefore needs no second Scribe or Isolator
+    call; it needs the same two files and a directory of its own to cut into
+    (`seg_%03d.wav` / `stem_*.wav` are per-speaker files with per-speaker
+    indices, so two speakers sharing one directory would overwrite each other).
+    That is the whole mechanism behind casting N characters from one paid scan —
+    see `ingest_api._do_cast`. Default None keeps the single-speaker path
+    byte-identical: read and write in the same workdir."""
     def prog(k: str, s: str) -> None:
         if progress:
             progress(k, s)
 
     _check(should_cancel)
-    all_segs = json.loads((work_dir / "segments.json").read_text("utf-8"))
+    src = Path(source_dir) if source_dir is not None else work_dir
+    work_dir.mkdir(parents=True, exist_ok=True)
+    all_segs = json.loads((src / "segments.json").read_text("utf-8"))
     tsegs = [s for s in all_segs if s["speaker"] == target]
-    clean = work_dir / "clean.wav"
+    clean = src / "clean.wav"
 
     prog("label", "active")
     todo = tsegs[:limit]

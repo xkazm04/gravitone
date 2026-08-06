@@ -104,6 +104,45 @@ export type Created = {
   identity?: number; identity_reason?: string; replaced?: string;
 };
 
+/**
+ * One speaker being turned into a Character by a cast
+ * (service/ingest_api.py::_do_cast, published on `job.cast.members`).
+ *
+ * The status is the whole reason this type exists: a cast is N independent
+ * clone phases against one recording, so "two of these three exist and here is
+ * the third's reason" has to be readable at any moment. `error` is the
+ * service's sanitized sentence for THIS member only — its siblings' Characters
+ * are untouched, and a member that failed was rolled back to nothing.
+ */
+export type CastMember = {
+  speaker_id: string;
+  character: string;
+  character_id?: string | null;
+  status: "pending" | "labelling" | "cloning" | "done" | "error" | string;
+  error?: string | null;
+  voices?: (Created & { character_id?: string })[];
+  emotions?: string[];
+  emotions_done?: number;
+  emotions_total?: number;
+  current?: string | null;
+  stems?: { emotion: string; seconds: number; segments: number; eligible: boolean; note?: string | null }[];
+  utterances?: number;
+};
+
+export type CastJob = {
+  members: CastMember[];
+  done?: number;
+  failed?: number;
+  /** The cast was cancelled (or reaped) before every member was reached. */
+  abandoned?: boolean;
+  /** The per-JOB external-call budget, spent by the WHOLE cast — and the
+   *  service's sentence when a cap was reached, which for a cast is a real
+   *  outcome (later speakers keep their fast-model labels) rather than a
+   *  footnote. Null when nothing was capped. */
+  budget_note?: string | null;
+  spend?: { total_calls?: number; calls?: Record<string, number> } | null;
+};
+
 export type Job = {
   status: string; step: string | null; steps: LoaderStep[]; partial: PartialData;
   speakers: Speaker[] | null; duration: number; result: Result | null; error: string | null;
@@ -125,6 +164,10 @@ export type Job = {
   // from, and which emotions the user has re-cast. Served on every poll so a
   // reload never shows a ledger whose numbers disagree with the audio.
   casting?: { assignments: Record<string, number[]>; edited: string[] } | null;
+  // THE CAST — the other exit from the speaker screen. Absent on every job that
+  // took the single-speaker route, which is a different fact from a cast with
+  // no members: the completion screen branches on its presence.
+  cast?: CastJob | null;
   // Whether this recording's audio was KEPT on the box for the character, and —
   // always — why not. Optional here only because an older service would not
   // send it; when it is present the complete screen states it.
@@ -191,11 +234,11 @@ export type ModeInfo = {
 
 export type Phase =
   | "upload" | "processing" | "speaker" | "review"
-  | "committing" | "complete" | "expired";
+  | "committing" | "casting" | "complete" | "expired";
 
 // Phases where the job is live server-side and must be polled.
 export const POLLING_PHASES: ReadonlySet<Phase> = new Set<Phase>([
-  "processing", "speaker", "committing",
+  "processing", "speaker", "committing", "casting",
 ]);
 
 // Phases where NOTHING is progressing server-side — but the job can still die
@@ -227,6 +270,10 @@ export function statusToPhase(job: Job): Phase | null {
     case "running": return "processing";
     case "done": return "review";
     case "committing": return "committing";
+    // One job labelling and cloning N speakers — its own screen, because there
+    // is nothing per-emotion to show: the progress that matters is per
+    // CHARACTER, and one of them can fail while the others finish.
+    case "casting": return "casting";
     case "committed": return "complete";
     case "cancelled":
     case "expired": return "expired";
@@ -287,6 +334,10 @@ export type Action =
   | { type: "JOB_POLLED"; job: Job }
   | { type: "JOB_EXPIRED" }
   | { type: "SPEAKER_CHOSEN" }
+  // The other exit from the speaker screen: N speakers, N Characters, one job.
+  // Optimistic exactly as SPEAKER_CHOSEN is — the service has accepted the
+  // cast, and the next poll brings the per-member rows it will fill in.
+  | { type: "CAST_STARTED" }
   | { type: "COMMIT_STARTED"; character: string; cid: string; total: number }
   // `error: null` is the backpressure case: the commit was refused before any
   // cloning started, so the review ledger is returned to WITHOUT a failure
@@ -375,6 +426,9 @@ export function reducer(state: State, action: Action): State {
       // Optimistic: the backend flips to running and clears partial; the next
       // poll refreshes the loader from the server.
       return { ...state, phase: "processing" };
+
+    case "CAST_STARTED":
+      return { ...state, phase: "casting", error: null };
 
     case "COMMIT_STARTED":
       return { ...state, phase: "committing", error: null,

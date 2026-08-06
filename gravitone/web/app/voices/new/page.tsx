@@ -42,6 +42,10 @@ import {
   reducer, initialState, POLLING_PHASES, WATCH_PHASES,
   type CastResult, type Character, type Job, type ModeInfo, type Stem,
 } from "./_state/machine";
+import {
+  MAX_CAST_MEMBERS, castMembers, castOutcome, castProgress, castRefusal,
+  memberStatusLabel, type CastSelection,
+} from "./_state/cast";
 import { CANCEL_UNFINISHED, assetRefusal, cancelIngest } from "./_state/failures";
 import { candidates, commitRecipes, recipeById } from "./_state/audition";
 import { corpusNotice } from "./_state/corpus";
@@ -61,7 +65,7 @@ const SCAN_PHASES: ReadonlySet<string> = new Set(["processing", "speaker", "revi
 // Which mutating call is in flight. `submitting` (a ref) still owns the atomic
 // double-submit gate; this is the same fact made VISIBLE — a ref cannot put a
 // button into a pending state, and the scan kickoff is allowed 120 seconds.
-type Pending = null | "scan" | "commit" | `speaker:${string}`;
+type Pending = null | "scan" | "commit" | "cast" | `speaker:${string}`;
 
 // Which door the recording comes through. The link tab is a second WAY IN and
 // nothing more: it produces the same job id, so every screen after this one is
@@ -77,7 +81,8 @@ type Backpressure = {
   detail: string;
   retryAfterSec: number;
   stated: boolean;   // did the response actually carry a Retry-After?
-  action: { kind: "scan" } | { kind: "link" } | { kind: "speaker"; sid: string } | { kind: "commit" };
+  action: { kind: "scan" } | { kind: "link" } | { kind: "speaker"; sid: string }
+    | { kind: "cast" } | { kind: "commit" };
 };
 
 /** Retry-After (delta-seconds form) → a number; 1s when it is absent/bad. */
@@ -112,6 +117,11 @@ export default function NewCharacterPage() {
   // which tab the user happened to click, which a reload would forget.
   const externalSource = job?.source?.kind === "url";
   const consentStatement = externalSource ? EXTERNAL_CONSENT_STATEMENT : CONSENT_STATEMENT;
+  // THE CASTING BOARD's selection: {speaker id -> the name typed for it}. Pure
+  // input state (it exists only between the speaker screen appearing and the
+  // cast starting), so it lives here rather than in the flow's state graph —
+  // the same rule the consent checkbox and the chosen File follow.
+  const [castSel, setCastSel] = useState<CastSelection>({});
   const [file, setFile] = useState<File | null>(null);
   const [dragging, setDragging] = useState(false);
   // The link door. `linkTab` is which input is on screen; `link` is the pasted
@@ -295,6 +305,26 @@ export default function NewCharacterPage() {
   useEffect(() => {
     if (phase === "upload") { recorded.current = false; setVaultWarn(false); return; }
     if (phase !== "complete" || recorded.current) return;
+    // A CAST creates several characters at once, so ownership is recorded per
+    // member (each one knows its own character id and name). The single-commit
+    // path below reads `pendingCommit`, which a cast never sets — without this
+    // branch every cast Character would land in the roster with no consent
+    // receipt in the vault at all.
+    const castMade = (job?.cast?.members ?? []).filter((m) => m.status === "done");
+    if (user && castMade.length > 0) {
+      recorded.current = true;
+      const rows = castMade.flatMap((m) => (m.voices ?? []).map((v) => ({
+        voice_id: v.voice_id,
+        character_id: v.character_id ?? m.character_id ?? "",
+        character_name: m.character,
+        emotion: v.emotion,
+      })));
+      if (rows.length > 0) {
+        void recordVoiceOwnership(user, rows, "ingested")
+          .then((res) => { if (res.failed > 0) setVaultWarn(true); });
+      }
+      return;
+    }
     const pending = state.pendingCommit;
     // Only consume the one-shot once we actually have BOTH the auth'd user and
     // the committed voices. A "complete" render that lands before Firebase's
@@ -307,7 +337,7 @@ export default function NewCharacterPage() {
         character_name: pending.character, emotion: v.emotion,
       })), "ingested").then((res) => { if (res.failed > 0) setVaultWarn(true); });
     }
-  }, [phase, user, created, state.pendingCommit]);
+  }, [phase, user, created, state.pendingCommit, job?.cast]);
 
   /** Present a 429 as backpressure. Never touches `error` — that is rose. */
   async function backpressure(r: Response, action: Backpressure["action"]) {
@@ -330,6 +360,7 @@ export default function NewCharacterPage() {
     if (b.action.kind === "scan") void startScan();
     else if (b.action.kind === "link") void startLinkScan();
     else if (b.action.kind === "speaker") void chooseSpeaker(b.action.sid);
+    else if (b.action.kind === "cast") void startCast();
     else void commit();
   }
 
@@ -415,6 +446,41 @@ export default function NewCharacterPage() {
       dispatch({ type: "SPEAKER_CHOSEN" });
     } catch {
       dispatch({ type: "SET_ERROR", error: "couldn't select that speaker — the backend may be offline" });
+    } finally {
+      submitting.current = false;
+      if (mounted.current) setPending(null);
+    }
+  }
+
+  /** Cast every ticked speaker into a Character of its own.
+   *
+   *  The other exit from this screen. It commits WITHOUT the review ledger —
+   *  one attestation, every eligible emotion of every selected speaker — so the
+   *  consent tick is taken here, and the panel says what is skipped. The
+   *  single-speaker path above is untouched: it still goes to the ledger. */
+  async function startCast() {
+    if (submitting.current || !job?.speakers) return;
+    const members = castMembers(castSel, job.speakers);
+    // Refused in the browser first, in the user's own terms; the service
+    // enforces every one of these again.
+    const refusal = castRefusal(members) ?? (consented ? null
+      : "Attest that you have the right to use this recording before cloning it.");
+    if (refusal) { dispatch({ type: "SET_ERROR", error: refusal }); return; }
+    transport.pause();
+    submitting.current = true;
+    setPending("cast"); setBusyNotice(null);
+    try {
+      const r = await fetch(`/api/ingest/${jobId}/cast`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ members, attested: consented, statement: consentStatement }),
+      });
+      // Nothing has started server-side: stay on the board with the selection
+      // intact and offer the same call again.
+      if (r.status === 429) { await backpressure(r, { kind: "cast" }); return; }
+      if (!r.ok) throw new Error((await readDetail(r)) ?? "couldn't start the cast");
+      dispatch({ type: "CAST_STARTED" });
+    } catch (e) {
+      dispatch({ type: "SET_ERROR", error: e instanceof Error ? e.message : "couldn't start the cast" });
     } finally {
       submitting.current = false;
       if (mounted.current) setPending(null);
@@ -513,7 +579,7 @@ export default function NewCharacterPage() {
 
   function startOver() {
     setFile(null); setBusyNotice(null); setKeepCorpus(false);
-    setCancelFailed(null); setClipRefusal(null);
+    setCancelFailed(null); setClipRefusal(null); setCastSel({}); setConsented(false);
     dispatch({ type: "RESET", kind: "start-over" });
   }
 
@@ -522,7 +588,7 @@ export default function NewCharacterPage() {
     // decision about THIS audio, and carrying it forward would keep a second
     // recording on the box on the strength of a tick about the first.
     setFile(null); setBusyNotice(null); setKeepCorpus(false);
-    setCancelFailed(null); setClipRefusal(null);
+    setCancelFailed(null); setClipRefusal(null); setCastSel({}); setConsented(false);
     dispatch({ type: "RESET", kind: "scan-another" });
   }
 
@@ -826,48 +892,189 @@ export default function NewCharacterPage() {
           </div>
         )}
 
-        {/* SPEAKER PICK */}
-        {phase === "speaker" && job?.speakers && (
+        {/* SPEAKER PICK — the casting board */}
+        {phase === "speaker" && job?.speakers && (() => {
+          const picked = castMembers(castSel, job.speakers);
+          const castRefused = picked.length > 0 ? castRefusal(picked) : null;
+          const multi = job.speakers.length > 1;
+          return (
           <div className="mt-8 max-w-3xl">
             <h2 className="font-instrument text-2xl text-white">
-              {job.mode === "sovereign" ? "This is what will be cloned." : "Which voice is your character?"}
+              {job.mode === "sovereign" && !multi
+                ? "This is what will be cloned."
+                : multi ? "Who is in this recording?" : "Which voice is your character?"}
             </h2>
-            {/* "N speakers detected" is a diarization result. Sovereign mode has
-                no diarizer — its single entry is an assumption, not a finding,
-                and it was also printing "1 speakers". */}
-            <p className="mt-1 text-sm text-white/60">
-              {job.mode === "sovereign"
-                ? "Sovereign mode cannot tell speakers apart, so everything audible is treated as one speaker. Play the sample to hear what that is, then continue."
-                : `${job.speakers.length} speaker${job.speakers.length === 1 ? "" : "s"} detected. Play a sample, then pick the one to build from.`}
+            {/* "N speakers detected" is a diarization result. Sovereign mode
+                without the local diarizer has none — its single entry is an
+                assumption, not a finding. */}
+            <p className="mt-1 max-w-2xl text-sm text-white/60">
+              {job.mode === "sovereign" && !multi
+                ? "Sovereign mode found one speaker here, so everything audible is treated as the same person. Play the sample to hear what that is, then continue."
+                : `${job.speakers.length} speaker${job.speakers.length === 1 ? "" : "s"} detected. Play a sample, then take one to the review ledger — or tick several and cast them all at once, from this one scan.`}
             </p>
             <div className="mt-5 space-y-2">
-              {job.speakers.map((s, i) => (
-                <div key={s.id} className="glass-panel flex items-center gap-3 rounded-xl px-4 py-3">
-                  <span className="grid h-9 w-9 shrink-0 place-items-center rounded-full text-sm font-semibold text-slate-950" style={{ background: `hsl(${(i * 67) % 360} 85% 65%)` }}>{i + 1}</span>
-                  <button onClick={() => playClip(`/api/ingest/${jobId}/speaker-preview/${s.id}`, s.id)} aria-label="Play sample"
-                    className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-cyan-300 text-[12px] text-slate-950 transition hover:brightness-110">
-                    {playing === s.id ? "⏸" : "▶"}
-                  </button>
-                  <div className="min-w-0 flex-1">
-                    <div className="font-jetbrains text-[12px] text-white/80">{s.id} · <span className="text-white">{s.seconds}s</span> · {s.utterances} utterances</div>
-                    {/* Quotation marks + italics mean "this is what they said".
-                        In sovereign mode nothing is transcribed, so sample_text
-                        is a finding about the recording and is set as one. */}
-                    {job.mode === "sovereign" ? (
-                      <div className="text-[12px] leading-snug text-white/50">{s.sample_text}</div>
-                    ) : (
-                      <div className="line-clamp-1 text-sm italic text-white/50">“{s.sample_text}”</div>
+              {job.speakers.map((s, i) => {
+                const on = castSel[s.id] !== undefined;
+                return (
+                <div key={s.id} className={`glass-panel rounded-xl px-4 py-3 transition ${on ? "border border-cyan-400/25 bg-cyan-400/[0.04]" : ""}`}>
+                  <div className="flex items-center gap-3">
+                    <input type="checkbox" checked={on} aria-label={`Cast ${s.id} as a character`}
+                      onChange={(e) => {
+                        setCastSel((cur) => {
+                          const next = { ...cur };
+                          if (e.target.checked) next[s.id] = next[s.id] ?? "";
+                          else delete next[s.id];
+                          return next;
+                        });
+                        dispatch({ type: "SET_ERROR", error: null });
+                      }}
+                      className="h-4 w-4 shrink-0 accent-cyan-300" />
+                    <span className="grid h-9 w-9 shrink-0 place-items-center rounded-full text-sm font-semibold text-slate-950" style={{ background: `hsl(${(i * 67) % 360} 85% 65%)` }}>{i + 1}</span>
+                    <button onClick={() => playClip(`/api/ingest/${jobId}/speaker-preview/${s.id}`, s.id)} aria-label="Play sample"
+                      className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-cyan-300 text-[12px] text-slate-950 transition hover:brightness-110">
+                      {playing === s.id ? "⏸" : "▶"}
+                    </button>
+                    <div className="min-w-0 flex-1">
+                      <div className="font-jetbrains text-[12px] text-white/80">{s.id} · <span className="text-white">{s.seconds}s</span> · {s.utterances} utterances</div>
+                      {/* Quotation marks + italics mean "this is what they said".
+                          In sovereign mode nothing is transcribed, so sample_text
+                          is a finding about the recording and is set as one. */}
+                      {job.mode === "sovereign" ? (
+                        <div className="text-[12px] leading-snug text-white/50">{s.sample_text}</div>
+                      ) : (
+                        <div className="line-clamp-1 text-sm italic text-white/50">“{s.sample_text}”</div>
+                      )}
+                    </div>
+                    {/* The single-speaker route, unchanged: this speaker alone,
+                        through the review ledger, exactly as before. */}
+                    <Button onClick={() => chooseSpeaker(s.id)} disabled={pending !== null}
+                      className="shrink-0 cursor-pointer px-4 py-2 text-[13px]">
+                      {pending === `speaker:${s.id}` ? "selecting…" : "Review this →"}
+                    </Button>
+                  </div>
+                  {on && (
+                    <div className="mt-3 flex flex-wrap items-center gap-2 pl-7">
+                      <label htmlFor={`cast-name-${s.id}`} className="font-jetbrains text-[11px] text-cyan-200/80">
+                        becomes
+                      </label>
+                      <input id={`cast-name-${s.id}`} value={castSel[s.id] ?? ""}
+                        placeholder="Character name"
+                        onChange={(e) => {
+                          const v = e.target.value;
+                          setCastSel((cur) => ({ ...cur, [s.id]: v }));
+                          dispatch({ type: "SET_ERROR", error: null });
+                        }}
+                        className="font-hanken w-56 rounded-xl border border-white/12 bg-white/[0.03] px-3 py-1.5 text-sm text-white placeholder:text-white/40 focus:border-cyan-400/40 focus:outline-none" />
+                    </div>
+                  )}
+                </div>
+                );
+              })}
+            </div>
+
+            {/* THE CAST. One recording, one paid scan, N Characters — and it
+                clones straight through, so everything the review ledger would
+                have asked (which emotions, which take, keep the audio?) is
+                stated here instead of silently decided. */}
+            {picked.length > 0 && (
+              <div className="glass-panel mt-5 rounded-2xl p-5">
+                <div className="font-jetbrains text-[11px] uppercase tracking-widest text-cyan-300/80">
+                  cast {picked.length} character{picked.length === 1 ? "" : "s"} · one scan
+                </div>
+                <p className="mt-2 max-w-2xl text-sm text-white/65">
+                  Each ticked speaker is labelled and cloned from the audio this scan already
+                  produced — no second transcription, no second isolation, one job. A cast
+                  clones every emotion that clears the length minimum and skips the review
+                  ledger; if one speaker can&apos;t be cast, the others still are, and this
+                  screen will say which.
+                </p>
+                <p className="font-jetbrains mt-2 text-[11px] leading-relaxed text-white/40">
+                  Up to {MAX_CAST_MEMBERS} at a time. The recording itself is not kept for a
+                  cast — clone a single speaker if you want its audio stored on this box.
+                </p>
+                <label className="mt-4 flex cursor-pointer items-start gap-2 text-[13px] text-white/70">
+                  <input type="checkbox" checked={consented} onChange={(e) => setConsented(e.target.checked)}
+                    className="mt-0.5 accent-cyan-300" />
+                  <span>
+                    {consentStatement}{" "}
+                    <span className="font-jetbrains text-[11px] text-white/45">
+                      (one attestation covers this cast — it is stored with every Character it
+                      creates{externalSource ? ", together with the link it came from" : ""})
+                    </span>
+                  </span>
+                </label>
+                {castRefused && (
+                  <p className="font-jetbrains mt-3 text-[11px] text-amber-200/80">{castRefused}</p>
+                )}
+                <Button onClick={startCast}
+                  disabled={pending !== null || !consented || castRefused !== null}
+                  className="mt-4 cursor-pointer">
+                  {pending === "cast" ? "Starting the cast…" : `Cast ${picked.length} character${picked.length === 1 ? "" : "s"} →`}
+                </Button>
+              </div>
+            )}
+          </div>
+          );
+        })()}
+
+        {/* CASTING — per-CHARACTER progress, because one can fail alone */}
+        {phase === "casting" && (() => {
+          const { total, settled, current } = castProgress(job?.cast);
+          const members = job?.cast?.members ?? [];
+          const pct = total ? Math.round((settled / total) * 100) : 0;
+          return (
+            <div className="mt-10 max-w-3xl">
+              <div className="font-jetbrains text-[12px] uppercase tracking-widest text-cyan-300">
+                casting · {settled}/{total || "…"}
+              </div>
+              <h2 className="font-instrument mt-2 text-3xl text-white">
+                Building {total || "the"} character{total === 1 ? "" : "s"} from one recording.
+              </h2>
+              <p className="mt-1 text-sm text-white/60">
+                {current
+                  ? <>Now: <span className="text-white">{current.character || current.speaker_id}</span> — {memberStatusLabel(current)}.</>
+                  : "Labelling and cloning each speaker in turn on the CPU engine…"}
+              </p>
+              <div className="mt-5 h-1.5 w-full max-w-md overflow-hidden rounded-full bg-white/10"
+                role="progressbar" aria-valuenow={pct} aria-valuemin={0} aria-valuemax={100}
+                aria-label={`Casting characters, ${settled} of ${total} settled`}>
+                <div className="h-full rounded-full bg-cyan-300 transition-all duration-500" style={{ width: `${pct}%` }} />
+              </div>
+              <div className="mt-5 space-y-2">
+                {members.map((m) => (
+                  <div key={m.speaker_id} className="glass-panel flex flex-wrap items-center gap-3 rounded-xl px-4 py-3">
+                    <span className={`h-2 w-2 shrink-0 rounded-full ${m.status === "done" ? "bg-emerald-300" : m.status === "error" ? "bg-rose-400" : m.status === "pending" ? "bg-white/25" : "bg-cyan-300"}`} />
+                    <span className="text-sm text-white">{m.character || m.speaker_id}</span>
+                    <span className="font-jetbrains text-[11px] text-white/45">{m.speaker_id}</span>
+                    <span className="font-jetbrains ml-auto text-[11px] text-white/60">
+                      {memberStatusLabel(m)}
+                    </span>
+                    {/* A speaker that could not be cast, said the moment it is
+                        known — the others keep going. */}
+                    {m.status === "error" && m.error && (
+                      <span className="font-jetbrains w-full text-[11px] leading-snug text-amber-200/80">
+                        {m.error}
+                      </span>
                     )}
                   </div>
-                  <Button onClick={() => chooseSpeaker(s.id)} disabled={pending !== null}
-                    className="shrink-0 cursor-pointer px-4 py-2 text-[13px]">
-                    {pending === `speaker:${s.id}` ? "selecting…" : "Use this →"}
-                  </Button>
-                </div>
-              ))}
+                ))}
+              </div>
+              <button onClick={cancelCommit}
+                className="font-jetbrains mt-6 cursor-pointer rounded-full border border-white/15 px-5 py-2 text-[13px] text-white/70 transition hover:bg-white/5">
+                {cancelFailed ? "Try cancelling again" : "Cancel"}
+              </button>
+              <p className="font-jetbrains mt-2 text-[11px] text-white/40">
+                Cancelling stops the cast where it is — characters already finished are kept.
+              </p>
+              {cancelFailed && (
+                <ErrorBanner severity="warning" className="mt-4 max-w-xl">
+                  {cancelFailed} — {CANCEL_UNFINISHED}. This screen keeps following the job,
+                  so if the cast finishes you will see it.
+                </ErrorBanner>
+              )}
             </div>
-          </div>
-        )}
+          );
+        })()}
 
         {/* REVIEW — ledger */}
         {phase === "review" && result && (() => {
@@ -1257,8 +1464,109 @@ export default function NewCharacterPage() {
           </div>
         )}
 
-        {/* COMPLETE */}
-        {phase === "complete" && (
+        {/* COMPLETE — a CAST. Per character, because the outcome is per
+            character: some of them can exist while others do not. */}
+        {phase === "complete" && job?.cast && (() => {
+          const outcome = castOutcome(job.cast);
+          if (!outcome) return null;
+          return (
+            <div className="mt-10 max-w-3xl">
+              <div className="glass-panel rounded-2xl p-6">
+                <div className={`font-jetbrains text-[11px] uppercase tracking-widest ${outcome.failed.length ? "text-amber-300" : "text-emerald-300"}`}>
+                  {outcome.failed.length ? "cast · partly" : "cast"}
+                </div>
+                <h2 className="font-instrument mt-2 text-3xl text-white">{outcome.headline}</h2>
+                <p className="mt-2 text-sm text-white/60">
+                  All of them from one scan of this recording — one transcription, one
+                  isolation, {outcome.made.length} character{outcome.made.length === 1 ? "" : "s"}.
+                </p>
+                {/* A cast that was cancelled (or reaped) before every ticked
+                    speaker was reached. The finished ones are real. */}
+                {job.cast.abandoned && (
+                  <ErrorBanner severity="warning" className="mt-3">
+                    This cast stopped before every speaker was reached — the characters
+                    listed below were finished and are yours; the rest were not started.
+                  </ErrorBanner>
+                )}
+                {/* The per-JOB external-call budget covered the WHOLE cast, and
+                    when a cap was reached that is an outcome, not a footnote:
+                    later speakers kept their fast-model labels. */}
+                {job.cast.budget_note && (
+                  <ErrorBanner severity="warning" className="mt-3">{job.cast.budget_note}</ErrorBanner>
+                )}
+
+                <div className="mt-5 space-y-3">
+                  {outcome.made.map((m) => (
+                    <div key={m.speaker_id} className="rounded-xl border border-white/8 bg-white/[0.02] px-4 py-3">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="h-2 w-2 rounded-full bg-emerald-300" />
+                        <span className="text-sm text-white">{m.character}</span>
+                        <span className="font-jetbrains text-[11px] text-white/40">from {m.speaker_id}</span>
+                        {m.character_id && (
+                          <Link href={`/voices/${m.character_id}`}
+                            className="font-jetbrains ml-auto rounded-full border border-cyan-400/35 bg-cyan-400/10 px-3 py-1 text-[11px] text-cyan-100 transition hover:bg-cyan-400/20">
+                            open →
+                          </Link>
+                        )}
+                      </div>
+                      <div className="mt-2 flex flex-wrap gap-1.5">
+                        {(m.voices ?? []).map((v) => {
+                          const em = emotionMeta(v.emotion);
+                          return (
+                            <span key={v.voice_id}
+                              className="font-jetbrains inline-flex items-center gap-1.5 rounded-full border border-white/12 bg-white/5 px-2.5 py-1 text-[11px] text-white/80">
+                              <span className="h-1.5 w-1.5 rounded-full" style={{ background: `hsl(${em.hue} 80% 62%)` }} />{em.label}
+                              {typeof v.identity === "number" && (
+                                <span className="tabular-nums text-cyan-200/85">identity {v.identity.toFixed(2)}</span>
+                              )}
+                            </span>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                  {/* NOT an all-or-nothing lie: the speakers that could not be
+                      cast are listed with the service's own reason, and nothing
+                      of theirs was left behind in the roster. */}
+                  {outcome.failed.map((m) => (
+                    <div key={m.speaker_id} className="rounded-xl border border-amber-400/25 bg-amber-400/[0.04] px-4 py-3">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="h-2 w-2 rounded-full bg-rose-400" />
+                        <span className="text-sm text-white">{m.character || m.speaker_id}</span>
+                        <span className="font-jetbrains text-[11px] text-white/40">from {m.speaker_id}</span>
+                        <span className="font-jetbrains ml-auto text-[11px] text-amber-200/85">not cast</span>
+                      </div>
+                      <p className="font-jetbrains mt-1 text-[11px] leading-relaxed text-amber-200/80">
+                        {m.error ?? "this speaker could not be cast"} — nothing was added to your
+                        roster for them.
+                      </p>
+                    </div>
+                  ))}
+                </div>
+
+                {vaultWarn && (
+                  <p className="font-jetbrains mt-3 rounded-lg border border-amber-400/25 bg-amber-400/5 px-3 py-2 text-[11px] text-amber-200/85">
+                    Voices cloned, but a consent receipt couldn’t be saved to your vault.
+                    Reload “My Voices” — if they’re missing, re-open the character to
+                    re-record ownership.
+                  </p>
+                )}
+
+                <div className="mt-6 flex flex-wrap gap-3">
+                  <Link href="/voices" className="rounded-full bg-cyan-300 px-5 py-2.5 text-sm font-semibold text-slate-950 transition hover:brightness-110">
+                    Back to roster →
+                  </Link>
+                  <button onClick={startOver} className="font-jetbrains cursor-pointer rounded-full border border-white/15 px-5 py-2.5 text-sm text-white/85 transition hover:bg-white/5">
+                    Scan another recording
+                  </button>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
+
+        {/* COMPLETE — a single-speaker commit */}
+        {phase === "complete" && !job?.cast && (
           <div className="mt-10 max-w-2xl">
             <div className="glass-panel rounded-2xl p-6">
               <div className="font-jetbrains text-[11px] uppercase tracking-widest text-emerald-300">character ready</div>

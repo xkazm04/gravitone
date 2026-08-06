@@ -38,7 +38,7 @@ describe("statusToPhase", () => {
   it("maps every non-error status to the phase it means", () => {
     const cases: [string, string][] = [
       ["awaiting_speaker", "speaker"], ["running", "processing"], ["done", "review"],
-      ["committing", "committing"], ["committed", "complete"],
+      ["committing", "committing"], ["casting", "casting"], ["committed", "complete"],
       ["cancelled", "expired"], ["expired", "expired"],
     ];
     for (const [status, phase] of cases) {
@@ -51,7 +51,11 @@ describe("statusToPhase", () => {
   });
 
   it("polls exactly the phases where the job is live server-side", () => {
-    expect([...POLLING_PHASES].sort()).toEqual(["committing", "processing", "speaker"]);
+    // "casting" is the second exit from the speaker screen — one job cloning N
+    // characters, and the only place its per-member outcome appears is the job
+    // payload this poller fetches.
+    expect([...POLLING_PHASES].sort())
+      .toEqual(["casting", "committing", "processing", "speaker"]);
     expect(POLLING_PHASES.has("review")).toBe(false);
     expect(POLLING_PHASES.has("complete")).toBe(false);
   });

@@ -4,6 +4,7 @@
   GET  /v1/ingest/{job}                     → { status, step, steps[], partial, speakers, result }
   GET  /v1/ingest/{job}/speaker-preview/{id}→ per-speaker sample wav
   POST /v1/ingest/{job}/speaker             { speaker_id }  [start label+stem for that speaker]
+  POST /v1/ingest/{job}/cast                { members[{speaker_id, character}] } → N Characters
   GET  /v1/ingest/{job}/preview/{emotion}   → stem wav (the SPEAKER's own audio)
   GET  /v1/ingest/{job}/segment/{i}         → ONE labelled segment's wav
   POST /v1/ingest/{job}/stems               { assignments, reset? } → re-spliced stems
@@ -23,6 +24,21 @@ JOB, not a blocking call, for exactly the reason commit is one.
 
 Status flow: running → awaiting_speaker → running → done. `partial` streams live
 intermediate data (word count, speakers, per-emotion tally) for a data-rich loader.
+
+THE CAST (one video, many characters): `awaiting_speaker` has a second exit.
+`POST /{job}/cast` takes a LIST of (speaker, name) and fans labelling + commit
+over each of them against the SAME `clean.wav` and `segments.json` the one paid
+analyze already produced — one job, one Scribe call, one Isolator call, N
+Characters. Each speaker gets its own subdirectory (`cast_<speaker>/`) because
+`seg_%03d.wav` and `stem_*.wav` are per-speaker files; nothing else about the
+pipeline changes, and the single-speaker route above is untouched. The two exits
+share the same 409 (`awaiting_speaker` is left by whichever arrives first), the
+whole cast runs in ONE phase thread in the owning process (replica affinity),
+holds ONE admission slot, and shares ONE `Spend` — so the per-JOB retry and
+escalation budgets bound the cast, not each speaker (`_cast_budget_note` says so
+when the cap is reached). Per-speaker outcome is published on `job["cast"]`,
+which the studio already polls: a speaker that fails is rolled back and NAMED
+while its siblings keep their Characters.
 
 Durability: every job owns a subdir under INGEST_WORK_DIR holding its files and a
 `state.json` mirror of the job dict. All JOBS mutations happen under a single
@@ -79,6 +95,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -161,7 +178,11 @@ _REAL_THREAD = threading.Thread
 
 # Statuses that mean "a thread is doing work for this job right now". They are
 # what the admission gate counts and what GC refuses to reap on the idle TTL.
-ACTIVE_STATUSES = ("running", "committing")
+# "casting" is ONE job labelling and cloning N speakers in one phase thread: it
+# holds one admission slot (a cast is not N jobs) and it must age on the running
+# TTL, because a three-character cast is three clone phases end to end and the
+# idle TTL would reap the workdir out from under it half way through.
+ACTIVE_STATUSES = ("running", "committing", "casting")
 # The only TTL an ACTIVE job can hit. Expiry is measured from the last state
 # mutation (`touched`), not from creation: a cloud scan of a long recording, or
 # a commit started 25 minutes after the scan, used to be reaped mid-phase by the
@@ -983,6 +1004,31 @@ def _reconcile(job: dict, work_dir: Path) -> None:
         return
 
     made = [r for r in journal.get("registered") or [] if isinstance(r, dict)]
+    if journal.get("kind") == "cast":
+        # A cast is N independent Characters, so a restart does NOT undo it
+        # wholesale: every member that reached "done" is a complete Character
+        # the user asked for, and only the one that was mid-clone left the
+        # half-Character `_rollback` exists for.
+        members = [m for m in journal.get("members") or [] if isinstance(m, dict)]
+        done = [m for m in members if m.get("state") == "done"]
+        stray = [r for m in members if m.get("state") != "done"
+                 for r in (m.get("registered") or []) if isinstance(r, dict)]
+        if stray:
+            _rollback(str(job.get("id")), stray, "was interrupted by a restart mid-cast")
+        kept = [r for m in done for r in (m.get("registered") or [])
+                if isinstance(r, dict)]
+        job["committed"] = kept
+        if journal.get("state") == "done" or (members and len(done) == len(members)):
+            job["status"] = "committed"
+            job["error"] = None
+        else:
+            job["status"] = "error"
+            job["error"] = (
+                f"interrupted by a restart mid-cast — {len(done)} character(s) had "
+                f"been cast and were KEPT" +
+                (f"; {len(stray)} half-cloned voice(s) were removed" if stray else ""))
+        _clear_journal(work_dir)
+        return
     if journal.get("kind") == "rederive":
         job["status"] = "error"
         job["error"] = ("interrupted by restart" if not made else
@@ -1122,7 +1168,7 @@ def _rehydrate() -> None:
                         job.get("id"))
             continue
         job["cancel"] = False
-        if job.get("status") in ("running", "committing"):
+        if job.get("status") in ACTIVE_STATUSES:
             # Not just a relabel: whatever this job registered before the
             # process stopped is undone, or finished, from its journal.
             _reconcile(job, d)
@@ -1624,6 +1670,225 @@ def _do_commit(job_id: str, character: str, emotions: list[str], character_id: s
             logger.warning("ingest job %s: corpus capture failed: %s", job_id, exc)
 
 
+# ── the cast: one recording, N characters ─────────────────────────────────────
+# How many speakers one recording may be cast into at once. A boundary check on
+# a client-supplied list, in the same spirit as MAX_ASSIGNED_SEGMENTS — but this
+# one also bounds SPEND: each member is up to `limit` classifier batches against
+# the shared per-job budget, and each is a full clone phase (one model load per
+# member). Six is well past any real dialogue scene and far short of a recording
+# a diarizer split into noise.
+MAX_CAST_MEMBERS = 6
+#: Legal speaker ids. They reach a DIRECTORY NAME (`cast_<id>/`), so they are
+#: validated the way every other write path here validates one — rejected, never
+#: sanitised — on top of having to be a speaker this scan actually found.
+_SPEAKER_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,40}")
+# Per-member lifecycle, in order. "pending" is what a member sits at until the
+# cast reaches it — a cast of three is three sequential phases, and a member the
+# thread has not started is a different fact from one that failed.
+CAST_MEMBER_STATES = ("pending", "labelling", "cloning", "done", "error")
+
+
+def _valid_speaker_id(sid: str) -> str:
+    sid = (sid or "").strip()
+    if not _SPEAKER_ID_RE.fullmatch(sid):
+        raise HTTPException(400, "that is not a valid speaker id")
+    return sid
+
+
+def _member_dir(work_dir: Path, speaker_id: str) -> Path:
+    """This member's own cutting room. `clean.wav` and `segments.json` stay in
+    the JOB's directory and are read from there by every member."""
+    return work_dir / f"cast_{_valid_speaker_id(speaker_id)}"
+
+
+def _update_member(job: dict, idx: int, **fields) -> None:
+    """Mutate ONE member's row and persist. Same no-op-when-cancelled rule as
+    `_update`: a lagging member must not resurrect a torn-down job."""
+    with _LOCK:
+        if job.get("cancel"):
+            return
+        cast = dict(job.get("cast") or {})
+        members = list(cast.get("members") or [])
+        if 0 <= idx < len(members):
+            members[idx] = {**members[idx], **fields}
+        cast["members"] = members
+        job["cast"] = cast
+        _persist(job)
+
+
+def _cast_budget_note(snap: dict) -> str | None:
+    """The sentence a cast owes its user when the per-JOB budget bit.
+
+    The budgets are the point: labelling N speakers x M emotions multiplies the
+    classifier calls, and the cap bounds the JOB rather than each speaker. So a
+    long cast CAN exhaust it — and when it does the pipeline degrades exactly as
+    it always has (the flash label stands, marked `escalation: "skipped"`),
+    which is a degradation the user has to be told about rather than a refusal.
+    Every character is still cast; their labels are just less sure.
+    """
+    parts: list[str] = []
+    skipped = int(snap.get("escalations_skipped") or 0)
+    if skipped:
+        parts.append(
+            f"the per-recording classifier budget was reached — {skipped} uncertain "
+            "clip(s) kept their fast-model label instead of being re-checked by the "
+            "slower model. Every character above was still cast; their emotion "
+            "labels are simply less sure")
+    retries, budget = int(snap.get("retries") or 0), int(snap.get("retry_budget") or 0)
+    if budget and retries >= budget:
+        parts.append(
+            f"the per-recording retry budget ({budget}) was spent, so a provider "
+            "that was failing was not retried again for the later speakers")
+    return ". ".join(parts) + "." if parts else None
+
+
+def _do_cast(job_id: str, statement: str) -> None:
+    """Label + clone every selected speaker, against ONE analyzed recording.
+
+    Sequential by construction, and that is the design rather than a limitation:
+    the two paid calls are already spent, what remains is CPU (ffmpeg extracts,
+    a classifier fan-out that is already pooled, and one TTS model load per
+    member), and running members in parallel would multiply the heaviest thing
+    on a CPU-only box while still holding one admission slot.
+
+    PARTIAL FAILURE IS THE NORMAL CASE, so it is handled first: a member that
+    fails is rolled back to nothing (the same `_rollback` a failed commit uses —
+    no half-Characters, ever) and NAMED on its own row, and the cast continues.
+    A cast where one of three speakers failed ends `committed` with two
+    Characters and a stated reason for the third; only a cast where NOTHING
+    could be made ends in error.
+    """
+    job = _get_job(job_id)
+    if job is None:  # cancelled between Thread.start() and here
+        return
+    observability.bind_ingest_job(job_id, job["mode"])
+    wd = Path(job["work_dir"])
+    cancelled = _canceller(job)
+    members = list((job.get("cast") or {}).get("members") or [])
+    ledger = _spend_for(job_id)
+
+    # The durable twin of `cast.members`, for the exception this process does
+    # not get to handle (see "the commit journal" and `_reconcile`).
+    journal = {"kind": "cast", "state": "running", "job_id": job_id,
+               "members": [{"speaker_id": m.get("speaker_id"),
+                            "character": m.get("character"),
+                            "character_id": m.get("character_id"),
+                            "state": "pending", "registered": []} for m in members],
+               "started": time.time()}
+    _write_journal(wd, journal)
+
+    abandoned = False
+    for idx, member in enumerate(members):
+        if cancelled():
+            abandoned = True
+            break
+        sid = str(member.get("speaker_id") or "")
+        name = str(member.get("character") or "")
+        cid_req = member.get("character_id")
+        sub = _member_dir(wd, sid)
+        registered: list[dict] = []
+
+        def _note(v: dict, idx: int = idx, registered: list = registered) -> None:
+            registered.append(v)
+            journal["members"][idx]["registered"] = [
+                {"voice_id": r.get("voice_id"), "emotion": r.get("emotion")}
+                for r in registered if isinstance(r, dict)]
+            _write_journal(wd, journal)
+
+        try:
+            _update_member(job, idx, status="labelling")
+            journal["members"][idx]["state"] = "labelling"
+            _write_journal(wd, journal)
+            res = ingest.label_and_stem(
+                sub, sid, source_dir=wd, mode=job["mode"],
+                partial=lambda d, i=idx: _update_member(job, i, progress=d),
+                should_cancel=cancelled, spend=ledger)
+            stems = [s for s in (res.get("stems") or []) if isinstance(s, dict)]
+            emotions = [s["emotion"] for s in stems if s.get("eligible")]
+            if not emotions:
+                # Named, not a bare "commit created nothing": the recording
+                # simply does not hold enough of this person to clone.
+                raise errors.UserFacing(
+                    f"none of this speaker's stems reached the "
+                    f"{res.get('min_stem') or ingest.MIN_STEM_SECONDS:.0f}s minimum this "
+                    "backend clones from — there is too little of them in this recording")
+            _update_member(
+                job, idx, status="cloning", emotions=emotions,
+                stems=[{k: s.get(k) for k in ("emotion", "seconds", "segments",
+                                              "eligible", "note")} for s in stems],
+                utterances=res.get("utterances"))
+            journal["members"][idx]["state"] = "cloning"
+            _write_journal(wd, journal)
+            created = ingest.commit(
+                sub, name, emotions, cid_req,
+                consent=statement, clip_sha256=job.get("clip_sha256"),
+                progress=lambda done, cur, i=idx, total=len(emotions):
+                    _update_member(job, i, emotions_done=done, emotions_total=total,
+                                   current=cur),
+                should_cancel=cancelled, on_voice=_note)
+            if cancelled():
+                raise ingest.Cancelled()
+            if not created:
+                raise errors.UserFacing(
+                    "no voice could be cloned for this speaker — every stem was "
+                    "either too short or already held by that character")
+            cid = cid_req or voices._slug(name)
+            journal["members"][idx]["state"] = "done"
+            _write_journal(wd, journal)
+            _update_member(job, idx, status="done", character_id=cid, error=None,
+                           voices=[{**v, "character_id": cid} for v in created],
+                           emotions_done=len(created), emotions_total=len(emotions),
+                           current=None)
+        except ingest.Cancelled:
+            _rollback(job_id, registered, "was cancelled mid-cast")
+            abandoned = True
+            break
+        except Exception as exc:  # noqa: BLE001 - ONE member, never the cast
+            # Terminal for this member: undo what it registered, say why, and
+            # keep going. The siblings are unrelated Characters.
+            _rollback(job_id, registered, f"failed while casting '{sid}'")
+            journal["members"][idx]["state"] = "error"
+            journal["members"][idx]["registered"] = []
+            _write_journal(wd, journal)
+            _update_member(job, idx, status="error", voices=[], current=None,
+                           error=errors.sanitize_detail(
+                               f"casting {name or sid}", exc))
+
+    snap = ledger.snapshot()
+    with _LOCK:
+        if not job.get("cancel"):
+            cast = dict(job.get("cast") or {})
+            rows = list(cast.get("members") or [])
+            done = [m for m in rows if m.get("status") == "done"]
+            failed = [m for m in rows if m.get("status") == "error"]
+            voices_made = [v for m in done for v in (m.get("voices") or [])]
+            cast.update({"done": len(done), "failed": len(failed),
+                         "abandoned": abandoned, "spend": snap,
+                         "budget_note": _cast_budget_note(snap)})
+            job["cast"] = cast
+            job["committed"] = voices_made
+            job["partial"] = {"emotions_done": len(voices_made),
+                              "emotions_total": len(voices_made), "current": None}
+            if done:
+                journal["state"] = "done"
+                _write_journal(wd, journal)
+                job["status"] = "committed"
+                job["error"] = None
+            else:
+                job["status"] = "error"
+                job["error"] = ("no character could be cast from this recording — "
+                                "each speaker says why above")
+            _persist(job)
+    _clear_journal(wd)
+    logger.info("ingest job %s: cast finished — %d character(s), %d failed, "
+                "%d external call(s)", job_id,
+                sum(1 for m in (job.get("cast") or {}).get("members") or []
+                    if m.get("status") == "done"),
+                sum(1 for m in (job.get("cast") or {}).get("members") or []
+                    if m.get("status") == "error"),
+                int(snap.get("total_calls") or 0))
+
+
 def _do_rederive(job_id: str, character_id: str, emotions: list[str] | None) -> None:
     """Rebuild + re-export one character's voices from its corpus, as a phase.
 
@@ -1792,6 +2057,10 @@ def _new_job(job_id: str, work_dir: Path, resolved: str, clip_sha256: str,
         # means "the stems are exactly what the pipeline proposed", which is a
         # different fact from an assignment map that happens to match it.
         "casting": None,
+        # THE CAST (many characters from this one recording). None on every job
+        # that took the single-speaker exit — absent means "this was never a
+        # cast", which is not the same as a cast with no members.
+        "cast": None,
         # Provenance. See UPLOAD_SOURCE.
         "source": dict(source),
         # Corpus state. `requested` is what the caller asked for at upload time
@@ -1993,6 +2262,13 @@ _PUBLIC_KEYS = ("id", "status", "step", "steps", "partial", "speakers",
                 # tab, must not show a ledger whose numbers no longer match the
                 # audio on disk.
                 "casting",
+                # THE CAST: one row per selected speaker — what it is doing,
+                # what it made, and (per speaker) why it did not. This is how
+                # partial failure reaches the studio: the poller that follows a
+                # cast is the poller that already follows every other phase, so
+                # "two of three characters exist and here is the third's reason"
+                # is read from the job rather than inferred from a voice list.
+                "cast",
                 # Whether this job's audio was kept, and — always — why not.
                 "corpus",
                 # Where the audio came from. The studio reads this to decide
@@ -2093,6 +2369,131 @@ def choose_speaker(job_id: str, req: SpeakerReq) -> dict:
         _persist(job)
     _spawn(_label, (job_id, req.speaker_id), f"ingest-label-{job_id}")
     return {"status": "running"}
+
+
+def _attestation(job: dict, attested: bool, statement: str) -> str:
+    """The consent statement this job's Voices will carry, or a 422.
+
+    ONE rule for every path that clones from a recording — the single-speaker
+    commit and the cast alike. A link-sourced job attests something DIFFERENT,
+    and the difference is the whole point: "I own this voice" is false for a
+    video someone else published, and a receipt that stores a false sentence
+    launders the claim instead of recording it. The requirement is not weakened
+    for those jobs — it is replaced by the true one, verbatim, and the source is
+    appended so the record names the recording the attestation is about. One
+    attestation covers a whole cast, and every Character it creates stores it.
+    """
+    statement = (statement or "").strip()
+    if not attested or not statement:
+        raise HTTPException(422, "ownership attestation required to clone a voice")
+    if (job.get("source") or {}).get("kind") == "url":
+        if statement != ingest_url.EXTERNAL_STATEMENT:
+            raise HTTPException(422, (
+                "this recording came from a link, not from you — the "
+                f'attestation must read exactly: "{ingest_url.EXTERNAL_STATEMENT}"'))
+        statement = f"{statement} Source: {(job.get('source') or {}).get('url')}"
+    return statement
+
+
+class CastMemberReq(BaseModel):
+    speaker_id: str
+    character: str
+    #: Extend an existing Character instead of creating one. Same field, same
+    #: meaning and same validation as `CommitReq.character_id`.
+    character_id: str | None = None
+
+
+class CastReq(BaseModel):
+    members: list[CastMemberReq]
+    # The same server-side consent gate a commit carries. ONE attestation for
+    # the whole cast: it is a statement about the RECORDING, and the recording
+    # is the same one for every speaker in it.
+    attested: bool = False
+    statement: str = ""
+
+
+@router.post(INGEST + "/{job_id}/cast")
+def cast(job_id: str, req: CastReq) -> dict:
+    """Cast N speakers of ONE analyzed recording into N Characters.
+
+    The second exit from `awaiting_speaker`, and deliberately a separate route
+    rather than a list-accepting `/speaker`: the two do different things at the
+    far end. `/speaker` labels one speaker and STOPS at a review ledger the user
+    edits (recipes, the casting board, per-emotion keep/descope) before a
+    separate commit; a cast has no per-speaker ledger to edit — it takes the
+    attestation up front and clones every eligible stem of every selected
+    speaker. Making `/speaker` accept a list would have made one route mean two
+    different flows depending on the length of its argument, and would have had
+    to answer "which speaker's stems are in `result`?" for the studio. They stay
+    coherent on the thing that matters: both leave `awaiting_speaker`, so
+    whichever arrives second gets the same 409 the flow has always had.
+
+    Admission is taken ONCE — a cast is one job doing more work, not N jobs, and
+    every member runs on the one phase thread in the process that owns the job.
+    """
+    _admit()   # one slot: labelling + N clone phases, all on one thread
+    if not req.members:
+        raise HTTPException(400, "choose at least one speaker to cast")
+    if len(req.members) > MAX_CAST_MEMBERS:
+        raise HTTPException(
+            400, f"at most {MAX_CAST_MEMBERS} characters can be cast from one "
+                 "recording at a time")
+    seen_speakers: set[str] = set()
+    seen_cids: set[str] = set()
+    members: list[dict] = []
+    for m in req.members:
+        sid = _valid_speaker_id(m.speaker_id)
+        name = (m.character or "").strip()
+        if m.character_id is not None and m.character_id != voices._slug(m.character_id):
+            raise HTTPException(400, "character_id is not a valid character id")
+        if not name and not m.character_id:
+            raise HTTPException(400, f"name the character for speaker {sid}")
+        if sid in seen_speakers:
+            raise HTTPException(400, f"speaker {sid} is listed twice")
+        seen_speakers.add(sid)
+        cid = m.character_id or voices._slug(name)
+        if not cid:
+            raise HTTPException(400, f"'{name}' is not a usable character name")
+        if cid in seen_cids:
+            # Two speakers into one Character would race each other for the same
+            # (character_id, emotion) slots — the second one's voices would be
+            # skipped as "already held" and the user would be told two people
+            # were cloned when one was.
+            raise HTTPException(
+                400, f"two speakers cannot be cast into the same character ({cid})")
+        seen_cids.add(cid)
+        members.append({"speaker_id": sid, "character": name,
+                        "character_id": m.character_id, "status": "pending",
+                        "error": None, "voices": []})
+
+    with _LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return job_expired()
+        if job["status"] != "awaiting_speaker":
+            raise HTTPException(409, "not awaiting speaker")
+        known = {s.get("id") for s in (job.get("speakers") or [])}
+        for m in members:
+            if m["speaker_id"] not in known:
+                raise HTTPException(
+                    400, f"{m['speaker_id']} is not a speaker this scan found")
+        statement = _attestation(job, req.attested, req.statement)
+        job["status"] = "casting"
+        job["partial"] = {}
+        job["cast"] = {"members": members, "done": 0, "failed": 0,
+                       "abandoned": False, "spend": None, "budget_note": None}
+        # A cast clones straight through, so there is no review ledger and no
+        # corpus-capture moment: retention is opt-in AT the consent step of a
+        # single-speaker commit, and silently keeping N speakers' audio on the
+        # strength of one tick is not that. Named rather than absent.
+        job["corpus"] = {
+            "requested": bool((job.get("corpus") or {}).get("requested")),
+            "captured": False,
+            "reason": "the recording is not kept for a multi-speaker cast — clone "
+                      "a single speaker if you want its audio stored on this box"}
+        _persist(job)
+    _spawn(_do_cast, (job_id, statement), f"ingest-cast-{job_id}")
+    return {"status": "casting", "members": len(members)}
 
 
 class AuditionReq(BaseModel):
@@ -2578,23 +2979,9 @@ def commit(job_id: str, req: CommitReq):
             raise HTTPException(409, "scan not finished")
         if not req.character.strip() and not req.character_id:
             raise HTTPException(400, "character name required")
-        statement = req.statement.strip()
-        if not req.attested or not statement:
-            raise HTTPException(422, "ownership attestation required to clone a voice")
-        # A link-sourced job attests something DIFFERENT, and the difference is
-        # the whole point: "I own this voice" is false for a video someone else
-        # published, and a receipt that stores a false sentence launders the
-        # claim instead of recording it. The requirement is not weakened for
-        # these jobs — it is replaced by the true one, verbatim, so the stored
-        # receipt says what the user actually agreed to.
-        if (job.get("source") or {}).get("kind") == "url":
-            if statement != ingest_url.EXTERNAL_STATEMENT:
-                raise HTTPException(422, (
-                    "this recording came from a link, not from you — the "
-                    f'attestation must read exactly: "{ingest_url.EXTERNAL_STATEMENT}"'))
-            # The source belongs IN the receipt: an attestation about a
-            # recording is only checkable if the record names the recording.
-            statement = f"{statement} Source: {(job['source'] or {}).get('url')}"
+        # ONE consent rule for every clone path, including the link-sourced
+        # sentence and the source stamped into the receipt (see `_attestation`).
+        statement = _attestation(job, req.attested, req.statement)
         want_corpus = ((job.get("corpus") or {}).get("requested", False)
                        if req.corpus is None else bool(req.corpus))
         job["status"] = "committing"
@@ -2748,6 +3135,16 @@ def cancel_job(job_id: str):
         job["status"] = "cancelled"
         work_dir = job["work_dir"]
         is_rederive = job.get("mode") == "rederive"
+        # A cancelled CAST keeps the characters it already finished, for the
+        # same reason a cancelled rebuild keeps its voices: each one is a whole
+        # Character the user asked for, not the half of one that `_rollback`
+        # exists to undo (the member that was mid-clone IS rolled back, by the
+        # phase thread's own Cancelled path). So say which ones are live.
+        made = [{"character": m.get("character"),
+                 "character_id": m.get("character_id"),
+                 "voices": len(m.get("voices") or [])}
+                for m in ((job.get("cast") or {}).get("members") or [])
+                if isinstance(m, dict) and m.get("status") == "done"]
         JOBS.pop(job_id, None)
         _SPEND.pop(job_id, None)
     rebuilt: list[dict] = []
@@ -2762,6 +3159,8 @@ def cancel_job(job_id: str):
     forget_metrics(work_dir)
     if is_rederive:
         return {"status": "cancelled", "rebuilt": rebuilt, "kept": True}
+    if made:
+        return {"status": "cancelled", "cast": made, "kept": True}
     return {"status": "cancelled"}
 
 
