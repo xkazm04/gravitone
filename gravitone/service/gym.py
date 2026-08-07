@@ -720,7 +720,7 @@ def _turns(wire: _Wire, recorded: dict | None) -> tuple[dict, list[dict], str]:
 def _turns_from_recording(recorded: dict) -> list[dict]:
     out: list[dict] = []
     for i, turn in enumerate(recorded.get("turns") or []):
-        out.append({
+        entry = {
             "i": i,
             "role": str(turn.get("role") or ""),
             "text": str(turn.get("text") or ""),
@@ -728,7 +728,13 @@ def _turns_from_recording(recorded: dict) -> list[dict]:
             "transcribe_s": turn.get("transcribe_s"),
             "answer_s": turn.get("answer_s"),
             "interrupted": bool(turn.get("interrupted")),
-        })
+        }
+        # Mouth telemetry travels with the turn when the recorder captured it
+        # — a replay's internal-lens evidence is the same shape as a live
+        # session's. Absent stays absent.
+        if turn.get("spoke") is not None:
+            entry["spoke"] = turn["spoke"]
+        out.append(entry)
     return out
 
 

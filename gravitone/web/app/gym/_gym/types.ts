@@ -133,6 +133,31 @@ export type AgentsAnswer = {
   enabled: boolean;
 };
 
+/** Which mouth spoke one part of an agent turn — the internal lens's
+ *  telemetry. `emotion` is what the brain asked for; `used` is the slot that
+ *  actually spoke; `fallback` true means the request went unmet (missing
+ *  slot, derived stand-in, or a voice no Character owns). */
+export type SpokeEntry = {
+  voice_id: string;
+  tts: string;
+  emotion: string | null;
+  used: string | null;
+  fallback: boolean | null;
+};
+
+/** One per-turn verdict from the operator's ear. */
+export type CareMark = {
+  turn: number;
+  verdict: "ok" | "off";
+  emotion?: string | null;
+  note?: string | null;
+};
+
+export type CareAnswer = {
+  marks: CareMark[];
+  updated_at?: number;
+};
+
 /** One turn of a RECORDED conversation's transcript (recording.py::Turn).
  *  This is the original call's own evidence — replay artifacts (GymTurn)
  *  reproduce these numbers; the forensic room reads them directly. */
@@ -146,6 +171,9 @@ export type RecordedTurn = {
   transcribe_s?: number | null;
   answer_s?: number | null;
   interrupted?: boolean;
+  /** Agent turns only, and only on recordings made since mouth telemetry
+   *  landed — absent elsewhere, never null-filled. */
+  spoke?: SpokeEntry[];
 };
 
 /** GET /v1/convai/conversations/{id} — the transcript as recorded. */

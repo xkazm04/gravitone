@@ -34,7 +34,7 @@ import wave
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from service.atomicio import atomic_write_text
+from service.atomicio import atomic_write_text, file_lock
 from service.config import SETTINGS
 
 logger = logging.getLogger("gravitone.convai")
@@ -59,6 +59,13 @@ class Turn:
     # audio — the number a listener experiences as "how long it thought".
     answer_s: float | None = None
     interrupted: bool = False
+    # Only on an agent turn: which mouth spoke each part of the reply —
+    # {voice_id, tts, emotion (requested), used (spoken), fallback}. The
+    # session hangs a LIVE list here and the renderer appends to it while
+    # audio is still going out; close() serializes the final state. This is
+    # the internal-lens telemetry: a care decision about a Character's slot
+    # starts from knowing which slot actually spoke.
+    spoke: list | None = None
 
 
 def recordings_dir() -> Path:
@@ -155,7 +162,7 @@ class Recorder:
             "duration_s": self.elapsed(),
             "sample_rate": self.rate,
             "ended": reason,
-            "turns": [asdict(t) for t in self.turns],
+            "turns": [_turn_dict(t) for t in self.turns],
         }
         try:
             atomic_write_text(self.dir / "transcript.json",
@@ -172,6 +179,62 @@ class Recorder:
                     self.conversation_id, self.dir, payload["duration_s"],
                     len(self.turns))
         evict_oldest()
+
+
+def _turn_dict(turn: Turn) -> dict:
+    """One turn as the transcript stores it. ``spoke`` is agent-only
+    telemetry — absent, not null, on every turn that has none."""
+    d = asdict(turn)
+    if d.get("spoke") is None:
+        d.pop("spoke", None)
+    return d
+
+
+# -- care marks --------------------------------------------------------------
+# The operator's per-turn verdicts on a recorded conversation ("this reply
+# sounds off — retrain angry"), stored beside the evidence they are about.
+# Whole-document semantics: PUT replaces the list. The studio holds the full
+# set while the operator listens, and a merge contract would invent conflict
+# cases this surface does not have.
+
+def _care_path(conversation_id: str) -> Path | None:
+    """The care file for an id, or None for an id we never minted (same
+    alnum-only rule as ``load`` — these are path segments)."""
+    if not conversation_id or not conversation_id.isalnum():
+        return None
+    return recordings_dir() / conversation_id / "care.json"
+
+
+def load_care(conversation_id: str) -> dict | None:
+    """A conversation's care marks; ``{"marks": []}`` when none are stored
+    yet; None when the conversation itself does not exist."""
+    path = _care_path(conversation_id)
+    if path is None or not path.parent.is_dir():
+        return None
+    try:
+        found = json.loads(path.read_text("utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"marks": []}
+    return found if isinstance(found, dict) else {"marks": []}
+
+
+def save_care(conversation_id: str, marks: list[dict]) -> dict | None:
+    """Replace a conversation's marks. None when the conversation is gone.
+
+    The cross-process ``file_lock``, not just an atomic write: the service
+    runs as N single-worker replicas, and two studio tabs saving through two
+    replicas must serialize on the existence-check-then-write — ``os.replace``
+    prevents a torn file, not a lost update.
+    """
+    path = _care_path(conversation_id)
+    if path is None or not path.parent.is_dir():
+        return None
+    payload = {"marks": marks, "updated_at": round(time.time(), 3)}
+    with file_lock(path.parent / ".care.lock"):
+        if not path.parent.is_dir():
+            return None
+        atomic_write_text(path, json.dumps(payload, indent=2, ensure_ascii=False))
+    return payload
 
 
 def evict_oldest(limit: int = MAX_CONVERSATIONS) -> int:
@@ -231,5 +294,11 @@ def listing(limit: int = 50) -> list[dict]:
                           ("agent_id", "duration_s", "turns", "ended", "brain")
                           if k in meta})
             entry["status"] = "complete"
+        try:
+            marks = json.loads((d / "care.json").read_text("utf-8")).get("marks")
+            if isinstance(marks, list):
+                entry["care_marks"] = len(marks)
+        except (OSError, json.JSONDecodeError):
+            pass  # no marks yet — absent, not zero
         out.append(entry)
     return out

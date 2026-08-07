@@ -219,6 +219,51 @@ class RecordedConversationTests(ConversationTests, _RecordingCase):
         self.assertEqual(res.status_code, 404)
         self.assertIn("CONVAI_RECORD", res.json()["detail"])
 
+    def test_an_emotion_part_speaks_through_the_characters_slot(self) -> None:
+        """[emotion:happy] resolves to the owning Character's slot, and the
+        transcript records which mouth spoke — hit and fallback alike."""
+        from service import demand as demand_mod
+        from service import voices as voices_mod
+
+        self._engine()
+        originals = (voices_mod.character_for_voice, voices_mod.emotion_map,
+                     voices_mod.prosody_map, demand_mod.record_fallback)
+        recorded_demand: list[tuple[str, str]] = []
+        voices_mod.character_for_voice = lambda vid: "sarah"
+        voices_mod.emotion_map = lambda cid: {"happy": "sarah_happy",
+                                              "baseline": "sarah_base"}
+        voices_mod.prosody_map = lambda cid: {}
+        demand_mod.record_fallback = lambda cid, e: recorded_demand.append((cid, e))
+        try:
+            with self.client.websocket_connect(self._url()) as ws:
+                self._init(ws, first_message="[emotion:happy] Wonderful to "
+                                             "meet you. [emotion:sad] Onward.")
+                meta = ws.receive_json()
+                conversation_id = meta[
+                    "conversation_initiation_metadata_event"]["conversation_id"]
+                self._until(ws, "agent_response")
+                ws.receive_json()  # at least one audio event
+        finally:
+            (voices_mod.character_for_voice, voices_mod.emotion_map,
+             voices_mod.prosody_map, demand_mod.record_fallback) = originals
+
+        body = json.loads(
+            (self.dir_for(conversation_id) / "transcript.json").read_text("utf-8"))
+        agent = next(t for t in body["turns"] if t["role"] == "agent")
+        spoke = agent["spoke"]
+        self.assertEqual(spoke[0], {"voice_id": "sarah_happy",
+                                    "tts": "pocket-tts", "emotion": "happy",
+                                    "used": "happy", "fallback": False})
+        # "sad" has no slot: the deterministic walk lands on baseline, the
+        # telemetry says so, and the demand counter heard about it.
+        self.assertEqual(spoke[1]["used"], "baseline")
+        self.assertTrue(spoke[1]["fallback"])
+        self.assertIn(("sarah", "sad"), recorded_demand)
+        # Caller turns carry no mouth — absent, not null.
+        for t in body["turns"]:
+            if t["role"] == "candidate":
+                self.assertNotIn("spoke", t)
+
     def test_a_recorded_track_is_served_for_listening(self) -> None:
         self._engine()
         with self.client.websocket_connect(self._url()) as ws:
@@ -245,6 +290,68 @@ class RecordedConversationTests(ConversationTests, _RecordingCase):
             "/v1/convai/conversations/abc123/audio/transcript")
         self.assertEqual(wrong.status_code, 404)
         self.assertIn("track", wrong.json()["detail"])
+
+
+class CareTests(_RecordingCase):
+    """The operator's per-turn care marks: stored beside the evidence."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        from fastapi import FastAPI
+
+        host = FastAPI()
+        host.include_router(convai.router)
+        self.client = TestClient(host, raise_server_exceptions=False)
+        Recorder("cared1", RATE).close()  # a conversation directory to mark
+
+    def test_no_marks_yet_is_an_empty_list_not_a_404(self) -> None:
+        res = self.client.get("/v1/convai/conversations/cared1/care")
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertEqual(res.json()["marks"], [])
+
+    def test_marks_round_trip_and_reach_the_listing(self) -> None:
+        put = self.client.put(
+            "/v1/convai/conversations/cared1/care",
+            json={"marks": [{"turn": 2, "verdict": "off", "emotion": "angry",
+                             "note": "flat — retrain this slot"}]})
+        self.assertEqual(put.status_code, 200, put.text)
+        self.assertIn("updated_at", put.json())
+
+        got = self.client.get("/v1/convai/conversations/cared1/care").json()
+        self.assertEqual(got["marks"][0]["verdict"], "off")
+        self.assertEqual(got["marks"][0]["emotion"], "angry")
+
+        row = next(r for r in recording.listing()
+                   if r["conversation_id"] == "cared1")
+        self.assertEqual(row["care_marks"], 1)
+
+    def test_put_replaces_the_whole_document(self) -> None:
+        for marks in ([{"turn": 0, "verdict": "off"}],
+                      [{"turn": 1, "verdict": "ok"}]):
+            self.client.put("/v1/convai/conversations/cared1/care",
+                            json={"marks": marks})
+        got = self.client.get("/v1/convai/conversations/cared1/care").json()
+        self.assertEqual([m["turn"] for m in got["marks"]], [1])
+
+    def test_an_unknown_conversation_is_a_404_both_ways(self) -> None:
+        self.assertEqual(self.client.get(
+            "/v1/convai/conversations/ghost/care").status_code, 404)
+        self.assertEqual(self.client.put(
+            "/v1/convai/conversations/ghost/care",
+            json={"marks": []}).status_code, 404)
+
+    def test_a_hostile_id_is_refused_not_resolved(self) -> None:
+        res = self.client.put("/v1/convai/conversations/with-dash/care",
+                              json={"marks": []})
+        self.assertEqual(res.status_code, 404)
+
+    def test_a_wrong_shape_is_a_422(self) -> None:
+        for bad in ({"marks": [{"turn": -1, "verdict": "ok"}]},
+                    {"marks": [{"turn": 0, "verdict": "meh"}]},
+                    {"marks": [{"turn": 0}]}):
+            res = self.client.put("/v1/convai/conversations/cared1/care",
+                                  json=bad)
+            self.assertEqual(res.status_code, 422, bad)
 
 
 if __name__ == "__main__":

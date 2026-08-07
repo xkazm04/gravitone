@@ -15,6 +15,8 @@ import { loadRoster, type Character } from "@/app/voices/_data/characters";
 import { diagnose, type Finding } from "./diagnose";
 import type {
   AgentsAnswer,
+  CareAnswer,
+  CareMark,
   GymComparison,
   GymRun,
   RecordingsAnswer,
@@ -294,6 +296,30 @@ export function useGymRuns() {
 
 function runsOf(runs: SessionRun[], sourceName: string): SessionRun[] {
   return runs.filter((r) => r.run.source_name === sourceName);
+}
+
+// ---------------------------------------------------------------------------
+// Care marks — the operator's per-turn verdicts, whole-document semantics.
+// ---------------------------------------------------------------------------
+
+export async function fetchCare(sessionId: string): Promise<CareAnswer> {
+  return apiJson<CareAnswer>(
+    `/api/gym/recordings/${encodeURIComponent(sessionId)}/care`,
+    undefined,
+    "could not load care marks",
+  );
+}
+
+export async function saveCare(sessionId: string, marks: CareMark[]): Promise<CareAnswer> {
+  return apiJson<CareAnswer>(
+    `/api/gym/recordings/${encodeURIComponent(sessionId)}/care`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ marks }),
+    },
+    "could not save care marks",
+  );
 }
 
 // ---------------------------------------------------------------------------

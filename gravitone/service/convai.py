@@ -76,11 +76,12 @@ import time
 import uuid
 import wave
 from hashlib import sha256
-from typing import AsyncIterator, Callable, Iterable
+from typing import AsyncIterator, Callable, Iterable, Literal
 
 import numpy as np
 from fastapi import APIRouter, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
 
 from service import dialog, engines, piper, recording, stt
 from service.cache import CachedPcm, SynthCache
@@ -421,6 +422,39 @@ def get_conversation(conversation_id: str) -> dict:
     return found
 
 
+class CareMark(BaseModel):
+    """One per-turn verdict from the operator's ear."""
+
+    turn: int = Field(..., ge=0, le=9999)
+    verdict: Literal["ok", "off"]
+    emotion: str | None = Field(None, max_length=40,
+                                description="the slot the verdict is about")
+    note: str | None = Field(None, max_length=500)
+
+
+class CareBody(BaseModel):
+    marks: list[CareMark] = Field(..., max_length=200)
+
+
+@router.get("/v1/convai/conversations/{conversation_id}/care")
+def get_care(conversation_id: str) -> dict:
+    """The operator's care marks for one recorded conversation."""
+    found = recording.load_care(conversation_id)
+    if found is None:
+        raise HTTPException(404, f"no recorded conversation '{conversation_id}'")
+    return found
+
+
+@router.put("/v1/convai/conversations/{conversation_id}/care")
+def put_care(conversation_id: str, body: CareBody) -> dict:
+    """Replace the marks — whole-document, see recording.save_care."""
+    saved = recording.save_care(conversation_id,
+                                [m.model_dump() for m in body.marks])
+    if saved is None:
+        raise HTTPException(404, f"no recorded conversation '{conversation_id}'")
+    return saved
+
+
 @router.get("/v1/convai/conversations/{conversation_id}/audio/{track}")
 def get_conversation_audio(conversation_id: str, track: str):
     """One recorded track, for the operator's own forensic listening.
@@ -637,6 +671,14 @@ class _Session:
         # Languages we have already apologized for. One refusal per language per
         # call: a whole Czech reply must not become five identical apologies.
         self._refused: set[str] = set()
+        # Per-turn mouth telemetry: which voice/emotion spoke each part of the
+        # reply being rendered. _speak points this at a fresh list per turn and
+        # hangs the SAME list on the recorded Turn, so entries the renderer
+        # appends while audio is still going out are serialized at close.
+        self._spoke: list[dict] = []
+        # voice_id -> owning character_id (None: no Character owns it). Cached
+        # because the lookup walks the voice registry.
+        self._voice_character: dict[str, str | None] = {}
 
         self._send_lock = asyncio.Lock()   # several tasks send; frames must not interleave
         self._turn: asyncio.Task | None = None
@@ -1191,6 +1233,11 @@ class _Session:
         """
         to_render: asyncio.Queue = asyncio.Queue()
         rendered: asyncio.Queue = asyncio.Queue()
+        # A fresh telemetry list BEFORE the renderer starts — it may reach
+        # _synthesize for sentence one while this loop is still reading
+        # sentence two out of the brain.
+        spoke: list[dict] = []
+        self._spoke = spoke
         renderer = asyncio.create_task(self._render(to_render, rendered))
         parts: list[dialog.TurnPart] = []
         hang_up = False
@@ -1214,7 +1261,8 @@ class _Session:
             self._turns += 1
             await self._send({"type": "agent_response",
                               "agent_response_event": {"agent_response": reply}})
-            spoken_turn = Turn(role="agent", text=reply, at_s=self.recorder.elapsed())
+            spoken_turn = Turn(role="agent", text=reply, at_s=self.recorder.elapsed(),
+                               spoke=spoke)
             self.recorder.turn(spoken_turn)
 
             first_audio = True
@@ -1422,6 +1470,19 @@ class _Session:
         and each engine's own native rate is resampled on its own path.
         """
         voice, is_piper = self._mouth(getattr(text, "language", None))
+        emotion = getattr(text, "emotion", None)
+        used: str | None = None
+        fell_back: bool | None = None
+        if emotion and not is_piper:
+            voice, used, fell_back = await self._emotion_mouth(voice, emotion)
+        elif emotion:
+            # Piper has no emotion slots. The request is noted as unmet rather
+            # than silently dropped — that is the internal lens's whole job.
+            fell_back = True
+        entry = {"voice_id": voice, "tts": "piper" if is_piper else "pocket-tts",
+                 "emotion": emotion, "used": used, "fallback": fell_back}
+        if not self._spoke or self._spoke[-1] != entry:
+            self._spoke.append(entry)
         if is_piper:
             return await asyncio.get_event_loop().run_in_executor(
                 None, self._synthesize_piper, str(text), voice)
@@ -1434,6 +1495,46 @@ class _Session:
                                         timeout=SETTINGS.request_timeout_s)
         return await asyncio.get_event_loop().run_in_executor(
             None, wav_to_pcm, result.wav_bytes, self.rate)
+
+    async def _emotion_mouth(self, voice: str, emotion: str) -> tuple[str, str | None, bool]:
+        """The pocket-tts mouth for one emotion-carrying part.
+
+        Same contract as ``/v1/speak``: the Character that owns the session's
+        voice, the deterministic ``resolve()`` walk, and a fallback recorded
+        as demand so the coverage loop keeps asking for the missing take. A
+        voice no Character owns cannot emote — the part speaks the configured
+        voice and the telemetry says the request went unmet. Resolution must
+        never cost the turn: any surprise degrades to the configured voice.
+        """
+        try:
+            from service import demand, emotions, voices
+
+            loop = asyncio.get_event_loop()
+            if voice not in self._voice_character:
+                self._voice_character[voice] = await loop.run_in_executor(
+                    None, voices.character_for_voice, voice)
+            cid = self._voice_character[voice]
+            if cid is None:
+                return voice, None, True
+
+            def _resolve() -> tuple[str, str, bool] | None:
+                emap = voices.emotion_map(cid)
+                if not emap:
+                    return None
+                got = emotions.resolve(emotion, emap,
+                                       prosody=voices.prosody_map(cid))
+                if got[2]:
+                    demand.record_fallback(cid, emotion)
+                return got
+
+            got = await loop.run_in_executor(None, _resolve)
+            if got is None:
+                return voice, None, True
+            return got
+        except Exception:  # noqa: BLE001 - telemetry must not kill the turn
+            logger.exception("convai %s: emotion resolution failed for %r",
+                             self.conversation_id, emotion)
+            return voice, None, True
 
     def _synthesize_piper(self, text: str, voice: str | None = None) -> bytes:
         """Blocking; runs on the threadpool. Piper voices synthesize at their own

@@ -940,6 +940,19 @@ def find_character(character_id: str) -> Character | None:
     return next((c for c in list_characters() if c.character_id == character_id), None)
 
 
+def character_for_voice(voice_id: str) -> str | None:
+    """The Character that owns ``voice_id``, or None when no Character does.
+
+    The conversation layer asks this so an agent configured with a plain
+    voice can emote through the owning Character's slots — one registry walk,
+    cached by the session per voice.
+    """
+    for c in list_characters():
+        if any(v.voice_id == voice_id for v in c.voices):
+            return c.character_id
+    return None
+
+
 def get_character_or_404(character_id: str) -> Character:
     """find_character, raising the canonical 404 when it's absent."""
     c = find_character(character_id)

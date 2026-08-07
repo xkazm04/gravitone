@@ -256,6 +256,7 @@
             "gravitone/web/app/api/gym/recordings/route.ts",
             "gravitone/web/app/api/gym/recordings/[id]/route.ts",
             "gravitone/web/app/api/gym/recordings/[id]/audio/[track]/route.ts",
+            "gravitone/web/app/api/gym/recordings/[id]/care/route.ts",
             "gravitone/web/app/api/gym/replay/route.ts",
             "gravitone/web/app/api/gym/compare/route.ts"
           ],
@@ -374,7 +375,7 @@
     "Web Studio › Voice Creation Studio [ui] — 9 files",
     "Web Studio › Character & Voice Management [ui] — 16 files",
     "Web Studio › Ops Transparency [ui] — 4 files",
-    "Web Studio › Conversation Gym Studio [ui] — 16 files",
+    "Web Studio › Conversation Gym Studio [ui] — 17 files",
     "Web Studio › TTS Playground [ui] — 9 files",
     "Design System & Brand › App Shell & Landing [ui] — 6 files",
     "Design System & Brand › Emotion Glyph Art [lib] — 3 files",
@@ -383,7 +384,7 @@
   "summary": {
     "totalGroups": 4,
     "totalContexts": 17,
-    "totalFiles": 101,
+    "totalFiles": 102,
     "categories": {
       "lib": 3,
       "api": 3,
