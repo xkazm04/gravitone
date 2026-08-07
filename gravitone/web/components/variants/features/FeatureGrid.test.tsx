@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, it, vi } from "vitest";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { FEATURES } from "@/lib/content";
 import FeatureGrid from "./FeatureGrid";
@@ -15,25 +15,8 @@ import { PREVIEW_KEYS, type PreviewKey } from "./previews";
  */
 function Harness() {
   const [preview, setPreview] = useState<PreviewKey | null>(null);
-  const [pinned, setPinned] = useState(false);
-  const suppressHoverUntil = useRef(0);
-
-  const closePreview = useCallback(() => {
-    setPreview(null);
-    setPinned(false);
-    suppressHoverUntil.current = Date.now() + 350;
-  }, []);
-  const hoverOpen = useCallback(
-    (key: PreviewKey) => {
-      if (pinned || Date.now() < suppressHoverUntil.current) return;
-      setPreview(key);
-    },
-    [pinned],
-  );
-  const pinOpen = useCallback((key: PreviewKey) => {
-    setPreview(key);
-    setPinned(true);
-  }, []);
+  const closePreview = useCallback(() => setPreview(null), []);
+  const openPreview = useCallback((key: PreviewKey) => setPreview(key), []);
 
   useEffect(() => {
     if (!preview) return;
@@ -46,14 +29,8 @@ function Harness() {
 
   return (
     <>
-      <FeatureGrid
-        preview={preview}
-        pinned={pinned}
-        onHoverOpen={hoverOpen}
-        onPin={pinOpen}
-        onLeave={() => setPreview(null)}
-      />
-      <FeatureSpotlight preview={preview} pinned={pinned} onClose={closePreview} />
+      <FeatureGrid preview={preview} onOpen={openPreview} />
+      <FeatureSpotlight preview={preview} onClose={closePreview} />
     </>
   );
 }
@@ -107,77 +84,45 @@ describe("FeatureGrid", () => {
     expect(FEATURES.map((f) => f.key).sort()).toEqual([...PREVIEW_KEYS].sort());
   });
 
-  it("opens a peek on hover that the cursor can simply walk away from", async () => {
+  it("does NOT open on hover — click is the only open gesture", () => {
     stubMedia(false);
     render(<Harness />);
     const card = screen.getByText(FEATURES[0].title).closest("[role='button']")!;
-
     fireEvent.pointerEnter(card, { pointerType: "mouse" });
-    const dialog = screen.getByRole("dialog");
-    expect(dialog).toHaveAccessibleName(FEATURES[0].title);
-    // A peek is inert: no aria-modal, and the overlay does not take the pointer.
-    expect(dialog).not.toHaveAttribute("aria-modal", "true");
-    expect(screen.queryByRole("button", { name: "Close" })).toBeNull();
-
-    fireEvent.pointerLeave(card, { pointerType: "mouse" });
-    // AnimatePresence holds the node through its exit, so removal is awaited
-    // rather than asserted on the next tick.
-    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(screen.queryByRole("dialog")).toBeNull();
+    fireEvent.focus(card);
+    expect(screen.queryByRole("dialog")).toBeNull();
   });
 
-  it("pins on click, and pinning is what makes it a modal", () => {
+  it("opens a modal on click", () => {
     stubMedia(false);
     render(<Harness />);
     fireEvent.click(screen.getByText(FEATURES[1].title).closest("[role='button']")!);
 
     const dialog = screen.getByRole("dialog");
+    expect(dialog).toHaveAccessibleName(FEATURES[1].title);
     expect(dialog).toHaveAttribute("aria-modal", "true");
     expect(screen.getByRole("button", { name: "Close" })).toBeTruthy();
-    // Pinned, hovering another card must not steal the modal out from under a
-    // reader who deliberately opened this one.
-    fireEvent.pointerEnter(screen.getByText(FEATURES[4].title).closest("[role='button']")!, {
-      pointerType: "mouse",
-    });
-    expect(screen.getByRole("dialog")).toHaveAccessibleName(FEATURES[1].title);
   });
 
-  it("pins from the keyboard too — Enter is not a mouse", () => {
+  it("opens from the keyboard too — Enter is not a mouse", () => {
     stubMedia(false);
     render(<Harness />);
     const card = screen.getByText(FEATURES[2].title).closest("[role='button']")!;
-    fireEvent.focus(card);
-    expect(screen.getByRole("dialog")).toBeTruthy();
     fireEvent.keyDown(card, { key: "Enter" });
     expect(screen.getByRole("dialog")).toHaveAttribute("aria-modal", "true");
   });
 
-  it("closes on Escape, and does not spring straight back open under the cursor", async () => {
+  it("closes on Escape", async () => {
     stubMedia(false);
     render(<Harness />);
-    const card = screen.getByText(FEATURES[3].title).closest("[role='button']")!;
-    fireEvent.click(card);
+    fireEvent.click(screen.getByText(FEATURES[3].title).closest("[role='button']")!);
     expect(screen.getByRole("dialog")).toBeTruthy();
 
     act(() => {
       fireEvent.keyDown(window, { key: "Escape" });
     });
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-
-    // The browser re-fires hover on the card the overlay just stopped covering.
-    // Without the suppression window that would reopen what was just dismissed.
-    fireEvent.pointerEnter(card, { pointerType: "mouse" });
-    expect(screen.queryByRole("dialog")).toBeNull();
-  });
-
-  it("ignores hover from a finger — a tap must not peek and pin at once", () => {
-    stubMedia(false);
-    render(<Harness />);
-    const card = screen.getByText(FEATURES[6].title).closest("[role='button']")!;
-    // On a touchscreen `pointerenter` fires immediately before the click.
-    fireEvent.pointerEnter(card, { pointerType: "touch" });
-    expect(screen.queryByRole("dialog")).toBeNull();
-    fireEvent.click(card);
-    expect(screen.getByRole("dialog")).toHaveAttribute("aria-modal", "true");
   });
 
   it("closes when the scrim is clicked", async () => {
@@ -189,12 +134,19 @@ describe("FeatureGrid", () => {
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
   });
 
+  it("marks each openable card with the expand affordance glyph", () => {
+    stubMedia(false);
+    const { container } = render(<Harness />);
+    // One quiet symbol per card, no "click here" caption anywhere.
+    expect(container.querySelectorAll("[role='button'] svg.lucide-maximize-2, [role='button'] svg.lucide-maximize2").length + container.querySelectorAll("[role='button'] span[aria-hidden] svg").length).toBeGreaterThanOrEqual(8);
+    expect(screen.queryByText(/click here/i)).toBeNull();
+    expect(screen.queryByText(/hover any card/i)).toBeNull();
+  });
+
   it("renders every diagram whole under reduced motion — stopped, not missing", async () => {
     stubMedia(true);
     render(<Harness />);
     for (const f of FEATURES) {
-      // Pinning ignores the hover-suppression window, so each card can be opened
-      // straight after the previous one closed.
       fireEvent.click(screen.getByText(f.title).closest("[role='button']")!);
       const dialog = screen.getByRole("dialog");
       // Every preview ends on a closing note. If reduced motion had DROPPED

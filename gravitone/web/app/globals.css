@@ -169,6 +169,21 @@ body { margin: 0; }
 .scope-trace { stroke-dasharray: 1400; animation: trace 3.2s ease-out forwards; }
 @keyframes blink { 50% { opacity: 0; } }
 .cursor-blink { animation: blink 1.1s steps(1) infinite; }
+/* Themed overflow, for the rare surface that genuinely needs it (modals size
+   their content to FIT — these exist so that when a small viewport forces a
+   scroll anyway, the scrollbar is ours and not the OS chrome). Thin, hairline
+   track, cyan-tinted thumb that brightens under the cursor. */
+.scroll-y, .scroll-x { scrollbar-width: thin; scrollbar-color: rgba(103,232,249,0.25) transparent; }
+.scroll-y { overflow-y: auto; overflow-x: hidden; }
+.scroll-x { overflow-x: auto; overflow-y: hidden; }
+.scroll-y::-webkit-scrollbar, .scroll-x::-webkit-scrollbar { width: 6px; height: 6px; }
+.scroll-y::-webkit-scrollbar-track, .scroll-x::-webkit-scrollbar-track { background: transparent; }
+.scroll-y::-webkit-scrollbar-thumb, .scroll-x::-webkit-scrollbar-thumb {
+  border-radius: 9999px; background: rgba(103,232,249,0.22);
+}
+.scroll-y::-webkit-scrollbar-thumb:hover, .scroll-x::-webkit-scrollbar-thumb:hover {
+  background: rgba(103,232,249,0.45);
+}
 .chip-tech {
   border: 1px solid rgba(16,185,129,0.35); background: rgba(16,185,129,0.06);
   color: #34d399; letter-spacing: 0.12em;

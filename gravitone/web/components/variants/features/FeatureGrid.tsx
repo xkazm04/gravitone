@@ -1,6 +1,7 @@
 "use client";
 
 import { motion } from "framer-motion";
+import { Maximize2 } from "lucide-react";
 import { FEATURES } from "@/lib/content";
 import { makeRise } from "@/components/ui/tokens";
 import FeatureCardArt from "./FeatureCardArt";
@@ -10,9 +11,13 @@ import { isPreviewKey, type PreviewKey } from "./previews";
  * The eight feature cards.
  *
  * Each is title + two lines of copy over its own watermark, and each opens a
- * live diagram of the mechanism it claims — hover to peek, click or Enter to
- * pin. The spotlight's open/pinned state lives in the PAGE (StudioDark), because
- * the modal renders at the page root while the cards that drive it sit here.
+ * live diagram of the mechanism it claims — on CLICK (or Enter), as a modal.
+ * Hover-peek was tried and retired: the owner found two overlapping open
+ * gestures confusing, and a modal that can appear under a passing cursor
+ * competes with reading the grid. The affordance is a small expand glyph in
+ * the card corner — a symbol, not a "click here" caption. The spotlight's
+ * open state lives in the PAGE (StudioDark), because the modal renders at the
+ * page root while the cards that drive it sit here.
  *
  * The old grid was `sm:grid-cols-2` numbered cards: eight equal blocks of prose
  * with "01".."08" as the only thing distinguishing them. Three columns and a
@@ -35,24 +40,15 @@ const rise = makeRise({ y: 24, duration: 0.7, stagger: 0.08 });
 
 export default function FeatureGrid({
   preview,
-  pinned,
-  onHoverOpen,
-  onPin,
-  onLeave,
+  onOpen,
 }: {
   preview: PreviewKey | null;
-  pinned: boolean;
-  onHoverOpen: (key: PreviewKey) => void;
-  onPin: (key: PreviewKey) => void;
-  onLeave: () => void;
+  onOpen: (key: PreviewKey) => void;
 }) {
   return (
     <section id="api" className="border-t border-white/5 py-14">
       <div className="mb-6 flex flex-wrap items-end justify-between gap-3">
         <h2 className="font-instrument text-3xl text-white">Eight things it already does.</h2>
-        <p className="font-jetbrains text-[11px] uppercase tracking-widest text-white/50">
-          hover any card to see the mechanism
-        </p>
       </div>
 
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
@@ -72,30 +68,11 @@ export default function FeatureGrid({
                     tabIndex: 0,
                     "aria-haspopup": "dialog" as const,
                     "aria-expanded": open,
-                    // React's own enter/leave, not framer's onHoverStart. The
-                    // gesture behaviour that matters here is the touch filter,
-                    // and it is one line — worth having in the open, next to the
-                    // reason for it: on a touchscreen `pointerenter` fires
-                    // immediately before the tap's click, so an unfiltered peek
-                    // would open and be instantly pinned by the same finger,
-                    // and the "hover to peek, tap to pin" split would collapse.
-                    onPointerEnter: (e: React.PointerEvent) => {
-                      if (e.pointerType === "touch") return;
-                      onHoverOpen(key);
-                    },
-                    onPointerLeave: (e: React.PointerEvent) => {
-                      if (e.pointerType === "touch") return;
-                      if (!pinned) onLeave();
-                    },
-                    onFocus: () => onHoverOpen(key),
-                    onBlur: () => {
-                      if (!pinned) onLeave();
-                    },
-                    onClick: () => onPin(key),
+                    onClick: () => onOpen(key),
                     onKeyDown: (e: React.KeyboardEvent) => {
                       if (e.key === "Enter" || e.key === " ") {
                         e.preventDefault();
-                        onPin(key);
+                        onOpen(key);
                       }
                     },
                   }
@@ -113,6 +90,16 @@ export default function FeatureGrid({
               }`}
             >
               {key && <FeatureCardArt preview={key} />}
+              {/* The clickable affordance: a small expand glyph, no caption.
+                  Quiet at rest, brightens with the card's hover hairline. */}
+              {key && (
+                <span
+                  aria-hidden
+                  className="absolute right-4 top-4 z-10 text-white/25 transition-colors group-hover:text-cyan-200/80"
+                >
+                  <Maximize2 className="h-3.5 w-3.5" />
+                </span>
+              )}
               {/* The art is absolutely positioned, so it would paint over
                   statically-positioned text. One positioned wrapper puts the copy
                   back on top without a z-index on every line. */}

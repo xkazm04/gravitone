@@ -62,33 +62,11 @@ export default function StudioDark() {
   // has `overflow-hidden` (for the corner wash) and a hover transform, either of
   // which would clip or re-anchor a fixed overlay.
   //
-  // Two states, not one. A hover opens a PEEK the cursor can walk away from; a
-  // click or Enter PINS it, which is what gives touch and keyboard the same show
-  // a mouse gets.
+  // One state: a card click (or Enter) opens the modal; Escape, the scrim or
+  // the close button dismiss it. Hover-peek was retired by owner call.
   const [preview, setPreview] = useState<PreviewKey | null>(null);
-  const [pinned, setPinned] = useState(false);
-  // Closing while the cursor still sits on a card makes the browser re-fire
-  // hover on that card the instant the overlay unmounts — reopening exactly what
-  // was just dismissed. Ignore hover-opens for a beat.
-  const suppressHoverUntil = useRef(0);
-
-  const closePreview = useCallback(() => {
-    setPreview(null);
-    setPinned(false);
-    suppressHoverUntil.current = Date.now() + 350;
-  }, []);
-  const hoverOpen = useCallback(
-    (key: PreviewKey) => {
-      if (pinned || Date.now() < suppressHoverUntil.current) return;
-      setPreview(key);
-    },
-    [pinned],
-  );
-  const pinOpen = useCallback((key: PreviewKey) => {
-    setPreview(key);
-    setPinned(true);
-  }, []);
-  const leavePreview = useCallback(() => setPreview(null), []);
+  const closePreview = useCallback(() => setPreview(null), []);
+  const openPreview = useCallback((key: PreviewKey) => setPreview(key), []);
 
   useEffect(() => {
     if (!preview) return;
@@ -235,13 +213,7 @@ export default function StudioDark() {
         </section>
 
         {/* features — eight cards, each opening a diagram of its own mechanism */}
-        <FeatureGrid
-          preview={preview}
-          pinned={pinned}
-          onHoverOpen={hoverOpen}
-          onPin={pinOpen}
-          onLeave={leavePreview}
-        />
+        <FeatureGrid preview={preview} onOpen={openPreview} />
 
         {/* ElevenLabs switch kit: the two bills, plotted, crossover and all */}
         <PricingSection />
@@ -289,7 +261,7 @@ export default function StudioDark() {
       <SectionRail />
       {/* Rendered at the page root, outside the content column and outside the
           card that opened it — see the state block above. */}
-      <FeatureSpotlight preview={preview} pinned={pinned} onClose={closePreview} />
+      <FeatureSpotlight preview={preview} onClose={closePreview} />
     </div>
   );
 }
