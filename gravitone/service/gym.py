@@ -106,12 +106,30 @@ TRAILING_SILENCE_MS = 1200
 QUIET_MS = 1200
 # How quiet the wire has to be before a POLITE caller starts talking again. Wire
 # silence alone is not enough (see _Wire.wait_for_floor): the reply also has to
-# have PLAYED, which is the number this window sits on top of.
-POLITE_QUIET_MS = 250
+# have PLAYED, which is the number this window sits on top of. It must also be
+# LONGER than a synthesizer's between-sentence pause: a reply arrives sentence
+# by sentence, and on a box rendering slower than the audio plays, the gap
+# between two sentences of ONE reply is wire silence a 250 ms window mistook
+# for the end of the turn. 1.2 s matches the trailing-silence hangover.
+POLITE_QUIET_MS = 1200
 # Longest a polite caller holds its tongue for one agent turn. Past this it
 # talks anyway - an agent that never stops is a finding the run should record,
 # not a driver that hangs.
 POLITE_MAX_WAIT_S = 20.0
+# After the caller finishes an utterance, how long a polite driver waits for
+# the ear to confirm it heard words (a `user_transcript`). A real transcriber
+# needs seconds; at pace 0 the next utterance would otherwise land while the
+# answer to this one is still being formed, and the gate would read that as a
+# barge-in the original call never had. A silence that produces no transcript
+# within this window was a false onset (a door, a cough) and the feed resumes.
+POLITE_EAR_WAIT_S = 10.0
+# A caller frame counts as sound at this PCM16 amplitude - far above digital
+# silence, far below speech. Only the polite driver reads it, and only to
+# notice "I just finished saying something".
+SPEECH_LEVEL = 500
+# How many consecutive quiet frames after sound mean the utterance is over -
+# the same order of magnitude as the gate's own hangover (~1 s at 100 ms frames).
+QUIET_FRAMES_TO_YIELD = 10
 # Whole-replay ceiling. A hung brain must fail the run, not the CI job.
 DEADLINE_S = 180.0
 
@@ -280,7 +298,8 @@ class _Wire:
                 # The far end closed, or the test transport tore the streams
                 # down when the driver left the `with` block. Either way this
                 # thread's job is over; the reason is kept for the error path.
-                self.close_reason = getattr(exc, "reason", None) or type(exc).__name__
+                self.close_reason = (getattr(exc, "reason", None)
+                                     or f"{type(exc).__name__}: {exc}"[:200].strip())
                 break
             with self._lock:
                 self.messages.append(msg if isinstance(msg, dict) else {})
@@ -350,13 +369,40 @@ class _Wire:
             with self._lock:
                 if not self._floor:
                     return True
-                idle = now - self._last_at
-                played = (self._floor_first_audio_at is None
-                          or now - self._floor_first_audio_at
-                          >= self._floor_audio_s)
-                if idle >= quiet_s and played:
-                    self._floor = False
-                    return True
+                if self._floor_first_audio_at is None:
+                    # The reply is ANNOUNCED but its first audio has not
+                    # arrived: the synthesizer is working. Treating this gap as
+                    # "already played" is how a polite replay against a real
+                    # model blasted the whole recording over the agent's
+                    # opening — the fake engine's instant audio never shows
+                    # the gap, which is why no test caught it. The floor is
+                    # held; POLITE_MAX_WAIT_S still bounds a reply that never
+                    # produces audio at all.
+                    pass
+                else:
+                    idle = now - self._last_at
+                    played = (now - self._floor_first_audio_at
+                              >= self._floor_audio_s)
+                    if idle >= quiet_s and played:
+                        self._floor = False
+                        return True
+            time.sleep(0.02)
+        return False
+
+    def count(self, kind: str) -> int:
+        with self._lock:
+            return sum(1 for m in self.messages if m.get("type") == kind)
+
+    def wait_for_count(self, kind: str, above: int, timeout_s: float) -> bool:
+        """Block until a NEW message of ``kind`` arrives (count exceeds
+        ``above``). Unlike wait_for, this cannot be satisfied by a message
+        that was already there before the caller started waiting."""
+        until = time.monotonic() + timeout_s
+        while time.monotonic() < until:
+            if self.count(kind) > above:
+                return True
+            if self.stopped:
+                return False
             time.sleep(0.02)
         return False
 
@@ -467,11 +513,39 @@ def replay(source: str | Path, *, agent_id: str | None = None,
                                  [t["text"] for t in turns
                                   if t["role"] == "candidate"]),
         "events": {k: v for k, v in events.items() if k != "frames_sent"},
+        # Why the socket stopped, when it stopped abnormally. A run whose wire
+        # died mid-replay must say so, or its empty turn list reads as "the
+        # agent said nothing" — the same lie an empty table tells.
+        "wire_closed": wire.close_reason,
     }
     logger.info("gym run %s: %s turn(s), %d interruption(s), %.2fs wall",
                 run_id, artifact["totals"]["turns"],
                 artifact["totals"]["interruptions"], wall_s)
     return artifact
+
+
+def _frame_has_sound(chunk: bytes) -> bool:
+    """True when one PCM16 frame contains anything above digital silence.
+
+    Deliberately crude - this is not a VAD, it is the one bit the polite
+    driver needs ("did I just say something?"), computed without numpy so
+    compare()-only installs never pay for it.
+    """
+    for j in range(0, len(chunk) - 1, 2):
+        v = int.from_bytes(chunk[j:j + 2], "little", signed=True)
+        if v >= SPEECH_LEVEL or v <= -SPEECH_LEVEL:
+            return True
+    return False
+
+
+def _needs_lifespan(app: Any) -> bool:
+    """True when this is the service's own app and nobody built its engine —
+    the bare-process CLI/CI path. Under a live server (or a test that installed
+    an engine) running the lifespan AGAIN would build a second model pool just
+    to throw it away."""
+    import service.app as appmod
+
+    return app is appmod.app and appmod.ENGINE is None
 
 
 def _default_app() -> Any:
@@ -511,6 +585,12 @@ def _drive(app: Any, agent_id: str, pcm: bytes, rate: int, *, pace: float,
     from service import convai
 
     client = TestClient(app)
+    # The app's lifespan is what builds the engine. Under a live server it has
+    # already run; a test installs its own engine. But the bare-process paths —
+    # `python -m service.gym run` and `suite` in CI — import an app nobody has
+    # started, and every synthesis then refuses with "the engine is not
+    # running". Entering the TestClient runs startup/shutdown around the drive.
+    lifespan = _needs_lifespan(app)
     url = (f"/v1/convai/conversation?agent_id={quote(agent_id)}"
            f"&token={convai.mint_ticket(agent_id)}")
     step = max(2, int(rate * frame_ms / 1000) * 2)
@@ -518,7 +598,8 @@ def _drive(app: Any, agent_id: str, pcm: bytes, rate: int, *, pace: float,
     started = time.monotonic()
     conversation_id: str | None = None
     frames = 0
-    with client.websocket_connect(url) as ws:
+    with (client if lifespan else contextlib.nullcontext()), \
+            client.websocket_connect(url) as ws:
         wire = _Wire(ws, deadline_s, rate)
         wire.start()
         try:
@@ -534,6 +615,21 @@ def _drive(app: Any, agent_id: str, pcm: bytes, rate: int, *, pace: float,
                       "announce the conversation.")
             conversation_id = ((meta.get("conversation_initiation_metadata_event")
                                 or {}).get("conversation_id") or None)
+            if polite:
+                # Politeness must start BEFORE frame 1: at pace 0 the whole
+                # recording fits in the socket before the opening is even
+                # announced, and no per-frame floor check can pause frames
+                # that are already gone. The opening is template text —
+                # announced within milliseconds when there is one — so a case
+                # that suppressed it (override first_message: "") spends this
+                # one grace period and nothing else. Three seconds, not one:
+                # on a live server the announcement shares an event loop with
+                # real traffic, and a grace the announcement can lose to is a
+                # barge-in generator (measured: 1.0s lost the race on this
+                # box, exactly once per replay, always on the opening).
+                wire.wait_for("agent_response", 3.0)
+            spoke = False       # sound has gone out since the last yield
+            quiet_run = 0       # consecutive quiet frames after that sound
             for i in range(0, len(pcm), step):
                 if wire.stopped:
                     break   # the agent hung up mid-recording; stop feeding it
@@ -545,11 +641,36 @@ def _drive(app: Any, agent_id: str, pcm: bytes, rate: int, *, pace: float,
                     # politely waited out.
                     wire.wait_for_floor(polite_quiet_ms / 1000.0,
                                         POLITE_MAX_WAIT_S)
+                chunk = pcm[i:i + step]
                 ws.send_json({"user_audio_chunk": base64.b64encode(
-                    pcm[i:i + step]).decode("ascii")})
+                    chunk).decode("ascii")})
                 frames += 1
                 if pace:
                     time.sleep(frame_s * pace)
+                if not polite:
+                    continue
+                # Politeness has a second half. The floor wait above yields
+                # while the agent SPEAKS; this yields after the caller speaks —
+                # because the answer to an utterance starts with silence
+                # (transcription, then the brain), and at pace 0 the next
+                # utterance would land inside that silence and be scored as a
+                # barge-in the recording never contained. The samples are
+                # still byte-identical and in order; only their wall-clock
+                # arrival moves, exactly like the floor wait.
+                if _frame_has_sound(chunk):
+                    spoke, quiet_run = True, 0
+                elif spoke:
+                    quiet_run += 1
+                    if quiet_run >= QUIET_FRAMES_TO_YIELD:
+                        spoke, quiet_run = False, 0
+                        heard = wire.count("user_transcript")
+                        answered = wire.count("agent_response")
+                        if wire.wait_for_count("user_transcript", heard,
+                                               POLITE_EAR_WAIT_S):
+                            # Words confirmed; now the brain owes a reply.
+                            wire.wait_for_count("agent_response", answered,
+                                                POLITE_MAX_WAIT_S)
+                        # else: no words in it (a false onset) - resume.
             wire.wait_quiet(quiet_ms / 1000.0,
                             max(1.0, deadline_s - (time.monotonic() - started)))
         finally:

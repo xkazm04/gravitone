@@ -16,6 +16,7 @@ import io
 import json
 import shutil
 import tempfile
+import time
 import unittest
 import wave
 from pathlib import Path
@@ -236,6 +237,45 @@ class ReplayTests(_GymCase):
         self.assertEqual(run["totals"]["interruptions"], 0)
         self.assertTrue(run["wire"]["polite"])
         self.assertEqual(run["events"]["interruption"], 0)
+
+    def test_a_slow_synthesizer_does_not_break_politeness(self) -> None:
+        """The floor is held while a reply is announced but not yet audible.
+
+        A real model takes ~1.5s to produce a reply's first sentence; in that
+        gap the wire is silent. The driver used to read that silence as "the
+        agent finished" and blast the whole recording over the opening —
+        turning every polite replay against a real engine into a pile of
+        invented barge-ins. An engine slower than the polite quiet window is
+        the regression guard.
+        """
+        self.engine.close()
+        self.engine = fake_engine.FakeEngine(workers=2, delay=0.7)
+        appmod.ENGINE = self.engine
+        run = self.replay(self.golden(), pace=0.0,
+                          override=None)  # keep the (slow) opening line
+        self.assertEqual(run["totals"]["interruptions"], 0)
+        self.assertEqual(run["totals"]["candidate_turns"], 2)
+
+    def test_a_slow_transcriber_does_not_break_politeness(self) -> None:
+        """The feed also yields after the CALLER finishes an utterance.
+
+        The answer to an utterance begins with silence — a real transcriber
+        needs seconds — and at pace 0 the next utterance used to land inside
+        that silence, cancelling the half-formed answer as a barge-in. The
+        stubbed ear gets a real delay to reproduce what the instant stub
+        always hid.
+        """
+        instant = stt.transcribe_pcm
+
+        def slow_transcribe(pcm, **kwargs):
+            time.sleep(0.5)
+            return instant(pcm, **kwargs)
+
+        stt.transcribe_pcm = slow_transcribe
+        run = self.replay(self.golden(), pace=0.0)
+        self.assertEqual(run["totals"]["interruptions"], 0)
+        self.assertEqual(run["totals"]["candidate_turns"], 2)
+        self.assertEqual(run["totals"]["agent_turns"], 2)
 
     def test_an_impolite_replay_talks_over_the_agent(self) -> None:
         """The other half of the same claim - barge-in on purpose.

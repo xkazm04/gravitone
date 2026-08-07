@@ -3088,4 +3088,15 @@ def main():
 
 
 if __name__ == "__main__":
+    # `python -m service.app` executes this file as the module `__main__`, so
+    # the served app — and the ENGINE the lifespan builds into it — live under
+    # that name. Anything that later says `import service.app` (the gym's
+    # in-process replay driver does) would then get a SECOND copy of this
+    # module: a different app object whose ENGINE is None. That is how a replay
+    # on a live box came to refuse with "the synthesis engine is not running"
+    # while the same box was speaking fine. Alias the canonical name to THIS
+    # instance before anything can import it, so there is only ever one.
+    import sys
+
+    sys.modules.setdefault("service.app", sys.modules[__name__])
     main()
