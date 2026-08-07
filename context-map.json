@@ -70,6 +70,22 @@
           ]
         },
         {
+          "name": "Visual Scene Pipeline",
+          "description": "The studio's eyes and director brain: optional video-only download tier (yt-dlp), local scene segmentation with one frame per 5-30s scene (ffmpeg), Qwen3.8 vision descriptions over DashScope (key-gated), and the one-shot LLM provider seam (Claude CLI local, OpenAI-compat cloud presets) for narration direction.",
+          "businessFeature": "Visual Scene Pipeline",
+          "category": "lib",
+          "filePaths": [
+            "gravitone/service/frames.py",
+            "gravitone/service/vision.py",
+            "gravitone/service/brain.py",
+            "gravitone/service/tests/test_frames.py",
+            "gravitone/service/tests/test_vision.py",
+            "gravitone/service/tests/test_brain.py"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
           "name": "Speech Synthesis API",
           "description": "ElevenLabs-compatible HTTP endpoint: POST /v1/text-to-speech/{voice_id} returns wav/mp3/pcm audio with timing headers, plus /health and /metrics; optional xi-api-key auth and API-key management router.",
           "businessFeature": "Speech Synthesis API",

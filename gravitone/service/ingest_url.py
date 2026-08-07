@@ -84,6 +84,22 @@ _WATCH_INTERVAL_S = 0.25
 #: Basename yt-dlp writes into the work dir (extension is the itag's own).
 STEM = "link-src"
 
+#: Basename of the OPTIONAL video-only stream (see `download_video`). A
+#: separate stem so the audio path's "exactly one media file" contract keeps
+#: holding per stem when both live in one work dir.
+VIDEO_STEM = "link-video"
+
+#: The video tier's own ceilings. Video is 10-50x the bytes of an audio itag,
+#: so it gets its own byte cap and wall clock instead of silently inheriting
+#: the audio ones and failing every fetch.
+VIDEO_MAX_BYTES = int(os.environ.get("INGEST_VIDEO_MAX_BYTES", "")
+                      or 200 * 1024 * 1024)
+VIDEO_DOWNLOAD_TIMEOUT_S = float(os.environ.get("INGEST_VIDEO_TIMEOUT", "") or 300)
+
+#: Frames are read at scene granularity, not pixel-peeped — 480p is plenty for
+#: "what is going on in this shot" and keeps the fetch small.
+VIDEO_MAX_HEIGHT = int(os.environ.get("INGEST_VIDEO_HEIGHT", "") or 480)
+
 
 class LinkRefusal(Exception):
     """A named refusal with the status the caller should see.
@@ -267,19 +283,67 @@ def download(url: str, dest: Path, *, max_bytes: int,
     exceeds the cap. A lying Content-Length buys an attacker a quarter of a
     second of disk — the same stance as narrate's read of one byte past the cap.
     """
-    dest.mkdir(parents=True, exist_ok=True)
     cmd = build_download_cmd(url, dest, max_bytes=max_bytes,
                              trim_seconds=trim_seconds)
-    errfile = dest / "ytdlp.stderr"
-    deadline = time.monotonic() + (timeout or DOWNLOAD_TIMEOUT_S)
+    return _fetch(cmd, url, dest, stem=STEM, max_bytes=max_bytes,
+                  timeout=timeout or DOWNLOAD_TIMEOUT_S,
+                  too_big=_too_big(max_bytes))
+
+
+def build_video_download_cmd(url: str, dest: Path, *, max_bytes: int,
+                             trim_seconds: float | None = None) -> list[str]:
+    """The VIDEO argv — same contract as `build_download_cmd` (no transcode,
+    no mux, one itag's own bytes) for the video-only stream. There is
+    deliberately no audio in the selector: the frames pipeline reads pictures,
+    and the re-voice muxer pairs this stream with audio this service made —
+    the original soundtrack already lives in `link-src.*`.
+    """
+    h = VIDEO_MAX_HEIGHT
+    cmd = _ytdlp_base() + [
+        "-f", f"bestvideo[height<={h}][ext=mp4]/bestvideo[height<={h}]/bestvideo",
+        "--max-filesize", str(int(max_bytes)),
+        "--no-part", "--no-continue", "--no-mtime",
+        "-o", str(dest / f"{VIDEO_STEM}.%(ext)s"),
+    ]
+    if trim_seconds is not None:
+        cmd += ["--download-sections", f"*0-{int(trim_seconds)}"]
+    cmd.append(url)
+    return cmd
+
+
+def download_video(url: str, dest: Path, *, max_bytes: int | None = None,
+                   trim_seconds: float | None = None,
+                   timeout: float | None = None) -> Path:
+    """Fetch the video-only stream into `dest`; return the file written.
+
+    Optional tier: the voice pipeline never needs it, the studio's visual
+    features do. Callers treat a refusal here as "this job has no picture",
+    not as a failed scan — which is why it is a separate call and not a flag
+    on `download`.
+    """
+    cmd = build_video_download_cmd(url, dest,
+                                   max_bytes=max_bytes or VIDEO_MAX_BYTES,
+                                   trim_seconds=trim_seconds)
+    return _fetch(cmd, url, dest, stem=VIDEO_STEM,
+                  max_bytes=max_bytes or VIDEO_MAX_BYTES,
+                  timeout=timeout or VIDEO_DOWNLOAD_TIMEOUT_S,
+                  too_big=_too_big_video(max_bytes or VIDEO_MAX_BYTES))
+
+
+def _fetch(cmd: list[str], url: str, dest: Path, *, stem: str, max_bytes: int,
+           timeout: float, too_big: str) -> Path:
+    """One watched yt-dlp run. Everything `download` promised, per stem."""
+    dest.mkdir(parents=True, exist_ok=True)
+    errfile = dest / f"ytdlp-{stem}.stderr"
+    deadline = time.monotonic() + timeout
     try:
         with errfile.open("wb") as err:
             proc = _popen(cmd, stdout=subprocess.DEVNULL, stderr=err)
             try:
                 while proc.poll() is None:
-                    if _written_bytes(dest) > max_bytes:
+                    if _written_bytes(dest, stem) > max_bytes:
                         _kill(proc)
-                        raise LinkRefusal(413, _too_big(max_bytes))
+                        raise LinkRefusal(413, too_big)
                     if time.monotonic() > deadline:
                         _kill(proc)
                         raise LinkRefusal(504, (
@@ -297,18 +361,18 @@ def download(url: str, dest: Path, *, max_bytes: int,
     stderr = _read_tail(errfile)
     errfile.unlink(missing_ok=True)
 
-    written = _media_files(dest)
+    written = _media_files(dest, stem)
     if proc.returncode != 0 or not written:
         _cleanup(written)
         _log_ytdlp("download", url, stderr)
         # `--max-filesize` aborts with a non-zero exit and this phrase; it is
         # a cap refusal, not a broken link, and must not read as one.
         if "larger than max-filesize" in (stderr or "").lower():
-            raise LinkRefusal(413, _too_big(max_bytes))
+            raise LinkRefusal(413, too_big)
         raise LinkRefusal(422, _extractor_message(stderr))
     if len(written) > 1:
-        # One audio itag, one file. More than that means a format selection we
-        # did not ask for (a mux), and muxing is exactly what we forbid.
+        # One itag, one file. More than that means a format selection we did
+        # not ask for (a mux), and muxing is exactly what we forbid.
         _cleanup(written)
         raise LinkRefusal(422, (
             "that link produced more than one media file, which this box does "
@@ -316,7 +380,7 @@ def download(url: str, dest: Path, *, max_bytes: int,
     src = written[0]
     if src.stat().st_size > max_bytes:
         src.unlink(missing_ok=True)
-        raise LinkRefusal(413, _too_big(max_bytes))
+        raise LinkRefusal(413, too_big)
     if src.stat().st_size == 0:
         src.unlink(missing_ok=True)
         raise LinkRefusal(422, (
@@ -426,14 +490,20 @@ def _too_big(max_bytes: int) -> str:
             f"ceiling this box will fetch. {DROP_INSTEAD.capitalize()}.")
 
 
-def _media_files(dest: Path) -> list[Path]:
-    return sorted(p for p in dest.glob(f"{STEM}.*")
+def _too_big_video(max_bytes: int) -> str:
+    return (f"that video is over the {max_bytes // (1024 * 1024)} MB ceiling "
+            f"this box will fetch for pictures — the voice can still be "
+            f"cloned without them.")
+
+
+def _media_files(dest: Path, stem: str = STEM) -> list[Path]:
+    return sorted(p for p in dest.glob(f"{stem}.*")
                   if p.is_file() and p.suffix != ".stderr")
 
 
-def _written_bytes(dest: Path) -> int:
+def _written_bytes(dest: Path, stem: str = STEM) -> int:
     total = 0
-    for p in dest.glob(f"{STEM}*"):
+    for p in dest.glob(f"{stem}*"):
         try:
             total += p.stat().st_size
         except OSError:

@@ -59,15 +59,17 @@ class _FakeProc:
     """A yt-dlp that writes `written` bytes to the output file and exits."""
 
     def __init__(self, dest: Path, written: bytes = b"OggS-audio",
-                 returncode: int = 0, stderr: str = "", ext: str = "webm") -> None:
+                 returncode: int = 0, stderr: str = "", ext: str = "webm",
+                 stem: str | None = None) -> None:
         self.dest, self.written, self.returncode = dest, written, returncode
         self.stderr_text, self.ext = stderr, ext
+        self.stem = stem or ingest_url.STEM
         self._polled = 0
         self.killed = False
 
     def __call__(self, cmd, stdout=None, stderr=None):
         if self.written:
-            (self.dest / f"{ingest_url.STEM}.{self.ext}").write_bytes(self.written)
+            (self.dest / f"{self.stem}.{self.ext}").write_bytes(self.written)
         if self.stderr_text and stderr is not None:
             stderr.write(self.stderr_text.encode())
         return self
@@ -221,6 +223,60 @@ class DownloadShapeTests(unittest.TestCase):
                 with self.assertRaises(ingest_url.LinkRefusal) as ctx:
                     ingest_url.download(URL, dest, max_bytes=1024)
         self.assertEqual(ctx.exception.status, 503)
+
+
+class VideoTierTests(unittest.TestCase):
+    """The optional video-only fetch. Same contract as audio (no transcode,
+    no mux, watched byte cap), its own stem so both can share a work dir."""
+
+    def test_the_video_command_carries_no_postprocessor_and_no_audio(self) -> None:
+        cmd = ingest_url.build_video_download_cmd(URL, Path("/tmp/x"),
+                                                  max_bytes=2048)
+        joined = " ".join(cmd)
+        for forbidden in ("-x", "--extract-audio", "--audio-format",
+                          "--recode-video", "--merge-output-format"):
+            self.assertNotIn(forbidden, cmd)
+        self.assertIn("bestvideo", joined)
+        self.assertNotIn("bestaudio", joined)      # pictures only, on purpose
+        self.assertNotIn("+", joined.split("-f ")[1].split(" ")[0])  # no mux
+        self.assertIn(ingest_url.VIDEO_STEM, joined)
+        self.assertEqual(cmd[cmd.index("--max-filesize") + 1], "2048")
+
+    def test_video_download_returns_its_own_stem(self) -> None:
+        with TemporaryDirectory() as td:
+            dest = Path(td)
+            fake = _FakeProc(dest, ext="mp4", stem=ingest_url.VIDEO_STEM)
+            with mock.patch.object(ingest_url, "_popen", fake):
+                out = ingest_url.download_video(URL, dest, max_bytes=1 << 20)
+            self.assertEqual(out.name, f"{ingest_url.VIDEO_STEM}.mp4")
+
+    def test_the_two_stems_do_not_see_each_other(self) -> None:
+        with TemporaryDirectory() as td:
+            dest = Path(td)
+            (dest / f"{ingest_url.VIDEO_STEM}.mp4").write_bytes(b"v" * 100)
+            # the audio fetch must not count or return the video file
+            fake = _FakeProc(dest)
+            with mock.patch.object(ingest_url, "_popen", fake):
+                out = ingest_url.download(URL, dest, max_bytes=150)
+            self.assertEqual(out.name, f"{ingest_url.STEM}.webm")
+        self.assertEqual(
+            [p.name for p in ingest_url._media_files(dest,
+                                                     ingest_url.VIDEO_STEM)],
+            [])                                     # tmpdir gone — just shape
+
+    def test_a_video_over_its_cap_names_the_video_ceiling(self) -> None:
+        with TemporaryDirectory() as td:
+            dest = Path(td)
+            fake = _FakeProc(dest, written=b"v" * 300, ext="mp4",
+                             stem=ingest_url.VIDEO_STEM, returncode=None)  # type: ignore[arg-type]
+            fake.returncode = 0
+            big = _FakeProc(dest, written=b"v" * 300, ext="mp4",
+                            stem=ingest_url.VIDEO_STEM)
+            with mock.patch.object(ingest_url, "_popen", big):
+                with self.assertRaises(ingest_url.LinkRefusal) as ctx:
+                    ingest_url.download_video(URL, dest, max_bytes=100)
+            self.assertEqual(ctx.exception.status, 413)
+            self.assertIn("voice can still be cloned", ctx.exception.message)
 
 
 class ScanUrlRouteTests(unittest.TestCase):
