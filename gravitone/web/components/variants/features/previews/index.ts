@@ -42,6 +42,8 @@ import PerformanceSignal from "./PerformanceSignal";
 import PerformanceStage from "./PerformanceStage";
 import AgentsSignal from "./AgentsSignal";
 import AgentsStage from "./AgentsStage";
+import ArmSignal from "./ArmSignal";
+import ArmStage from "./ArmStage";
 
 export type PreviewKey =
   | "compat"
@@ -95,7 +97,7 @@ export const PREVIEWS: Record<PreviewKey, PreviewDef> = {
     bodies: { steps: PerformancePreview, signal: PerformanceSignal, stage: PerformanceStage },
   },
   agents: { icon: Radio, bodies: { steps: AgentsPreview, signal: AgentsSignal, stage: AgentsStage } },
-  arm: { icon: Cpu, bodies: { steps: ArmPreview } },
+  arm: { icon: Cpu, bodies: { steps: ArmPreview, signal: ArmSignal, stage: ArmStage } },
 };
 
 /** The body to render, with the steps fallback applied. */
