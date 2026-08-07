@@ -156,10 +156,10 @@ describe("PricingSection · the prototype lens strip", () => {
     }
   });
 
-  it("swaps the picture and drops the paragraphs, keeping the contracts", async () => {
+  it.each(["A", "B"])("lens %s swaps the picture and drops the paragraphs, keeping the contracts", async (lens) => {
     render(<PricingSection />);
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "A" }));
+      fireEvent.click(screen.getByRole("button", { name: lens }));
     });
 
     // The two paragraph blocks are the thing these variants exist to kill.

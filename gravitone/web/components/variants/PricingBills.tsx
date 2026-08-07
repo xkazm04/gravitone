@@ -16,6 +16,7 @@ import {
   fmtChars,
   growthSeries,
 } from "./pricingTimeline";
+import { easedTimeFor } from "./pricingShared";
 import { Caption, Draw, HAIR, Illus, Label, Node, TravelPulse, accentVar } from "./features/previews/illus";
 
 /*
@@ -113,28 +114,6 @@ const T_RUN = 0.45; // both bills start billing
 const D_RUN = 2.0; // twenty-four months
 const T_CAP = T_RUN + D_RUN + 0.3; // the caption lands inside 3 seconds
 
-/**
- * When the sweep is AT a given month.
- *
- * The draw is eased, so a marker placed at the linear fraction of the month
- * would land while the stroke is somewhere else entirely — EASE is a strong
- * ease-out and by a fifth of the way through it has already drawn well past
- * half. This inverts the curve (bisection on the cubic-bezier, exact enough at
- * 24 steps) so a node lands on the month it is naming.
- */
-function easedTimeFor(progress: number): number {
-  const [x1, y1, x2, y2] = EASE;
-  const bez = (a: number, b: number, t: number) =>
-    3 * (1 - t) ** 2 * t * a + 3 * (1 - t) * t ** 2 * b + t ** 3;
-  let lo = 0;
-  let hi = 1;
-  for (let i = 0; i < 24; i++) {
-    const mid = (lo + hi) / 2;
-    if (bez(y1, y2, mid) < progress) lo = mid;
-    else hi = mid;
-  }
-  return bez(x1, x2, (lo + hi) / 2);
-}
 /** The delay at which the sweep reaches `month`. */
 const whenMonth = (month: number) => T_RUN + easedTimeFor((month - 1) / (N - 1)) * D_RUN;
 

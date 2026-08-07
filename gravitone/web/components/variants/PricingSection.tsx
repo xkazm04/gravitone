@@ -41,6 +41,7 @@ import { useStillMotion } from "@/lib/useStillMotion";
 import { accentVar } from "./features/previews/illus";
 import PricingSignal from "./PricingSignal";
 import PricingBills from "./PricingBills";
+import PricingClimb from "./PricingClimb";
 import {
   AssumptionChips,
   BenchmarksLink,
@@ -279,10 +280,4 @@ function VariantLens({ lens, armed, still }: { lens: Lens; armed: boolean; still
       </div>
     </>
   );
-}
-
-/* Placeholder until the variant lands in its own commit. */
-function PricingClimb({ still }: { still: boolean }) {
-  void still;
-  return <div className="aspect-[1160/560] w-full rounded-2xl border border-white/5 bg-white/[0.015]" />;
 }
