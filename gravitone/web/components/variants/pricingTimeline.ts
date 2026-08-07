@@ -1,15 +1,22 @@
 // The shape of the landing pricing illustration, derived — never re-derived.
 //
-// The section used to plot cost against VOLUME on a log-log chart. It now plots
-// cost against TIME, because that is the shape of the claim the project actually
-// makes: the software is free forever and a rented box accrues at a fixed rate,
-// so what a subscription does over two years is the whole argument. A volume
-// chart makes you imagine the months; a time chart draws them.
+// THE STORY THIS FILE COMPUTES: one project's usage GROWING, month after month,
+// and the two bills that grow with it — or don't.
 //
-// Every number here comes out of lib/switchkit.ts — that module is the single
-// source of truth for the comparison (it exists because the SwitchKit estimator
-// and the /benchmarks planner had each grown their own copy of the arithmetic
-// and drifted). This file computes MONTHS and COORDINATE-READY TOTALS and
+// It has been through three shapes. It plotted cost against VOLUME on a log-log
+// chart (volume is not an axis anyone lives on). Then it accumulated two fixed
+// monthly bills over 24 months at ONE assumed volume — which quietly made the
+// whole comparison a function of the volume we picked, and had no crossover in
+// it at all, because at a fixed volume the winner is decided in month 1. Usage
+// growth is the honest version of both: the thing that actually changes over two
+// years is how much you generate, the subscription's staircase is a function OF
+// that, and the crossover becomes a real MONTH — the month usage passes the
+// point where a tier costs more than the machine.
+//
+// Every price comes out of lib/switchkit.ts — that module is the single source
+// of truth for the comparison (it exists because the SwitchKit estimator and the
+// /benchmarks planner had each grown their own copy of the arithmetic and
+// drifted). This file computes MONTHS, USAGE and COORDINATE-READY COSTS and
 // nothing else: no prices, no tier names, no break-even of its own.
 //
 // It is separate from the illustration so it can be tested without rendering
@@ -19,144 +26,167 @@
 
 import {
   ARM_BOXES,
-  CHARS_PER_AUDIO_MINUTE,
   ELEVENLABS_TIERS,
   breakEvenChars,
-  elTierFor,
   estimateMonthly,
   type ArmBox,
   type ElTier,
 } from "@/lib/switchkit";
 
-/** How far the story runs. Two years: long enough that an accumulation has a
- *  shape, short enough that nobody has to believe a five-year projection. */
+/** How far the story runs. Two years: long enough that growth has a shape,
+ *  short enough that nobody has to believe a five-year projection. */
 export const TIMELINE_MONTHS = 24;
 
-/** The box the story is about — the small always-on Graviton preset. */
+/** The box the story starts on — the small always-on Graviton preset. */
 export const BOX: ArmBox = ARM_BOXES[0];
 
+/** What that box costs for a month, from switchkit: on-demand list price × all
+ *  730 hours. Not a rate we retype; `estimateMonthly` owns it. */
+export const BOX_USD_MONTH = estimateMonthly(0, BOX).boxUsd;
+
 /*
- * THE VOLUME ASSUMPTION, and why it is two numbers rather than one.
+ * THE GROWTH ASSUMPTION, and why these two endpoints.
  *
- * A cumulative comparison without its volume is a lie: "$2,376 versus $294" is
- * only true at some particular monthly usage, and picking the usage picks the
- * winner. So the section names its assumption on the drawing itself, and it
- * draws BOTH sides of the break-even rather than the flattering one.
+ * A comparison over time needs a usage curve, and picking the curve picks the
+ * winner — so the endpoints are not numbers we chose, they are two published
+ * tier ceilings, and the section states the whole assumption in visible prose.
  *
- *   HEADLINE — 500k chars/mo, the Pro tier's own ceiling. Above break-even,
- *     where the box is the cheaper bill and the gap widens every month.
- *   BELOW    — 30k chars/mo, the Starter tier's ceiling. BELOW break-even,
- *     where an always-on box costs MORE, forever, and the picture says so at
- *     the same 24-month span.
+ *   START — the SMALLEST tier's ceiling (the free allowance): month 1 is a
+ *     project that has just launched and fits inside what ElevenLabs gives away.
+ *     Starting here is deliberately the unflattering choice: in month 1 their
+ *     bill is $0 and no self-hosted machine beats $0.
+ *   END   — the SECOND-LARGEST tier's ceiling: a serious product, still short of
+ *     the enterprise tier. Ending here rather than at the top of the table keeps
+ *     the projection inside volumes an indie project actually reaches.
  *
- * Both are tier ceilings rather than round numbers we chose, so neither is a
- * volume picked to win an argument.
+ * Between them, CONSTANT-RATE growth — the same percentage every month. It is
+ * one number a reader can check (GROWTH_PCT), it has no inflection we could have
+ * placed to flatter ourselves, and it is what "a product that keeps growing"
+ * means. A linear ramp would have been the flattering choice: it spends far more
+ * of the two years at high volume, where we win.
  */
-export const HEADLINE_CHARS = 500_000;
-export const BELOW_CHARS = 30_000;
+export const START_CHARS = ELEVENLABS_TIERS[0].charsPerMonth;
+export const END_CHARS = ELEVENLABS_TIERS[ELEVENLABS_TIERS.length - 2].charsPerMonth;
 
-/** The cheapest tier that covers each assumed volume — via switchkit, so a tier
- *  table edit moves the labels instead of leaving them quietly lying. */
-export const HEADLINE_TIER: ElTier = elTierFor(HEADLINE_CHARS);
-export const BELOW_TIER: ElTier = elTierFor(BELOW_CHARS);
-
-/** Monthly volume at which the always-on box starts being the cheaper bill.
- *  null if it never is within the published tiers. */
-export const BREAK_EVEN_CHARS: number | null = breakEvenChars(BOX);
-
-/** The two bills for one month at a given volume: the subscription that covers
- *  it, and the box running 24/7 whether or not it speaks. */
-export type MonthlyPair = {
-  /** The ElevenLabs list price for that monthly volume. */
-  el: number;
-  /** The box, billed all 730 hours — the worst case for us, and the only
-   *  honest one: an always-on machine does not stop when you stop talking. */
-  box: number;
-  /** The software itself. Zero. MIT, self-hosted, no seat and no meter. This
-   *  is a field rather than a literal in the drawing because a series the eye
-   *  is asked to follow should come from the same place as its siblings. */
-  software: 0;
-};
-
-export function monthlyPair(chars: number, box: ArmBox = BOX): MonthlyPair {
-  const e = estimateMonthly(chars, box);
-  return { el: e.elUsd, box: e.boxUsd, software: 0 };
-}
-
-/** One month of the accumulation: the running totals at the END of month n.
- *  `month: 0` is the day you started, before either bill has landed. */
-export type CumulativePoint = {
-  month: number;
-  el: number;
-  box: number;
-  software: 0;
-};
+/** Month-over-month growth factor that carries START to END across the span. */
+export const GROWTH = (END_CHARS / START_CHARS) ** (1 / (TIMELINE_MONTHS - 1));
+/** The same figure as the percentage the prose quotes. */
+export const GROWTH_PCT = Math.round((GROWTH - 1) * 100);
 
 /**
- * The cumulative spend, month by month.
+ * Usage in a given month — `month` may be fractional, so a read-out can tick
+ * along the same curve the drawing is scaled by.
  *
- * Both bills are monthly and neither changes with time, so both totals are
- * staircases — one riser per month, of a height that never varies. That is
- * deliberately NOT collapsed into two straight lines: the risers are the story
- * (a subscription is a thing that lands again every month), and a smooth ramp
- * would draw a metered bill rather than a recurring one.
+ * The endpoints are returned exactly rather than as `10000 * GROWTH ** 23`,
+ * because the story's first and last figures are tier ceilings a reader can
+ * look up and floating-point drift would make them ALMOST that.
  */
-export function cumulativeSeries(
-  chars: number,
-  box: ArmBox = BOX,
-  months: number = TIMELINE_MONTHS,
-): CumulativePoint[] {
-  const per = monthlyPair(chars, box);
-  const n = Math.max(0, Math.floor(months));
-  const out: CumulativePoint[] = [];
-  for (let month = 0; month <= n; month++) {
-    out.push({ month, el: per.el * month, box: per.box * month, software: 0 });
+export function usageAt(month: number, months: number = TIMELINE_MONTHS): number {
+  if (month <= 1) return START_CHARS;
+  if (month >= months) return END_CHARS;
+  return Math.round(START_CHARS * GROWTH ** (month - 1));
+}
+
+/**
+ * The preset that can actually carry a month's volume.
+ *
+ * `overCapacity` is switchkit's own definition (audio-minutes against the box's
+ * measured throughput for all 730 hours), so the upgrade rule here is not a
+ * second opinion. If the growing volume ever outruns the small box, the series
+ * steps up to the next preset and the drawing gets an honest riser — at the
+ * current table it never does, and the section says so out loud rather than
+ * letting the absence of a step read as an absence of a limit.
+ */
+export function boxFor(chars: number): ArmBox {
+  return (
+    ARM_BOXES.find((b) => !estimateMonthly(chars, b).overCapacity) ??
+    ARM_BOXES[ARM_BOXES.length - 1]
+  );
+}
+
+/** One month of the story: what was generated, and what each side billed. */
+export type GrowthPoint = {
+  month: number;
+  /** Characters generated that month. */
+  chars: number;
+  audioMinutes: number;
+  /** The cheapest ElevenLabs tier covering that month's volume. */
+  tier: ElTier;
+  /** Their bill that month, from switchkit. */
+  el: number;
+  /** The preset carrying that month's volume, and what it bills running 24/7 —
+   *  the worst case for us, and the only honest one: an always-on machine does
+   *  not stop when you stop talking. */
+  box: ArmBox;
+  boxUsd: number;
+  /** The software itself. Zero. MIT, self-hosted, no seat and no meter. A field
+   *  rather than a literal in the drawing because a series the eye is asked to
+   *  follow should come from the same place as its siblings. */
+  software: 0;
+  /** True in the months where the SUBSCRIPTION is the cheaper bill. Never
+   *  clamped away — lib/switchkit.ts leaves `savingsUsd` signed for the same
+   *  reason, and those months are the point of drawing the whole span. */
+  boxCostsMore: boolean;
+};
+
+export function growthSeries(months: number = TIMELINE_MONTHS): GrowthPoint[] {
+  const out: GrowthPoint[] = [];
+  for (let month = 1; month <= months; month++) {
+    const chars = usageAt(month, months);
+    const box = boxFor(chars);
+    const e = estimateMonthly(chars, box);
+    out.push({
+      month,
+      chars,
+      audioMinutes: e.audioMinutes,
+      tier: e.elTier,
+      el: e.elUsd,
+      box,
+      boxUsd: e.boxUsd,
+      software: 0,
+      boxCostsMore: e.boxUsd > e.elUsd,
+    });
   }
   return out;
 }
 
-/** What the subscription cost over the whole span that the box did not. Signed:
- *  NEGATIVE below break-even, where the box is the worse buy. Never clamp it —
- *  lib/switchkit.ts leaves `savingsUsd` unclamped for the same reason. */
-export function gapUsd(
-  chars: number,
-  box: ArmBox = BOX,
-  months: number = TIMELINE_MONTHS,
-): number {
-  const per = monthlyPair(chars, box);
-  return (per.el - per.box) * months;
+/** The first month in which the box is the cheaper bill — the real crossover,
+ *  now that usage moves. null if it never happens inside the span. */
+export function crossoverMonth(series: GrowthPoint[]): number | null {
+  return series.find((p) => !p.boxCostsMore)?.month ?? null;
 }
 
-/** One row of the picture's table view — the same two bills, per published
- *  tier, at one month and across the whole span. */
-export type TimelineRow = {
-  tier: ElTier;
-  audioMinutes: number;
-  elMonth: number;
-  boxMonth: number;
-  elTotal: number;
-  boxTotal: number;
-  /** True where the always-on box is the WORSE buy at that volume. */
-  boxCostsMore: boolean;
-};
-
-export function timelineRows(
-  box: ArmBox = BOX,
-  months: number = TIMELINE_MONTHS,
-): TimelineRow[] {
-  return ELEVENLABS_TIERS.map((tier) => {
-    const per = monthlyPair(tier.charsPerMonth, box);
-    return {
-      tier,
-      audioMinutes: tier.charsPerMonth / CHARS_PER_AUDIO_MINUTE,
-      elMonth: per.el,
-      boxMonth: per.box,
-      elTotal: per.el * months,
-      boxTotal: per.box * months,
-      boxCostsMore: per.box > per.el,
-    };
-  });
+/** The first month the small preset can no longer carry the volume and the
+ *  series steps up. null when one box carries the whole span. */
+export function boxUpgradeMonth(series: GrowthPoint[]): number | null {
+  return series.find((p) => p.box !== series[0].box)?.month ?? null;
 }
+
+/** The quiet running totals — one secondary figure, not a second chart. */
+export function growthTotals(series: GrowthPoint[]): { el: number; box: number; gap: number } {
+  const el = series.reduce((a, p) => a + p.el, 0);
+  const box = series.reduce((a, p) => a + p.boxUsd, 0);
+  // Signed, never clamped: below the crossover this difference is negative and
+  // the section is required to be able to say so.
+  return { el, box, gap: el - box };
+}
+
+/** The monthly volume at which the box STARTS being the cheaper bill: the
+ *  ceiling of the cheapest tier priced above the box's 24/7 cost. */
+export const BREAK_EVEN_CHARS: number | null = breakEvenChars(BOX);
+
+/**
+ * The last monthly volume at which the SUBSCRIPTION is still the cheaper bill.
+ *
+ * This is the number the honesty copy needs, and it is NOT `BREAK_EVEN_CHARS`.
+ * That one names the ceiling of the first tier priced above the machine, so
+ * saying "below it the box costs more" was wrong for every volume between the
+ * two: at 50k chars/mo you are already paying for that tier and the box has
+ * already won. What is true is that the subscription wins up to and including
+ * the ceiling of the most expensive tier priced AT OR UNDER the box's month.
+ */
+export const EL_CHEAPER_THROUGH_CHARS: number | null =
+  ELEVENLABS_TIERS.filter((t) => t.usdPerMonth <= BOX_USD_MONTH).at(-1)?.charsPerMonth ?? null;
 
 /** Compact volume label — "30k", "500k", "2M". */
 export function fmtChars(chars: number): string {

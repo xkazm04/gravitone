@@ -2,15 +2,23 @@ import { beforeAll, describe, expect, it, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { renderToStaticMarkup } from "react-dom/server";
 import PricingSection from "./PricingSection";
-import { ELEVENLABS_PRICING, ELEVENLABS_PRICING_NOTE, breakEvenChars } from "@/lib/switchkit";
-import { BOX, HEADLINE_CHARS, HEADLINE_TIER, TIMELINE_MONTHS } from "./pricingTimeline";
+import { ELEVENLABS_PRICING, ELEVENLABS_PRICING_NOTE } from "@/lib/switchkit";
+import {
+  BOX,
+  EL_CHEAPER_THROUGH_CHARS,
+  END_CHARS,
+  START_CHARS,
+  TIMELINE_MONTHS,
+  crossoverMonth,
+  growthSeries,
+} from "./pricingTimeline";
 
 // This section renders competitor prices, so the claims contract in
 // lib/content.ts applies to it: the citation is only defensible while it travels
 // with its date and its source. Two more things have to survive every future
-// redesign of this band — the crossover, where our own box is the WORSE buy, and
-// the volume the cumulative comparison assumes (a two-year total without its
-// monthly volume is not a comparison, it is a number picked to win).
+// redesign of this band — the months where our own box is the WORSE buy, and the
+// usage curve the whole comparison assumes (a two-year story without its growth
+// assumption is not a comparison, it is a shape picked to win).
 
 // framer's scroll-entrance hooks (whileInView, useInView) need an
 // IntersectionObserver, which every browser has and jsdom does not. It never
@@ -40,6 +48,9 @@ beforeAll(() => {
   );
 });
 
+const SERIES = growthSeries();
+const CROSS = crossoverMonth(SERIES)!;
+
 describe("PricingSection", () => {
   it("renders the ElevenLabs attribution and its live source link", () => {
     render(<PricingSection />);
@@ -51,21 +62,31 @@ describe("PricingSection", () => {
 
   it("says out loud where the box is the worse buy", () => {
     render(<PricingSection />);
-    const chars = breakEvenChars(BOX)!;
     const honesty = screen.getByText(/costs MORE than the ElevenLabs tier/);
-    expect(honesty).toHaveTextContent(chars.toLocaleString("en-US"));
+    // The threshold quoted is the volume the subscription is cheaper THROUGH —
+    // not the tier ceiling above it, which would overstate our own losing range.
+    expect(honesty).toHaveTextContent(EL_CHEAPER_THROUGH_CHARS!.toLocaleString("en-US"));
+    expect(honesty).toHaveTextContent(`months 1–${CROSS - 1} of this timeline`);
     expect(honesty).toHaveTextContent("The box only wins once you use it");
     // Nothing self-hosted beats free, and the drawing cannot say so out loud.
     expect(honesty).toHaveTextContent(/Free tier's first 10,000 chars\/mo are \$0/);
   });
 
-  it("states the volume the cumulative comparison assumes, in words", () => {
+  it("states the growth assumption the whole timeline rests on, in words", () => {
     render(<PricingSection />);
-    // The illustration carries this too, but it is aria-hidden — so the prose
-    // has to name it independently or the totals are unanchored.
-    const volume = HEADLINE_CHARS.toLocaleString("en-US");
-    expect(screen.getByText(new RegExp(`over ${TIMELINE_MONTHS} months at a fixed\\s+${volume} chars/mo`))).toBeTruthy();
-    expect(screen.getAllByText(new RegExp(volume)).length).toBeGreaterThanOrEqual(2);
+    // The read-out carries it too, but the illustration is aria-hidden — so the
+    // prose has to name it independently or the curve is unanchored.
+    const start = START_CHARS.toLocaleString("en-US");
+    const end = END_CHARS.toLocaleString("en-US");
+    expect(
+      screen.getByText(
+        new RegExp(
+          `one project growing from\\s+${start} to ${end} characters a month over ${TIMELINE_MONTHS} months`,
+        ),
+      ),
+    ).toBeTruthy();
+    // …and the rate, so a reader can check the curve rather than trust it.
+    expect(screen.getByText(/growth every month/)).toBeTruthy();
   });
 
   it("names the box price as a 24/7 cost, not a cost-per-use", () => {
@@ -73,7 +94,7 @@ describe("PricingSection", () => {
     // $12.26 is what the machine bills whether or not it speaks — the legend
     // must not let that read as a usage charge.
     expect(screen.getByText(/flat, running 24\/7/)).toBeTruthy();
-    expect(screen.getByText(/billed all 730 hours of\s+every month/)).toBeTruthy();
+    expect(screen.getByText(/billed all 730\s+hours of every month/)).toBeTruthy();
   });
 
   it("keeps the open-source line separate from the hardware line", () => {
@@ -90,19 +111,20 @@ describe("PricingSection", () => {
     render(<PricingSection />);
     // Named in the legend AND in the table header — the two places identity is
     // allowed to live. Never in the stroke colour alone.
-    expect(screen.getAllByText(`ElevenLabs ${HEADLINE_TIER.name}`).length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText("ElevenLabs tiers")).toBeTruthy();
     expect(screen.getAllByText(new RegExp(BOX.name.replace(/[().]/g, "\\$&"))).length).toBeGreaterThanOrEqual(2);
   });
 
   it("offers the drawing's numbers as a table, so no value is picture-gated", () => {
     render(<PricingSection />);
     const table = screen.getByRole("table");
-    expect(table).toHaveTextContent("Creator");
-    expect(table).toHaveTextContent("Business");
-    // Losing rows say so in words, not in colour.
+    // One row per month, usage included: the picture's x-axis and its engine.
+    expect(table).toHaveTextContent(START_CHARS.toLocaleString("en-US"));
+    expect(table).toHaveTextContent(END_CHARS.toLocaleString("en-US"));
+    expect(table.querySelectorAll("tbody tr").length).toBe(TIMELINE_MONTHS);
+    // Losing months say so in words, not in colour.
     expect(table).toHaveTextContent("(more)");
-    // And the cumulative half of the story is in the table too, not only drawn.
-    expect(table).toHaveTextContent(`ElevenLabs · ${TIMELINE_MONTHS} mo`);
+    expect(table).toHaveTextContent("(they cross)");
   });
 
   it("survives server rendering with the illustration unmounted", () => {

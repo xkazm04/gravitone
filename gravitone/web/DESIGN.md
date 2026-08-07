@@ -50,6 +50,28 @@ genuinely missing — a second parallel vocabulary is the failure mode.
   (`accentVar()` / `--gt-*` in compositions). `tokens.test.ts` pins them — a
   token change is a deliberate, tested act.
 
+## Scale is a property of the surface
+
+> Added 2026-08-07, after the pricing band was rebuilt to an owner critique:
+> *"we applied specific low-detail techniques into a frame they don't fit."*
+
+The 380-unit height budget in `Illus` is the **spotlight modal's** constraint —
+`max-h-[85vh]` on a 1280×800 laptop — and it was never the language's. A
+landing-section illustration owns the full `max-w-6xl` column and scrolls with
+the page, so it is authored **landscape and large** (`PricingSignal` is
+1160×520): big geometry, few labels, whitespace as a deliberate element.
+
+The failure this fixes: taking the spotlight's *techniques* — the hairline
+density, the calipers, the 8px annotation clusters, two panels in one frame —
+and shrinking them into a card on a full-width surface. Signal's philosophy is
+ONE story drawn in motion, one accent, honesty in the geometry. A miniature
+dense diagram is the opposite of that however correctly it is drawn.
+
+**The arm's-length test.** Stand back from the illustration: it must read as one
+sentence. Then count the text elements inside it — more than about eight and the
+drawing has stopped carrying the story. Labels at 8–9px are a symptom, not the
+disease; raising them will not fix a composition that needed twelve of them.
+
 ## Honesty is drawn, not footnoted
 
 The claims discipline (`lib/content.ts:61-94`, `lib/switchkit.ts`) extends into
@@ -133,6 +155,9 @@ glance mid-scroll (band)?* Compose for that distance.
 - Infinite ambient motion; animation that re-runs on every re-render;
   `useReducedMotion` from framer in anything the server renders.
 - Retyped figures in SVG; a drawn comparison without its stated assumption.
+- A miniature dense diagram on a full-width surface — see "Scale is a property
+  of the surface". Also: a comparison drawn at a FIXED assumption, where the
+  winner is decided before the first frame and there is no crossover to draw.
 
 ## For future sessions
 

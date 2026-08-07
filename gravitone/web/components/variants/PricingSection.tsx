@@ -1,17 +1,21 @@
 "use client";
 
-// Landing section: what a subscription costs OVER TIME, next to what the same
-// two years cost on one always-on Arm box — including the volumes where the box
-// is the worse buy.
+// Landing section: what two years cost when the USAGE GROWS — one always-on Arm
+// box against the ElevenLabs tier that covers each month's volume, including the
+// months where the box is the worse buy.
 //
-// The band has now shed two things. It shed a slider, because the slider hid the
-// story behind an interaction. Then it shed a log-log recharts plot of cost
-// against VOLUME, because volume was never the axis the argument lives on: the
-// software is free forever and a rented box accrues at a fixed rate, so what a
-// subscription DOES is accumulate, and accumulation is a thing that happens in
-// months. ./PricingSignal.tsx draws those months in the same illustration
-// vocabulary as the eight feature spotlights (features/previews/illus.tsx) —
-// which also means the landing no longer ships a chart library to reach it.
+// The band has now shed three things. It shed a slider, because the slider hid
+// the story behind an interaction. Then it shed a log-log recharts plot of cost
+// against VOLUME, because volume is not an axis anyone lives on. Then it shed
+// its own two-panel cumulative miniature: at a FIXED monthly volume the winner
+// is decided in month one, so there was no crossover to draw and the totals were
+// really just a function of the volume we had picked. Growing usage is the
+// honest version — the subscription's staircase becomes a consequence of the
+// project succeeding, and the crossover becomes a real month.
+//
+// ./PricingSignal.tsx draws it full width in the same illustration vocabulary as
+// the eight feature spotlights (features/previews/illus.tsx) — which also means
+// the landing does not ship a chart library to reach it.
 //
 // The snippet that used to live here left earlier and has not come back: it was
 // never marketing, it lives where someone with a key can actually use it (/keys
@@ -34,28 +38,38 @@ import { useStillMotion } from "@/lib/useStillMotion";
 import { accentVar } from "./features/previews/illus";
 import PricingSignal from "./PricingSignal";
 import {
-  BELOW_CHARS,
-  BELOW_TIER,
   BOX,
-  BREAK_EVEN_CHARS,
-  HEADLINE_CHARS,
-  HEADLINE_TIER,
+  BOX_USD_MONTH,
+  EL_CHEAPER_THROUGH_CHARS,
+  END_CHARS,
+  GROWTH_PCT,
+  START_CHARS,
   TIMELINE_MONTHS,
-  fmtChars,
-  monthlyPair,
-  timelineRows,
+  boxUpgradeMonth,
+  crossoverMonth,
+  growthSeries,
+  growthTotals,
 } from "./pricingTimeline";
 
 const rise = makeRise({ y: 24, duration: 0.7, stagger: 0.08 });
 
 const FREE_TIER = ELEVENLABS_TIERS[0];
-const ROWS = timelineRows();
-const HEAD_RATE = monthlyPair(HEADLINE_CHARS);
-const BELOW_RATE = monthlyPair(BELOW_CHARS);
-const HEAD_ESTIMATE = estimateMonthly(HEADLINE_CHARS, BOX);
+const SERIES = growthSeries();
+const TOTALS = growthTotals(SERIES);
+const CROSS = crossoverMonth(SERIES);
+const UPGRADE = boxUpgradeMonth(SERIES);
+const LAST = SERIES[SERIES.length - 1];
+/** The last month the subscription is still the cheaper bill, and the first one
+ *  it is not — the two rows the honesty copy quotes. */
+const LAST_CHEAP = CROSS === null ? LAST : SERIES[CROSS - 2];
+const FIRST_COSTLY = CROSS === null ? null : SERIES[CROSS - 1];
+/** Headroom at the top of the span, from switchkit's own capacity figure. */
+const PEAK = estimateMonthly(END_CHARS, BOX);
+
+const num = (n: number) => n.toLocaleString("en-US");
 
 const CYAN = accentVar("cyan");
-const OTHER = "rgba(255,255,255,0.55)";
+const OTHER = "rgba(255,255,255,0.62)";
 
 /** A legend entry — and each series' direct label, since the drawing is
  *  aria-hidden and identity is never allowed to live in a stroke colour. */
@@ -98,12 +112,12 @@ export default function PricingSection() {
         whileInView="show"
         viewport={{ once: true, margin: "-60px" }}
         custom={1}
-        className="glass-panel mt-8 rounded-3xl p-5 sm:p-6"
+        className="glass-panel mt-8 rounded-3xl p-5 sm:p-8"
       >
         {/* Legend first, and always. The drawing is aria-hidden by construction,
             so this block — plus the table below — is where the series live for
             anyone the picture cannot reach. */}
-        <div className="grid gap-4 border-b border-white/5 pb-5 sm:grid-cols-3">
+        <div className="grid gap-4 border-b border-white/5 pb-6 sm:grid-cols-3">
           <Key
             color={CYAN}
             name="Gravitone itself"
@@ -113,25 +127,26 @@ export default function PricingSection() {
           <Key
             color={CYAN}
             name={BOX.name}
-            value={`${fmtUsd(HEAD_RATE.box)}/mo`}
+            value={`${fmtUsd(BOX_USD_MONTH)}/mo`}
             note="flat, running 24/7 — the volume does not change it"
           />
           <Key
             color={OTHER}
-            name={`ElevenLabs ${HEADLINE_TIER.name}`}
-            value={`${fmtUsd(HEAD_RATE.el)}/mo`}
-            note={`the tier that covers ${HEADLINE_CHARS.toLocaleString("en-US")} chars/mo — the volume this comparison assumes`}
+            name="ElevenLabs tiers"
+            value={`${fmtUsd(SERIES[0].el)} → ${fmtUsd(LAST.el)}/mo`}
+            note={`whichever published tier covers that month — ${SERIES[0].tier.name} in month 1, ${LAST.tier.name} in month ${TIMELINE_MONTHS}`}
           />
         </div>
 
-        {/* The picture. Mounted when the band is on its way in, so the draw
-            starts where the reader can see it; the placeholder holds the exact
-            box so the swap cannot shift the page under someone mid-read. */}
-        <div className="mt-5">
+        {/* The picture, at the full width of the column. Mounted when the band is
+            on its way in, so the draw starts where the reader can see it; the
+            placeholder holds the exact box so the swap cannot shift the page
+            under someone mid-read. */}
+        <div className="mt-6">
           {armed ? (
             <PricingSignal still={still} />
           ) : (
-            <div className="aspect-[680/404] max-h-[404px] w-full rounded-2xl border border-white/5 bg-white/[0.015]" />
+            <div className="aspect-[1160/560] w-full rounded-2xl border border-white/5 bg-white/[0.015]" />
           )}
         </div>
 
@@ -140,30 +155,44 @@ export default function PricingSection() {
             savingsUsd is deliberately unclamped in lib/switchkit.ts for exactly
             this reason, and a pricing section that only shows the flattering
             side of its own break-even is lying by omission. The picture draws
-            this case at its own scale; the words state it too. */}
-        {BREAK_EVEN_CHARS !== null && (
-          <p className="font-jetbrains mt-5 rounded-xl border border-amber-400/25 bg-amber-400/5 px-4 py-3 text-[12px] leading-relaxed text-amber-100/85">
-            Below ~{BREAK_EVEN_CHARS.toLocaleString("en-US")} chars/mo
-            (≈{Math.round(BREAK_EVEN_CHARS / CHARS_PER_AUDIO_MINUTE).toLocaleString("en-US")} audio-min)
-            an always-on {BOX.name} costs MORE than the ElevenLabs tier that covers you — at{" "}
-            {BELOW_CHARS.toLocaleString("en-US")} chars/mo it is {fmtUsd(BELOW_RATE.box)}/mo against{" "}
-            {BELOW_TIER.name}&apos;s {fmtUsd(BELOW_RATE.el)}, and {TIMELINE_MONTHS} months of that never
-            turns around. Their {FREE_TIER.name} tier&apos;s first{" "}
-            {FREE_TIER.charsPerMonth.toLocaleString("en-US")} chars/mo are $0, which no box beats. The box
-            only wins once you use it.
+            those months at the same scale as the rest; the words state them. */}
+        {EL_CHEAPER_THROUGH_CHARS !== null && FIRST_COSTLY !== null && (
+          <p className="font-jetbrains mt-6 rounded-xl border border-amber-400/25 bg-amber-400/5 px-4 py-3 text-[12px] leading-relaxed text-amber-100/85">
+            Up to {num(EL_CHEAPER_THROUGH_CHARS)} chars/mo
+            (≈{num(Math.round(EL_CHEAPER_THROUGH_CHARS / CHARS_PER_AUDIO_MINUTE))} audio-min)
+            an always-on {BOX.name} costs MORE than the ElevenLabs tier that covers you — that is
+            months 1–{FIRST_COSTLY.month - 1} of this timeline, where {fmtUsd(BOX_USD_MONTH)}/mo of machine runs
+            against {LAST_CHEAP.tier.name}&apos;s {fmtUsd(LAST_CHEAP.el)} at {num(LAST_CHEAP.chars)}{" "}
+            chars/mo. Their {FREE_TIER.name} tier&apos;s first {num(FREE_TIER.charsPerMonth)} chars/mo
+            are $0, which no box beats. The box only wins once you use it: month {FIRST_COSTLY.month} is where{" "}
+            {num(FIRST_COSTLY.chars)} chars/mo lands in {FIRST_COSTLY.tier.name} at{" "}
+            {fmtUsd(FIRST_COSTLY.el)} and stays past the machine for good.
           </p>
         )}
 
         <p className="font-jetbrains mt-3 text-[11px] leading-relaxed text-white/45">
-          List price against list price, over {TIMELINE_MONTHS} months at a fixed{" "}
-          {HEADLINE_CHARS.toLocaleString("en-US")} chars/mo: ElevenLabs&apos; published{" "}
-          {HEADLINE_TIER.name} tier against one Arm box on on-demand pricing, billed all 730 hours of
-          every month. ~{CHARS_PER_AUDIO_MINUTE.toLocaleString("en-US")} chars ≈ one audio minute, so
-          that volume is about{" "}
-          {Math.round(HEAD_ESTIMATE.audioMinutes).toLocaleString("en-US")} audio-min/mo — well inside
-          what a {BOX.name} sustains ({Math.round(HEAD_ESTIMATE.boxCapacityMinutes).toLocaleString("en-US")}{" "}
-          audio-min/mo at its measured {BOX.aggregateRtf}× realtime). The software is MIT and costs
-          nothing at any volume; the line above the floor is rented hardware, not a licence.{" "}
+          The assumption, plainly: <span className="text-white/70">one project growing from{" "}
+          {num(START_CHARS)} to {num(END_CHARS)} characters a month over {TIMELINE_MONTHS} months</span> —
+          the {FREE_TIER.name} tier&apos;s ceiling to the {LAST.tier.name} tier&apos;s ceiling, at the
+          same ~{GROWTH_PCT}% growth every month. Each month is priced at whichever ElevenLabs tier
+          covers that month&apos;s volume, against one Arm box on on-demand pricing, billed all 730
+          hours of every month. ~{num(CHARS_PER_AUDIO_MINUTE)} chars ≈ one audio minute, so month{" "}
+          {TIMELINE_MONTHS} is about {num(Math.round(PEAK.audioMinutes))} audio-min —{" "}
+          {UPGRADE === null ? (
+            <>
+              still well inside the {num(Math.round(PEAK.boxCapacityMinutes))} audio-min/mo a{" "}
+              {BOX.name} sustains at its measured {BOX.aggregateRtf}× realtime, so the box never has
+              to grow across this span
+            </>
+          ) : (
+            <>
+              past what one {BOX.name} sustains, so the box steps up to the larger preset in month{" "}
+              {UPGRADE} and the drawing carries that riser
+            </>
+          )}
+          . Across the {TIMELINE_MONTHS} months the two run to {fmtUsd(TOTALS.el)} against{" "}
+          {fmtUsd(TOTALS.box)}. The software is MIT and costs nothing at any volume; the line above
+          the floor is rented hardware, not a licence.{" "}
           <Link href="/benchmarks" className="text-cyan-300/80 underline-offset-2 transition hover:text-cyan-200 hover:underline">
             See the measured benchmarks →
           </Link>
@@ -191,39 +220,37 @@ export default function PricingSection() {
           <summary className="font-jetbrains cursor-pointer text-[11px] uppercase tracking-wider text-white/55 transition hover:text-white/80">
             the same numbers as a table
           </summary>
-          <div className="mt-3 overflow-x-auto">
+          <div className="scroll-y mt-3 max-h-96 overflow-x-auto">
             <table className="font-jetbrains w-full min-w-[34rem] text-left text-[11px] tabular-nums">
               <caption className="sr-only">
-                Cost by monthly volume: the ElevenLabs tier that covers it against one always-on Arm
-                box, for one month and across {TIMELINE_MONTHS} months.
+                Month by month over {TIMELINE_MONTHS} months: the assumed usage, the ElevenLabs tier
+                that covers it and its price, and one always-on {BOX.name}.
               </caption>
               <thead className="text-white/50">
                 <tr>
-                  <th scope="col" className="py-1.5 pr-3 font-normal">volume / mo</th>
+                  <th scope="col" className="py-1.5 pr-3 font-normal">month</th>
+                  <th scope="col" className="py-1.5 pr-3 font-normal">chars / mo</th>
                   <th scope="col" className="py-1.5 pr-3 font-normal">audio-min</th>
+                  <th scope="col" className="py-1.5 pr-3 font-normal">ElevenLabs tier</th>
                   <th scope="col" className="py-1.5 pr-3 font-normal">ElevenLabs / mo</th>
-                  <th scope="col" className="py-1.5 pr-3 font-normal">{BOX.name} / mo</th>
-                  <th scope="col" className="py-1.5 pr-3 font-normal">ElevenLabs · {TIMELINE_MONTHS} mo</th>
-                  <th scope="col" className="py-1.5 font-normal">{BOX.name} · {TIMELINE_MONTHS} mo</th>
+                  <th scope="col" className="py-1.5 font-normal">{BOX.name} / mo</th>
                 </tr>
               </thead>
               <tbody className="text-white/80">
-                {ROWS.map((r) => (
-                  <tr key={r.tier.name} className="border-t border-white/5">
+                {SERIES.map((p) => (
+                  <tr key={p.month} className="border-t border-white/5">
                     <th scope="row" className="py-1.5 pr-3 font-normal text-white/60">
-                      {fmtChars(r.tier.charsPerMonth)} · {r.tier.name}
+                      {p.month}
+                      {p.month === CROSS && <span className="text-cyan-300/80"> (they cross)</span>}
                     </th>
-                    <td className="py-1.5 pr-3">{Math.round(r.audioMinutes).toLocaleString("en-US")}</td>
-                    <td className="py-1.5 pr-3">{fmtUsd(r.elMonth)}</td>
-                    {/* Losing rows say so in words, not in colour. */}
-                    <td className="py-1.5 pr-3">
-                      {fmtUsd(r.boxMonth)}
-                      {r.boxCostsMore && <span className="text-amber-200/80"> (more)</span>}
-                    </td>
-                    <td className="py-1.5 pr-3">{fmtUsd(r.elTotal)}</td>
+                    <td className="py-1.5 pr-3">{num(p.chars)}</td>
+                    <td className="py-1.5 pr-3">{num(Math.round(p.audioMinutes))}</td>
+                    <td className="py-1.5 pr-3">{p.tier.name}</td>
+                    <td className="py-1.5 pr-3">{fmtUsd(p.el)}</td>
+                    {/* Losing months say so in words, not in colour. */}
                     <td className="py-1.5">
-                      {fmtUsd(r.boxTotal)}
-                      {r.boxCostsMore && <span className="text-amber-200/80"> (more)</span>}
+                      {fmtUsd(p.boxUsd)}
+                      {p.boxCostsMore && <span className="text-amber-200/80"> (more)</span>}
                     </td>
                   </tr>
                 ))}
@@ -234,7 +261,8 @@ export default function PricingSection() {
               no variation: it is the same number in every cell. */}
           <p className="font-jetbrains mt-3 text-[11px] leading-relaxed text-white/45">
             Gravitone itself is $0.00 on every row, in every month — MIT, self-hosted. The only cost
-            in the {BOX.name} columns is the machine.
+            in the {BOX.name} column is the machine. Over the whole span: {fmtUsd(TOTALS.el)} against{" "}
+            {fmtUsd(TOTALS.box)}.
           </p>
         </details>
       </motion.div>
