@@ -26,6 +26,7 @@ import {
   ELEVENLABS_TIERS,
   fmtUsd,
 } from "@/lib/switchkit";
+import CostBar from "./CostBar";
 import LocalEnginePanel from "./LocalEnginePanel";
 
 const ease = [0.22, 1, 0.36, 1] as const;
@@ -148,12 +149,14 @@ export default function BenchmarksView() {
                         )}
                       </span>
                     </div>
-                    <div className="mt-1.5 h-2.5 overflow-hidden rounded-full bg-white/5">
-                      <div
-                        className={`h-full rounded-full ${r.isGravitone ? "bg-gradient-to-r from-cyan-400 to-emerald-300" : "bg-white/25"}`}
-                        style={{ width: `${logWidth(r.usdPerAudioHour, minC, maxC)}%` }}
-                      />
-                    </div>
+                    {/* Same log geometry, same source of truth — the bar now
+                        DRAWS itself once when the row comes into view instead
+                        of simply being there. The price above it is untouched. */}
+                    <CostBar
+                      rowKey={r.name}
+                      accent={r.isGravitone}
+                      pct={logWidth(r.usdPerAudioHour, minC, maxC)}
+                    />
                     <div className="font-jetbrains mt-1 text-[11px] text-white/45">{r.detail}</div>
                   </div>
                 );

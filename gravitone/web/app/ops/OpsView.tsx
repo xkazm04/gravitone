@@ -61,12 +61,27 @@ function Stat({
   );
 }
 
+/** A mono label with a hairline running out of it to the page edge.
+ *
+ *  The house chrome idiom (web/DESIGN.md, restrained tier), and the whole of
+ *  what Signal is allowed to do on this page: /ops is numbers-first, every tile
+ *  is a measurement, and the language's job here is to separate the groups —
+ *  not to draw anything. No motion, no accent, no picture. */
+function SectionLabel({ title }: { title: string }) {
+  return (
+    <div className="flex items-center gap-3">
+      <h2 className="font-jetbrains shrink-0 text-[11px] uppercase tracking-widest text-white/50">
+        {title}
+      </h2>
+      <span aria-hidden className="h-px flex-1 bg-white/8" />
+    </div>
+  );
+}
+
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <section className="mt-8">
-      <h2 className="font-jetbrains text-[11px] uppercase tracking-widest text-white/50">
-        {title}
-      </h2>
+      <SectionLabel title={title} />
       <div className="mt-3 grid grid-cols-2 gap-3 md:grid-cols-4">{children}</div>
     </section>
   );
@@ -88,9 +103,7 @@ function Deployment({ config }: { config: Record<string, unknown> | undefined })
   if (!shown.length) return null;
   return (
     <section className="mt-8">
-      <h2 className="font-jetbrains text-[11px] uppercase tracking-widest text-white/50">
-        This replica
-      </h2>
+      <SectionLabel title="This replica" />
       <div className="font-jetbrains mt-3 flex flex-wrap gap-x-6 gap-y-2 rounded-xl border border-white/8 bg-black/30 p-4 text-[11px] text-white/60">
         {shown.map(([k, v]) => (
           <span key={k}>

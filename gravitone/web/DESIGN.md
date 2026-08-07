@@ -282,3 +282,37 @@ that shape for the next surface.
   and the rose/amber severity contract are already this app's honesty language;
   restyling them would have been change for its own sake, and every one of them
   is a truthful thing a user reads.
+
+### ops · benchmarks — 2026-08-07
+
+Both pages are numbers-first and stay that way. Nothing here replaced, summarised
+or decorated a figure a user reads.
+
+**Applied**
+
+- `app/benchmarks/CostBar.tsx` (new, in `BenchmarksView`) — the hand-rolled
+  log-scale leaderboard bar is now a `<Draw>` stroke that dash-draws itself once
+  when its row scrolls into view. Same `logWidth`, same `lib/benchmarks.ts`
+  source, same track: only the entrance changed. A measured Gravitone row keeps
+  the cyan→emerald accent because it is the point; an ElevenLabs row went
+  HAIRLINE, which is the colour law applied honestly to a comparison — the price
+  beside it was always the claim. It draws immediately where there is no
+  `IntersectionObserver`, because an invisible bar is a missing datum and that is
+  a worse failure than a missing animation.
+- `app/ops/OpsView.tsx` — `SectionLabel`: the mono label with a hairline running
+  out of it to the page edge, on every section including "This replica". Static,
+  no accent, no motion. That is the entire budget this page gets.
+
+**Deliberately skipped**
+
+- **"benchmarks with no local artifacts"** — no such state exists. `BENCHMARKS`
+  is a committed table, so the leaderboard is never empty; the closest thing is
+  `LocalEnginePanel`'s "checking this browser…" / "the capability probe did not
+  complete", and both are honest sentences about a measurement in flight or
+  refused. A teaching drawing over a probe result would be decorating a fact.
+- **The ops stat tiles** — untouched, including the load-bearing em dash for a
+  null. A meter stays a meter; drawing a sparkline behind a p99 would be exactly
+  the "picture replaces a truthful number" the law forbids.
+- **The capacity planner, methodology block and live proof strip** — inputs,
+  code the user copies, and a live measurement. None of them is a mechanism
+  needing explanation, and all three are read rather than admired.
