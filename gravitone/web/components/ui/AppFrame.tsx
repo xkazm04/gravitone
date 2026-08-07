@@ -16,6 +16,7 @@ export const MODULES = [
   { label: "Playground", href: "/playground" },
   { label: "Voices", href: "/voices" },
   { label: "API keys", href: "/keys" },
+  { label: "Gym", href: "/gym" },
   { label: "Ops", href: "/ops" },
 ];
 

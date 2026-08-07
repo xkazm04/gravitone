@@ -55,6 +55,21 @@
           "apiRoutes": []
         },
         {
+          "name": "Conversation Gym & Replay",
+          "description": "Replay a recorded conversation as a deterministic test: stream user.wav back through the agent socket, emit a run artifact (turns, latency distributions, WER drift), score run B against run A with named checks, and run suites of golden recordings in CI.",
+          "businessFeature": "Conversation Gym & Replay",
+          "category": "api",
+          "filePaths": [
+            "gravitone/service/gym.py",
+            "gravitone/service/tests/test_gym.py"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/v1/convai/replay",
+            "/v1/convai/compare"
+          ]
+        },
+        {
           "name": "Speech Synthesis API",
           "description": "ElevenLabs-compatible HTTP endpoint: POST /v1/text-to-speech/{voice_id} returns wav/mp3/pcm audio with timing headers, plus /health and /metrics; optional xi-api-key auth and API-key management router.",
           "businessFeature": "Speech Synthesis API",
@@ -222,6 +237,30 @@
           ]
         },
         {
+          "name": "Conversation Gym Studio",
+          "description": "The /gym page: pick a recorded conversation, replay it against the agent with pace/politeness knobs, read the run artifact, and score reruns against baselines. Prototype round: three directional variants (Bench / Session / Ladder) behind a throwaway switcher.",
+          "businessFeature": "Conversation Gym Studio",
+          "category": "ui",
+          "filePaths": [
+            "gravitone/web/app/gym/page.tsx",
+            "gravitone/web/app/gym/_gym/types.ts",
+            "gravitone/web/app/gym/_gym/data.ts",
+            "gravitone/web/app/gym/_gym/shared.tsx",
+            "gravitone/web/app/gym/_variants/GymBench.tsx",
+            "gravitone/web/app/gym/_variants/GymSession.tsx",
+            "gravitone/web/app/gym/_variants/GymLadder.tsx",
+            "gravitone/web/app/api/gym/agents/route.ts",
+            "gravitone/web/app/api/gym/recordings/route.ts",
+            "gravitone/web/app/api/gym/recordings/[id]/route.ts",
+            "gravitone/web/app/api/gym/replay/route.ts",
+            "gravitone/web/app/api/gym/compare/route.ts"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/api/gym/*"
+          ]
+        },
+        {
           "name": "TTS Playground",
           "description": "Interactive console to type text, pick a voice and emotion, and hear synthesized speech; includes an emotion A/B that renders one line under two emotions side by side. Streams audio through server-side proxy routes that hide the backend and avoid CORS.",
           "businessFeature": "TTS Playground",
@@ -322,6 +361,7 @@
     "TTS Service Core › Voice & Emotion Library [lib] — 2 files",
     "TTS Service Core › Voice Cloning & Ingest Pipeline [api] — 4 files",
     "TTS Service Core › Concurrency Engine & Metrics [lib] — 2 files",
+    "TTS Service Core › Conversation Gym & Replay [api] — 2 files",
     "TTS Service Core › Speech Synthesis API [api] — 4 files",
     "Performance & Deployment › Packaging & Deployment [config] — 3 files",
     "Performance & Deployment › Load Testing & Benchmarks [test] — 5 files",
@@ -330,6 +370,7 @@
     "Web Studio › Voice Creation Studio [ui] — 9 files",
     "Web Studio › Character & Voice Management [ui] — 16 files",
     "Web Studio › Ops Transparency [ui] — 4 files",
+    "Web Studio › Conversation Gym Studio [ui] — 12 files",
     "Web Studio › TTS Playground [ui] — 9 files",
     "Design System & Brand › App Shell & Landing [ui] — 6 files",
     "Design System & Brand › Emotion Glyph Art [lib] — 3 files",
@@ -337,14 +378,14 @@
   ],
   "summary": {
     "totalGroups": 4,
-    "totalContexts": 15,
-    "totalFiles": 83,
+    "totalContexts": 17,
+    "totalFiles": 97,
     "categories": {
       "lib": 3,
-      "api": 2,
+      "api": 3,
       "config": 1,
       "test": 1,
-      "ui": 8
+      "ui": 9
     },
     "domains": {
       "feature": 2,
