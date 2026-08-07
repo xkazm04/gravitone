@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   accept, asRegion, fallbackNote, heuristicDirector, propose, proposalSummary, REASONS,
-  reject, retag, sentences, type Director, type Suggestion,
+  reject, retag, reviewText, sentences, type Director, type Suggestion,
 } from "./suggest";
-import { parseTags, scoreRegion } from "./shared";
+import { DEFAULT_TEXT, parseTags, scoreRegion } from "./shared";
 
 // This pass reads punctuation, capitals and brackets. It does not read MEANING,
 // and the tests are written to hold it to exactly that: every assertion below
@@ -111,8 +111,28 @@ describe("heuristicDirector — the rules, and only the rules", () => {
     expect(heuristicDirector(text, ["baseline"])).toEqual([]);
   });
 
+  it("treats an EMPTY vocabulary as unknown rather than as nothing-addressable", () => {
+    // A console whose roster has not loaded used to get zero suggestions and be
+    // told its text contained no cues — a claim about the writing, made from a
+    // missing Character.
+    const text = "This part is amazing! And where did it go?";
+    expect(heuristicDirector(text, []).map((s) => s.value)).toEqual(["excited", "confused"]);
+  });
+
   it("skips a span too short to be worth a Voice switch", () => {
     expect(heuristicDirector("Hi! Ok?", SCALE)).toEqual([]);
+  });
+
+  it("keeps the short lines dialogue is made of", () => {
+    // MIN_SPAN was 8, which declined "Wait!" and "Stop!" — the most obviously
+    // directable things anyone types. A row is one click to reject; an absence
+    // is a mystery.
+    const text = "Wait! What is that?";
+    expect(covered(text, heuristicDirector(text, SCALE))).toEqual(["Wait!", "What is that?"]);
+    // …and the aside inside a sentence still beats the sentence, unchanged: the
+    // second span here is the bracket, not the question that contains it.
+    const cued = "Wait! (be quiet) What is that?";
+    expect(covered(cued, heuristicDirector(cued, SCALE))).toEqual(["Wait!", "(be quiet)"]);
   });
 
   it("skips a bracketed aside with no words in it", () => {
@@ -234,15 +254,55 @@ describe("the accept / reject state machine", () => {
   });
 });
 
+describe("reviewText — WHY a pass came back empty, not just that it did", () => {
+  it("reports the survivors and no reason when there is nothing to explain", () => {
+    const p = reviewText("Where did it go? This part is amazing!", SCALE, []);
+    expect(p.suggestions).toHaveLength(2);
+    expect(p).toMatchObject({ found: 2, alreadyDirected: 0, offScale: [] });
+  });
+
+  // THE BUG. The composer ships with `Hello there. [excited]This part is
+  // amazing![/excited] And now, back to normal.`, so the very first click
+  // anyone ever makes hits this case — and it used to be reported as "found
+  // none of them here", which is a false statement about the user's writing.
+  it("separates 'already directed' from 'nothing found' on the DEFAULT text", () => {
+    const { text, regions } = parseTags(DEFAULT_TEXT);
+    const p = reviewText(text, SCALE, regions);
+    expect(p.suggestions).toEqual([]);
+    expect(p.found).toBe(1);
+    expect(p.alreadyDirected).toBe(1);
+    expect(proposalSummary(p)).toMatch(/already directed/);
+    expect(proposalSummary(p)).not.toMatch(/found none of them here/);
+  });
+
+  it("names the emotions a Character's scale cannot address", () => {
+    const p = reviewText("Where did it go? This part is amazing!", ["baseline", "calm"], []);
+    expect(p.suggestions).toEqual([]);
+    expect(p.offScale.sort()).toEqual(["confused", "excited"]);
+    expect(proposalSummary(p)).toMatch(/Confused, Excited/);
+  });
+
+  it("still says 'found none' when that is the truth", () => {
+    const p = reviewText("The report landed on Tuesday. It was thorough and dull.", SCALE, []);
+    expect(p).toMatchObject({ found: 0, alreadyDirected: 0, offScale: [] });
+    expect(proposalSummary(p)).toMatch(/punctuation, capitals and brackets/);
+  });
+});
+
 describe("what the user is told", () => {
+  const outcome = (suggestions: Suggestion[]): Parameters<typeof proposalSummary>[0] =>
+    ({ suggestions, found: suggestions.length, alreadyDirected: 0, offScale: [] });
+  const three = outcome(heuristicDirector("Where did it go? THIS IS RIDICULOUS. And then (quietly) it reappeared!", SCALE));
+
   it("states the METHOD rather than implying comprehension", () => {
-    expect(proposalSummary(3)).toMatch(/from punctuation and phrasing/);
-    expect(proposalSummary(3)).toMatch(/not a reading/);
-    expect(proposalSummary(1)).toMatch(/^1 suggestion /);
+    expect(three.suggestions).toHaveLength(3);
+    expect(proposalSummary(three)).toMatch(/from punctuation and phrasing/);
+    expect(proposalSummary(three)).toMatch(/not a reading/);
+    expect(proposalSummary(outcome(three.suggestions.slice(0, 1)))).toMatch(/^1 suggestion /);
   });
 
   it("explains an empty result by naming what it looked for", () => {
-    expect(proposalSummary(0)).toMatch(/punctuation, capitals and brackets/);
+    expect(proposalSummary(outcome([]))).toMatch(/punctuation, capitals and brackets/);
   });
 
   it("marks the fallback consequence in composerWarnings' own words", () => {

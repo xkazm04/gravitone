@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useState } from "react";
 import ScoreEditor from "./ScoreEditor";
-import { parseTags } from "./shared";
+import { DEFAULT_TEXT, parseTags } from "./shared";
 
 // The score is a VIEW of a string the engine already understands, so every test
 // here asserts on the string that comes back out. If the editor's picture and
@@ -51,7 +51,11 @@ const area = () => screen.getByRole("textbox", { name: "Score text" }) as HTMLTe
 // Scoped to the score SECTION, not to the textarea's immediate parent: the text
 // surface is now a wrapper (mirror + textarea, ScoreText) rather than a bare
 // element, so `parentElement` stopped being the section that holds the notice.
-const notice = () => screen.getByRole("textbox", { name: "Score text" }).closest("section")?.querySelector("[aria-live]")?.textContent ?? "";
+// The director's answer is a live region too, so this is scoped past it — the
+// two say different things and a test that reads whichever came first would be
+// asserting on the DOM order rather than on the message.
+const notice = () => screen.getByRole("textbox", { name: "Score text" }).closest("section")
+  ?.querySelector("[aria-live]:not([data-testid])")?.textContent ?? "";
 
 /** Select characters [a, b) in the score's text area. */
 function select(a: number, b: number) {
@@ -423,5 +427,64 @@ describe("ScoreEditor — the director proposes, it never applies", () => {
   it("offers nothing to direct when there is nothing written", () => {
     mount("");
     expect(screen.getByRole("button", { name: /direct this text/ })).toBeDisabled();
+  });
+});
+
+// "always does not do anything" — the report that produced this block.
+//
+// It was true, and it was not one bug. On the text the composer SHIPS WITH, the
+// rules find exactly one span and then drop it (the default line is already
+// directed), so the honest answer was "nothing to add" — and that answer was
+// rendered as a 10px `text-white/50` fragment inside the button's own flex row,
+// which on this panel is indistinguishable from having pressed nothing. Then it
+// named the wrong reason on top of that. Every case here is about the click
+// having a VISIBLE answer.
+describe("ScoreEditor — the director always answers, out loud", () => {
+  const answer = () => screen.queryByTestId("director-note")?.textContent ?? "";
+  const press = () => fireEvent.click(screen.getByRole("button", { name: /direct this text/ }));
+
+  it("says something visible for the DEFAULT text, whose one cue is already directed", () => {
+    mount(DEFAULT_TEXT);
+    expect(screen.queryByTestId("director-note")).not.toBeInTheDocument();
+    press();
+    // The regression this whole item is about: the click must produce a node.
+    expect(screen.getByTestId("director-note")).toBeVisible();
+    expect(answer()).toMatch(/already directed/);
+    // …and must NOT blame the writing for a filter the user's own direction set.
+    expect(answer()).not.toMatch(/found none of them here/);
+    expect(wire()).toBe(DEFAULT_TEXT); // still nothing applied
+  });
+
+  it("shows real rows for a line with obvious cues", () => {
+    mount("Wait! (be quiet) What is that?", { scale: ["excited", "whisper", "confused", "sad"] });
+    press();
+    expect(rows().length).toBeGreaterThan(0);
+    expect(screen.getByText(/from punctuation and phrasing/)).toBeInTheDocument();
+    // "Wait!" is five characters — under the old floor of eight, which declined
+    // the shortest lines dialogue is actually made of.
+    expect(ghosts().length).toBeGreaterThan(0);
+    expect(screen.getByRole("button", { name: /^Accept .* "Wait!"/ })).toBeInTheDocument();
+  });
+
+  it("names the scale as the reason when the scale is the reason", () => {
+    // A Character that can only be calm cannot be handed an excited span, and
+    // the message says THAT rather than claiming the text held no cues.
+    mount("This part is amazing!", { scale: ["calm"], available: ["baseline", "calm"] });
+    press();
+    expect(answer()).toMatch(/cannot address/);
+    expect(answer()).toMatch(/Excited/);
+  });
+
+  it("keeps the empty answer on screen for the honest empty case too", () => {
+    mount("The report landed on Tuesday. It was thorough and dull.");
+    press();
+    expect(screen.getByTestId("director-note")).toBeVisible();
+    expect(answer()).toMatch(/punctuation, capitals and brackets/);
+  });
+
+  it("announces the answer rather than only drawing it", () => {
+    mount(DEFAULT_TEXT);
+    press();
+    expect(screen.getByTestId("director-note")).toHaveAttribute("aria-live", "polite");
   });
 });

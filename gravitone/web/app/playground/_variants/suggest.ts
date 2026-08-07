@@ -85,8 +85,16 @@ const RULES: Record<SuggestReason, { emotion: string; rank: number }> = {
  * tagged audio is a Voice switch nobody can hear and a row everybody has to
  * dismiss. Precision means declining the ones that are technically right and
  * practically worthless.
+ *
+ * Loosened from 8 to 4 deliberately. Eight characters excluded the shortest
+ * lines dialogue is actually made of — "Wait!", "Stop!", "(shh)", "Why?" — which
+ * are among the most obviously directable things anyone would type, and the
+ * first pass declining them is a large part of why this button felt inert. Four
+ * still declines "Hi!" and "Ok?", where a Voice switch genuinely is inaudible.
+ * The cost is more rows to audit on punchy dialogue; that is the right cost,
+ * because a row is one click to reject and an absence is a mystery.
  */
-const MIN_SPAN = 8;
+const MIN_SPAN = 4;
 
 /** Sentence ends, and the newlines that end one just as firmly. */
 const TERMINATOR = /[.!?…]+["')\]]*|\n+/g;
@@ -155,8 +163,10 @@ function isShout(slice: string): boolean {
 }
 
 /** The rules, in the order they are looked for. Pure and separately testable so
- *  a rule can be judged without rendering anything. */
-function candidates(text: string): Suggestion[] {
+ *  a rule can be judged without rendering anything — and exported, because
+ *  `reviewText` has to be able to say "the rules DID find something, it just
+ *  wasn't offerable", which needs the unfiltered list. */
+export function candidates(text: string): Suggestion[] {
   const found: Suggestion[] = [];
   const add = (start: number, end: number, reason: SuggestReason) => {
     const span = tighten(text, start, end);
@@ -195,9 +205,14 @@ function candidates(text: string): Suggestion[] {
  * — which is what `toTags` requires anyway, the grammar having no nesting.
  */
 export const heuristicDirector: Director = (plain, vocabulary) => {
-  const allowed = new Set(vocabulary.map((v) => v.toLowerCase()));
+  // An EMPTY vocabulary is unknown, not empty. It used to mean "nothing is
+  // addressable", so a console whose Character had not loaded produced zero
+  // suggestions and said the text contained no cues — a claim about the writing
+  // made on the basis of a missing roster. Unknown means offer everything and
+  // let `fallbackNote` state the consequence.
+  const allowed = vocabulary.length > 0 ? new Set(vocabulary.map((v) => v.toLowerCase())) : null;
   const ranked = candidates(plain)
-    .filter((s) => allowed.has(s.value))
+    .filter((s) => allowed === null || allowed.has(s.value))
     .sort((a, b) => RULES[a.reason].rank - RULES[b.reason].rank || a.start - b.start);
 
   const kept: Suggestion[] = [];
@@ -224,6 +239,55 @@ export function propose(
 ): Suggestion[] {
   return director(plain, vocabulary)
     .filter((s) => !existing.some((r) => r.start < s.end && s.start < r.end));
+}
+
+/**
+ * The whole outcome of one pass — not just what survived it.
+ *
+ * `propose` returns a list, and a list has exactly one empty value, so every
+ * reason for emptiness was reported with the same sentence: "found none of
+ * them here". On the text this composer SHIPS WITH that sentence is false. The
+ * default line is `Hello there. [excited]This part is amazing![/excited] And
+ * now, back to normal.` — the rules find its one exclamation every time and
+ * then drop it, because the user (well, the default) has already directed those
+ * exact words. So the first click anyone ever makes returned nothing and blamed
+ * the writing for it. That is the bug behind "it does not do anything".
+ *
+ * These four numbers let the UI name the ACTUAL reason.
+ */
+export type Proposal = {
+  /** What survived everything — the rows to review. */
+  suggestions: Suggestion[];
+  /** Spans the rules matched at all, before any filtering. */
+  found: number;
+  /** Dropped because the user has already directed those words. */
+  alreadyDirected: number;
+  /** Emotions the rules wanted that this Character's scale cannot address. */
+  offScale: string[];
+};
+
+/** Run a pass and keep the reasons, not just the survivors. Same arguments and
+ *  the same seam as `propose`, which it wraps. */
+export function reviewText(
+  plain: string,
+  vocabulary: string[],
+  existing: ScoreRegion[],
+  director: Director = heuristicDirector,
+): Proposal {
+  const all = candidates(plain);
+  const directable = director(plain, vocabulary);
+  const suggestions = directable.filter(
+    (s) => !existing.some((r) => r.start < s.end && s.start < r.end),
+  );
+  const allowed = new Set(vocabulary.map((v) => v.toLowerCase()));
+  return {
+    suggestions,
+    found: all.length,
+    alreadyDirected: directable.length - suggestions.length,
+    offScale: vocabulary.length === 0
+      ? []
+      : [...new Set(all.map((s) => s.value).filter((v) => !allowed.has(v)))],
+  };
 }
 
 /** Drop one suggestion. */
@@ -275,14 +339,30 @@ export function asRegion(s: Suggestion): ScoreRegion {
   return scoreRegion(s.start, s.end, s.value);
 }
 
-/** The one-line summary of a proposal run. States the METHOD, because a user
- *  who thinks this understood their writing will trust it more than it has
- *  earned. */
-export function proposalSummary(count: number): string {
-  if (count === 0) {
-    return "No suggestions — this pass only reads punctuation, capitals and brackets, and found none of them here.";
+/**
+ * The one-line summary of a proposal run.
+ *
+ * States the METHOD, because a user who thinks this understood their writing
+ * will trust it more than it has earned — and, when nothing comes back, states
+ * WHICH of the three empty outcomes it was. A message that names the wrong
+ * reason is the same bug as no message: "found none of them here" told users
+ * their text had no cues when the truth was "your one cue is already directed",
+ * and there is a different next action behind each.
+ */
+export function proposalSummary(p: Proposal): string {
+  const n = p.suggestions.length;
+  if (n > 0) {
+    return `${n} suggestion${n === 1 ? "" : "s"} from punctuation and phrasing — a first pass, not a reading. Review each.`;
   }
-  return `${count} suggestion${count === 1 ? "" : "s"} from punctuation and phrasing — a first pass, not a reading. Review each.`;
+  const span = (k: number) => `${k} span${k === 1 ? "" : "s"}`;
+  if (p.alreadyDirected > 0) {
+    return `Nothing new — the ${span(p.alreadyDirected)} this pass found ${p.alreadyDirected === 1 ? "is" : "are"} already directed. Clear a region to have those words looked at again.`;
+  }
+  if (p.offScale.length > 0) {
+    const names = p.offScale.map((v) => emotionMeta(v).label).join(", ");
+    return `Nothing to suggest — the ${span(p.found)} this pass found want ${names}, which this Character's scale cannot address.`;
+  }
+  return "No suggestions — this pass only reads punctuation, capitals and brackets, and found none of them here.";
 }
 
 /** The fallback consequence for a suggestion the Character has not recorded —

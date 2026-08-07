@@ -31,7 +31,7 @@ import { emotionMeta } from "@/lib/emotions";
 import { useCopyFeedback } from "@/lib/useCopyFeedback";
 import ScoreText from "./ScoreText";
 import {
-  accept, asRegion, fallbackNote, propose, proposalSummary, REASONS,
+  accept, asRegion, fallbackNote, proposalSummary, REASONS, reviewText,
   // Aliased: `retag` is already this component's word for re-aiming a PLACED
   // region, and the two must not be confused — one edits the string, the other
   // edits a proposal that is not in the string yet.
@@ -158,9 +158,13 @@ export default function ScoreEditor({
    *  request to gate, cancel or fail, because there is no model: see suggest.ts
    *  for why this is rules rather than the narrate endpoint the idea assumed. */
   function direct() {
-    const found = propose(text, choices, regions);
-    setSuggestions(found);
-    setDirectorNote(proposalSummary(found.length));
+    // `reviewText`, not `propose`: a list has one empty value and this pass has
+    // THREE empty outcomes, which used to be reported with the one sentence
+    // that happened to be wrong for the default text. The note below always
+    // changes, so the click always has a visible answer.
+    const outcome = reviewText(text, choices, regions);
+    setSuggestions(outcome.suggestions);
+    setDirectorNote(proposalSummary(outcome));
     setNotice(null);
   }
 
@@ -437,10 +441,23 @@ export default function ScoreEditor({
             </button>
           </>
         )}
-        {directorNote && (
-          <span className="font-jetbrains text-[10px] leading-relaxed text-white/50">{directorNote}</span>
-        )}
       </div>
+
+      {/* The ANSWER to the button — its own block, at reading size.
+          This was a 10px `text-white/50` span wedged into the button row, so
+          the one outcome a first-time user always got (the shipped default text
+          has exactly one cue, and it is already directed) looked identical to
+          having pressed nothing. An action whose only response is invisible is
+          an action that "does not do anything". */}
+      {directorNote && (
+        <p
+          aria-live="polite"
+          data-testid="director-note"
+          className="font-hanken rounded-xl border border-violet-300/25 bg-violet-400/[0.06] px-3 py-2 text-[12px] leading-relaxed text-violet-100/90"
+        >
+          {directorNote}
+        </p>
+      )}
 
       {/* The review. Every row states the RULE that produced it, because the
           rule is the whole explanation — this pass reads punctuation, capitals
