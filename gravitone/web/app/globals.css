@@ -128,22 +128,6 @@ body { margin: 0; }
   opacity: var(--gt-level);
 }
 
-/* switch-kit volume slider (landing bill calculator) */
-.switch-slider {
-  appearance: none; height: 4px; border-radius: 999px; cursor: pointer;
-  background: linear-gradient(90deg, var(--gt-track-cyan), var(--gt-track-violet));
-}
-.switch-slider::-webkit-slider-thumb {
-  appearance: none; height: 18px; width: 18px; border-radius: 999px;
-  background: var(--gt-accent-cyan); border: 2px solid var(--gt-thumb-ring);
-  box-shadow: 0 0 14px var(--gt-glow-cyan-strong);
-}
-.switch-slider::-moz-range-thumb {
-  height: 18px; width: 18px; border-radius: 999px;
-  background: var(--gt-accent-cyan); border: 2px solid var(--gt-thumb-ring);
-  box-shadow: 0 0 14px var(--gt-glow-cyan-strong);
-}
-
 /* ---------------------------------------------------------------------------
    B · STICKER STUDIO — warm-cream neo-brutalist
 --------------------------------------------------------------------------- */

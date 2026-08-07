@@ -4,6 +4,7 @@ import { createElement } from "react";
 import GravitoneTokens from "./GravitoneTokens";
 import {
   ACCENT,
+  CHART,
   CSS_TOKENS,
   EASE,
   EASE_CSS,
@@ -55,6 +56,31 @@ describe("token emission", () => {
     expect(CSS_TOKENS["--gt-aurora-period"]).toBe("22s");
     expect(CSS_TOKENS["--gt-ink"]).toBe(INK);
     expect(CSS_TOKENS["--gt-accent-cyan"]).toBe(ACCENT.cyan);
+  });
+
+  // DELIBERATE ADDITION (landing pricing chart). These are NOT the ACCENT trio
+  // and must not be "tidied up" into it: the accents are display colours that
+  // fail the dataviz palette checks as 2px data strokes (too light, and cyan vs
+  // emerald falls under the normal-vision ΔE floor). These steps passed the
+  // validator against this page's own surface. Changing one means re-running it,
+  // not adjusting the expectation below.
+  it("publishes the validated chart series colours", () => {
+    expect(CHART.el).toBe("#9a6cf9");
+    expect(CHART.box).toBe("#09a1c1");
+    expect(CHART.boxLarge).toBe("#0b6d84");
+    expect(CSS_TOKENS["--gt-chart-el"]).toBe(CHART.el);
+    expect(CSS_TOKENS["--gt-chart-box"]).toBe(CHART.box);
+    expect(CSS_TOKENS["--gt-chart-box-large"]).toBe(CHART.boxLarge);
+  });
+
+  it("keeps the chart series out of the status vocabulary", () => {
+    // amber = warning and rose = error everywhere in this app (ErrorBanner).
+    // A competitor's price line is an identity, not a fault condition, so no
+    // series may wear a status hue.
+    for (const c of [CHART.el, CHART.box, CHART.boxLarge]) {
+      const [r, g, b] = [1, 3, 5].map((i) => parseInt(c.slice(i, i + 2), 16));
+      expect(r).toBeLessThan(Math.max(g, b)); // never a warm/red-dominant hue
+    }
   });
 
   it("keeps the CSS ease and the framer ease the same curve", () => {

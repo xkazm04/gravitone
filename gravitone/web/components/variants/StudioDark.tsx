@@ -12,7 +12,7 @@ import Equalizer, { usePauseOffscreen } from "@/components/ui/Equalizer";
 import { EYEBROW_CLASS } from "@/components/ui/Primitives";
 import { MODULES } from "@/components/ui/AppFrame";
 import { makeRise } from "@/components/ui/tokens";
-import SwitchKit from "./SwitchKit";
+import PricingSection from "./PricingSection";
 import HeroMicDemo from "./HeroMicDemo";
 import SectionRail from "./SectionRail";
 
@@ -66,8 +66,9 @@ export default function StudioDark() {
             </span>
             <span className="font-instrument text-2xl tracking-tight text-white">{BRAND}</span>
           </Link>
-          {/* Signed-in users get route navigation; signed-out visitors get none
-              (the marketing section anchors are removed for them). */}
+          {/* Signed-in users get route navigation here; signed-out visitors get
+              none, because every module route bounces them. Their way around
+              the page is <SectionRail /> at the foot of this file. */}
           <div className="font-jetbrains hidden items-center gap-7 text-[13px] text-white/70 md:flex">
             {user &&
               MODULES.map((r) => (
@@ -200,8 +201,8 @@ export default function StudioDark() {
           ))}
         </section>
 
-        {/* ElevenLabs switch kit: bill calculator + one-line switcher */}
-        <SwitchKit />
+        {/* ElevenLabs switch kit: the two bills, plotted, crossover and all */}
+        <PricingSection />
 
         {/* playground teaser */}
         <section id="playground" className="py-14">
