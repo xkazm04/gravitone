@@ -2306,10 +2306,24 @@ def modes() -> dict:
     `diarization.available` says which of the two answers this box is giving,
     and `enable` is the exact command that changes it."""
     have_diarizer = ingest.diarization_available()
+    have_transcriber = ingest.transcription_available()
     return {
         "resolved_auto": ingest.resolve_mode("auto"),
-        "sovereign": {"limits": list(ingest.sovereign_limits(have_diarizer)),
-                      "note": ingest.sovereign_note(have_diarizer),
+        "sovereign": {"limits": list(ingest.sovereign_limits(have_diarizer,
+                                                             have_transcriber)),
+                      "note": ingest.sovereign_note(have_diarizer,
+                                                    have_transcriber),
+                      "transcription": {
+                          "available": have_transcriber,
+                          "enable": "pip install faster-whisper",
+                          "detail": (
+                              "sovereign scans are transcribed on this machine "
+                              "by Whisper — words and timing never leave it"
+                              if have_transcriber else
+                              "sovereign scans find speech by level and "
+                              "transcribe nothing until faster-whisper is "
+                              "installed; nothing leaves the machine either "
+                              "way")},
                       "diarization": {
                           "available": have_diarizer,
                           "enable": "python -m service.diarize --download",
@@ -2539,10 +2553,22 @@ def build_scene(segments: list[dict], cast_map: dict[str, str],
             omitted[sid] = omitted.get(sid, 0) + 1
             interrupted = True
             continue
+        seg_start = seg.get("start")
+        seg_end = seg.get("end")
         if lines and lines[-1]["speaker"] == sid and not interrupted:
             lines[-1]["text"] = f"{lines[-1]['text']} {text}"
+            if isinstance(seg_end, (int, float)):
+                lines[-1]["end"] = round(float(seg_end), 2)
             continue
-        lines.append({"speaker": sid, "character_id": cid, "text": text})
+        lines.append({"speaker": sid, "character_id": cid, "text": text,
+                      # WHERE the line sits in the recording. The studio's
+                      # script view ignores these today; the re-voice pipeline
+                      # cannot exist without them. None when the transcriber
+                      # gave no timing — never 0, which is a real timestamp.
+                      "start": (round(float(seg_start), 2)
+                                if isinstance(seg_start, (int, float)) else None),
+                      "end": (round(float(seg_end), 2)
+                              if isinstance(seg_end, (int, float)) else None)})
         interrupted = False
     total = len(lines)
     return {"lines": lines[:max_lines], "total_lines": total,
@@ -2582,10 +2608,20 @@ def scene(job_id: str):
         segments = []
     if not any(str(s.get("text") or "").strip() for s in segments
                if isinstance(s, dict)):
+        # WHY there is no transcript differs by machine now that sovereign
+        # scans can transcribe locally — the scan's own report is the truth
+        # (not installed / failed / heard nothing), so prefer it over copy
+        # that would claim the capability doesn't exist on a box that has it.
+        tx = ((job.get("detection") or {}).get("transcription") or {}
+              ) if job.get("mode") == "sovereign" else {}
+        why = tx.get("reason") or (
+            "local transcription heard no words in this recording"
+            if tx.get("applied") else
+            "sovereign mode found speech by level and transcribed nothing"
+            if job.get("mode") == "sovereign" else "")
         return {"available": False, "reason": (
             "this scan produced no transcript, so there are no lines to re-perform"
-            + (" — sovereign mode finds speech by level and transcribes nothing"
-               if job.get("mode") == "sovereign" else ""))}
+            + (f" — {why}" if why else ""))}
     cast_map = {str(m["speaker_id"]): str(m["character_id"]) for m in members}
     scene = build_scene(segments, cast_map)
     if not scene["lines"]:

@@ -416,14 +416,19 @@ class SovereignAnalyzeTests(unittest.TestCase):
     def _run(self, pattern, amp=0.4, floor_amp=0.0005, diarizer=None):
         """`diarizer` is a stub result, or None for "not installed" — which is
         pinned rather than inherited from the machine, because a developer who
-        HAS the models would otherwise get different assertions than CI."""
+        HAS the models would otherwise get different assertions than CI. The
+        transcriber is pinned off for the same reason (and because Whisper on
+        a synthesised beep fixture would be slow and hear nothing anyway);
+        SovereignTranscriptionTests covers it with a stub."""
         td = TemporaryDirectory()
         wd = Path(td.name)
         src = wd / "src.wav"
         _clip(src, pattern, amp=amp, floor_amp=floor_amp)
         steps: list[tuple[str, str]] = []
         parts: list[dict] = []
-        with _stub_diarizer(diarizer):
+        with _stub_diarizer(diarizer), \
+                mock.patch.object(ingest, "transcription_available",
+                                  return_value=False):
             res = ingest.sovereign_analyze(
                 src, wd / "work", progress=lambda k, s: steps.append((k, s)),
                 partial=parts.append)
@@ -461,6 +466,47 @@ class SovereignAnalyzeTests(unittest.TestCase):
             # the line the loader renders while the scan runs
             self.assertTrue(parts)
             self.assertIn("stayed on this machine", parts[0]["transcript"])
+
+    def test_a_transcribing_box_puts_words_on_the_scan(self) -> None:
+        """With the transcriber present the scan speaks: transcript in the
+        payload, real words as the speaker's sample line, `words.json` for the
+        re-voice pipeline, and limits that no longer claim 'no transcript'."""
+        from service.stt import Transcript, Word
+        td = TemporaryDirectory()
+        wd = Path(td.name)
+        src = wd / "src.wav"
+        _clip(src, TALK, amp=0.4, floor_amp=0.0005)
+
+        def fake_transcribe(audio, **kw):
+            # every fixture utterance gets one word, timed inside it
+            segs = json.loads((wd / "work" / "segments.json").read_text("utf-8")) \
+                if (wd / "work" / "segments.json").is_file() else []
+            del segs  # segments.json is written after transcription; time by scan
+            words = [Word(text=f"word{i}", start=0.5 + i * 3.4,
+                          end=1.0 + i * 3.4) for i in range(4)]
+            return Transcript(text="word0 word1 word2 word3", language_code="en",
+                              language_probability=0.9, duration_s=13.0,
+                              transcribe_s=0.5, words=words)
+
+        with td, _stub_diarizer(None), \
+                mock.patch.object(ingest, "transcription_available",
+                                  return_value=True), \
+                mock.patch("service.stt.transcribe", fake_transcribe), \
+                mock.patch("service.stt.describe_model",
+                           return_value={"model": "small"}):
+            res = ingest.sovereign_analyze(src, wd / "work")
+            segs = json.loads((wd / "work" / "segments.json").read_text("utf-8"))
+            self.assertEqual(res["transcript"], "word0 word1 word2 word3")
+            self.assertTrue((wd / "work" / "words.json").is_file())
+            self.assertTrue(any(str(s.get("text") or "").strip() for s in segs))
+            tx = res["detection"]["transcription"]
+            self.assertTrue(tx["applied"])
+            self.assertEqual(tx["model"], "small")
+            blob = " ".join(res["limits"])
+            self.assertIn("transcribed locally", blob)
+            self.assertNotIn("no transcript —", blob)
+            # the sample line is what the speaker said, not a mode notice
+            self.assertNotIn("sovereign mode", res["speakers"][0]["sample_text"])
 
     def test_result_is_json_serialisable(self) -> None:
         """It is persisted into job state and served — a NaN level would make
@@ -510,6 +556,98 @@ class SovereignAnalyzeTests(unittest.TestCase):
             self.assertTrue(base["eligible"])
             self.assertTrue((work / "stem_baseline.wav").is_file())
             self.assertEqual(out["spend"]["total_calls"], 0)   # nothing left the box
+
+
+# ── the local transcriber ─────────────────────────────────────────────────────
+class AttachWordsTests(unittest.TestCase):
+    """Words onto segments. Pure arithmetic — no audio, no model."""
+
+    @staticmethod
+    def _w(text, start, end):
+        from service.stt import Word
+        return Word(text=text, start=start, end=end)
+
+    def test_words_go_to_the_segment_they_overlap_most(self) -> None:
+        segs = [{"start": 0.0, "end": 2.0, "text": ""},
+                {"start": 3.0, "end": 5.0, "text": ""}]
+        ingest._attach_words(segs, [self._w("hello", 0.2, 0.8),
+                                    self._w("there", 1.0, 1.9),
+                                    self._w("again", 3.1, 3.6)])
+        self.assertEqual(segs[0]["text"], "hello there")
+        self.assertEqual(segs[1]["text"], "again")
+
+    def test_a_word_in_a_gap_goes_to_the_nearest_segment(self) -> None:
+        segs = [{"start": 0.0, "end": 2.0, "text": ""},
+                {"start": 6.0, "end": 8.0, "text": ""}]
+        ingest._attach_words(segs, [self._w("close", 2.1, 2.4),
+                                    self._w("far", 5.6, 5.9)])
+        self.assertEqual(segs[0]["text"], "close")
+        self.assertEqual(segs[1]["text"], "far")
+
+    def test_a_word_straddling_two_segments_is_not_duplicated(self) -> None:
+        segs = [{"start": 0.0, "end": 2.0, "text": ""},
+                {"start": 1.5, "end": 4.0, "text": ""}]
+        ingest._attach_words(segs, [self._w("split", 1.4, 1.8)])
+        self.assertEqual([s["text"] for s in segs].count("split"), 1)
+
+
+class TranscribeLocalTests(unittest.TestCase):
+    """The degrade ladder: not installed / failed / ran must not look alike."""
+
+    def _tx(self, words, text="hello there"):
+        from service.stt import Transcript
+        return Transcript(text=text, language_code="en",
+                          language_probability=0.9, duration_s=5.0,
+                          transcribe_s=1.0, words=words)
+
+    def test_not_installed_names_the_enable_command(self) -> None:
+        with TemporaryDirectory() as td:
+            with mock.patch.object(ingest, "transcription_available",
+                                   return_value=False):
+                report, tx = ingest._transcribe_local(
+                    Path(td) / "clean.wav", [], Path(td))
+        self.assertFalse(report["attempted"])
+        self.assertFalse(report["applied"])
+        self.assertIn("faster-whisper", report["reason"])
+        self.assertIsNone(tx)
+
+    def test_a_load_failure_degrades_and_says_so(self) -> None:
+        with TemporaryDirectory() as td:
+            with mock.patch.object(ingest, "transcription_available",
+                                   return_value=True), \
+                    mock.patch("service.stt.transcribe",
+                               side_effect=RuntimeError("weights missing")):
+                report, tx = ingest._transcribe_local(
+                    Path(td) / "clean.wav", [], Path(td))
+        self.assertTrue(report["attempted"])
+        self.assertFalse(report["applied"])
+        self.assertIn("failed", report["reason"])
+        self.assertIsNone(tx)
+
+    def test_success_attaches_text_and_persists_words(self) -> None:
+        from service.stt import Word
+        segs = [{"start": 0.0, "end": 2.0, "text": ""}]
+        words = [Word(text="hello", start=0.2, end=0.6),
+                 Word(text="there", start=0.8, end=1.2)]
+        with TemporaryDirectory() as td:
+            with mock.patch.object(ingest, "transcription_available",
+                                   return_value=True), \
+                    mock.patch("service.stt.transcribe",
+                               return_value=self._tx(words)), \
+                    mock.patch("service.stt.describe_model",
+                               return_value={"model": "small"}):
+                report, tx = ingest._transcribe_local(
+                    Path(td) / "clean.wav", segs, Path(td))
+            payload = json.loads((Path(td) / "words.json").read_text("utf-8"))
+        self.assertTrue(report["applied"])
+        self.assertEqual(report["model"], "small")
+        self.assertEqual(report["words"], 2)
+        self.assertEqual(segs[0]["text"], "hello there")
+        self.assertEqual([w["text"] for w in payload["words"]],
+                         ["hello", "there"])
+        self.assertEqual(payload["provenance"], {"model": "small"})
+        # the report is persisted into job state and served
+        json.loads(json.dumps(report))
 
 
 # ── the speaker overlay ──────────────────────────────────────────────────────
@@ -585,11 +723,26 @@ class SovereignLimitsCopyTests(unittest.TestCase):
         self.assertNotIn("--download", blob)
         self.assertIn("hypothesis", ingest.sovereign_note(True))
 
-    def test_the_other_two_limits_are_unchanged_by_the_diarizer(self) -> None:
+    def test_the_emotion_limit_is_unchanged_by_the_diarizer(self) -> None:
         for have in (True, False):
             blob = " ".join(ingest.sovereign_limits(have))
             self.assertIn("one emotion only", blob)
-            self.assertIn("no transcript", blob)
+
+    def test_absent_transcriber_names_the_command_that_enables_it(self) -> None:
+        blob = " ".join(ingest.sovereign_limits(True, False))
+        self.assertIn("no transcript", blob)
+        self.assertIn("faster-whisper", blob)
+        self.assertIn("no transcription",
+                      ingest.sovereign_note(True, False).lower())
+
+    def test_present_transcriber_states_the_caveats_not_a_promise(self) -> None:
+        blob = " ".join(ingest.sovereign_limits(True, True))
+        self.assertIn("transcribed locally", blob)
+        self.assertIn("approximate", blob)
+        # …and it must not still be telling the user to install what they have
+        self.assertNotIn("pip install", blob)
+        self.assertIn("transcribed locally",
+                      ingest.sovereign_note(True, True).lower())
 
     def test_an_unprobeable_diarizer_promises_less_rather_than_raising(self) -> None:
         with mock.patch("service.diarize.available", side_effect=OSError("boom")):

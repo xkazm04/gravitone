@@ -668,9 +668,15 @@ _LIMIT_EMOTION = (
     "one emotion only — there is no local emotion classifier, so every segment "
     "becomes the baseline (neutral) voice; the other emotions are recorded "
     "afterwards with the guided per-emotion capture")
-_LIMIT_TRANSCRIPT = (
+_LIMIT_NO_TRANSCRIBER = (
     "no transcript — speech is found by level, not by words, so nothing is "
-    "transcribed and no text ever leaves (or is written on) this machine")
+    "transcribed and no text ever leaves (or is written on) this machine. "
+    "`pip install faster-whisper` turns on local transcription, still entirely "
+    "on this machine")
+_LIMIT_TRANSCRIBER = (
+    "transcribed locally — Whisper runs on this machine, so the words and "
+    "their timing never leave it. Word timing is approximate and the text can "
+    "mishear names; the segment player is the ground truth")
 _LIMIT_NO_DIARIZER = (
     "single speaker — the local diarizer is not installed, so every detected "
     "span is treated as the same person and anyone else audible in the "
@@ -703,24 +709,46 @@ def diarization_available() -> bool:
         return False
 
 
-def sovereign_limits(diarization: bool | None = None) -> tuple[str, ...]:
+def transcription_available() -> bool:
+    """Whether local transcription (faster-whisper) could run on this machine.
+
+    Import probe only — deliberately NOT `stt.available()`, which loads the
+    Whisper weights and is called from `/v1/ingest/modes` (a copy path that
+    must stay cheap). A box where the import works but the weights fail to
+    load degrades at scan time, and the scan's `detection.transcription`
+    carries the reason.
+    """
+    try:
+        import importlib.util
+        return importlib.util.find_spec("faster_whisper") is not None
+    except Exception as exc:  # noqa: BLE001 - an optional capability, probed
+        _log(f"sovereign: transcriber availability probe failed ({exc!r})")
+        return False
+
+
+def sovereign_limits(diarization: bool | None = None,
+                     transcription: bool | None = None) -> tuple[str, ...]:
     """The mode's limits as they stand on THIS machine. One source of truth for
     the payload, `/v1/ingest/modes` and the studio panel that renders them."""
     have = diarization_available() if diarization is None else diarization
+    have_tx = transcription_available() if transcription is None else transcription
     return (_LIMIT_EMOTION,
             _LIMIT_DIARIZER if have else _LIMIT_NO_DIARIZER,
-            _LIMIT_TRANSCRIPT)
+            _LIMIT_TRANSCRIBER if have_tx else _LIMIT_NO_TRANSCRIBER)
 
 
-def sovereign_note(diarization: bool | None = None) -> str:
+def sovereign_note(diarization: bool | None = None,
+                   transcription: bool | None = None) -> str:
     """The one-line honest summary of the above, for a progress/partial slot."""
     have = diarization_available() if diarization is None else diarization
+    have_tx = transcription_available() if transcription is None else transcription
+    tx = ("Transcribed locally by Whisper" if have_tx else "No transcription")
     if have:
-        return ("sovereign mode — audio stayed on this machine. No transcription "
+        return (f"sovereign mode — audio stayed on this machine. {tx} "
                 "and no emotion classifier, so this scan produces the baseline "
                 "voice only; speakers are separated locally, and the count is a "
                 "hypothesis you correct at the next screen.")
-    return ("sovereign mode — audio stayed on this machine. No transcription, "
+    return (f"sovereign mode — audio stayed on this machine. {tx}, "
             "no diarization (single speaker assumed) and no emotion classifier: "
             "this scan produces the baseline voice only.")
 
@@ -1100,6 +1128,84 @@ def diarize_segments(clean: Path, scan: SpeechScan, min_dur: float = 1.2,
                         threshold=SETTINGS.diarize_threshold)
 
 
+def _attach_words(segs: list[dict], words) -> None:
+    """Give each diarized segment the words that fall inside it (max overlap;
+    a word landing in a gap goes to the nearest segment edge). Segments keep
+    their level-based boundaries — the transcript annotates them, it does not
+    redraw them, so the stem splicer downstream cuts exactly where it always
+    did."""
+    texts: list[list[str]] = [[] for _ in segs]
+    for w in words:
+        if not w.text:
+            continue
+        best_i, best_ov = None, 0.0
+        for i, s in enumerate(segs):
+            ov = min(s["end"], w.end) - max(s["start"], w.start)
+            if ov > best_ov:
+                best_i, best_ov = i, ov
+        if best_i is None and segs:
+            mid = (w.start + w.end) / 2.0
+            best_i = min(range(len(segs)),
+                         key=lambda i: min(abs(mid - segs[i]["start"]),
+                                           abs(mid - segs[i]["end"])))
+        if best_i is not None:
+            texts[best_i].append(w.text)
+    for s, t in zip(segs, texts):
+        s["text"] = " ".join(t)
+
+
+def _transcribe_local(clean: Path, segs: list[dict], work_dir: Path):
+    """Sovereign transcription pass: Whisper over `clean.wav`, words attached
+    to the diarized segments, and the full word list persisted as `words.json`
+    — the re-voice pipeline needs word timing, not just segment text.
+
+    Returns `(report, transcript_or_None)` and never raises: transcription is
+    an optional capability exactly like the diarizer, and a scan must not die
+    because an optional model could not load. The report says WHICH of
+    "not installed" / "failed" / "ran" happened, because those must not look
+    alike downstream.
+
+    Serialized behind stt's own run lock with every other decode in this
+    process (the CTranslate2 generator is not thread-safe) — a long clip
+    therefore delays live STT, the same single-decode posture stt.py already
+    documents."""
+    report: dict = {"attempted": False, "applied": False, "model": None,
+                    "language": None, "words": 0, "transcribe_s": None,
+                    "reason": None}
+    if not transcription_available():
+        report["reason"] = ("faster-whisper is not installed on this machine "
+                            "(`pip install faster-whisper` enables local "
+                            "transcription)")
+        return report, None
+    report["attempted"] = True
+    try:
+        from service import stt
+        tx = stt.transcribe(str(clean), word_timestamps=True)
+    except Exception as exc:  # noqa: BLE001 - optional capability: degrade, and say why
+        _log(f"sovereign: local transcription failed ({exc!r})")
+        report["reason"] = (f"local transcription failed ({type(exc).__name__})"
+                            " — the scan continued without a transcript")
+        return report, None
+    _attach_words(segs, tx.words)
+    try:
+        (work_dir / "words.json").write_text(json.dumps({
+            "provenance": stt.describe_model(),
+            "language": tx.language_code,
+            "language_probability": tx.language_probability,
+            "transcribe_s": tx.transcribe_s,
+            "words": [{"text": w.text, "start": w.start, "end": w.end,
+                       "confidence": w.confidence} for w in tx.words],
+        }), "utf-8")
+    except OSError as exc:
+        # The words file is a convenience for later phases; segments carry
+        # their own text either way. Losing it is loggable, not fatal.
+        _log(f"sovereign: words.json not persisted ({exc!r})")
+    report.update(applied=True, model=stt.describe_model().get("model"),
+                  language=tx.language_code or None, words=len(tx.words),
+                  transcribe_s=tx.transcribe_s)
+    return report, tx
+
+
 def sovereign_analyze(audio: Path, work_dir: Path,
                       progress: Callable[[str, str], None] | None = None,
                       partial: Callable[[dict], None] | None = None) -> dict:
@@ -1149,9 +1255,19 @@ def sovereign_analyze(audio: Path, work_dir: Path,
     # telling that user to go and download it would be the false-copy bug the
     # dynamic limits exist to prevent.
     have_diarizer = diarization["attempted"]
+
+    # WHAT was said, on machines that can hear words at all. faster-whisper is
+    # optional exactly like the diarizer: present → the scan gains a local
+    # transcript with word timing (nothing leaves the box); absent or failing →
+    # the level-only answer this mode always gave, with the reason recorded in
+    # `detection.transcription` instead of the two looking alike.
+    transcription, tx = _transcribe_local(clean, segs, work_dir)
+    have_tx = bool(transcription.get("applied"))
+
     if partial:
-        partial({"words": 0, "speakers": ids,
-                 "transcript": sovereign_note(have_diarizer)})
+        partial({"words": transcription["words"], "speakers": ids,
+                 "transcript": tx.text if (tx and tx.text)
+                 else sovereign_note(have_diarizer, have_tx)})
     prog("transcribe", "done")
 
     (work_dir / "segments.json").write_text(json.dumps(segs), "utf-8")
@@ -1166,9 +1282,14 @@ def sovereign_analyze(audio: Path, work_dir: Path,
         pv = work_dir / f"speaker_{sid}.wav"
         to_wav(clean, pv, longest["start"], min(longest["end"], longest["start"] + 6))
         # `sample_text` is the one line the speaker-pick screen renders per
-        # speaker. In sovereign mode there is no transcript to put there, so it
-        # carries the thing the user actually needs to know at that moment.
-        if diarization["applied"]:
+        # speaker. With a local transcript it carries what this speaker
+        # actually said (their longest utterance — the same clip the preview
+        # plays); without one it carries the thing the user needs to know at
+        # that moment instead.
+        quote = " ".join(str(longest.get("text") or "").split())
+        if quote:
+            sample = quote if len(quote) <= 160 else quote[:157] + "…"
+        elif diarization["applied"]:
             sample = (f"sovereign mode — {len(ss)} segment(s), {secs:.0f}s; separated "
                       "locally. The speaker count is a hypothesis and skews high — "
                       "listen before you pick")
@@ -1180,14 +1301,19 @@ def sovereign_analyze(audio: Path, work_dir: Path,
         speakers.append({"id": sid, "utterances": len(ss), "seconds": secs,
                          "sample_text": sample})
     speakers.sort(key=lambda s: -s["seconds"])
-    return {"duration": duration, "transcript": "", "speakers": speakers,
+    return {"duration": duration,
+            "transcript": (tx.text if have_tx and tx else ""),
+            "speakers": speakers,
             "note": scan.note,
-            "limits": list(sovereign_limits(have_diarizer)),
+            "limits": list(sovereign_limits(have_diarizer, have_tx)),
             "detection": {"outcome": scan.outcome, "spans": scan.spans,
                           # Who spoke, and how much to trust that — carried in
                           # `detection` (which is already persisted and served)
                           # rather than a new job field nothing would render.
                           "diarization": diarization,
+                          # Whether words were heard, by which model, or why
+                          # not — same posture as `diarization` above.
+                          "transcription": transcription,
                           "speech_seconds": scan.speech_seconds,
                           # NaN is not JSON — an unmeasured level is None, and
                           # this dict is persisted to job state and served.
@@ -1770,6 +1896,10 @@ def label_and_stem(work_dir: Path, target: str, min_stem: float = MIN_STEM_SECON
             lab = {"emotion": BASELINE, "confidence": 0.0, "cue": "", "model": "error"}
         seg_wav = work_dir / f"seg_{i:03d}.wav"
         lab.update({"i": i, "dur": round(s["end"] - s["start"], 2),
+                    # Absolute position in the source recording. `dur` alone
+                    # was enough to audit a stem; re-voicing a video needs to
+                    # know WHERE the line sat, so the position rides along.
+                    "start": round(s["start"], 2), "end": round(s["end"], 2),
                     "text": s["text"][:60], "wav": str(seg_wav),
                     "failure": failure,
                     # An unlabelled segment is UNUSED, not baseline audio: we do
@@ -1926,7 +2056,9 @@ def label_and_stem(work_dir: Path, target: str, min_stem: float = MIN_STEM_SECON
             # still verify the join against each segment's labelled duration).
             "segments": [{"i": l["i"], "emotion": l["emotion"],
                           "confidence": l["confidence"], "cue": l["cue"],
-                          "dur": l["dur"], "text": l["text"], "model": l["model"],
+                          "dur": l["dur"], "start": l.get("start"),
+                          "end": l.get("end"),
+                          "text": l["text"], "model": l["model"],
                           "failure": l.get("failure"), "ok": bool(l.get("ok")),
                           "outlier": _outlier_by_index.get(l["i"]),
                           "escalation": l.get("escalation")} for l in labelled]}

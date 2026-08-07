@@ -533,6 +533,18 @@ class SceneTests(unittest.TestCase):
         self.assertTrue(out["truncated"])
         self.assertEqual(out["total_lines"], ingest_api.MAX_SCENE_LINES * 2)
 
+    def test_lines_carry_the_segments_absolute_timing(self) -> None:
+        """A merged line spans first-segment start → last-segment end; a
+        segment without timing yields None, never a fake 0.0."""
+        segs = [{"speaker": "s0", "text": "Hello.", "start": 1.0, "end": 2.5},
+                {"speaker": "s0", "text": "Again.", "start": 3.0, "end": 4.25},
+                {"speaker": "s1", "text": "Hi."}]
+        out = ingest_api.build_scene(segs, {"s0": "ada", "s1": "bo"})
+        self.assertEqual((out["lines"][0]["start"], out["lines"][0]["end"]),
+                         (1.0, 4.25))
+        self.assertEqual((out["lines"][1]["start"], out["lines"][1]["end"]),
+                         (None, None))
+
     def test_empty_text_segments_produce_nothing(self) -> None:
         out = ingest_api.build_scene(
             [{"speaker": "s0", "text": ""}, {"speaker": "s0", "text": "   "}],
