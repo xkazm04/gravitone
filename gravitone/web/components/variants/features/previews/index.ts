@@ -36,6 +36,8 @@ import SovereignSignal from "./SovereignSignal";
 import SovereignStage from "./SovereignStage";
 import ScoreSignal from "./ScoreSignal";
 import ScoreStage from "./ScoreStage";
+import StreamSignal from "./StreamSignal";
+import StreamStage from "./StreamStage";
 
 export type PreviewKey =
   | "compat"
@@ -80,7 +82,10 @@ export const PREVIEWS: Record<PreviewKey, PreviewDef> = {
     icon: Highlighter,
     bodies: { steps: ScorePreview, signal: ScoreSignal, stage: ScoreStage },
   },
-  stream: { icon: Activity, bodies: { steps: StreamPreview } },
+  stream: {
+    icon: Activity,
+    bodies: { steps: StreamPreview, signal: StreamSignal, stage: StreamStage },
+  },
   performance: { icon: ScrollText, bodies: { steps: PerformancePreview } },
   agents: { icon: Radio, bodies: { steps: AgentsPreview } },
   arm: { icon: Cpu, bodies: { steps: ArmPreview } },
