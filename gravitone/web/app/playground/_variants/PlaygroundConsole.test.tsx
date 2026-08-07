@@ -689,3 +689,25 @@ describe("PlaygroundConsole — malformed and surprising tags are named before G
     expect(alerts()).not.toMatch(/spoken out loud|never closed|nearest match/);
   });
 });
+
+// ── the restrained tier: Signal accents in the log's states ──────────────────
+
+describe("PlaygroundConsole — the log's Signal accents stay accents", () => {
+  it("draws the empty log rather than only stating it, keeping the sentence", async () => {
+    await mountConsole();
+    // The copy is the drawing's caption now — it did not become a picture the
+    // user has to interpret, and it did not lose its words.
+    expect(screen.getByText("No takes yet — compose above and hit Generate.")).toBeInTheDocument();
+    expect(screen.queryByTestId("take-arrival")).not.toBeInTheDocument();
+  });
+
+  it("marks the newest take, and only ever one take", async () => {
+    await mountConsole();
+    await generateOnce();
+    expect(screen.getAllByTestId("take-arrival")).toHaveLength(1);
+    // A second take takes the marker off the first: it says "this just
+    // arrived", so two of them would say it about something that did not.
+    await generateOnce();
+    expect(screen.getAllByTestId("take-arrival")).toHaveLength(1);
+  });
+});

@@ -7,7 +7,8 @@
  * The console is a tool someone operates all day, so nothing here performs.
  * There is no illustration next to a control: what lives in this file are the
  * moments where the console has NOTHING to show but words — an empty log, a
- * render in flight. Each is drawn in the same vocabulary the landing uses
+ * render in flight — and the one moment it has something new to point at, a
+ * take that just landed. Each is drawn in the same vocabulary the landing uses
  * (`components/variants/features/previews/illus.tsx`), at a fraction of the
  * size, with the existing sentence kept verbatim as the caption.
  *
@@ -167,5 +168,34 @@ export function RenderRail({ still }: { still: boolean }) {
         )}
       </svg>
     </div>
+  );
+}
+
+/* ══════════════════════════════ a take arriving ═══════════════════════════ */
+
+/**
+ * One accent hairline across the top of the NEWEST take card, drawn once as
+ * that take arrives.
+ *
+ * The completion is already announced in text and in the log's order; this is
+ * its visual sibling — the "a signal just landed here" stroke, spent on a
+ * single line rather than a diagram. Exactly one card carries it at a time
+ * (the console renders it only for the newest take), so it stays a marker and
+ * never becomes card chrome: the next take takes the edge away from this one.
+ *
+ * It animates on mount and never again — a re-render of the same card is not a
+ * new arrival. Stilled, it is that hairline, present and complete.
+ */
+export function TakeArrival({ still }: { still: boolean }) {
+  return (
+    <svg
+      viewBox="0 0 100 2"
+      preserveAspectRatio="none"
+      aria-hidden
+      data-testid="take-arrival"
+      className="pointer-events-none absolute inset-x-5 top-0 h-[2px]"
+    >
+      <Draw d="M0 1 H100" duration={0.55} stroke={CYAN} width={2} opacity={0.85} still={still} />
+    </svg>
   );
 }

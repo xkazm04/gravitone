@@ -176,6 +176,13 @@ preference for itself.
   by definition, so it pauses offscreen (`usePauseOffscreen`) and stops dead
   under `still`. Every measured number on that row (elapsed, streamed seconds,
   queue depth, staleness) is untouched.
+- **A take arriving** → `signal.tsx::TakeArrival`. One accent hairline across
+  the top of the newest card, drawn once on mount. The completion is already
+  announced in text and in the log's order; this is the visual sibling, spent on
+  a single stroke. It is rendered for `takes[0]` ONLY — a marker that every card
+  carried would be chrome, and would be saying "this just arrived" about takes
+  that did not. `pointer-events-none`, so it can never eat a click on the card
+  it marks.
 
 **Skipped, with reasons**
 
@@ -189,3 +196,13 @@ preference for itself.
 - **Section headers and dividers.** Audited, not touched — `border-white/8` +
   uppercase mono `text-[11px]` already IS the landing's hairline/mono idiom.
   Aligning them would have been a diff with no perceptual change.
+- **A sweep on an applied emotion region.** `ScoreText` paints its highlights
+  through a mirrored overlay measured against a live textarea, and the region is
+  applied WHILE the caret is in that text. DESIGN.md's own "No" clause covers
+  it: never animate during text entry. The `score-applied` live region and the
+  span lighting up remain the announcement.
+
+**Test posture.** `signal.test.tsx` asserts the property that cannot be
+eyeballed and silently rots: the stilled render is the COMPLETE drawing — same
+`d` set, no dash offset held back, labels and caption already readable. Copy
+that shape for the next surface.

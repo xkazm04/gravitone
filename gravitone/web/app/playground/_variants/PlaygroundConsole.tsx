@@ -57,7 +57,7 @@ import ScriptScore from "./ScriptScore";
 import PunchIn, { type CommitPayload } from "./PunchIn";
 import { dropVariants } from "./variantStore";
 // The playground's Signal accents — the restrained tier of web/DESIGN.md.
-import { EmptyTakes, RenderRail } from "./signal";
+import { EmptyTakes, RenderRail, TakeArrival } from "./signal";
 
 function Bars({ peaks, progress = 0, active = false, className = "" }: { peaks: number[]; progress?: number; active?: boolean; className?: string }) {
   return (
@@ -1732,14 +1732,18 @@ export default function PlaygroundConsole() {
               metricsUnavailable={metricsUnavailable} healthStale={healthStale} still={still} />
           )}
 
-          {takes.map((t) => {
+          {takes.map((t, i) => {
             const isCurrent = playingId === t.id;
+            // The newest take, and only ever one of them: the arrival hairline
+            // is a marker, not card chrome (signal.tsx::TakeArrival).
+            const newest = i === 0;
             // Punch-in provenance. Absent on every take that was rendered in one
             // call, and on every record stored before the editor existed.
             const edits = readEdits(t);
             return (
               <motion.div key={t.id} layout initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }}
-                transition={{ duration: 0.4, ease: EASE }} className="glass-panel mb-2 rounded-xl px-5 py-4">
+                transition={{ duration: 0.4, ease: EASE }} className="glass-panel relative mb-2 rounded-xl px-5 py-4">
+                {newest && <TakeArrival still={still} />}
                 <div className="flex items-center gap-3">
                   {/* compare selector — 2+ takes become a client review link */}
                   <input

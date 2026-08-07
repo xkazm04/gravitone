@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { render } from "@testing-library/react";
-import { EmptyTakes, RenderRail } from "./signal";
+import { EmptyTakes, RenderRail, TakeArrival } from "./signal";
 
 /*
  * The playground's Signal accents, asserted at the one property that cannot be
@@ -73,5 +73,21 @@ describe("RenderRail — the loader has an honest frame at rest", () => {
   it("stays out of the accessibility tree — the elapsed clock is the report", () => {
     const { container } = render(<RenderRail still={false} />);
     expect(container.querySelector("svg")?.getAttribute("aria-hidden")).toBe("true");
+  });
+});
+
+describe("TakeArrival — the marker on the take that just landed", () => {
+  it("is one stroke, and it is still there when stilled", () => {
+    const moving = render(<TakeArrival still={false} />).container as HTMLElement;
+    const frozen = render(<TakeArrival still />).container as HTMLElement;
+    expect(paths(moving)).toEqual(["M0 1 H100"]);
+    // Reduced motion loses the sweep, never the line it swept.
+    expect(paths(frozen)).toEqual(paths(moving));
+  });
+
+  it("cannot intercept a click on the card it marks", () => {
+    const { container } = render(<TakeArrival still={false} />);
+    // `className` on an SVGElement is an SVGAnimatedString, not a string.
+    expect(container.querySelector("svg")?.getAttribute("class")).toContain("pointer-events-none");
   });
 });
