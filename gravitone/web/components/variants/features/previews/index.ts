@@ -40,6 +40,8 @@ import StreamSignal from "./StreamSignal";
 import StreamStage from "./StreamStage";
 import PerformanceSignal from "./PerformanceSignal";
 import PerformanceStage from "./PerformanceStage";
+import AgentsSignal from "./AgentsSignal";
+import AgentsStage from "./AgentsStage";
 
 export type PreviewKey =
   | "compat"
@@ -92,7 +94,7 @@ export const PREVIEWS: Record<PreviewKey, PreviewDef> = {
     icon: ScrollText,
     bodies: { steps: PerformancePreview, signal: PerformanceSignal, stage: PerformanceStage },
   },
-  agents: { icon: Radio, bodies: { steps: AgentsPreview } },
+  agents: { icon: Radio, bodies: { steps: AgentsPreview, signal: AgentsSignal, stage: AgentsStage } },
   arm: { icon: Cpu, bodies: { steps: ArmPreview } },
 };
 
