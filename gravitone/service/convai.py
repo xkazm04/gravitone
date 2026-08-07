@@ -80,6 +80,7 @@ from typing import AsyncIterator, Callable, Iterable
 
 import numpy as np
 from fastapi import APIRouter, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
 
 from service import dialog, engines, piper, recording, stt
 from service.cache import CachedPcm, SynthCache
@@ -418,6 +419,29 @@ def get_conversation(conversation_id: str) -> dict:
         raise HTTPException(404, f"no recorded conversation '{conversation_id}'. "
                                  "Recording is off unless CONVAI_RECORD=1.")
     return found
+
+
+@router.get("/v1/convai/conversations/{conversation_id}/audio/{track}")
+def get_conversation_audio(conversation_id: str, track: str):
+    """One recorded track, for the operator's own forensic listening.
+
+    ``get_conversation`` above deliberately does not serve audio on an id
+    guess, and that stays true: this route exists BECAUSE the conversation
+    router sits behind the convai scope, so only the operator's key reaches
+    it. Naturalness cannot be read off a transcript — a care decision about a
+    Character's voice is made by ear, and the two tracks share one timeline,
+    so a player can seek both to a turn's ``at_s`` and hear the moment.
+    """
+    if track not in ("user", "agent"):
+        raise HTTPException(404, "track must be 'user' or 'agent'")
+    if not conversation_id or not conversation_id.isalnum():
+        raise HTTPException(404, f"no recorded conversation '{conversation_id}'")
+    path = recording.recordings_dir() / conversation_id / f"{track}.wav"
+    if not path.is_file():
+        raise HTTPException(404, f"no {track} track recorded for "
+                                 f"'{conversation_id}'. Recording is off unless "
+                                 "CONVAI_RECORD=1.")
+    return FileResponse(path, media_type="audio/wav")
 
 
 @router.get("/v1/convai/conversation/get-signed-url")

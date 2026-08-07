@@ -219,6 +219,33 @@ class RecordedConversationTests(ConversationTests, _RecordingCase):
         self.assertEqual(res.status_code, 404)
         self.assertIn("CONVAI_RECORD", res.json()["detail"])
 
+    def test_a_recorded_track_is_served_for_listening(self) -> None:
+        self._engine()
+        with self.client.websocket_connect(self._url()) as ws:
+            self._init(ws, first_message="")
+            meta = ws.receive_json()
+            conversation_id = meta["conversation_initiation_metadata_event"]["conversation_id"]
+            self._speak(ws)
+            self._until(ws, "agent_response")
+            ws.receive_json()  # one audio event, so the agent track is non-empty
+
+        for track in ("user", "agent"):
+            res = self.client.get(
+                f"/v1/convai/conversations/{conversation_id}/audio/{track}")
+            self.assertEqual(res.status_code, 200, track)
+            self.assertEqual(res.headers["content-type"], "audio/wav")
+            self.assertEqual(res.content[:4], b"RIFF", track)
+
+    def test_audio_refuses_hostile_ids_and_unknown_tracks(self) -> None:
+        self._engine()
+        hostile = self.client.get(
+            "/v1/convai/conversations/..%2F..%2Fetc/audio/user")
+        self.assertEqual(hostile.status_code, 404)
+        wrong = self.client.get(
+            "/v1/convai/conversations/abc123/audio/transcript")
+        self.assertEqual(wrong.status_code, 404)
+        self.assertIn("track", wrong.json()["detail"])
+
 
 if __name__ == "__main__":
     unittest.main()
