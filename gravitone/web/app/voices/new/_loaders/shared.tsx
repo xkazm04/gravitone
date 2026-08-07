@@ -80,7 +80,7 @@ export function DetectionFinding({ detection, note }: { detection: Detection; no
   const speech = db(detection.speech_db);
   if (floor && speech) measured.push(`background ${floor}, speech ${speech}`);
   return (
-    <div className="rounded-xl border border-white/10 bg-white/[0.03] px-4 py-3">
+    <div className="rounded-xl border border-white/10 bg-white/[0.03] px-5 py-4">
       <div className="font-jetbrains text-[11px] uppercase tracking-widest text-cyan-300/80">
         finding · {headline}
       </div>
@@ -103,7 +103,7 @@ export function DetectionFinding({ detection, note }: { detection: Detection; no
 export function SovereignLimits({ limits, heading }: { limits: string[]; heading?: string }) {
   if (limits.length === 0) return null;
   return (
-    <div className="rounded-xl border border-emerald-400/20 bg-emerald-400/[0.04] px-4 py-3">
+    <div className="rounded-xl border border-emerald-400/20 bg-emerald-400/[0.04] px-5 py-4">
       <div className="font-jetbrains text-[11px] uppercase tracking-widest text-emerald-200/80">
         {heading ?? "sovereign mode · what it cannot do"}
       </div>

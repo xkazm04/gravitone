@@ -49,7 +49,7 @@ export default function CastExport({ character }: { character: Character }) {
   const missing = manifest.falls_back_to_baseline.length;
 
   return (
-    <div className="glass-panel mt-4 rounded-2xl p-5">
+    <div className="glass-panel mt-8 rounded-2xl p-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <span className="font-jetbrains text-[11px] uppercase tracking-widest text-white/60">
           export this cast

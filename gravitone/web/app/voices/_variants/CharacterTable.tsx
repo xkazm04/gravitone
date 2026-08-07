@@ -399,7 +399,7 @@ export default function CharacterTable() {
         </div>
       )}
 
-      <div className="glass-panel mt-4 overflow-x-auto rounded-xl">
+      <div className="glass-panel mt-4 overflow-x-auto rounded-2xl">
         <table className="w-full min-w-[940px] border-collapse text-sm">
           <thead className="sticky top-0 border-b border-white/8 bg-[#0b0e15]/80 backdrop-blur">
             <tr>

@@ -59,14 +59,14 @@ export default function CharacterVoices({ characterId }: { characterId: string }
     void addVoice(emotion, file, { consent: "uploaded" });
   }, [addVoice]);
 
-  if (loading) return <p className="py-20 text-sm text-white/60">Loading character…</p>;
+  if (loading) return <p className="py-10 text-sm text-white/60">Loading character…</p>;
 
   // Only a 404 is a missing character. A registry that is temporarily
   // unreadable (503) used to render the SAME dead-end, which told the user
   // their character was gone — the one thing we had not established.
   if (!character && notFound) {
     return (
-      <div className="py-20">
+      <div className="py-10">
         <p className="text-sm text-white/65">No character “{characterId}”.</p>
         <Link href="/voices" className="font-jetbrains mt-4 inline-block text-[12px] text-cyan-300/80 hover:text-cyan-200">
           ← back to characters
@@ -77,9 +77,9 @@ export default function CharacterVoices({ characterId }: { characterId: string }
 
   if (!character) {
     return (
-      <div className="py-20">
+      <div className="py-10">
         <ErrorBanner className="">{error ?? "this character could not be loaded"}</ErrorBanner>
-        <p className="mt-3 text-sm text-white/65">
+        <p className="mt-3 max-w-2xl text-sm text-white/65">
           “{characterId}” could not be loaded — that is a failed read, not a missing character.
           Its voices are untouched; retry once the backend recovers.
         </p>
@@ -97,14 +97,14 @@ export default function CharacterVoices({ characterId }: { characterId: string }
   }
 
   return (
-    <div className="py-10">
+    <div className="pb-24">
       <Link href="/voices" className="font-jetbrains text-[12px] text-white/60 transition hover:text-white">← characters</Link>
 
       <div className="mt-4 flex flex-wrap items-end justify-between gap-4">
         <div>
           <Eyebrow>voice overview</Eyebrow>
-          <h1 className="font-instrument mt-3 text-4xl text-white">{character.name}</h1>
-          <p className="mt-2 max-w-xl text-base text-white/70">
+          <h1 className="font-instrument mt-4 text-4xl text-white">{character.name}</h1>
+          <p className="mt-2 max-w-2xl text-base text-white/70">
             Each <span className="text-white">Voice</span> is one emotion of this{" "}
             <span className="text-white">Character</span>. Empty slots fall back to baseline.
           </p>

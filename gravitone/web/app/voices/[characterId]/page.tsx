@@ -7,7 +7,11 @@ export default async function CharacterPage({ params }: { params: Promise<{ char
   const { characterId } = await params;
   return (
     <AppFrame>
-      <CharacterVoices characterId={characterId} />
+      {/* Same route shape as /playground and /voices: AppFrame owns the
+          max-w-6xl gutter, the route owns the page's top/bottom rhythm. */}
+      <div className="py-10">
+        <CharacterVoices characterId={characterId} />
+      </div>
     </AppFrame>
   );
 }

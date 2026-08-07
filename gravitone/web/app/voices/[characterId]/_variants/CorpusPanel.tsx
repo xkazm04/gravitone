@@ -174,7 +174,7 @@ export default function CorpusPanel({
   const busyRebuilding = Boolean(jobId) && !done && !failed && !stopped;
 
   return (
-    <section className="mt-10">
+    <section className="mt-8">
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
           <h2 className="font-instrument text-2xl text-white">What this box keeps</h2>
@@ -357,7 +357,7 @@ function ClipRow({
   const identity = clip.fidelity?.stem_identity ?? null;
   const emotions = Object.entries(clip.emotions);
   return (
-    <li className="glass-panel rounded-2xl p-4">
+    <li className="glass-panel rounded-2xl p-5">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="font-jetbrains flex flex-wrap items-center gap-2 text-[11px] text-white/60">

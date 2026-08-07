@@ -57,7 +57,7 @@ export default function WaveformLab({ data }: { data: LoaderData }) {
 
   return (
     <div>
-      <div className="glass-panel rounded-2xl p-6">
+      <div className="glass-panel rounded-2xl p-5">
         <div className="flex h-28 items-end justify-center gap-[3px]">
           {colors.map((c, i) => (
             <span

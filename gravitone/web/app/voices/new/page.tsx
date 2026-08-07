@@ -38,7 +38,7 @@ const OpenAsScene = dynamic(() => import("./_review/OpenAsScene"), {
  *  panel it will become, saying what it is waiting for. */
 function PanelLoading({ label }: { label: string }) {
   return (
-    <div className="glass-panel rounded-2xl px-4 py-6">
+    <div className="glass-panel rounded-2xl px-5 py-4">
       <span className="font-jetbrains text-[11px] text-white/40">{label}</span>
     </div>
   );
@@ -610,7 +610,9 @@ export default function NewCharacterPage() {
 
   return (
     <AppFrame>
-      <div className="py-10">
+      {/* Same page rhythm as /playground: the route's top pad, then the
+          console's own bottom breathing room. AppFrame owns the width. */}
+      <div className="pb-24 pt-10">
         {/* The review screen's ONE audio element — stems, speaker samples and
             auditions all play through it. Never shown (this page draws its own
             play buttons per row), but it is a real element in the tree so the
@@ -618,7 +620,7 @@ export default function NewCharacterPage() {
         <audio {...transport.audioProps} className="hidden" />
         <Link href="/voices" className="font-jetbrains text-[12px] text-white/45 transition hover:text-white">← characters</Link>
         <Eyebrow>new character</Eyebrow>
-        <h1 className="font-instrument mt-3 text-4xl text-white">Build from a recording.</h1>
+        <h1 className="font-instrument mt-4 text-4xl text-white">Build from a recording.</h1>
         {/* Sovereign mode transcribes nothing, diarizes nothing and classifies
             no emotions — this sentence claimed all three unconditionally. */}
         <p className="mt-2 max-w-2xl text-base text-white/70">
@@ -680,7 +682,7 @@ export default function NewCharacterPage() {
             state nothing at all. Shown from the moment analyze finishes (that
             is when the backend has them) through the review ledger. */}
         {job?.mode === "sovereign" && SCAN_PHASES.has(phase) && (
-          <div className="mt-4 max-w-3xl space-y-3">
+          <div className="mt-8 space-y-3">
             {(job.limits?.length ?? 0) > 0 && (
               <SovereignLimits limits={job.limits!} heading="sovereign mode · what this scan cannot do" />
             )}
@@ -690,7 +692,7 @@ export default function NewCharacterPage() {
 
         {/* UPLOAD */}
         {phase === "upload" && (
-          <div className="mt-8 max-w-2xl">
+          <div className="mt-8">
             {/* Two doors into the same flow. A tab rather than a second page:
                 whichever one is used, what comes back is a job id and every
                 screen after this is identical. */}
@@ -706,7 +708,7 @@ export default function NewCharacterPage() {
             </div>
 
             {srcTab === "link" && (
-              <div className="glass-panel rounded-2xl p-4">
+              <div className="glass-panel rounded-2xl p-5">
                 <label htmlFor="ingest-link" className="text-sm text-white">
                   Paste a YouTube link
                 </label>
@@ -750,11 +752,11 @@ export default function NewCharacterPage() {
                 {/* Said before the paste, not after the failure: this box
                     fetches from YouTube only, and what it fetches is subject to
                     the same caps a file is. */}
-                <p className="font-jetbrains mt-2 text-[11px] leading-relaxed text-white/45">
+                <p className="font-jetbrains mt-2 max-w-2xl text-[11px] leading-relaxed text-white/45">
                   youtube.com or youtu.be, one video (not a playlist or a live stream).
                   The audio is fetched by the Gravitone box — {LIMITS_HINT}.
                 </p>
-                <p className="font-jetbrains mt-1 text-[11px] leading-relaxed text-white/35">
+                <p className="font-jetbrains mt-1 max-w-2xl text-[11px] leading-relaxed text-white/35">
                   You will be asked to attest that you have the right to use the recording
                   before anything is cloned.
                 </p>
@@ -813,7 +815,7 @@ export default function NewCharacterPage() {
             )}
 
             {/* privacy mode */}
-            <div className="glass-panel mt-4 rounded-2xl p-4">
+            <div className="glass-panel mt-4 rounded-2xl p-5">
               <div className="flex flex-wrap gap-2">
                 <button onClick={() => setIngestMode("auto")} aria-pressed={ingestMode === "auto"}
                   className={`font-jetbrains cursor-pointer rounded-full border px-3 py-1.5 text-[12px] transition ${ingestMode === "auto" ? "border-cyan-400/40 bg-cyan-400/10 text-cyan-200" : "border-white/12 text-white/60 hover:text-white"}`}>
@@ -840,12 +842,12 @@ export default function NewCharacterPage() {
                 )}
                 {ingestMode === "sovereign" ? (
                   modeInfo && (
-                    <p className="font-jetbrains text-[11px] leading-relaxed text-white/50">
+                    <p className="font-jetbrains max-w-2xl text-[11px] leading-relaxed text-white/50">
                       {modeInfo.sovereign.note}
                     </p>
                   )
                 ) : (
-                  <p className="font-jetbrains text-[11px] leading-relaxed text-white/50">
+                  <p className="font-jetbrains max-w-2xl text-[11px] leading-relaxed text-white/50">
                     Uses ElevenLabs (diarize + isolate) and Gemini (emotion labels) when the
                     backend has keys, and the local sovereign pipeline when it doesn&apos;t.
                     {modeInfo?.resolved_auto === "sovereign" &&
@@ -887,7 +889,7 @@ export default function NewCharacterPage() {
 
         {/* PROCESSING — Waveform Lab won the loader round */}
         {phase === "processing" && (
-          <div className="mt-10 max-w-3xl">
+          <div className="mt-8">
             {job?.mode === "sovereign" && (
               <p className="font-jetbrains mb-3 inline-flex items-center gap-2 rounded-full border border-emerald-400/25 bg-emerald-400/5 px-3 py-1 text-[11px] text-emerald-200">
                 🔒 sovereign mode — processing locally, audio stays on this machine
@@ -903,7 +905,7 @@ export default function NewCharacterPage() {
           const castRefused = picked.length > 0 ? castRefusal(picked) : null;
           const multi = job.speakers.length > 1;
           return (
-          <div className="mt-8 max-w-3xl">
+          <div className="mt-8">
             <h2 className="font-instrument text-2xl text-white">
               {job.mode === "sovereign" && !multi
                 ? "This is what will be cloned."
@@ -921,7 +923,7 @@ export default function NewCharacterPage() {
               {job.speakers.map((s, i) => {
                 const on = castSel[s.id] !== undefined;
                 return (
-                <div key={s.id} className={`glass-panel rounded-xl px-4 py-3 transition ${on ? "border border-cyan-400/25 bg-cyan-400/[0.04]" : ""}`}>
+                <div key={s.id} className={`glass-panel rounded-xl px-5 py-4 transition ${on ? "border border-cyan-400/25 bg-cyan-400/[0.04]" : ""}`}>
                   <div className="flex items-center gap-3">
                     <input type="checkbox" checked={on} aria-label={`Cast ${s.id} as a character`}
                       onChange={(e) => {
@@ -993,7 +995,7 @@ export default function NewCharacterPage() {
                   ledger; if one speaker can&apos;t be cast, the others still are, and this
                   screen will say which.
                 </p>
-                <p className="font-jetbrains mt-2 text-[11px] leading-relaxed text-white/40">
+                <p className="font-jetbrains mt-2 max-w-2xl text-[11px] leading-relaxed text-white/40">
                   Up to {MAX_CAST_MEMBERS} at a time. The recording itself is not kept for a
                   cast — clone a single speaker if you want its audio stored on this box.
                 </p>
@@ -1028,14 +1030,14 @@ export default function NewCharacterPage() {
           const members = job?.cast?.members ?? [];
           const pct = total ? Math.round((settled / total) * 100) : 0;
           return (
-            <div className="mt-10 max-w-3xl">
+            <div className="mt-8">
               <div className="font-jetbrains text-[12px] uppercase tracking-widest text-cyan-300">
                 casting · {settled}/{total || "…"}
               </div>
               <h2 className="font-instrument mt-2 text-3xl text-white">
                 Building {total || "the"} character{total === 1 ? "" : "s"} from one recording.
               </h2>
-              <p className="mt-1 text-sm text-white/60">
+              <p className="mt-1 max-w-2xl text-sm text-white/60">
                 {current
                   ? <>Now: <span className="text-white">{current.character || current.speaker_id}</span> — {memberStatusLabel(current)}.</>
                   : "Labelling and cloning each speaker in turn on the CPU engine…"}
@@ -1047,7 +1049,7 @@ export default function NewCharacterPage() {
               </div>
               <div className="mt-5 space-y-2">
                 {members.map((m) => (
-                  <div key={m.speaker_id} className="glass-panel flex flex-wrap items-center gap-3 rounded-xl px-4 py-3">
+                  <div key={m.speaker_id} className="glass-panel flex flex-wrap items-center gap-3 rounded-xl px-5 py-4">
                     <span className={`h-2 w-2 shrink-0 rounded-full ${m.status === "done" ? "bg-emerald-300" : m.status === "error" ? "bg-rose-400" : m.status === "pending" ? "bg-white/25" : "bg-cyan-300"}`} />
                     <span className="text-sm text-white">{m.character || m.speaker_id}</span>
                     <span className="font-jetbrains text-[11px] text-white/45">{m.speaker_id}</span>
@@ -1125,7 +1127,7 @@ export default function NewCharacterPage() {
               <span className="font-jetbrains text-[12px] text-white/60">{selected.size} selected</span>
             </div>
 
-            <div className="glass-panel mt-4 overflow-x-auto rounded-xl">
+            <div className="glass-panel mt-4 overflow-x-auto rounded-2xl">
               <table className="w-full min-w-[680px] border-collapse text-sm">
                 <thead className="border-b border-white/8">
                   <tr className="font-jetbrains text-[11px] uppercase tracking-widest text-white/60">
@@ -1321,7 +1323,7 @@ export default function NewCharacterPage() {
               </p>
             )}
 
-            <div className="glass-panel mt-6 max-w-2xl rounded-2xl p-5">
+            <div className="glass-panel mt-8 rounded-2xl p-5">
               <div className="flex gap-2">
                 <button onClick={() => dispatch({ type: "SET_MODE", mode: "new" })} className={`font-jetbrains cursor-pointer rounded-full border px-3 py-1.5 text-[12px] ${mode === "new" ? "border-cyan-400/40 bg-cyan-400/10 text-cyan-200" : "border-white/12 text-white/60"}`}>New character</button>
                 <button onClick={() => dispatch({ type: "SET_MODE", mode: "extend" })} disabled={characters.length === 0}
@@ -1366,7 +1368,7 @@ export default function NewCharacterPage() {
                   one is shown, and it is the one the backend requires verbatim
                   for a link-sourced job. Neither is optional; the checkbox
                   still gates the commit either way. */}
-              <label className="mt-4 flex cursor-pointer items-start gap-2 text-[13px] text-white/70">
+              <label className="mt-4 flex max-w-2xl cursor-pointer items-start gap-2 text-[13px] text-white/70">
                 <input type="checkbox" checked={consented} onChange={(e) => setConsented(e.target.checked)}
                   className="mt-0.5 accent-cyan-300" />
                 <span>
@@ -1378,7 +1380,7 @@ export default function NewCharacterPage() {
                 </span>
               </label>
               {externalSource && (
-                <p className="font-jetbrains mt-2 text-[11px] leading-relaxed text-white/45">
+                <p className="font-jetbrains mt-2 max-w-2xl text-[11px] leading-relaxed text-white/45">
                   This recording was fetched from a link, not recorded by you. Cloning a
                   voice from someone else&apos;s published audio may need their permission
                   — this attestation is stored with the voices and names the source video.
@@ -1391,7 +1393,7 @@ export default function NewCharacterPage() {
                   attestation above. Everything the checkbox promises is
                   inspectable and deletable from the character page, which is the
                   only thing that makes keeping it defensible. */}
-              <label className="mt-3 flex cursor-pointer items-start gap-2 border-t border-white/8 pt-3 text-[13px] text-white/70">
+              <label className="mt-3 flex max-w-2xl cursor-pointer items-start gap-2 border-t border-white/8 pt-3 text-[13px] text-white/70">
                 <input type="checkbox" checked={keepCorpus} onChange={(e) => setKeepCorpus(e.target.checked)}
                   className="mt-0.5 accent-emerald-300" />
                 <span>
@@ -1418,7 +1420,7 @@ export default function NewCharacterPage() {
           const current = job?.partial?.current ?? null;
           const pct = total ? Math.round((done / total) * 100) : 0;
           return (
-            <div className="mt-16 text-center">
+            <div className="mt-8 text-center">
               <div className="font-jetbrains text-[12px] uppercase tracking-widest text-cyan-300">
                 cloning voices · {done}/{total}
               </div>
@@ -1454,11 +1456,11 @@ export default function NewCharacterPage() {
 
         {/* EXPIRED — the job aged out (or was cancelled); poller stopped */}
         {phase === "expired" && (
-          <div className="mt-10 max-w-2xl">
-            <div className="glass-panel rounded-2xl p-6">
+          <div className="mt-8 max-w-3xl">
+            <div className="glass-panel rounded-2xl p-5">
               <div className="font-jetbrains text-[11px] uppercase tracking-widest text-amber-300">session expired</div>
               <h2 className="font-instrument mt-2 text-3xl text-white">This ingest session ended.</h2>
-              <p className="mt-2 text-sm text-white/60">
+              <p className="mt-2 max-w-2xl text-sm text-white/60">
                 Scan sessions are held for a limited time and then cleaned up. Nothing was saved — start over with your recording.
               </p>
               <button onClick={startOver}
@@ -1475,13 +1477,13 @@ export default function NewCharacterPage() {
           const outcome = castOutcome(job.cast);
           if (!outcome) return null;
           return (
-            <div className="mt-10 max-w-3xl">
-              <div className="glass-panel rounded-2xl p-6">
+            <div className="mt-8 max-w-3xl">
+              <div className="glass-panel rounded-2xl p-5">
                 <div className={`font-jetbrains text-[11px] uppercase tracking-widest ${outcome.failed.length ? "text-amber-300" : "text-emerald-300"}`}>
                   {outcome.failed.length ? "cast · partly" : "cast"}
                 </div>
                 <h2 className="font-instrument mt-2 text-3xl text-white">{outcome.headline}</h2>
-                <p className="mt-2 text-sm text-white/60">
+                <p className="mt-2 max-w-2xl text-sm text-white/60">
                   All of them from one scan of this recording — one transcription, one
                   isolation, {outcome.made.length} character{outcome.made.length === 1 ? "" : "s"}.
                 </p>
@@ -1502,7 +1504,7 @@ export default function NewCharacterPage() {
 
                 <div className="mt-5 space-y-3">
                   {outcome.made.map((m) => (
-                    <div key={m.speaker_id} className="rounded-xl border border-white/8 bg-white/[0.02] px-4 py-3">
+                    <div key={m.speaker_id} className="rounded-xl border border-white/8 bg-white/[0.02] px-5 py-4">
                       <div className="flex flex-wrap items-center gap-2">
                         <span className="h-2 w-2 rounded-full bg-emerald-300" />
                         <span className="text-sm text-white">{m.character}</span>
@@ -1534,7 +1536,7 @@ export default function NewCharacterPage() {
                       cast are listed with the service's own reason, and nothing
                       of theirs was left behind in the roster. */}
                   {outcome.failed.map((m) => (
-                    <div key={m.speaker_id} className="rounded-xl border border-amber-400/25 bg-amber-400/[0.04] px-4 py-3">
+                    <div key={m.speaker_id} className="rounded-xl border border-amber-400/25 bg-amber-400/[0.04] px-5 py-4">
                       <div className="flex flex-wrap items-center gap-2">
                         <span className="h-2 w-2 rounded-full bg-rose-400" />
                         <span className="text-sm text-white">{m.character || m.speaker_id}</span>
@@ -1579,8 +1581,8 @@ export default function NewCharacterPage() {
 
         {/* COMPLETE — a single-speaker commit */}
         {phase === "complete" && !job?.cast && (
-          <div className="mt-10 max-w-2xl">
-            <div className="glass-panel rounded-2xl p-6">
+          <div className="mt-8 max-w-3xl">
+            <div className="glass-panel rounded-2xl p-5">
               <div className="font-jetbrains text-[11px] uppercase tracking-widest text-emerald-300">character ready</div>
               <h2 className="font-instrument mt-2 text-3xl text-white">{created.length} voices cloned.</h2>
               {/* A pick that could not be honoured is STATED: the voice exists,
@@ -1697,7 +1699,7 @@ export default function NewCharacterPage() {
                   (result?.stems ?? []).filter((s) => !s.eligible).map((s) => s.emotion),
                 );
                 return (
-                  <div className="mt-6 rounded-2xl border border-amber-400/15 bg-amber-400/[0.04] p-4">
+                  <div className="mt-6 rounded-2xl border border-amber-400/15 bg-amber-400/[0.04] p-5">
                     <div className="font-jetbrains text-[11px] uppercase tracking-widest text-amber-200/80">
                       coverage coach · {done.size}/{EMOTION_IDS.length} recorded
                     </div>
