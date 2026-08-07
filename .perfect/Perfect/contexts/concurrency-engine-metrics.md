@@ -42,3 +42,8 @@ Round 5 (2026-07-28) — 5/5:
 - [[segmentation-earns-its-keep]] → **d9dd0d1** — batch cap derives from real parallelism; at the shipped `workers=1` the drop-in route is one job again. Also fixed the round-4 test that proved concurrency against a topology that never ships.
 
 **Observed effect**: 274 → 415 service tests across the round. Two of the five were cleanup of round-4 regressions the Director shipped.
+
+## Round 9 (2026-08-04) — re-scout post-moonshot + slate
+Moonshot added deadline engine, fabric/router, perf-ledger, buildstore, ratelimit. Scout 2026-08-04: deadline reaches engine from ONE branch only; promises never measured (invented 0.7/0.5 fractions, degrade-when-hopeless); ratelimit per-process (N× budget lie; router mode → one global bucket, no XFF); direction.py/demand.py violate cross-process law; SynthCache/voice-LRU cross-thread races; /v1/build sequential + per-line offload hops; router/drain_and_replace unreachable in shipped topology; README documents none of it.
+Slate: [[deadline-reaches-every-route]] [[promises-are-measured]] [[shared-limits-that-tell-the-truth]] [[the-law-applies-to-telemetry-too]] [[build-joins-the-pool]] — ALL 5 ACCEPTED (clean sweep).
+cooldown_until: round 11

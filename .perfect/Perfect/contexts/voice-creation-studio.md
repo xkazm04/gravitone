@@ -37,3 +37,8 @@ Round 6 (2026-07-28) — 4/4:
 - [[flow-state-truth]] → **86b77b6** — an error clears the state it invalidates, `RESET` fully resets, and the flow got its first 36 tests.
 
 **Observed effect**: this flow went from zero tests to 36 (web suite 90 → 139 across the round), and round 5's sovereign work became visible to users for the first time.
+
+## Round 10 (2026-08-04) — re-scout post-moonshot + slate
+(Corrects stale round-6 note: ledger now has SegmentBoard + AuditionPanel drill-downs; _state/ machine.) Flow honest through most phases BUT: review unpolled → 30-min expiry kills job under a live-looking screen, no exit affordance; corpus opt-in/view/delete/rederive fully built server-side with ZERO web surface; per-stem identity + identity_reason + replaced die at the TS type boundary (extend-overwrite says nothing); streamIngestAsset flattens all asset errors to "not found"; two audio transports overlap; full-result polling with no ETag/visibility; no dynamic imports; 10 proxy routes zero tests.
+Slate (ALL 5 ACCEPTED): [[the-corpus-door-opens]] [[fidelity-reaches-the-review]] [[review-doesnt-die-silently]] [[studio-polls-and-ships-less]] [[one-transport-in-the-lab]]
+cooldown_until: round 12

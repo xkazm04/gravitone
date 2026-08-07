@@ -43,13 +43,36 @@ Rough:
 - Not taken: the ETA basis reads `rtf` off restored takes with no version marker (folded into `absent-is-not-empty`); `voice_settings` is sent once per performance LINE, identically; the composer debounce rewrites the whole script on a pure focus move (`activeLine`); `browserFallback` fabricates `seconds` and renders it in the same slot as measured audio; a11y gaps (`aria-expanded` on a button that unmounts, chips conveying availability only via `title`, `role="dialog"` on the backdrop while focus is trapped in the inner panel); `fetchRoster` is a one-line wrapper with one caller; `MAX_BODY_BYTES` mirrors a `lib/backend.ts` constant with nothing enforcing it.
 
 ## Direction history
+2026-08-06 (round 11, user-steered emotion-UX redesign) — proposed 5, **ALL 5 ACCEPTED**: one-emotion-model ✅ spans-you-can-see ✅ composer-tells-the-truth ✅ a-picker-for-every-hand ✅ director-suggests-spans ✅. (Owner steer explicitly overrode the "new UX surfaces get rejected" taste rule for this context.)
 2026-07-13 — proposed 5: performance-composer ✅ honest-status-timing ✅ durable-takes ✅ streamed-playback ❌ follow-along-highlight ❌.
 2026-07-28 (round 7) — proposed 5, **all 5 accepted**: premium-format-in-console ✅ one-header-contract ✅ absent-is-not-empty ✅ console-surfaces-tested ✅ proxy-streams-audio ✅.
 2026-07-28 (round 4) — proposed 5, **all 5 accepted**: failure-truth-console ✅ meaningful-render-progress ✅ playground-load-path ✅ durable-iteration-loop ✅ reachable-characters ✅. Slate drawn from the banked scout; Director independently verified the rail cap (:517), the stale-banner `find` (:198) and the serialized roster await (:124-129) before presenting.
 ## Shipped
+Round 11 (2026-08-07) — 5/5, the emotion-UX redesign:
+- [[one-emotion-model]] → **47c2747** — wrapWithTag deleted; regions are the only application model; score IS the composer.
+- [[composer-tells-the-truth]] → **caeb5f7** — outcome-naming lint; first parse_segments tests; digit grammar fix both sides.
+- [[spans-you-can-see]] → **3719488** — verified-alignment mirror overlay; direction visible in the text itself.
+- [[a-picker-for-every-hand]] → **443bf47** — responsive + keyboard + announced picker.
+- [[director-suggests-spans]] → **87603db** — sovereign rule-based suggestions behind a pluggable Director seam (LLM premise falsified; narrate tags are structural constants).
+
 Round 7 (2026-07-28) — 5/5:
 - [[one-header-contract]] → **21a7064** — one derived source of truth for forwarded headers + a drift guard the Director teeth-checked personally.
 - [[premium-format-in-console]] → **2400f6b** — mp3 export end to end (download + code export); share/review stay wav-only and SAY SO, because `takes.py` rejects non-RIFF.
 - [[proxy-streams-audio]] → **b69cc11** — measured 102 MB → 26 MB peak RSS on a 64-line performance.
 - [[absent-is-not-empty]] → **2531a21** — three queue states where there was one; takes carry a `timingVersion` so a pre-fix take cannot calibrate the ETA.
 - [[console-surfaces-tested]] → **205054a** (+ Director **a854091**) — completion announcement, timer leak fixed, and the console's first 21 render tests.
+
+## Round 11 (2026-08-06) — emotion-UX scout (user-steered redesign)
+
+**Steer**: owner says the inline emotion syntax is easy to break (backspace corrupts tags; combining emotions across a paragraph is confusing) → redesign into a new UX concept.
+
+**HEADLINE**: the structured redesign already half-exists — `ScoreEditor`/`ScriptScore` (`shared.ts:274-488`: `ScoreRegion`, `parseTags`/`toTags`, `transformRegions`, `regionProblem`; 300+ lines of tests) are mounted but buried in collapsed `<details>` (`PlaygroundConsole.tsx:1443-1460`), while the primary path is a raw textarea + `wrapWithTag` literal splice (`emotions.ts:50-58`, `insertEmotion` `PlaygroundConsole.tsx:681-700`).
+
+Corruption vectors (verified): empty-insert caret lands INSIDE `[x][/x]` → one backspace makes `[x[/x]`; mid-tag edits make valid-shaped unknown emotions that silently resolve elsewhere (`emotions.py:414-455`); deleting a close tag extends the span to end-of-text (`emotions.py:87-93`); malformed tags are SPOKEN LITERALLY (`_TAG_RE` `emotions.py:66` doesn't match → text passes through); `setText` destroys native undo; zero tests on `wrapWithTag`/`insertEmotion`; no python test for `parse_segments`. Digit asymmetry: `normalize_emotion` allows digits, `_TAG_RE` doesn't → `mode2` unaddressable inline (mirrored `shared.ts:307-316`). `[baseline]` insertable from chips but forbidden by `regionProblem`. Wheel: 440px fixed (mobile overflow), tooltip-only availability, no listbox semantics. No lint before submit (`composerLimit` counts only length/bytes/lines).
+
+Constraints for redesign: tagged string stays the wire+storage contract (`/v1/speak`, `/v1/performance`, `composerStore`, takes replay, shares/`RePerform.castLines`, narrate emits tags at `narrate.py:741`); no nesting/overlap expressible; `fell_back` per-segment reporting must survive. Prior art to reuse: `transformRegions` edit rule, `Region.tsx`/`Track.tsx`, ScriptScore's "regions are DERIVED, never held", PunchIn per-region retake, `RePerform.castLines` segments→tags round-trip. Orphan: autofill has no web surface; POST /v1/narrate unproxied (round-9 scout, still true).
+
+## Round 9 (2026-08-04) — re-scout post-moonshot + slate
+Moonshot batches 1-7 reshaped the context (lanes, score, live stage, /t/[id] shares, narrator, punch-in). Scout brief 2026-08-04: streaming endpoint unused (seam hardcodes false), remix-parent sessionStorage never cleared, ensemble shares lose cast + single-voice reperform, 5 parallel audio transports (TakeScore gave up seeking), console re-renders 4×/s on timeupdate, share bundle drags engine, /v1/speak+performance+takes unbudgeted. Orphans: worklet.ts untested; autofill has no web surface; POST /v1/narrate unproxied.
+Slate: [[streaming-first-listen]] [[share-lineage-truth]] [[shares-keep-their-cast]] [[one-transport-with-a-seek-seam]] [[console-stops-paying-twice]] — ALL 5 ACCEPTED (clean sweep).
+cooldown_until: round 11

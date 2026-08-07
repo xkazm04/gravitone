@@ -19,6 +19,21 @@
 
 ## Skill improvement log
 
+Post-round-11 owner-directed day (2026-08-07) — landing/Signal/pricing arcs, ~35 commits:
+- **The prototype loop (variants behind a switcher → owner verdict → one-commit consolidation) is now proven at two scales** (8 spotlight bodies; the pricing band). Its highest-value step is the DIRECTOR-WRITTEN direction definitions: when every builder composes from the same two metaphor specs + a shared vocabulary file + exemplars, parallel builders produce one coherent hand.
+- **Codify the winning language IMMEDIATELY (DESIGN.md) and make builders append an application log.** Two restrained-tier builders later cited the doc's own clauses to refuse candidates — the doc started enforcing itself within hours of existing.
+- **Owner critiques are doctrine fuel**: "philosophy does not shrink-wrap / scale to the frame" and "paragraphs are useless on landing pages — visualize instead" both became DESIGN.md sections + tests (prose-cap) the same day. A critique that only fixes one surface is wasted.
+- **Builders keep falsifying briefs, now in DESIGN territory too**: monthly-vs-cumulative crossover (month 6 ≠ 10), the false "below ~100k" claim, the fake-crossover refusal, the dataviz-validator failure of the ACCENT trio. The reasoning-in-brief rule pays in design work exactly as in engineering.
+- **Ops rule learned twice, now written**: never `npm run build` in the main checkout while its dev server runs (.next corruption → blank page); builders build in worktrees, and any main-checkout build ends with .next wipe + dev restart.
+
+Round 11 (2026-08-06/07) — 10/10 shipped same session (propose + build), 10 commits, zero redos; 1961 → 2131 service tests, 1084 → 1385 web tests:
+- **A user steer overrides cooldown AND taste rules, but say so in the vault both times.** The owner named two contexts (one on cooldown) and asked for a UX redesign (a lens the taste log says gets rejected). Recording "steer overrides X" at propose time kept the history legible when both slates clean-swept.
+- **The best redesigns are promotions.** The playground's "new UX concept" was 60% already in the repo behind a collapsed `<details>` (ScoreEditor/ScriptScore). Scouts should always ask "does the target UX already exist somewhere unmounted/demoted?" before the Director drafts a greenfield direction.
+- **Constraint-first briefs keep beating mechanism-first briefs.** "No new decoder" survived contact with reality precisely because the scout established ffmpeg was already load-bearing — the constraint reduced to "no second copy", and yt-dlp-without-postprocessors satisfied it. Also: the D3 brief prescribed narrate as the mechanism and was falsified (structural constants, not inference); the direction survived because its VALUE (review-and-adjust suggestions) was stated separately from the mechanism.
+- **8 builder falsifications across 4 builders, all correct — the reasoning-in-brief rule is now the skill's highest-leverage line.** New corollary: when a builder returns DECISION NEEDED with a recommendation, answering with reasoning + constraints (not a verdict alone) produced a better D3 than either original option.
+- **Full-suite-per-wave, targeted-per-merge held at 2131 tests** (~4.5 min service, ~3 min web) — same rhythm as round 10, still catching zero late regressions. Keep it.
+- Watch item: one unreproduced web flake (suspect ScoreText useLayoutEffect measurement under load). If it reappears: characterise first (frozen-clock/act patterns), never reshape the test blind.
+
 Round 7 (2026-07-28) — 10/10 shipped, 12 commits; 469 → 540 service tests, 139 → 191 web tests:
 - **Put the REASONING in the brief, not just the acceptance criteria — builders falsified it four times and were right every time.** L2: "there is NO wall-clock saving on a direct clone" (my speed claim was padding; the load-back verification was always the real value). P2: the stale rail-refs bug is not reachable — it reverted, got 0 failures, kept the change as *hardening* and said so instead of claiming a fix. P1: mp3 takes cannot be shared because `takes.py` rejects non-RIFF, so it disabled share with a stated reason. W2 (round 6, same pattern): the ingest 429 never sent `Retry-After`. A builder cannot correct a claim it was never told.
 - **Run the teeth check on your OWN fixes too.** I reshaped a flaky test around `max_concurrent`, reasoning that concurrency was the timing-independent property — and the teeth check caught that it was vacuous, because `max_concurrent` counts what the FAKE executes (bounded by its own worker pool), not what was admitted. I nearly shipped a test that passed with the bug restored. The rule now applies to Director commits, not only builder ones.
@@ -104,3 +119,17 @@ Round 8 (2026-07-29):
   — so it pointed at a non-existent path and nothing could run until the
   builder repaired it. Use an absolute target AND verify the link resolves
   (`ls <worktree>/web/node_modules/.bin` or equivalent) before briefing.
+
+Round 9 (2026-08-04) — 10/10 shipped in ONE session (propose + build), 10 commits, zero redos; 1605 → 1893 service tests, 832 → 995 web tests:
+- **The environment note in this file was stale for a full campaign.** "compileall only, no runtime" was false — Python 3.14 runs the whole service suite locally. Verify the gate assumptions EVERY round-start (one 10-second pytest probe) instead of trusting config.md; a stale gate note under-verifies every merge.
+- **Worktrees moved OUTSIDE the repo** (C:/Users/mkdol/dolla/wt/) after the root restructure — a worktree inside the parent tree floods git status. Junction recipe (PowerShell New-Item -ItemType Junction, absolute target, Test-Path .bin/tsc) worked first time in all 3 web worktrees.
+- **Named seams beat file locks again, at scale**: two pairs of builders shared takes.py and app.py concurrently; every cherry-pick auto-merged clean because each brief named what the OTHER builder owned. This is now the default for any same-file concurrency.
+- **Briefs that state reasoning keep getting corrected — 5 falsifications this round, all correct** (promise double-count, XFF spoof hole, stats GIL nuance, audio-src viability, metatag grammar gap). The rule compounds: briefs must carry the argument, not just the criteria.
+- **Propose-and-build in one session works** when scouts are strong and the user clean-sweeps the gate; the pipelined review (merge E1 while P1 still building; fork E3/P2 from post-merge main) kept zero idle time. Sequenced forks again produced zero conflicts.
+
+Round 10 (2026-08-04, same day as round 9) — 10/10 shipped, 11 commits; 1893 → 1961 service tests, 995 → 1084 web tests:
+- **The "value paid for, never delivered" heuristic found its biggest prize yet**: an ENTIRE moonshot (voice-corpus) shipped server-complete and web-absent — dead code for a month. Scouts must always diff service routes against web proxies against UI calls; that three-way diff is where whole features hide.
+- **Sequenced waves are now the proven default for same-file work**: I-A→I-B and S-A→S-B each forked from post-merge main; zero conflicts across 4 builders and 10 direction commits, second round running.
+- **Briefs that prescribe a mechanism get corrected; briefs that state the constraint get satisfied.** S-B overturned the prescribed POLLING_PHASES fix for two reasons the Director missed and shipped a better shape (watch mode). Write the constraint ("expiry must be detected without wiping edits"), not the patch.
+- **Two rounds in one day is sustainable when gates are fast to read**: full service suite ~4-9 min, full web ~3 min. The wrap-gate rhythm (targeted per merge, full per wave) caught zero regressions late — evidence the per-merge targeted gates are selecting well.
+- Round-11 watch item: the reperform flake fix (348f800) should hold — if any timing flake appears in ratelimit-adjacent suites, characterise before touching (the frozen-clock pattern generalises).
