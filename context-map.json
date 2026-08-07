@@ -103,6 +103,22 @@
           ]
         },
         {
+          "name": "Video Re-voice",
+          "description": "Ability A of the studio: replace the dialogue in an analyzed video with cloned Characters. Stateless door takes the source URL plus the studio's (possibly edited) scene lines with absolute timing; the brain composes one emotion per line from each Character's real stems; every line runs the fit ladder (verbatim -> atempo <=1.08 -> brain rewrite-to-budget -> honest spill) and the per-line fit report names what happened. Background bed is not preserved (stated limit).",
+          "businessFeature": "Video Re-voice",
+          "category": "api",
+          "filePaths": [
+            "gravitone/service/revoice.py",
+            "gravitone/service/revoice_api.py",
+            "gravitone/service/tests/test_revoice.py"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/v1/revoice",
+            "/v1/revoice/{job}"
+          ]
+        },
+        {
           "name": "Speech Synthesis API",
           "description": "ElevenLabs-compatible HTTP endpoint: POST /v1/text-to-speech/{voice_id} returns wav/mp3/pcm audio with timing headers, plus /health and /metrics; optional xi-api-key auth and API-key management router.",
           "businessFeature": "Speech Synthesis API",

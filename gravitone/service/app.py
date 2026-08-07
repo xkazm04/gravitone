@@ -2664,6 +2664,11 @@ app.include_router(ingest_router, dependencies=[Depends(require_scope("clone"))]
 from service.voiceover_api import router as voiceover_router  # noqa: E402
 
 app.include_router(voiceover_router, dependencies=[Depends(require_scope("tts"))])
+# Re-voice (replace the dialogue in an analyzed video with cloned Characters,
+# from the studio's edited scene lines) — same reasoning, same scope.
+from service.revoice_api import router as revoice_router  # noqa: E402
+
+app.include_router(revoice_router, dependencies=[Depends(require_scope("tts"))])
 # Character Packs (export/import portable bundles) — exporting hands out the
 # raw voice embeddings, so both directions need the "voices" scope.
 app.include_router(packs_router, dependencies=[Depends(require_scope("voices"))])
