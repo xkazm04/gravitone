@@ -86,6 +86,23 @@
           "apiRoutes": []
         },
         {
+          "name": "Silent-Video Voiceover",
+          "description": "Ability B of the studio: a video without usable audio plus one Character becomes a narrated mp4 — scenes described by Qwen, narration written per scene by the text brain against a spoken-word budget, spoken in the Character's emotion stems, assembled at scene starts with an honest per-line fit report (spill/clip/silence measured, never hidden), muxed with the video stream copied.",
+          "businessFeature": "Silent-Video Voiceover",
+          "category": "api",
+          "filePaths": [
+            "gravitone/service/voiceover.py",
+            "gravitone/service/voiceover_api.py",
+            "gravitone/service/tests/test_voiceover.py"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/v1/voiceover/from-url",
+            "/v1/voiceover/upload",
+            "/v1/voiceover/{job}"
+          ]
+        },
+        {
           "name": "Speech Synthesis API",
           "description": "ElevenLabs-compatible HTTP endpoint: POST /v1/text-to-speech/{voice_id} returns wav/mp3/pcm audio with timing headers, plus /health and /metrics; optional xi-api-key auth and API-key management router.",
           "businessFeature": "Speech Synthesis API",

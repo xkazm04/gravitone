@@ -1765,7 +1765,13 @@ def _engine_synthesize(voice_id: str, text: str) -> bytes:
     """
     app = sys.modules.get("service.app")
     engine = getattr(app, "ENGINE", None) if app is not None else None
-    if engine is None or not getattr(engine, "ready", lambda: False)():
+    # `TtsEngine.ready` is a PROPERTY — calling it raised TypeError here for
+    # as long as this seam existed, which made every in-process calibration
+    # report "no synthesis engine is running" on a box whose engine was fine
+    # (see the identity_reason in any committed cast job). Accept a property
+    # or a callable double.
+    ready = getattr(engine, "ready", False) if engine is not None else False
+    if engine is None or not (ready() if callable(ready) else bool(ready)):
         raise RuntimeError("no synthesis engine is running in this process")
     job = engine.submit(voice_id, text)
     return job.future.result(timeout=CALIBRATION_TIMEOUT_S).wav_bytes

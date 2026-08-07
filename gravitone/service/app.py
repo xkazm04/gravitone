@@ -2658,6 +2658,12 @@ app.include_router(keys_router, dependencies=[Depends(require_scope("admin"))])
 # a budget that refuses the progress poller for the scan it is watching is
 # worse than no budget at all. Same limiter, same describe()-quoting 429.
 app.include_router(ingest_router, dependencies=[Depends(require_scope("clone"))])
+# Voiceover (narrate a silent video with an existing Character) — it renders
+# with voices that already exist, so the synthesis scope is the right gate;
+# creating the Character stays behind "clone" above.
+from service.voiceover_api import router as voiceover_router  # noqa: E402
+
+app.include_router(voiceover_router, dependencies=[Depends(require_scope("tts"))])
 # Character Packs (export/import portable bundles) — exporting hands out the
 # raw voice embeddings, so both directions need the "voices" scope.
 app.include_router(packs_router, dependencies=[Depends(require_scope("voices"))])
