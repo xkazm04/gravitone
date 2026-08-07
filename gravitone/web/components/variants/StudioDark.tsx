@@ -1,10 +1,10 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
-import { BRAND, HERO, STATS, FEATURES, PILLARS, VOICES, SAMPLE_TEXT, API_DOCS_URL } from "@/lib/content";
+import { BRAND, HERO, STATS, PILLARS, VOICES, SAMPLE_TEXT, API_DOCS_URL } from "@/lib/content";
 import { useAuth } from "@/lib/useAuth";
 import UserMenu from "@/components/ui/UserMenu";
 import MobileNav from "@/components/ui/MobileNav";
@@ -15,6 +15,9 @@ import { makeRise } from "@/components/ui/tokens";
 import PricingSection from "./PricingSection";
 import HeroMicDemo from "./HeroMicDemo";
 import SectionRail from "./SectionRail";
+import FeatureGrid from "./features/FeatureGrid";
+import { FeatureSpotlight } from "./features/FeatureSpotlight";
+import type { PreviewKey } from "./features/previews";
 
 // The landing rises further and slower than a dense module panel — but the
 // curve comes from the design system, not a local copy of it (this file used to
@@ -51,6 +54,51 @@ export default function StudioDark() {
     // this needs is to stop holding a destination nobody is travelling to.
     void signIn().catch(() => { pending.current = null; });
   };
+
+  // ── the feature spotlight ──────────────────────────────────────────────────
+  //
+  // This state lives here rather than in FeatureGrid because the modal renders
+  // at the PAGE root: inside the grid it would be a descendant of a card that
+  // has `overflow-hidden` (for the corner wash) and a hover transform, either of
+  // which would clip or re-anchor a fixed overlay.
+  //
+  // Two states, not one. A hover opens a PEEK the cursor can walk away from; a
+  // click or Enter PINS it, which is what gives touch and keyboard the same show
+  // a mouse gets.
+  const [preview, setPreview] = useState<PreviewKey | null>(null);
+  const [pinned, setPinned] = useState(false);
+  // Closing while the cursor still sits on a card makes the browser re-fire
+  // hover on that card the instant the overlay unmounts — reopening exactly what
+  // was just dismissed. Ignore hover-opens for a beat.
+  const suppressHoverUntil = useRef(0);
+
+  const closePreview = useCallback(() => {
+    setPreview(null);
+    setPinned(false);
+    suppressHoverUntil.current = Date.now() + 350;
+  }, []);
+  const hoverOpen = useCallback(
+    (key: PreviewKey) => {
+      if (pinned || Date.now() < suppressHoverUntil.current) return;
+      setPreview(key);
+    },
+    [pinned],
+  );
+  const pinOpen = useCallback((key: PreviewKey) => {
+    setPreview(key);
+    setPinned(true);
+  }, []);
+  const leavePreview = useCallback(() => setPreview(null), []);
+
+  useEffect(() => {
+    if (!preview) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") closePreview();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [preview, closePreview]);
+
   return (
     <div className="font-hanken relative min-h-screen overflow-hidden bg-[var(--gt-ink)] text-slate-200 grain">
       {/* atmosphere — aurora drift pauses once scrolled past */}
@@ -186,20 +234,14 @@ export default function StudioDark() {
           </div>
         </section>
 
-        {/* features */}
-        <section id="api" className="grid gap-4 py-14 sm:grid-cols-2">
-          {FEATURES.map((f, i) => (
-            <motion.div
-              key={f.key}
-              variants={rise} initial="hidden" whileInView="show" viewport={{ once: true, margin: "-60px" }} custom={i}
-              className="glass-panel group rounded-2xl p-6 transition hover:border-cyan-400/30"
-            >
-              <div className="font-jetbrains text-[11px] text-cyan-300/70">0{i + 1}</div>
-              <h3 className="font-instrument mt-2 text-xl text-white">{f.title}</h3>
-              <p className="mt-2 text-sm leading-relaxed text-slate-300/80">{f.body}</p>
-            </motion.div>
-          ))}
-        </section>
+        {/* features — eight cards, each opening a diagram of its own mechanism */}
+        <FeatureGrid
+          preview={preview}
+          pinned={pinned}
+          onHoverOpen={hoverOpen}
+          onPin={pinOpen}
+          onLeave={leavePreview}
+        />
 
         {/* ElevenLabs switch kit: the two bills, plotted, crossover and all */}
         <PricingSection />
@@ -245,6 +287,9 @@ export default function StudioDark() {
           because it is `position: fixed` and belongs to the page, not the flow.
           Shown to signed-out visitors too: these are marketing anchors. */}
       <SectionRail />
+      {/* Rendered at the page root, outside the content column and outside the
+          card that opened it — see the state block above. */}
+      <FeatureSpotlight preview={preview} pinned={pinned} onClose={closePreview} />
     </div>
   );
 }

@@ -238,9 +238,15 @@ function landing(): NarratableRoute {
       VOICES.map((v) => stop(`${v.name}, ${v.tag}`)),
       "#voices",
     ),
+    // The feature cards moved inside a grid wrapper when they gained their
+    // watermarks and spotlights (#api now holds a heading row and then the
+    // grid), so the highlight selector follows them. NarrationDock treats a
+    // selector that matches nothing as "no highlight", so a stale one fails
+    // silently — which is exactly why it is written next to the markup it
+    // depends on rather than guessed at.
     ...FEATURES.map((f, i) =>
       block(`feature-${f.key}`, "feature", f.title, [stop(f.title), f.body],
-            `#api > :nth-child(${i + 1})`),
+            `#api > div:last-of-type > :nth-child(${i + 1})`),
     ),
     block(
       "switch",

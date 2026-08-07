@@ -20,46 +20,86 @@ export const STATS = [
   { value: "26", label: "built-in voices" },
 ];
 
+// ── the eight cards ───────────────────────────────────────────────────────────
+//
+// Same claims contract as PILLARS below: every line names a surface that EXISTS,
+// and the header/route/figure it quotes is the real one, so a visitor can check
+// us with curl. The card opens an animated diagram of the same mechanism
+// (components/variants/features/previews/) — a diagram that shows something the
+// product does not do is the loudest possible version of this lie, so the
+// receipts live here, next to the copy, rather than in the drawing.
+//
+//   compat      — service/app.py: /v1/text-to-speech/{voice_id}, xi-api-key,
+//                 output_format; inert params named on X-Ignored-Settings
+//                 (app.py::_ignored_headers).
+//   cast        — service/ingest.py: one scan's analysis casts N speakers as
+//                 Characters (ingest.py:1737); every clone stores the ownership
+//                 attestation (voices.py:1232-1246 — cloning REFUSES without it).
+//   sovereign   — service/ingest.py "sovereign mode" (no cloud keys → auto-
+//                 selected); the optional offline diarizer is
+//                 `python -m service.diarize --download`, ~34 MB, sherpa-onnx,
+//                 no account (README "Sovereign mode"). What the mode cannot do
+//                 is stated by sovereign_limits(), not buried.
+//   score       — the playground's score editor: regions over the text with
+//                 visible spans; an emotion a Character lacks falls back and
+//                 says so per segment (X-Segments / the emotion fallback chain).
+//   stream      — POST /v1/text-to-speech/{voice_id}/stream, sentence-chunked.
+//                 pcm_*/wav_* stream; mp3_* returns one body and names why on
+//                 X-Stream-Fallback (app.py:1974) — the honest non-stream.
+//   performance — POST /v1/performance: one call, a voice per line, inline
+//                 [emotion] metatags, and what it actually did returned on
+//                 X-Performance-Report (app.py:2965).
+//   agents      — service/convai.py: the ElevenLabs Agents WebSocket served
+//                 locally (GET /v1/convai/conversation/get-signed-url + duplex
+//                 socket); service/vad.py finds turn boundaries; barge-in
+//                 included. $0.00/min because it is your box.
+//   arm         — lib/benchmarks.ts, transcribed from the measured table:
+//                 c8g.2xlarge 4.26× single-stream, 10.9 aud/s across 4
+//                 processes. Reproduce: `bash benchmark_arm.sh`.
+//
+// Still no competitor characterisation here. "Drop-in" is a fact about OUR API
+// surface. The one sanctioned numeric exception remains the pricing citation —
+// see the note above PILLARS.
 export const FEATURES = [
   {
-    key: "characters",
-    title: "Emotion-addressable Characters",
-    body: "One speaker, many moods. Address a Character by emotion — sarah:excited — and missing emotions fall back to the nearest on a fixed chain, reported in the response headers.",
+    key: "compat",
+    title: "Drop-in ElevenLabs API",
+    body: "Same paths, same xi-api-key, same output_format grammar — one base-URL swap and the client you already wrote keeps working. A parameter we accept but do not act on comes back named on X-Ignored-Settings, never silently dropped.",
   },
   {
-    key: "performance",
-    title: "Multi-character performances",
-    body: "POST /v1/performance renders a whole script — many Characters, inline [emotion] metatags — in one call. Compose it in the playground.",
+    key: "cast",
+    title: "One video → a whole cast",
+    body: "Paste a link and one paid analysis is enough: every speaker it separates can be cast as its own Character, not one blended voice. Each clone stores the ownership attestation its speaker agreed to — cloning refuses without one.",
+  },
+  {
+    key: "sovereign",
+    title: "Sovereign mode",
+    body: "No cloud keys, nothing leaving the machine. An optional ~34 MB offline diarizer still tells the speakers apart, at $0.00 and with no account to open — and the mode says out loud what it cannot do rather than degrading quietly.",
+  },
+  {
+    key: "score",
+    title: "Direct emotions like a score",
+    body: "Mark regions over the text and hear them: visible spans, a suggested direction for the line, one embedding per emotion. An emotion a Character lacks falls back to its baseline and is reported on that segment, not swapped behind your back.",
   },
   {
     key: "stream",
     title: "Streaming first-audio",
-    body: "The streaming endpoint returns audio sentence by sentence — the first line plays while the rest still renders. pcm and wav stream; mp3 uses the standard route.",
+    body: "The streaming endpoint returns audio sentence by sentence, so the first line is playing while the rest still renders. pcm and wav stream; mp3 cannot be transcoded incrementally, and says so on X-Stream-Fallback instead of pretending.",
   },
   {
-    key: "consent",
-    title: "Consent receipts on every clone",
-    body: "Every cloned voice stores the exact ownership attestation the speaker agreed to — ingest, direct upload, or studio. The receipt travels with the voice.",
+    key: "performance",
+    title: "Multi-character performances",
+    body: "POST /v1/performance renders a whole script in one call — a voice per line, inline [emotion] metatags, no orchestration on your side. What it actually did comes back line by line on X-Performance-Report.",
   },
   {
-    key: "api",
-    title: "ElevenLabs drop-in",
-    body: "Same paths, same xi-api-key, same output_format grammar — swap a base URL and existing client code works. A parameter we accept but do not act on is named in a response header, never silently dropped.",
+    key: "agents",
+    title: "Conversational agents, locally",
+    body: "The ElevenLabs Agents WebSocket, served from your own box: an app already written against it repoints by changing one base URL. Turn boundaries come from local VAD, barge-in works, and the per-minute bill is $0.00.",
   },
   {
-    key: "scale",
-    title: "Arm-native replica scaling",
-    body: "Run N single-worker replicas with one command — python -m service.replicas — using every Arm core you pay for. No GPU. No per-character bill.",
-  },
-  {
-    key: "audition",
-    title: "The audition matrix",
-    body: "One click renders every emotion a Character has on the same neutral line, so range and consistency are something you hear, not something we claim. Takes are cached; a busy engine counts down its own retry in the open.",
-  },
-  {
-    key: "ops",
-    title: "Ops in the open",
-    body: "The Ops page renders the engine's own live counters: in-flight, queue depth, latency percentiles, real-time factor. A number that has not been measured yet shows as a dash, never as a zero.",
+    key: "arm",
+    title: "Runs on Arm, and measured",
+    body: "4.26× realtime on a single c8g stream; 10.9 audio-seconds every second across four replicas on the same box. Every row is reproducible — clone the repo on your own Arm box and run bash benchmark_arm.sh.",
   },
 ];
 
