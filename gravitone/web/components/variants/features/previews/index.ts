@@ -8,6 +8,12 @@
  *
  * This registry pairs a key with its icon and its body. Title and copy come from
  * lib/content.ts, where the claims contract lives; nothing here restates them.
+ *
+ * Every body is drawn in the SIGNAL vocabulary (previews/illus.tsx): an
+ * oscilloscope picture of the mechanism, one accent per diagram, with the prose
+ * demoted to a single caption underneath. That is the whole vocabulary — the
+ * row-stack previews these replaced are gone, so a new spotlight has exactly one
+ * house style to match.
  */
 import type { ComponentType } from "react";
 import {
@@ -20,30 +26,14 @@ import {
   ShieldOff,
   Users,
 } from "lucide-react";
-import CompatPreview from "./CompatPreview";
-import CastPreview from "./CastPreview";
-import SovereignPreview from "./SovereignPreview";
-import ScorePreview from "./ScorePreview";
-import StreamPreview from "./StreamPreview";
-import PerformancePreview from "./PerformancePreview";
-import AgentsPreview from "./AgentsPreview";
-import ArmPreview from "./ArmPreview";
 import CompatSignal from "./CompatSignal";
-import CompatStage from "./CompatStage";
 import CastSignal from "./CastSignal";
-import CastStage from "./CastStage";
 import SovereignSignal from "./SovereignSignal";
-import SovereignStage from "./SovereignStage";
 import ScoreSignal from "./ScoreSignal";
-import ScoreStage from "./ScoreStage";
 import StreamSignal from "./StreamSignal";
-import StreamStage from "./StreamStage";
 import PerformanceSignal from "./PerformanceSignal";
-import PerformanceStage from "./PerformanceStage";
 import AgentsSignal from "./AgentsSignal";
-import AgentsStage from "./AgentsStage";
 import ArmSignal from "./ArmSignal";
-import ArmStage from "./ArmStage";
 
 export type PreviewKey =
   | "compat"
@@ -57,54 +47,24 @@ export type PreviewKey =
 
 export type PreviewBody = ComponentType<{ still: boolean }>;
 
-/** PROTOTYPING SCAFFOLD (throwaway). Three directional lenses on the same
- *  mechanism: `steps` is what shipped (list-rows + copy), `signal` tells it in
- *  waves and paths, `stage` as a spatial scene. Only `steps` is required — a
- *  feature whose new variants are not built yet falls back to it, so partial
- *  coverage renders instead of blanking. Deleted at consolidation, along with
- *  the tab strip in FeatureSpotlight. */
-export const VARIANTS = ["steps", "signal", "stage"] as const;
-export type PreviewVariant = (typeof VARIANTS)[number];
-
 export type PreviewDef = {
   icon: ComponentType<{ className?: string }>;
-  /** Animated bodies by lens. `still` is the visitor's reduced-motion
-   *  preference, passed down rather than read here so every preview resolves it
+  /** The animated diagram. `still` is the visitor's reduced-motion preference,
+   *  passed down rather than read here so every preview resolves it
    *  identically. */
-  bodies: { steps: PreviewBody; signal?: PreviewBody; stage?: PreviewBody };
+  Body: PreviewBody;
 };
 
 export const PREVIEWS: Record<PreviewKey, PreviewDef> = {
-  compat: {
-    icon: AudioLines,
-    bodies: { steps: CompatPreview, signal: CompatSignal, stage: CompatStage },
-  },
-  cast: { icon: Users, bodies: { steps: CastPreview, signal: CastSignal, stage: CastStage } },
-  sovereign: {
-    icon: ShieldOff,
-    bodies: { steps: SovereignPreview, signal: SovereignSignal, stage: SovereignStage },
-  },
-  score: {
-    icon: Highlighter,
-    bodies: { steps: ScorePreview, signal: ScoreSignal, stage: ScoreStage },
-  },
-  stream: {
-    icon: Activity,
-    bodies: { steps: StreamPreview, signal: StreamSignal, stage: StreamStage },
-  },
-  performance: {
-    icon: ScrollText,
-    bodies: { steps: PerformancePreview, signal: PerformanceSignal, stage: PerformanceStage },
-  },
-  agents: { icon: Radio, bodies: { steps: AgentsPreview, signal: AgentsSignal, stage: AgentsStage } },
-  arm: { icon: Cpu, bodies: { steps: ArmPreview, signal: ArmSignal, stage: ArmStage } },
+  compat: { icon: AudioLines, Body: CompatSignal },
+  cast: { icon: Users, Body: CastSignal },
+  sovereign: { icon: ShieldOff, Body: SovereignSignal },
+  score: { icon: Highlighter, Body: ScoreSignal },
+  stream: { icon: Activity, Body: StreamSignal },
+  performance: { icon: ScrollText, Body: PerformanceSignal },
+  agents: { icon: Radio, Body: AgentsSignal },
+  arm: { icon: Cpu, Body: ArmSignal },
 };
-
-/** The body to render, with the steps fallback applied. */
-export function previewBody(key: PreviewKey, variant: PreviewVariant): PreviewBody {
-  const b = PREVIEWS[key].bodies;
-  return b[variant] ?? b.steps;
-}
 
 export const PREVIEW_KEYS = Object.keys(PREVIEWS) as PreviewKey[];
 

@@ -1,17 +1,10 @@
 "use client";
 
-import { useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { X } from "lucide-react";
 import { FEATURES } from "@/lib/content";
 import { useStillMotion } from "@/lib/useStillMotion";
-import {
-  PREVIEWS,
-  VARIANTS,
-  previewBody,
-  type PreviewKey,
-  type PreviewVariant,
-} from "./previews";
+import { PREVIEWS, type PreviewKey } from "./previews";
 
 /*
  * The frame around a feature preview — a plain click-opened modal.
@@ -29,11 +22,6 @@ import {
  */
 export type { PreviewKey };
 
-/* PROTOTYPING SCAFFOLD (throwaway — deleted at consolidation together with
- * PREVIEWS.bodies). Module-level so flipping between cards keeps the chosen
- * lens; default `steps`, so nothing changes on load. */
-let chosenVariant: PreviewVariant = "steps";
-
 export function FeatureSpotlight({
   preview,
   onClose,
@@ -42,10 +30,9 @@ export function FeatureSpotlight({
   onClose: () => void;
 }) {
   const still = useStillMotion();
-  const [variant, setVariant] = useState<PreviewVariant>(chosenVariant);
   const def = preview ? PREVIEWS[preview] : null;
   const feature = preview ? FEATURES.find((f) => f.key === preview) : null;
-  const Body = preview ? previewBody(preview, variant) : null;
+  const Body = def?.Body ?? null;
 
   return (
     <AnimatePresence>
@@ -78,30 +65,11 @@ export function FeatureSpotlight({
                 </span>
                 <h3 className="font-instrument text-xl leading-tight text-white">{feature.title}</h3>
               </div>
-              {/* PROTOTYPING SCAFFOLD — the lens switcher. Throwaway. */}
-              <div className="ml-auto flex shrink-0 items-center gap-0.5 rounded-full border border-white/10 p-0.5">
-                {VARIANTS.map((v) => (
-                  <button
-                    key={v}
-                    type="button"
-                    onClick={() => {
-                      chosenVariant = v;
-                      setVariant(v);
-                    }}
-                    aria-pressed={v === variant}
-                    className={`font-jetbrains cursor-pointer rounded-full px-2 py-1 text-[10px] uppercase tracking-widest transition ${
-                      v === variant ? "bg-white/10 text-cyan-200" : "text-white/35 hover:text-white/70"
-                    }`}
-                  >
-                    {v}
-                  </button>
-                ))}
-              </div>
               <button
                 type="button"
                 onClick={onClose}
                 aria-label="Close"
-                className="grid h-8 w-8 shrink-0 cursor-pointer place-items-center rounded-full border border-white/12 text-white/70 transition hover:bg-white/5 hover:text-white"
+                className="ml-auto grid h-8 w-8 shrink-0 cursor-pointer place-items-center rounded-full border border-white/12 text-white/70 transition hover:bg-white/5 hover:text-white"
               >
                 <X className="h-4 w-4" aria-hidden />
               </button>
@@ -110,7 +78,7 @@ export function FeatureSpotlight({
                 Without it, reopening the same card would show a diagram already
                 finished, which is the one thing an animated explanation cannot
                 afford. */}
-            <div className="pt-5" key={`${preview}:${variant}`}>
+            <div className="pt-5" key={preview}>
               <Body still={still} />
             </div>
             <p className="font-jetbrains mt-5 text-right text-[11px] uppercase tracking-widest text-white/35">

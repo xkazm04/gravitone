@@ -1,31 +1,27 @@
 "use client";
 
 /*
- * The illustration vocabulary — the shared primitives the `signal` and `stage`
- * spotlight variants are composed from.
+ * The illustration vocabulary — the one toolbox every feature spotlight is
+ * composed from.
  *
- * WHY THIS FILE EXISTS. The shipped previews (`shared.tsx`) are a vocabulary of
- * ROWS: a stack of labelled lines that pop in. That vocabulary can only ever
- * produce step-by-step text, because a row is a sentence with a border. This
- * file is the other vocabulary — paths, pulses, waves, lanes and stages — so a
- * preview can be a PICTURE of its mechanism with the prose demoted to one
- * caption underneath.
+ * WHAT IT IS. Oscilloscope: near-monochrome hairlines on ink, ONE accent per
+ * diagram, everything drawn — <Draw>, <TravelPulse>, <WaveLine>, <Label>,
+ * <Node>, inside an <Illus> canvas, ending on one <Caption>. A spotlight is a
+ * PICTURE of its mechanism with the prose demoted to that single caption.
  *
- * TWO DIRECTIONS, ONE TOOLBOX.
- *   signal — oscilloscope. Near-monochrome hairlines on ink, ONE accent per
- *     diagram, everything drawn: <Draw>, <TravelPulse>, <WaveLine>, <Label>.
- *   stage  — diorama. Actors arranged in depth, entering with the pop/stamp
- *     spring the house already uses: <Stage>, <Lane>, <Tag>.
- * Both end on one <Caption>.
+ * It replaced a vocabulary of ROWS — a stack of labelled lines that popped in —
+ * which could only ever produce step-by-step text, because a row is a sentence
+ * with a border. Nothing of that survives; there is one house style here, and a
+ * new spotlight matches it.
  *
- * MOTION AUSTERITY holds (see shared.tsx): every entrance is entry-only. A
- * pulse travels its path ONCE and fades at arrival; nothing here loops, because
- * a spotlight is opened deliberately and then read.
+ * MOTION AUSTERITY. Every entrance is entry-only. A pulse travels its path ONCE
+ * and fades at arrival; nothing here loops, because a spotlight is opened
+ * deliberately and then read.
  *
- * STILL-AWARENESS holds too, and it is the same rule everywhere: `still` gates
- * the animation and never drops the element. A stilled <Draw> is a finished
- * stroke; a stilled <TravelPulse> is a dot parked at its destination — the
- * picture still says the same thing, it just says it all at once.
+ * STILL-AWARENESS is the same rule everywhere: `still` gates the animation and
+ * never drops the element. A stilled <Draw> is a finished stroke; a stilled
+ * <TravelPulse> is a dot parked at its destination — the picture still says the
+ * same thing, it just says it all at once.
  *
  * DASH GEOMETRY. Both <Draw> and <TravelPulse> set `pathLength={1}`, which
  * renormalises every dash unit to a fraction of the path. That is what lets a
@@ -39,12 +35,13 @@
 import type { CSSProperties, ReactNode } from "react";
 import { motion } from "framer-motion";
 import { EASE } from "@/components/ui/tokens";
-import { MONO, accentVar, pop, stamp, sweep, type Accent } from "./shared";
 
-export { MONO, accentVar, pop, stamp, sweep };
-export type { Accent };
+export type Accent = "cyan" | "violet" | "emerald";
 
-/** Hairline white, the recessive stroke both directions draw structure in. */
+/** The CSS var behind an accent name, for inline SVG strokes and glows. */
+export const accentVar = (a: Accent) => `var(--gt-accent-${a})`;
+
+/** Hairline white, the recessive stroke every diagram draws its structure in. */
 export const HAIR = "rgba(255,255,255,0.14)";
 
 /* ══════════════════════════════ waveform geometry ═════════════════════════ */
@@ -184,7 +181,7 @@ type DrawProps = {
 };
 
 /**
- * A path that draws itself. The workhorse of the `signal` direction.
+ * A path that draws itself. The workhorse of the whole vocabulary.
  *
  * `pathLength={1}` makes the dash units fractions of the path, so one
  * dashoffset tween from 1 → 0 draws any path, of any length, in the given
@@ -281,7 +278,7 @@ export function TravelPulse({
 /**
  * A waveform that draws itself, and can morph into another waveform.
  *
- * `morphTo` is the split/transform verb of the `signal` direction: give it a
+ * `morphTo` is the split/transform verb of the vocabulary: give it a
  * second set of wave options with the SAME `points` and the line will travel
  * from one shape to the other after it has finished drawing. Stilled, it
  * renders the destination shape — the end of the story, held.
@@ -433,124 +430,12 @@ export function Node({
   );
 }
 
-/* ══════════════════════════════ stage primitives ══════════════════════════ */
-
-/**
- * The diorama floor. A stage is a scene with a FAR and a NEAR: the vignette
- * and the horizon hairline give the actors somewhere to stand, so a chip
- * placed high reads as further away rather than merely higher up.
- */
-export function Stage({
-  children,
-  accent = "cyan",
-  className = "",
-}: {
-  children: ReactNode;
-  accent?: Accent;
-  className?: string;
-}) {
-  return (
-    <div className={`relative overflow-hidden rounded-2xl border border-white/8 ${className}`}>
-      <div
-        aria-hidden
-        className="pointer-events-none absolute inset-0"
-        style={{
-          background: `radial-gradient(120% 78% at 50% 108%, color-mix(in srgb, ${accentVar(
-            accent,
-          )} 13%, transparent), transparent 68%)`,
-        }}
-      />
-      <div
-        aria-hidden
-        className="pointer-events-none absolute inset-x-0 top-0 h-px"
-        style={{
-          background: `linear-gradient(90deg, transparent, ${accentVar(accent)}55, transparent)`,
-        }}
-      />
-      <div className="relative">{children}</div>
-    </div>
-  );
-}
-
-/**
- * A track across the stage: an accent rail on the left, an actor on it.
- *
- * `depth` (0 = downstage/near, 1 = upstage/far) dims and shrinks the lane, so a
- * fan of lanes reads as receding rather than as a list. That is the whole
- * difference between a diorama and the rows this file exists to replace.
- */
-export function Lane({
-  children,
-  accent = "cyan",
-  depth = 0,
-  delay = 0,
-  still = false,
-  className = "",
-}: {
-  children: ReactNode;
-  accent?: Accent;
-  depth?: number;
-  delay?: number;
-  still?: boolean;
-  className?: string;
-}) {
-  return (
-    <motion.div
-      initial={still ? { opacity: 1, x: 0 } : { opacity: 0, x: -18 }}
-      animate={{ opacity: 1 - depth * 0.35, x: 0 }}
-      transition={still ? undefined : { delay, duration: 0.5, ease: EASE }}
-      className={`relative flex items-center gap-2.5 ${className}`}
-      style={{ scale: 1 - depth * 0.08, transformOrigin: "left center" }}
-    >
-      <motion.span
-        aria-hidden
-        {...sweep(delay + 0.1, still)}
-        className="h-px flex-1 origin-left"
-        style={{
-          background: `linear-gradient(90deg, ${accentVar(accent)}00, ${accentVar(accent)}aa)`,
-        }}
-      />
-      {children}
-    </motion.div>
-  );
-}
-
-/** A micro-label chip for a stage scene — the DOM sibling of <Label>. */
-export function Tag({
-  children,
-  accent,
-  delay = 0,
-  still = false,
-  className = "",
-}: {
-  children: ReactNode;
-  accent?: Accent;
-  delay?: number;
-  still?: boolean;
-  className?: string;
-}) {
-  const c = accent ? accentVar(accent) : "rgba(255,255,255,0.5)";
-  return (
-    <motion.span
-      {...pop(delay, still)}
-      className={`font-jetbrains inline-flex items-center gap-1 whitespace-nowrap rounded-md border px-1.5 py-0.5 text-[9px] uppercase tracking-[0.14em] ${className}`}
-      style={{
-        borderColor: `color-mix(in srgb, ${c} 38%, transparent)`,
-        background: `color-mix(in srgb, ${c} 9%, transparent)`,
-        color: c,
-      }}
-    >
-      {children}
-    </motion.span>
-  );
-}
-
 /* ══════════════════════════════ the one line of prose ═════════════════════ */
 
 /**
  * The caption. ONE line, under the picture, secondary by construction.
  *
- * It is deliberately the only prose primitive in this file: if a variant needs
+ * It is deliberately the only prose primitive in this file: if a spotlight needs
  * two of these, the illustration is not carrying the story and the fix is in
  * the drawing, not here. The honest limit each feature ships with is usually
  * what this line spends itself on — the picture shows the mechanism, the

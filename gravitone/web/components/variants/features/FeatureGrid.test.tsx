@@ -4,7 +4,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { FEATURES } from "@/lib/content";
 import FeatureGrid from "./FeatureGrid";
 import { FeatureSpotlight } from "./FeatureSpotlight";
-import { PREVIEWS, PREVIEW_KEYS, VARIANTS, type PreviewKey } from "./previews";
+import { PREVIEWS, PREVIEW_KEYS, type PreviewKey } from "./previews";
 
 /*
  * The grid and the spotlight are one mechanism split across two components and a
@@ -158,28 +158,22 @@ describe("FeatureGrid", () => {
     }
   });
 
-  // PROTOTYPING SCAFFOLD — retire with the `bodies` map. The test above only
-  // ever opens the DEFAULT lens, so without this the signal/stage variants
-  // would carry no reduced-motion guard at all — and the illustration
-  // vocabulary is exactly where "gate the animation, keep the element" is easy
-  // to get wrong, because a stilled path that renders nothing still renders an
-  // <svg>.
-  it("renders every registered variant whole under reduced motion", () => {
+  // The test above opens each body through the modal and weighs its TEXT. That
+  // is not enough for a drawn diagram: the illustration vocabulary is exactly
+  // where "gate the animation, keep the element" is easy to get wrong, because
+  // an <svg> whose children were dropped under `still` still renders an <svg>
+  // and still carries its caption. The element count is what proves the picture
+  // itself survived being stopped.
+  it("renders every diagram's geometry whole under reduced motion", () => {
     stubMedia(true);
     const thin: string[] = [];
     for (const key of PREVIEW_KEYS) {
-      for (const variant of VARIANTS) {
-        const Body = PREVIEWS[key].bodies[variant];
-        if (!Body) continue;
-        const { container, unmount } = render(<Body still />);
-        const text = container.textContent?.length ?? 0;
-        // A drawn variant with no geometry is the failure this catches: an
-        // <svg> whose children were dropped under `still` still renders an
-        // <svg>, so the element count is what proves the picture survived.
-        const marks = container.querySelectorAll("*").length;
-        if (text < 40 || marks < 10) thin.push(`${key}/${variant} (${text} chars, ${marks} marks)`);
-        unmount();
-      }
+      const Body = PREVIEWS[key].Body;
+      const { container, unmount } = render(<Body still />);
+      const text = container.textContent?.length ?? 0;
+      const marks = container.querySelectorAll("*").length;
+      if (text < 40 || marks < 10) thin.push(`${key} (${text} chars, ${marks} marks)`);
+      unmount();
     }
     expect(thin).toEqual([]);
   });
