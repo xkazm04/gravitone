@@ -581,6 +581,56 @@ class ReplayEndpointTests(_GymCase):
         self.assertEqual(res.status_code, 422)
 
 
+class CompareEndpointTests(unittest.TestCase):
+    """POST /v1/convai/compare - pure arithmetic, so no _GymCase machinery."""
+
+    def setUp(self) -> None:
+        host = FastAPI()
+        host.include_router(gym.router)
+        self.client = TestClient(host, raise_server_exceptions=False)
+
+    def test_two_artifacts_in_the_body_are_scored(self) -> None:
+        res = self.client.post("/v1/convai/compare",
+                               json={"a": make_run(), "b": make_run()})
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertEqual(res.json()["verdict"], "pass")
+        self.assertEqual(res.json()["schema"], gym.COMPARE_SCHEMA)
+
+    def test_a_non_run_artifact_names_the_wrong_side(self) -> None:
+        res = self.client.post("/v1/convai/compare",
+                               json={"a": make_run(),
+                                     "b": {"schema": gym.COMPARE_SCHEMA}})
+        self.assertEqual(res.status_code, 422)
+        self.assertIn("'b'", res.json()["detail"])
+        self.assertIn(gym.RUN_SCHEMA, res.json()["detail"])
+
+    def test_thresholds_are_honoured_per_call(self) -> None:
+        slower = make_run()
+        slower["turns"][1]["answer_s"] = 2.0
+        slower["totals"] = gym._totals(slower["turns"], 3.0, {"audio": 4})
+        res = self.client.post(
+            "/v1/convai/compare",
+            json={"a": make_run(), "b": slower,
+                  "thresholds": {"answer_s_regression_abs_max_s": 5.0}})
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertEqual(res.json()["verdict"], "pass")
+
+    def test_an_unknown_threshold_is_refused_by_name(self) -> None:
+        res = self.client.post(
+            "/v1/convai/compare",
+            json={"a": make_run(), "b": make_run(),
+                  "thresholds": {"wer_dirft_max": 0.1}})
+        self.assertEqual(res.status_code, 422)
+        self.assertIn("wer_dirft_max", res.json()["detail"])
+
+    def test_a_non_numeric_threshold_is_a_422_not_a_500(self) -> None:
+        res = self.client.post(
+            "/v1/convai/compare",
+            json={"a": make_run(), "b": make_run(),
+                  "thresholds": {"wer_drift_max": "loose"}})
+        self.assertEqual(res.status_code, 422)
+
+
 class CliTests(_GymCase):
     """The console half: exit codes like certify.py, and ASCII-only output."""
 

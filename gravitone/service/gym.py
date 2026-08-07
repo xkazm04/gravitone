@@ -1038,6 +1038,50 @@ class ReplayRequest(BaseModel):
     override: dict | None = None
 
 
+class CompareRequest(BaseModel):
+    """`POST /v1/convai/compare` - score run B against run A, statelessly.
+
+    Both artifacts travel IN the body: the caller (the studio, a CI job on
+    another box) holds its own runs, and asking it to first write them to this
+    server's disk so `compare_to` could name a path would make a pure function
+    stateful for no reason.
+    """
+
+    a: dict = Field(..., description="the baseline run artifact")
+    b: dict = Field(..., description="the candidate run artifact")
+    thresholds: dict | None = Field(
+        None, description="per-call overrides of the default bar; unknown "
+                          "names are refused rather than silently unused")
+
+
+@router.post("/v1/convai/compare")
+def compare_runs(req: CompareRequest) -> dict:
+    """Score two run artifacts. Pure arithmetic - no model stack, no lock.
+
+    A wrong-shaped artifact is a 422 naming which side is wrong, because the
+    likeliest caller error is handing this a comparison (or a suite result)
+    where a run belongs - and compare() would then score two empty turn lists
+    against each other and report a confident "pass" about nothing.
+    """
+    for side, run in (("a", req.a), ("b", req.b)):
+        if run.get("schema") != RUN_SCHEMA:
+            raise HTTPException(
+                422, f"run '{side}' is not a {RUN_SCHEMA} artifact (schema: "
+                     f"{run.get('schema')!r}) - pass the JSON a replay returned")
+    limits: dict[str, float] | None = None
+    if req.thresholds is not None:
+        unknown = sorted(set(req.thresholds) - set(THRESHOLDS))
+        if unknown:
+            raise HTTPException(
+                422, f"unknown threshold(s) {', '.join(unknown)} - "
+                     f"available: {', '.join(sorted(THRESHOLDS))}")
+        try:
+            limits = {k: float(v) for k, v in req.thresholds.items()}
+        except (TypeError, ValueError):
+            raise HTTPException(422, "thresholds must be numbers")
+    return compare(req.a, req.b, limits)
+
+
 @router.post("/v1/convai/replay")
 def replay_conversation(req: ReplayRequest) -> dict:
     """Replay a recording against this replica's agent, in this process.
