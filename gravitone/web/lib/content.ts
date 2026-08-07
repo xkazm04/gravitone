@@ -203,7 +203,7 @@ export const SWITCH = {
   // No slider any more: the section plots both bills across the whole volume
   // range, crossover included. The copy says what the picture shows — including
   // the half where we lose, which is the point of showing it at all.
-  sub: "The API is ElevenLabs-compatible, so migrating is a base-URL change. One bill climbs with every character; the other is a machine that costs the same asleep or busy. Here is where they cross.",
+  sub: "One bill climbs with every character; the other is a machine priced the same asleep or busy. Migrating is a base-URL change.",
   note: "Same request shape · xi-api-key · wav/mp3/pcm",
 };
 

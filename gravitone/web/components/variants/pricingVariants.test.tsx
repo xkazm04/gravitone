@@ -2,15 +2,14 @@ import { describe, expect, it } from "vitest";
 import { render } from "@testing-library/react";
 import { fmtUsd } from "@/lib/switchkit";
 import PricingBills from "./PricingBills";
-import PricingClimb from "./PricingClimb";
 import {
-  END_CHARS,
+
   TIMELINE_MONTHS,
   crossoverMonth,
   cumulativeCrossoverMonth,
   cumulativeSeries,
   growthSeries,
-  tierSteps,
+
 } from "./pricingTimeline";
 
 /*
@@ -94,58 +93,5 @@ describe("PricingBills · variant A, the two bills", () => {
     expect(text).toContain("month 1 ·");
     expect(text).toContain(`month ${TIMELINE_MONTHS} ·`);
     expect(text).toContain("gravitone · $0 · mit");
-  });
-});
-
-describe("PricingClimb · variant B, the climb", () => {
-  it("draws the published ladder from the tier table, named and priced", () => {
-    const { container } = render(<PricingClimb still />);
-    const text = container.textContent ?? "";
-    // Every tier the span visits is named with its own published figure —
-    // above the road where it stands, below it in the valley caption.
-    for (const step of tierSteps(SERIES)) {
-      expect(text.toLowerCase()).toContain(step.tier.name.toLowerCase());
-      expect(text).toContain(fmtUsd(step.tier.usdPerMonth));
-    }
-    // …and the causeway carries the machine's own price.
-    expect(text).toContain(`${fmtUsd(SERIES[0].boxUsd)}/mo`);
-  });
-
-  it("draws the honest valley rather than footnoting it", () => {
-    const { container } = render(<PricingClimb still />);
-    const text = container.textContent ?? "";
-    expect(text).toContain(`months 1-${MONTHLY_CROSS - 1}`);
-    expect(text).toContain(`month ${MONTHLY_CROSS} · the climb crosses`);
-    // The valley is geometry, not a caption: the two cheap tiers sit BELOW the
-    // road's altitude in the same coordinate space as the rest of the picture.
-    const cheap = tierSteps(SERIES).filter((s) => s.tier.usdPerMonth <= SERIES[0].boxUsd);
-    expect(cheap.length).toBeGreaterThan(0);
-    for (const s of cheap) expect(s.toMonth).toBeLessThan(MONTHLY_CROSS);
-  });
-
-  it("stamps both 24-month totals once, at the end", () => {
-    const { container } = render(<PricingClimb still />);
-    const text = container.textContent ?? "";
-    expect(text).toContain(fmtUsd(TOTALS.el));
-    expect(text).toContain(fmtUsd(TOTALS.box));
-  });
-
-  it("keeps the drawing under the arm's-length label budget", () => {
-    const { container } = render(<PricingClimb still />);
-    expect(container.querySelectorAll("svg text").length).toBeLessThanOrEqual(8);
-  });
-
-  it("carries no paragraph of running prose — one caption, and it is short", () => {
-    const { container } = render(<PricingClimb still />);
-    const ps = paragraphs(container);
-    expect(ps).toHaveLength(1);
-    for (const p of ps) expect(p.length).toBeLessThanOrEqual(120);
-  });
-
-  it("renders the complete picture when motion is off", () => {
-    const { container } = render(<PricingClimb still />);
-    expect(undrawn(container)).toHaveLength(0);
-    // The read-out is the END of the climb, not a zero waiting to be animated.
-    expect(container.textContent).toContain(END_CHARS.toLocaleString("en-US"));
   });
 });

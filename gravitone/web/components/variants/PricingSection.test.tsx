@@ -1,16 +1,14 @@
 import { beforeAll, describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { render, screen } from "@testing-library/react";
 import { renderToStaticMarkup } from "react-dom/server";
 import PricingSection from "./PricingSection";
 import { ELEVENLABS_PRICING, ELEVENLABS_PRICING_NOTE } from "@/lib/switchkit";
 import {
   BOX,
-  EL_CHEAPER_THROUGH_CHARS,
   END_CHARS,
   GROWTH_PCT,
   START_CHARS,
   TIMELINE_MONTHS,
-  crossoverMonth,
   growthSeries,
 } from "./pricingTimeline";
 
@@ -20,6 +18,12 @@ import {
 // redesign of this band — the months where our own box is the WORSE buy, and the
 // usage curve the whole comparison assumes (a two-year story without its growth
 // assumption is not a comparison, it is a shape picked to win).
+//
+// CONSOLIDATED (owner verdict): variant A, "two bills, counted", is the only
+// picture, and the prose paragraphs are extinct — the assumption travels as
+// CHIPS, the losing months live in the drawing (PricingBills' own tests pin
+// both crossings) and in the table's worded rows. These tests describe the
+// section frame; pricingVariants.test.tsx describes the picture.
 
 // framer's scroll-entrance hooks (whileInView, useInView) need an
 // IntersectionObserver, which every browser has and jsdom does not. It never
@@ -27,8 +31,6 @@ import {
 // this file wants to test: the drawing is aria-hidden by construction, so
 // everything that matters must be readable without it.
 beforeAll(() => {
-  // useStillMotion subscribes to a media query; jsdom ships no matchMedia at
-  // all. "Motion is fine" is the same answer the server gives.
   vi.stubGlobal("matchMedia", (query: string) => ({
     matches: false,
     media: query,
@@ -49,9 +51,6 @@ beforeAll(() => {
   );
 });
 
-const SERIES = growthSeries();
-const CROSS = crossoverMonth(SERIES)!;
-
 describe("PricingSection", () => {
   it("renders the ElevenLabs attribution and its live source link", () => {
     render(<PricingSection />);
@@ -61,59 +60,22 @@ describe("PricingSection", () => {
     expect(source).toHaveAttribute("rel", expect.stringContaining("noreferrer"));
   });
 
-  it("says out loud where the box is the worse buy", () => {
-    render(<PricingSection />);
-    const honesty = screen.getByText(/costs MORE than the ElevenLabs tier/);
-    // The threshold quoted is the volume the subscription is cheaper THROUGH —
-    // not the tier ceiling above it, which would overstate our own losing range.
-    expect(honesty).toHaveTextContent(EL_CHEAPER_THROUGH_CHARS!.toLocaleString("en-US"));
-    expect(honesty).toHaveTextContent(`months 1–${CROSS - 1} of this timeline`);
-    expect(honesty).toHaveTextContent("The box only wins once you use it");
-    // Nothing self-hosted beats free, and the drawing cannot say so out loud.
-    expect(honesty).toHaveTextContent(/Free tier's first 10,000 chars\/mo are \$0/);
-  });
-
-  it("states the growth assumption the whole timeline rests on, in words", () => {
+  it("states the growth assumption as chips — the prose form is extinct", () => {
     render(<PricingSection />);
     // The read-out carries it too, but the illustration is aria-hidden — so the
-    // prose has to name it independently or the curve is unanchored.
-    const start = START_CHARS.toLocaleString("en-US");
-    const end = END_CHARS.toLocaleString("en-US");
-    expect(
-      screen.getByText(
-        new RegExp(
-          `one project growing from\\s+${start} to ${end} characters a month over ${TIMELINE_MONTHS} months`,
-        ),
-      ),
-    ).toBeTruthy();
-    // …and the rate, so a reader can check the curve rather than trust it.
-    expect(screen.getByText(/growth every month/)).toBeTruthy();
+    // chip strip has to name it independently or the curve is unanchored.
+    expect(screen.getByText(`+${GROWTH_PCT}% every month`)).toBeTruthy();
+    expect(screen.getByText(`${TIMELINE_MONTHS} months`)).toBeTruthy();
+    // The box price is a 24/7 cost, not a cost-per-use — the chip says so.
+    expect(screen.getByText(new RegExp("billed all 730\\s?h/mo"))).toBeTruthy();
+    expect(screen.getByText(/whichever published tier covers the month/)).toBeTruthy();
   });
 
-  it("names the box price as a 24/7 cost, not a cost-per-use", () => {
-    render(<PricingSection />);
-    // $12.26 is what the machine bills whether or not it speaks — the legend
-    // must not let that read as a usage charge.
-    expect(screen.getByText(/flat, running 24\/7/)).toBeTruthy();
-    expect(screen.getByText(/billed all 730\s+hours of every month/)).toBeTruthy();
-  });
-
-  it("keeps the open-source line separate from the hardware line", () => {
-    render(<PricingSection />);
-    // The cheap line in the picture is a rented machine, not the software. If
-    // those two ever merge into one "self-hosted" number, the section has
-    // started selling a licence it does not charge for.
-    expect(screen.getByText("Gravitone itself")).toBeTruthy();
-    expect(screen.getByText("$0 / forever")).toBeTruthy();
-    expect(screen.getByText(/the line above the floor is rented hardware, not a licence/)).toBeTruthy();
-  });
-
-  it("carries a legend for every series — identity is never colour alone", () => {
-    render(<PricingSection />);
-    // Named in the legend AND in the table header — the two places identity is
-    // allowed to live. Never in the stroke colour alone.
-    expect(screen.getByText("ElevenLabs tiers")).toBeTruthy();
-    expect(screen.getAllByText(new RegExp(BOX.name.replace(/[().]/g, "\\$&"))).length).toBeGreaterThanOrEqual(2);
+  it("keeps every paragraph short — no running prose survived consolidation", () => {
+    const { container } = render(<PricingSection />);
+    for (const p of container.querySelectorAll("p")) {
+      expect((p.textContent ?? "").length).toBeLessThanOrEqual(160);
+    }
   });
 
   it("offers the drawing's numbers as a table, so no value is picture-gated", () => {
@@ -123,9 +85,12 @@ describe("PricingSection", () => {
     expect(table).toHaveTextContent(START_CHARS.toLocaleString("en-US"));
     expect(table).toHaveTextContent(END_CHARS.toLocaleString("en-US"));
     expect(table.querySelectorAll("tbody tr").length).toBe(TIMELINE_MONTHS);
-    // Losing months say so in words, not in colour.
+    // Losing months say so in words, not in colour — the honesty that used to
+    // be a paragraph lives here and in the drawing's two marked crossings.
     expect(table).toHaveTextContent("(more)");
     expect(table).toHaveTextContent("(they cross)");
+    // Identity is never colour alone: both series are named in the table.
+    expect(table.textContent).toContain(BOX.name);
   });
 
   it("survives server rendering with the illustration unmounted", () => {
@@ -134,46 +99,13 @@ describe("PricingSection", () => {
     const html = renderToStaticMarkup(<PricingSection />);
     expect(html).toContain('id="switch"');
     expect(html).toContain(ELEVENLABS_PRICING.sourceLabel);
-    expect(html).toContain("costs MORE than the ElevenLabs tier");
     // …and the story is readable without a single pixel of drawing.
     expect(html).toContain("<table");
+    expect(html).toContain(`+${GROWTH_PCT}% every month`);
   });
 });
 
-/*
- * PROTOTYPING SCAFFOLD (deleted at consolidation together with the lens strip).
- * The one property worth asserting about a throwaway switcher is that it is
- * throwaway: `current` is what a reader gets, so every test above still
- * describes the shipping page.
- */
-describe("PricingSection · the prototype lens strip", () => {
-  it("defaults to the shipping lens, so nothing changes on load", () => {
-    render(<PricingSection />);
-    const current = screen.getByRole("button", { name: "current" });
-    expect(current).toHaveAttribute("aria-pressed", "true");
-    for (const other of ["A", "B"]) {
-      expect(screen.getByRole("button", { name: other })).toHaveAttribute("aria-pressed", "false");
-    }
-  });
-
-  it.each(["A", "B"])("lens %s swaps the picture and drops the paragraphs, keeping the contracts", async (lens) => {
-    render(<PricingSection />);
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: lens }));
-    });
-
-    // The two paragraph blocks are the thing these variants exist to kill.
-    expect(screen.queryByText(/costs MORE than the ElevenLabs tier/)).toBeNull();
-    expect(screen.queryByText(/The assumption, plainly/)).toBeNull();
-
-    // Their facts survive as chips…
-    const chips = screen.getByLabelText("the assumptions this comparison rests on");
-    expect(chips).toHaveTextContent(`+${GROWTH_PCT}% every month`);
-    expect(chips).toHaveTextContent(`${TIMELINE_MONTHS} months`);
-    expect(chips).toHaveTextContent("730 h/mo");
-
-    // …and the two contracts are outside the lens, so no variant can lose them.
-    expect(screen.getByRole("link", { name: ELEVENLABS_PRICING.sourceLabel })).toBeTruthy();
-    expect(screen.getByRole("table").querySelectorAll("tbody tr").length).toBe(TIMELINE_MONTHS);
-  });
+// Sanity: the series the section renders is the tested one.
+it("renders exactly the growthSeries months", () => {
+  expect(growthSeries()).toHaveLength(TIMELINE_MONTHS);
 });

@@ -208,9 +208,8 @@ export function NumbersTable({
       {/* The third series in the drawing has no column here because it has no
           variation: it is the same number in every cell. */}
       <p className="font-jetbrains mt-3 text-[11px] leading-relaxed text-white/45">
-        Gravitone itself is $0.00 on every row, in every month — MIT, self-hosted. The only cost in
-        the {BOX.name} column is the machine. Over the whole span: {fmtUsd(totals.el)} against{" "}
-        {fmtUsd(totals.box)}.
+        Gravitone itself: $0.00 every month — MIT, self-hosted. The {BOX.name} column is the
+        machine. Whole span: {fmtUsd(totals.el)} vs {fmtUsd(totals.box)}.
       </p>
     </details>
   );

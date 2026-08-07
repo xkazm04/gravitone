@@ -124,7 +124,7 @@ const round = (v: number) => Math.round(v * 100) / 100;
  * `max-h-[85vh]` and MUST NOT SCROLL on a 1280×800 laptop, which leaves roughly
  * 500 CSS px for the whole body: keep those at or under 380. A LANDING-SECTION
  * illustration has the whole content column and scrolls with the page, so it may
- * run landscape and larger (PricingSignal is 1160×520) — the constraint there is
+ * run landscape and larger (PricingBills is 1160×560) — the constraint there is
  * the composition's own, not the modal's. See DESIGN.md, "Scale is a property of
  * the surface".
  */
