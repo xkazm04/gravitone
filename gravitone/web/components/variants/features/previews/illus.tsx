@@ -145,7 +145,8 @@ export function Illus({
       viewBox={`0 0 ${w} ${h}`}
       className={`w-full ${className}`}
       style={{ maxHeight: `${h}px` }}
-      role="img"
+      // The picture is the argument, but it is a picture: the caption under it
+      // and the card copy behind it carry the same claim in text.
       aria-hidden
       preserveAspectRatio="xMidYMid meet"
     >

@@ -28,6 +28,10 @@ import StreamPreview from "./StreamPreview";
 import PerformancePreview from "./PerformancePreview";
 import AgentsPreview from "./AgentsPreview";
 import ArmPreview from "./ArmPreview";
+import CompatSignal from "./CompatSignal";
+import CompatStage from "./CompatStage";
+import CastSignal from "./CastSignal";
+import CastStage from "./CastStage";
 
 export type PreviewKey =
   | "compat"
@@ -59,8 +63,11 @@ export type PreviewDef = {
 };
 
 export const PREVIEWS: Record<PreviewKey, PreviewDef> = {
-  compat: { icon: AudioLines, bodies: { steps: CompatPreview } },
-  cast: { icon: Users, bodies: { steps: CastPreview } },
+  compat: {
+    icon: AudioLines,
+    bodies: { steps: CompatPreview, signal: CompatSignal, stage: CompatStage },
+  },
+  cast: { icon: Users, bodies: { steps: CastPreview, signal: CastSignal, stage: CastStage } },
   sovereign: { icon: ShieldOff, bodies: { steps: SovereignPreview } },
   score: { icon: Highlighter, bodies: { steps: ScorePreview } },
   stream: { icon: Activity, bodies: { steps: StreamPreview } },
