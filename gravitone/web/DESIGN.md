@@ -110,6 +110,19 @@ read (tables/meters stay tables/meters, with the `<details>` accessible
 fallback pattern); never animate during text entry or audio playback where it
 competes with the content itself.
 
+## Scale to the frame (owner correction, 2026-08-07)
+
+Signal's philosophy does not shrink-wrap. The spotlight vocabulary (dense
+hairline miniatures, micro-labels, calipers) fits a **modal-sized** frame a
+user deliberately opened. A **section-scale** band on the landing is a
+different frame and takes the philosophy, not the techniques: ONE story, drawn
+big — full content width, generous height, two or three shapes, few and large
+labels, whitespace as part of the design. The first Signal pricing section
+failed exactly this way: a 680-unit two-panel miniature with 8px label
+clusters, correct in every rule and wrong in the frame. Ask before composing:
+*is this a picture the user leans into (modal) or one that must read at a
+glance mid-scroll (band)?* Compose for that distance.
+
 ## Anti-patterns (each earned its place here)
 
 - Step-by-step text rows with icons as "diagrams" — the thing Signal replaced.
