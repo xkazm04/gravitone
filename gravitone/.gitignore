@@ -3,7 +3,6 @@ __pycache__/
 *.pyc
 logs/
 results/
-recordings/
 samples/
 voices/*.safetensors
 *.wav
@@ -22,9 +21,13 @@ emotion_demand.json
 # are tracked source.
 /takes/
 /reviews/
+# Same anchoring, same reason: the runtime call-recording store (and the gym's
+# replay artifacts next to it) live at this root; unanchored `recordings/` also
+# swallowed web/app/api/gym/recordings, which is tracked source.
+/recordings/
+/gym-runs/
 .worktrees/
 ingest_jobs/
-recordings/
 piper_voices/
 diarization_models/
 build_store/
