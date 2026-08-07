@@ -430,6 +430,47 @@ describe("ScoreEditor — the director proposes, it never applies", () => {
   });
 });
 
+// The composer's vertical stack used to be seven blocks with three headings
+// that all began with the word "direct". These assert the order and the
+// grouping, because that IS the fix — every behaviour below was already true.
+describe("ScoreEditor — one panel, in the order the composer is read", () => {
+  const panel = () => document.querySelector("[data-direction-panel]") as HTMLElement;
+  const track = () => screen.getByRole("group", { name: /Emotion regions over/ });
+  const before = (a: Element, b: Element) =>
+    !!(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+
+  it("reads text, then the lane strip, then ONE direction panel", () => {
+    mount("one [excited]two[/excited] three");
+    expect(before(area(), track())).toBe(true);
+    expect(before(track(), panel())).toBe(true);
+    expect(document.querySelectorAll("[data-direction-panel]")).toHaveLength(1);
+  });
+
+  it("holds the selection actions and the whole-text action in that one panel", () => {
+    mount(TEXT, { chips: <button type="button">Excited</button> });
+    for (const name of ["Excited", "+ add region", /direct this text/]) {
+      expect(panel()).toContainElement(screen.getByRole("button", { name }));
+    }
+    // …and the chips come FIRST, because they are the fast path for the thing
+    // the row beneath them does explicitly.
+    expect(before(screen.getByRole("button", { name: "Excited" }),
+                  screen.getByRole("button", { name: "+ add region" }))).toBe(true);
+  });
+
+  it("keeps the region inspector in the panel rather than in a box of its own", () => {
+    mount("one [excited]two[/excited] three");
+    fireEvent.click(screen.getByRole("button", { name: /Region 1 of 1/ }));
+    const numeric = screen.getByLabelText("Region start, character offset");
+    expect(panel()).toContainElement(numeric);
+    expect(numeric.closest("[data-direction-panel] > .rounded-xl")).toBeNull();
+  });
+
+  it("still says what an undirected line will sound like", () => {
+    mount(TEXT);
+    expect(screen.getByText(/No direction yet/)).toBeInTheDocument();
+  });
+});
+
 // "always does not do anything" — the report that produced this block.
 //
 // It was true, and it was not one bug. On the text the composer SHIPS WITH, the

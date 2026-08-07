@@ -7,7 +7,7 @@
 // a textarea, which is why the most expressive capability in the product was
 // invisible unless you read the API docs. Here the same string is a SCORE: the
 // text is the horizontal axis, each directed span is an object beneath it
-// tinted by its emotion's hue and badged with its sigil, and you place one by
+// tinted by its emotion's hue and badged with its icon, and you place one by
 // selecting words.
 //
 // Three rules this component is built around:
@@ -22,6 +22,14 @@
 //  * A region never drifts onto words it was not written for. When an edit
 //    changes the words under a region the region is CLEARED and the notice says
 //    which one and why (shared.transformRegions).
+//  * ONE PANEL PER DECISION. The stack reads text -> lane strip -> direction
+//    panel, and that is the whole composer. It used to read text, director row,
+//    review list, lane, empty-state box, placement row, inspector box — plus
+//    the chip row the console drew below all of it, under a third heading with
+//    the word "direct" in it. Everything that DIRECTS now lives in one bordered
+//    container, ordered by what it acts on: the selection first (chips, then
+//    the same operation named explicitly), the whole text second, the selected
+//    region's inspector last, separated by hairlines rather than by boxes.
 
 import { useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import EmotionIcon from "@/components/ui/EmotionIcon";
@@ -49,9 +57,12 @@ import {
  *  the same operation (shared.applyEmotion). */
 export type ScoreEditorHandle = { applyEmotion: (emotion: string) => void };
 
-/** How the lane is drawn. Tall enough for a badge + a label, short enough that
- *  the score does not dominate the composer it hangs under. */
-const LANE_HEIGHT = 40;
+/** How the lane is drawn. A STRIP attached to the text, not a section under it:
+ *  40px with its own heading and its own empty-state box read as a second
+ *  panel, and the composer's vertical stack was already three panels too long.
+ *  28 is the floor a <Region> stays grabbable at (it insets 4px top and bottom,
+ *  and its badge is 18). */
+const LANE_HEIGHT = 28;
 
 /** Offered when a Character reports no scale at all, so the placement control
  *  is never an empty dropdown next to an enabled button. */
@@ -68,6 +79,7 @@ export default function ScoreEditor({
   available = [],
   scale,
   expr = DEFAULT_EXPRESSION,
+  chips,
   disabled = false,
   className = "",
 }: {
@@ -85,6 +97,14 @@ export default function ScoreEditor({
    *  Character's own recorded slots. */
   scale?: string[];
   expr?: Expression;
+  /** The emotion chip row (and its wheel button), rendered INSIDE this
+   *  component's one direction panel. It is the console's node because the same
+   *  row also serves script mode, where the selection it acts on lives on a
+   *  different surface — but it belongs in this panel, beside the other things
+   *  that act on a selection, rather than in a section of its own two borders
+   *  further down the page. Absent → the panel simply starts at the placement
+   *  row. */
+  chips?: React.ReactNode;
   disabled?: boolean;
   className?: string;
 }) {
@@ -391,6 +411,54 @@ export default function ScoreEditor({
         placeholder="Type the line, select the words you want to direct, then add a region."
       />
 
+      {/* The lane, immediately under the words and slimmed to a STRIP: this is
+          a timeline attached to the text, not a section of its own. It used to
+          sit below the director, the review list AND the placement row — three
+          panels away from the words its offsets are counted in. Regions are
+          placed proportionally over the character range, which is what makes
+          them draggable at all. */}
+      <div className="space-y-1">
+        <div ref={railRef}>
+          <Track label={`Emotion regions over ${text.length} characters`} height={LANE_HEIGHT} bars={0}>
+            {regions.map((r, i) => {
+              const m = emotionMeta(r.value);
+              return (
+                <Region
+                  // Keyed by POSITION IN THE SCORE, not by offsets: a key that
+                  // changed on every nudge remounted the region and threw
+                  // keyboard focus off the handle mid-resize, so one arrow press
+                  // was all you got. Regions are always sorted, so the index is
+                  // stable for as long as the region exists.
+                  key={i}
+                  start={r.start}
+                  end={r.end}
+                  total={text.length}
+                  hue={m.hue}
+                  label={m.label}
+                  text={text.slice(r.start, r.end)}
+                  index={i}
+                  count={regions.length}
+                  selected={selected === i}
+                  previewing={preview?.index === i}
+                  disabled={disabled}
+                  badge={<EmotionIcon emotion={r.value} size={16} dim={!available.includes(r.value)} />}
+                  onSelect={() => setSelected(i)}
+                  onPreview={() => void playRegion(i)}
+                  onResize={(edge, to) => resize(i, edge, to)}
+                  offsetAt={offsetAt}
+                />
+              );
+            })}
+          </Track>
+        </div>
+        {regions.length === 0 && (
+          <p className="font-jetbrains px-0.5 text-[10px] leading-relaxed text-white/45">
+            No direction yet — the whole line is spoken in the Character&apos;s baseline Voice.
+            Select words above, then direct them below.
+          </p>
+        )}
+      </div>
+
       {showRaw && (
         <div className="space-y-1">
           <div className="flex items-center justify-between gap-2">
@@ -411,256 +479,231 @@ export default function ScoreEditor({
         </div>
       )}
 
-      {/* The director. Deliberately below the text and above the lane: it acts
-          on what is written and produces things you then review. */}
-      <div className="flex flex-wrap items-center gap-2">
-        <button
-          type="button"
-          onClick={direct}
-          disabled={disabled || text.trim().length === 0}
-          className="font-jetbrains rounded-full border border-violet-400/30 bg-violet-400/5 px-3 py-1 text-[11px] text-violet-200 transition enabled:hover:bg-violet-400/10 disabled:opacity-40"
-        >
-          ✎ direct this text
-        </button>
-        {suggestions.length > 0 && (
-          <>
-            <button
-              type="button"
-              onClick={() => take(suggestions.map((_, i) => i))}
-              disabled={disabled}
-              className="font-jetbrains rounded-full border border-white/15 px-3 py-1 text-[11px] text-white/75 transition enabled:hover:border-emerald-400/40 enabled:hover:text-emerald-200 disabled:opacity-40"
-            >
-              accept all
-            </button>
-            <button
-              type="button"
-              onClick={dismissAll}
-              className="font-jetbrains rounded-full border border-white/15 px-3 py-1 text-[11px] text-white/60 transition hover:border-white/30 hover:text-white/80"
-            >
-              dismiss all
-            </button>
-          </>
-        )}
-      </div>
+      {/* THE DIRECTION PANEL — one container for one decision.
+          This was three standalone pieces stacked down the page, each with its
+          own heading and its own border: the chip row ("direct the selected
+          words", which lived up in the console), the placement row ("direct
+          selection as … + add region"), and the director ("direct this text").
+          A user reading top to bottom met the word "direct" three times in
+          three boxes and had to work out that they were one control. They are
+          grouped here by WHAT THEY ACT ON — the selection first, the whole text
+          second — with a single divider between the two, and nothing repeats a
+          heading its container already carries. */}
+      <div data-direction-panel className="space-y-3 rounded-xl border border-white/10 bg-white/[0.02] px-3 py-3">
+        {chips}
 
-      {/* The ANSWER to the button — its own block, at reading size.
-          This was a 10px `text-white/50` span wedged into the button row, so
-          the one outcome a first-time user always got (the shipped default text
-          has exactly one cue, and it is already directed) looked identical to
-          having pressed nothing. An action whose only response is invisible is
-          an action that "does not do anything". */}
-      {directorNote && (
-        <p
-          aria-live="polite"
-          data-testid="director-note"
-          className="font-hanken rounded-xl border border-violet-300/25 bg-violet-400/[0.06] px-3 py-2 text-[12px] leading-relaxed text-violet-100/90"
-        >
-          {directorNote}
-        </p>
-      )}
-
-      {/* The review. Every row states the RULE that produced it, because the
-          rule is the whole explanation — this pass reads punctuation, capitals
-          and brackets, and a user who is shown that can forgive a weak call.
-          A confident, unexplained guess is the thing to avoid: it would be
-          claiming a comprehension nothing here has. */}
-      {suggestions.length > 0 && (
-        <ul className="space-y-1.5 rounded-xl border border-dashed border-violet-300/25 bg-violet-400/[0.03] px-3 py-2">
-          {suggestions.map((s, i) => {
-            const m = emotionMeta(s.value);
-            const note = fallbackNote(s.value, available);
-            return (
-              <li key={`${s.start}-${s.reason}`} className="flex flex-wrap items-center gap-2">
-                <span
-                  aria-hidden
-                  className="h-2.5 w-2.5 shrink-0 rounded-full border border-dashed"
-                  style={{ borderColor: `hsl(${m.hue} 88% 68%)`, background: `hsl(${m.hue} 82% 55% / 0.2)` }}
-                />
-                <span className="font-hanken min-w-0 flex-1 truncate text-[12px] text-white/80">
-                  &ldquo;{text.slice(s.start, s.end)}&rdquo;
-                </span>
-                <select
-                  value={s.value}
-                  disabled={disabled}
-                  onChange={(e) => setSuggestions((list) => retagSuggestion(list, i, e.target.value))}
-                  aria-label={`Emotion for the suggestion at characters ${s.start} to ${s.end}`}
-                  className="font-jetbrains rounded-lg border border-white/15 bg-black/40 px-2 py-0.5 text-[11px] text-white/85 focus:border-cyan-400/40 focus:outline-none"
-                >
-                  {[...new Set([s.value, ...choices])].map((id) => (
-                    <option key={id} value={id} className="bg-slate-900 text-white">{emotionMeta(id).label}</option>
-                  ))}
-                </select>
-                <span className="font-jetbrains text-[10px] text-white/45">{REASONS[s.reason]}</span>
-                <button
-                  type="button"
-                  onClick={() => take([i])}
-                  disabled={disabled}
-                  aria-label={`Accept ${m.label} for "${text.slice(s.start, s.end)}"`}
-                  className="font-jetbrains rounded-full border border-white/15 px-2.5 py-0.5 text-[11px] text-white/75 transition enabled:hover:border-emerald-400/40 enabled:hover:text-emerald-200 disabled:opacity-40"
-                >
-                  accept
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setSuggestions((list) => rejectSuggestion(list, i))}
-                  aria-label={`Reject ${m.label} for "${text.slice(s.start, s.end)}"`}
-                  className="font-jetbrains rounded-full border border-white/15 px-2.5 py-0.5 text-[11px] text-white/55 transition hover:border-rose-400/40 hover:text-rose-200"
-                >
-                  reject
-                </button>
-                {note && <span className="font-jetbrains w-full text-[10px] text-amber-200/80">{note}</span>}
-              </li>
-            );
-          })}
-        </ul>
-      )}
-
-      {/* The lane. Regions are placed proportionally over the character range,
-          which is what makes them draggable at all. */}
-      <div ref={railRef}>
-        <Track label={`Emotion regions over ${text.length} characters`} height={LANE_HEIGHT} bars={0}>
-          {regions.map((r, i) => {
-            const m = emotionMeta(r.value);
-            return (
-              <Region
-                // Keyed by POSITION IN THE SCORE, not by offsets: a key that
-                // changed on every nudge remounted the region and threw
-                // keyboard focus off the handle mid-resize, so one arrow press
-                // was all you got. Regions are always sorted, so the index is
-                // stable for as long as the region exists.
-                key={i}
-                start={r.start}
-                end={r.end}
-                total={text.length}
-                hue={m.hue}
-                label={m.label}
-                text={text.slice(r.start, r.end)}
-                index={i}
-                count={regions.length}
-                selected={selected === i}
-                previewing={preview?.index === i}
-                disabled={disabled}
-                badge={<EmotionIcon emotion={r.value} size={16} dim={!available.includes(r.value)} />}
-                onSelect={() => setSelected(i)}
-                onPreview={() => void playRegion(i)}
-                onResize={(edge, to) => resize(i, edge, to)}
-                offsetAt={offsetAt}
-              />
-            );
-          })}
-        </Track>
-      </div>
-
-      {regions.length === 0 && (
-        <p className="font-jetbrains rounded-xl border border-dashed border-white/12 px-3 py-2 text-[11px] leading-relaxed text-white/50">
-          No direction yet — this whole line is spoken in the Character&apos;s baseline Voice. Select
-          words above and add a region to switch the Voice for just those words.
-        </p>
-      )}
-
-      {/* Placement. The selection is stated as a number so the accessible path
-          and the pointer path are visibly the same operation. */}
-      <div className="flex flex-wrap items-center gap-2">
-        <label className="font-jetbrains text-[11px] text-white/55" htmlFor="score-emotion">
-          direct selection as
-        </label>
-        <select
-          id="score-emotion"
-          value={emotion}
-          disabled={disabled}
-          onChange={(e) => setPending(e.target.value)}
-          className="font-jetbrains rounded-lg border border-white/15 bg-black/40 px-2 py-1 text-[12px] text-white/85 focus:border-cyan-400/40 focus:outline-none"
-        >
-          {choices.map((id) => (
-            <option key={id} value={id} className="bg-slate-900 text-white">
-              {emotionMeta(id).label}
-              {available.length > 0 && !available.includes(id) ? " (not recorded)" : ""}
-            </option>
-          ))}
-        </select>
-        <button
-          type="button"
-          onClick={addRegion}
-          disabled={disabled}
-          className="font-jetbrains rounded-full border border-cyan-400/30 bg-cyan-400/5 px-3 py-1 text-[11px] text-cyan-200 transition enabled:hover:bg-cyan-400/10 disabled:opacity-40"
-        >
-          + add region
-        </button>
-        <span className="font-jetbrains text-[10px] text-white/40">
-          {selLen > 0
-            ? `${selLen} character${selLen === 1 ? "" : "s"} selected (${Math.min(sel.start, sel.end)}–${Math.max(sel.start, sel.end)})`
-            : "select words in the text above"}
-        </span>
-      </div>
-
-      {/* The inspector — the numeric path M2 names as mandatory, and the place a
-          region is retagged, previewed and deleted. */}
-      {active && selected !== null && (
-        <div className="grid gap-2 rounded-xl border border-white/10 bg-white/[0.02] px-3 py-2 sm:grid-cols-[auto_auto_auto_1fr]">
-          <label className="font-jetbrains flex items-center gap-1.5 text-[11px] text-white/55">
-            from
-            <input
-              type="number"
-              min={0}
-              max={active.end - 1}
-              value={active.start}
-              disabled={disabled}
-              onChange={(e) => resize(selected, "start", Number(e.target.value))}
-              aria-label="Region start, character offset"
-              className="font-jetbrains w-16 rounded-lg border border-white/15 bg-black/40 px-2 py-1 text-[12px] text-white/85 focus:border-cyan-400/40 focus:outline-none"
-            />
-          </label>
-          <label className="font-jetbrains flex items-center gap-1.5 text-[11px] text-white/55">
-            to
-            <input
-              type="number"
-              min={active.start + 1}
-              max={text.length}
-              value={active.end}
-              disabled={disabled}
-              onChange={(e) => resize(selected, "end", Number(e.target.value))}
-              aria-label="Region end, character offset"
-              className="font-jetbrains w-16 rounded-lg border border-white/15 bg-black/40 px-2 py-1 text-[12px] text-white/85 focus:border-cyan-400/40 focus:outline-none"
-            />
+        {/* Everything that acts on THE SELECTION. The chips above are the fast
+            path; this is the same operation with the emotion named explicitly,
+            and the selection stated as a number so the accessible path and the
+            pointer path are visibly the same thing. */}
+        <div className="flex flex-wrap items-center gap-2">
+          <label className="font-jetbrains text-[11px] text-white/55" htmlFor="score-emotion">
+            direct selection as
           </label>
           <select
-            value={active.value}
+            id="score-emotion"
+            value={emotion}
             disabled={disabled}
-            onChange={(e) => retag(selected, e.target.value)}
-            aria-label="Region emotion"
+            onChange={(e) => setPending(e.target.value)}
             className="font-jetbrains rounded-lg border border-white/15 bg-black/40 px-2 py-1 text-[12px] text-white/85 focus:border-cyan-400/40 focus:outline-none"
           >
-            {[...new Set([active.value, ...choices])].map((id) => (
+            {choices.map((id) => (
               <option key={id} value={id} className="bg-slate-900 text-white">
                 {emotionMeta(id).label}
+                {available.length > 0 && !available.includes(id) ? " (not recorded)" : ""}
               </option>
             ))}
           </select>
-          <div className="flex items-center justify-end gap-2">
-            <button
-              type="button"
-              onClick={() => (preview?.index === selected ? stopPreview() : void playRegion(selected))}
-              disabled={disabled || busy}
-              className="font-jetbrains rounded-full border border-white/15 px-3 py-1 text-[11px] text-white/75 transition enabled:hover:border-cyan-400/40 enabled:hover:text-cyan-200 disabled:opacity-40"
-            >
-              {busy ? "rendering…" : preview?.index === selected ? "stop" : "hear this region"}
-            </button>
-            <button
-              type="button"
-              onClick={() => remove(selected)}
-              disabled={disabled}
-              className="font-jetbrains rounded-full border border-white/15 px-3 py-1 text-[11px] text-white/60 transition enabled:hover:border-rose-400/40 enabled:hover:text-rose-200 disabled:opacity-40"
-            >
-              delete
-            </button>
-          </div>
-          <p className="font-jetbrains text-[10px] text-white/40 sm:col-span-4">
-            {available.length > 0 && !available.includes(active.value)
-              ? `${emotionMeta(active.value).label} is not recorded for this Character — the nearest recorded emotion is used, then baseline.`
-              : "Drag an edge, nudge it with the arrow keys, or type an offset. Shift+arrow moves five characters."}
-          </p>
+          <button
+            type="button"
+            onClick={addRegion}
+            disabled={disabled}
+            className="font-jetbrains rounded-full border border-cyan-400/30 bg-cyan-400/5 px-3 py-1 text-[11px] text-cyan-200 transition enabled:hover:bg-cyan-400/10 disabled:opacity-40"
+          >
+            + add region
+          </button>
+          <span className="font-jetbrains text-[10px] text-white/40">
+            {selLen > 0
+              ? `${selLen} character${selLen === 1 ? "" : "s"} selected (${Math.min(sel.start, sel.end)}–${Math.max(sel.start, sel.end)})`
+              : "select words in the text above"}
+          </span>
         </div>
-      )}
+
+        {/* …and the one thing that acts on THE WHOLE TEXT, on its own line
+            under a hairline rather than in a section of its own. */}
+        <div className="flex flex-wrap items-center gap-2 border-t border-white/8 pt-3">
+          <button
+            type="button"
+            onClick={direct}
+            disabled={disabled || text.trim().length === 0}
+            className="font-jetbrains rounded-full border border-violet-400/30 bg-violet-400/5 px-3 py-1 text-[11px] text-violet-200 transition enabled:hover:bg-violet-400/10 disabled:opacity-40"
+          >
+            ✎ direct this text
+          </button>
+          {suggestions.length > 0 && (
+            <>
+              <button
+                type="button"
+                onClick={() => take(suggestions.map((_, i) => i))}
+                disabled={disabled}
+                className="font-jetbrains rounded-full border border-white/15 px-3 py-1 text-[11px] text-white/75 transition enabled:hover:border-emerald-400/40 enabled:hover:text-emerald-200 disabled:opacity-40"
+              >
+                accept all
+              </button>
+              <button
+                type="button"
+                onClick={dismissAll}
+                className="font-jetbrains rounded-full border border-white/15 px-3 py-1 text-[11px] text-white/60 transition hover:border-white/30 hover:text-white/80"
+              >
+                dismiss all
+              </button>
+            </>
+          )}
+        </div>
+
+        {/* The ANSWER to the button — its own block, at reading size.
+            This was a 10px `text-white/50` span wedged into the button row, so
+            the one outcome a first-time user always got (the shipped default text
+            has exactly one cue, and it is already directed) looked identical to
+            having pressed nothing. An action whose only response is invisible is
+            an action that "does not do anything". */}
+        {directorNote && (
+          <p
+            aria-live="polite"
+            data-testid="director-note"
+            className="font-hanken rounded-xl border border-violet-300/25 bg-violet-400/[0.06] px-3 py-2 text-[12px] leading-relaxed text-violet-100/90"
+          >
+            {directorNote}
+          </p>
+        )}
+
+        {/* The review. Every row states the RULE that produced it, because the
+            rule is the whole explanation — this pass reads punctuation, capitals
+            and brackets, and a user who is shown that can forgive a weak call.
+            A confident, unexplained guess is the thing to avoid: it would be
+            claiming a comprehension nothing here has. */}
+        {suggestions.length > 0 && (
+          <ul className="space-y-1.5 rounded-xl border border-dashed border-violet-300/25 bg-violet-400/[0.03] px-3 py-2">
+            {suggestions.map((s, i) => {
+              const m = emotionMeta(s.value);
+              const note = fallbackNote(s.value, available);
+              return (
+                <li key={`${s.start}-${s.reason}`} className="flex flex-wrap items-center gap-2">
+                  <span
+                    aria-hidden
+                    className="h-2.5 w-2.5 shrink-0 rounded-full border border-dashed"
+                    style={{ borderColor: `hsl(${m.hue} 88% 68%)`, background: `hsl(${m.hue} 82% 55% / 0.2)` }}
+                  />
+                  <span className="font-hanken min-w-0 flex-1 truncate text-[12px] text-white/80">
+                    &ldquo;{text.slice(s.start, s.end)}&rdquo;
+                  </span>
+                  <select
+                    value={s.value}
+                    disabled={disabled}
+                    onChange={(e) => setSuggestions((list) => retagSuggestion(list, i, e.target.value))}
+                    aria-label={`Emotion for the suggestion at characters ${s.start} to ${s.end}`}
+                    className="font-jetbrains rounded-lg border border-white/15 bg-black/40 px-2 py-0.5 text-[11px] text-white/85 focus:border-cyan-400/40 focus:outline-none"
+                  >
+                    {[...new Set([s.value, ...choices])].map((id) => (
+                      <option key={id} value={id} className="bg-slate-900 text-white">{emotionMeta(id).label}</option>
+                    ))}
+                  </select>
+                  <span className="font-jetbrains text-[10px] text-white/45">{REASONS[s.reason]}</span>
+                  <button
+                    type="button"
+                    onClick={() => take([i])}
+                    disabled={disabled}
+                    aria-label={`Accept ${m.label} for "${text.slice(s.start, s.end)}"`}
+                    className="font-jetbrains rounded-full border border-white/15 px-2.5 py-0.5 text-[11px] text-white/75 transition enabled:hover:border-emerald-400/40 enabled:hover:text-emerald-200 disabled:opacity-40"
+                  >
+                    accept
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSuggestions((list) => rejectSuggestion(list, i))}
+                    aria-label={`Reject ${m.label} for "${text.slice(s.start, s.end)}"`}
+                    className="font-jetbrains rounded-full border border-white/15 px-2.5 py-0.5 text-[11px] text-white/55 transition hover:border-rose-400/40 hover:text-rose-200"
+                  >
+                    reject
+                  </button>
+                  {note && <span className="font-jetbrains w-full text-[10px] text-amber-200/80">{note}</span>}
+                </li>
+              );
+            })}
+          </ul>
+        )}
+
+        {/* The inspector — the numeric path M2 names as mandatory, and the place
+            a region is retagged, previewed and deleted. A hairline and nothing
+            else: it used to draw its own rounded box, and a box inside a box is
+            the visual noise this consolidation exists to remove. */}
+        {active && selected !== null && (
+          <div className="grid gap-2 border-t border-white/8 pt-3 sm:grid-cols-[auto_auto_auto_1fr]">
+            <label className="font-jetbrains flex items-center gap-1.5 text-[11px] text-white/55">
+              from
+              <input
+                type="number"
+                min={0}
+                max={active.end - 1}
+                value={active.start}
+                disabled={disabled}
+                onChange={(e) => resize(selected, "start", Number(e.target.value))}
+                aria-label="Region start, character offset"
+                className="font-jetbrains w-16 rounded-lg border border-white/15 bg-black/40 px-2 py-1 text-[12px] text-white/85 focus:border-cyan-400/40 focus:outline-none"
+              />
+            </label>
+            <label className="font-jetbrains flex items-center gap-1.5 text-[11px] text-white/55">
+              to
+              <input
+                type="number"
+                min={active.start + 1}
+                max={text.length}
+                value={active.end}
+                disabled={disabled}
+                onChange={(e) => resize(selected, "end", Number(e.target.value))}
+                aria-label="Region end, character offset"
+                className="font-jetbrains w-16 rounded-lg border border-white/15 bg-black/40 px-2 py-1 text-[12px] text-white/85 focus:border-cyan-400/40 focus:outline-none"
+              />
+            </label>
+            <select
+              value={active.value}
+              disabled={disabled}
+              onChange={(e) => retag(selected, e.target.value)}
+              aria-label="Region emotion"
+              className="font-jetbrains rounded-lg border border-white/15 bg-black/40 px-2 py-1 text-[12px] text-white/85 focus:border-cyan-400/40 focus:outline-none"
+            >
+              {[...new Set([active.value, ...choices])].map((id) => (
+                <option key={id} value={id} className="bg-slate-900 text-white">
+                  {emotionMeta(id).label}
+                </option>
+              ))}
+            </select>
+            <div className="flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => (preview?.index === selected ? stopPreview() : void playRegion(selected))}
+                disabled={disabled || busy}
+                className="font-jetbrains rounded-full border border-white/15 px-3 py-1 text-[11px] text-white/75 transition enabled:hover:border-cyan-400/40 enabled:hover:text-cyan-200 disabled:opacity-40"
+              >
+                {busy ? "rendering…" : preview?.index === selected ? "stop" : "hear this region"}
+              </button>
+              <button
+                type="button"
+                onClick={() => remove(selected)}
+                disabled={disabled}
+                className="font-jetbrains rounded-full border border-white/15 px-3 py-1 text-[11px] text-white/60 transition enabled:hover:border-rose-400/40 enabled:hover:text-rose-200 disabled:opacity-40"
+              >
+                delete
+              </button>
+            </div>
+            <p className="font-jetbrains text-[10px] text-white/40 sm:col-span-4">
+              {available.length > 0 && !available.includes(active.value)
+                ? `${emotionMeta(active.value).label} is not recorded for this Character — the nearest recorded emotion is used, then baseline.`
+                : "Drag an edge, nudge it with the arrow keys, or type an offset. Shift+arrow moves five characters."}
+            </p>
+          </div>
+        )}
+      </div>
 
       {/* One live region for every refusal, clearance and failure above. */}
       <p aria-live="polite" className="font-jetbrains min-h-[1rem] text-[11px] leading-relaxed text-amber-200/90">

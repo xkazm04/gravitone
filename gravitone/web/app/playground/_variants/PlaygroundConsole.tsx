@@ -20,11 +20,11 @@ import { AnimatePresence, motion } from "framer-motion";
 import { Button, Eyebrow } from "@/components/ui/Primitives";
 import { EASE } from "@/components/ui/tokens";
 import { EMOTION_IDS, emotionMeta } from "@/lib/emotions";
-import EmotionIcon from "@/components/ui/EmotionIcon";
+import EmotionChips from "./EmotionChips";
 import {
   appendEdit, applyEmotion, composerLimit, composerWarnings, DEFAULT_EXPRESSION, DEFAULT_TEXT,
   editPlainText, isTimingBasis, MAX_SCRIPT_LINES, MAX_TEXT_CHARS, parseTags, readEdits,
-  SCORE_BASELINE, stripTags, TAKE_TIMING_VERSION, wrappedAnnouncement,
+  stripTags, TAKE_TIMING_VERSION, wrappedAnnouncement,
   type Expression, type PerfLine, type ScriptLine, type Segment, type Take,
 } from "./shared";
 // Composer durability — the same IndexedDB mechanism the take log uses.
@@ -1465,9 +1465,15 @@ export default function PlaygroundConsole() {
               stray keystroke to break. */}
           {mode === "solo" ? (
             <div className="px-5 py-4">
+              {/* The chips are handed IN rather than drawn below: they act on
+                  the score's selection, so they belong in the score's own
+                  direction panel. Script mode draws the same component itself,
+                  because there the selection lives on a line instead. */}
               <ScoreEditor ref={scoreRef} value={text} onChange={setText} onSubmit={generate}
                 characterId={charId} expr={expr}
-                available={character?.emotions ?? []} scale={scale} />
+                available={character?.emotions ?? []} scale={scale}
+                chips={<EmotionChips scale={scale} recorded={character?.emotions ?? []}
+                  onPick={insertEmotion} onOpenWheel={() => setPickerOpen(true)} />} />
             </div>
           ) : (
             <div className="space-y-2 px-5 py-4">
@@ -1550,46 +1556,18 @@ export default function PlaygroundConsole() {
             </p>
           )}
 
-          {/* emotion chips + wheel */}
-          <div className="border-t border-white/8 px-5 py-4">
-            <div className="mb-2 flex items-center justify-between">
-              <span className="font-jetbrains text-[11px] uppercase tracking-widest text-white/60">direct the selected words</span>
-              <button
-                onClick={() => setPickerOpen(true)}
-                className="font-jetbrains inline-flex items-center gap-1.5 rounded-full border border-cyan-400/30 bg-cyan-400/5 px-3 py-1 text-[11px] text-cyan-200 transition hover:bg-cyan-400/10"
-              >
-                ◎ emotion wheel
-              </button>
+          {/* SCRIPT's copy of the chip row. Solo hands the same component to
+              the score, where it sits inside the one direction panel beside the
+              other things that act on a selection; here the selection lives on
+              whichever line has focus, so the row stays a sibling of the scene
+              — the same ordering rule (words, then their lanes, then the one
+              place you direct them), applied to a surface with N sets of words. */}
+          {mode === "script" && (
+            <div className="border-t border-white/8 px-5 py-4">
+              <EmotionChips scale={scale} recorded={character?.emotions ?? []}
+                onPick={insertEmotion} onOpenWheel={() => setPickerOpen(true)} />
             </div>
-            <div className="flex flex-wrap gap-1.5">
-              {scale.map((id) => {
-                const e = emotionMeta(id);
-                const has = character?.emotions.includes(id) ?? false;
-                const custom = !EMOTION_IDS.includes(id);
-                // Baseline is the ABSENCE of a region, not a region worth that
-                // name — `regionProblem` refuses the spelling outright — so the
-                // baseline chip is the eraser rather than a tag nothing accepts.
-                const clears = id === SCORE_BASELINE;
-                return (
-                  <button key={id} onClick={() => insertEmotion(id)}
-                    // Without this the accessible name is the art's alt text
-                    // followed by the label ("Excited emotion Excited").
-                    aria-label={clears ? "Clear region" : e.label}
-                    title={clears
-                      ? "Clear direction — the selected words go back to this Character's baseline Voice"
-                      : has ? `${e.label} — available` : `${e.label} — not recorded: the nearest recorded emotion is used, then baseline`}
-                    className={`font-jetbrains inline-flex items-center gap-1.5 rounded-full py-1 pl-1 pr-2.5 text-[11px] transition ${
-                      has ? `border bg-white/5 text-white/85 ${custom ? "border-violet-400/30 hover:border-violet-400/60" : "border-white/15 hover:border-cyan-400/40"}`
-                          : `border border-dashed text-white/60 ${custom ? "border-violet-400/20" : "border-white/12"}`}`}>
-                    <span className="grid h-5 w-5 place-items-center rounded-full bg-black/40">
-                      <EmotionIcon emotion={id} size={16} dim={!has} />
-                    </span>
-                    {clears ? "Clear region" : e.label}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
+          )}
 
           {/* What the tags in this composer will do, BEFORE the render. Amber:
               the take will be produced, it just will not say what its author

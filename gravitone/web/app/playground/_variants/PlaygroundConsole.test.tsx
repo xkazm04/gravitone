@@ -615,6 +615,29 @@ describe("PlaygroundConsole — emotions are placed as regions, never typed as t
     expect(sent[0].text).toBe("[sad]Hello[/sad] there.");
     expect(sent[1].text).toBe("[excited]Great to finally meet you![/excited]");
   });
+
+  // The chip row used to be a section of the console, two borders below the
+  // score, under a third heading beginning with the word "direct" — so the one
+  // control the user needs was split across three boxes. In solo it is now
+  // handed INTO the score's direction panel; in script it stays a sibling of
+  // the scene, because there the selection lives on a line.
+  it("draws the chips inside the score's direction panel in solo, exactly once", async () => {
+    await mountConsole();
+    expect(screen.getAllByText("direct the selected words")).toHaveLength(1);
+    const panel = document.querySelector("[data-direction-panel]") as HTMLElement;
+    expect(panel).toContainElement(chip("Excited"));
+    expect(panel).toContainElement(chip("Clear region"));
+    expect(panel).toContainElement(screen.getByRole("button", { name: /emotion wheel/ }));
+  });
+
+  it("keeps the same chips — and the same operation — in script mode", async () => {
+    await mountConsole();
+    fireEvent.click(screen.getByRole("button", { name: "script" }));
+    expect(screen.getAllByText("direct the selected words")).toHaveLength(1);
+    // No solo score in script mode, so nothing to hand them to.
+    expect(document.querySelector("[data-direction-panel]")).toBeNull();
+    expect(chip("Excited")).toBeInTheDocument();
+  });
 });
 
 // ── direction 5: the composer says what its tags will do ─────────────────────
