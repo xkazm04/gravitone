@@ -12,6 +12,7 @@ import { EMOTION_IDS, emotionMeta } from "@/lib/emotions";
 import TagEditor from "./TagEditor";
 import { hueOf, relTime, useCharacters, useVoicePreview, patchCharacterReq, deleteCharacterReq, collisionVoice, bulkDeleteQuestion, deleteCharacterQuestion, weakestVoice, weaknessOf, type Character } from "../_data/characters";
 import SignalChip from "./SignalChip";
+import RosterEmpty from "./RosterEmpty";
 import { ApiError, readDetail } from "@/lib/apiFetch";
 import { useAuth } from "@/lib/useAuth";
 import { useMounted } from "@/lib/useMounted";
@@ -448,11 +449,21 @@ export default function CharacterTable() {
                 </button>
               </td></tr>
             )}
+            {/* Two different empty rows. A roster with no characters at all is
+                the one place on this page with nothing to compete with, so it
+                TEACHES (Signal, full tier): the drawing says what a Character
+                is, and the sentence below it — unchanged — stays the caption.
+                "No characters match." is a filter result over a roster that
+                exists; drawing there would be decoration. */}
             {!loading && !rosterUnavailable && rows.length === 0 && (
-              <tr><td colSpan={10} className="px-3 py-8 text-center text-sm text-white/60">
-                {characters.length === 0
-                  ? "No characters yet — clone a recording or import a pack to make one."
-                  : "No characters match."}
+              <tr><td colSpan={10} className="px-3 py-10 text-center text-sm text-white/60">
+                {characters.length === 0 ? (
+                  <RosterEmpty>
+                    No characters yet — clone a recording or import a pack to make one.
+                  </RosterEmpty>
+                ) : (
+                  "No characters match."
+                )}
               </td></tr>
             )}
             {rows.map((c) => {

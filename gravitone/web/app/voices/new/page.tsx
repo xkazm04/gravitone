@@ -56,6 +56,7 @@ import { candidates, commitRecipes, recipeById } from "./_state/audition";
 import { corpusNotice } from "./_state/corpus";
 import { identityMeasured, isEdited, stemIdentity } from "./_state/casting";
 import { useCasting } from "./_state/useCasting";
+import SelectionSweep from "./_signal/SelectionSweep";
 import {
   ACCEPT_ATTR, LIMITS_HINT, checkBytes, checkDuration,
 } from "./_state/uploadLimits";
@@ -923,7 +924,12 @@ export default function NewCharacterPage() {
               {job.speakers.map((s, i) => {
                 const on = castSel[s.id] !== undefined;
                 return (
-                <div key={s.id} className={`glass-panel rounded-xl px-5 py-4 transition ${on ? "border border-cyan-400/25 bg-cyan-400/[0.04]" : ""}`}>
+                <div key={s.id} className={`glass-panel relative overflow-hidden rounded-xl px-5 py-4 transition ${on ? "border border-cyan-400/25 bg-cyan-400/[0.04]" : ""}`}>
+                  {/* One accent on one state — the row's base hairline draws
+                      itself when this speaker is cast. Everything else on the
+                      row (sample, seconds, utterances, Review this →) is
+                      exactly as it was. */}
+                  {on && <SelectionSweep />}
                   <div className="flex items-center gap-3">
                     <input type="checkbox" checked={on} aria-label={`Cast ${s.id} as a character`}
                       onChange={(e) => {

@@ -6,6 +6,7 @@
 // The waveform IS the data, not a spinner beside it.
 
 import { EmotionTally, segmentFailureNote, stateOf, usableCounts, type LoaderData } from "./shared";
+import StepRail from "./StepRail";
 import { EMOTIONS } from "@/lib/emotions";
 
 const BARS = 52;
@@ -78,6 +79,11 @@ export default function WaveformLab({ data }: { data: LoaderData }) {
         <div className="mt-5 text-center">
           <div className="font-jetbrains text-[12px] uppercase tracking-widest text-cyan-300">{headline}</div>
         </div>
+        {/* Where the job is in the backend's own pipeline. The headline above
+            names the step it is IN; the rail says which steps that step comes
+            after and which are still ahead — the same LoaderStep list, nothing
+            fabricated between them. */}
+        <StepRail steps={data.steps} />
       </div>
 
       {/* live readout */}

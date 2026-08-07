@@ -165,7 +165,9 @@
             "gravitone/web/app/api/ingest/[job]/commit/route.ts",
             "gravitone/web/app/api/ingest/[job]/speaker/route.ts",
             "gravitone/web/app/api/ingest/[job]/speaker-preview/[sid]/route.ts",
-            "gravitone/web/app/api/ingest/[job]/preview/[emotion]/route.ts"
+            "gravitone/web/app/api/ingest/[job]/preview/[emotion]/route.ts",
+            "gravitone/web/app/voices/new/_loaders/StepRail.tsx",
+            "gravitone/web/app/voices/new/_signal/SelectionSweep.tsx"
           ],
           "target": null,
           "apiRoutes": [
@@ -193,7 +195,8 @@
             "gravitone/web/app/api/characters/[id]/route.ts",
             "gravitone/web/app/api/voices/route.ts",
             "gravitone/web/app/api/voices/[id]/route.ts",
-            "gravitone/web/app/voices/_data/characters.ts"
+            "gravitone/web/app/voices/_data/characters.ts",
+            "gravitone/web/app/voices/_variants/RosterEmpty.tsx"
           ],
           "target": null,
           "apiRoutes": [

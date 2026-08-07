@@ -206,3 +206,51 @@ preference for itself.
 eyeballed and silently rots: the stilled render is the COMPLETE drawing — same
 `d` set, no dash offset held back, labels and caption already readable. Copy
 that shape for the next surface.
+
+### voices — 2026-08-07
+
+**Applied**
+
+- `app/voices/new/_loaders/StepRail.tsx` (new, in `WaveformLab`) — the ingest
+  pipeline drawn as one line, one segment per backend step. Active step in the
+  accent with a single travelling pulse; done steps settle to hairline; pending
+  steps are the dashed route not taken. Every segment's `<Draw>` is keyed on
+  `${key}:${state}`, so a step draws exactly once, at the moment it changes.
+  Semantics untouched: the keys, labels and states are the backend's own
+  (`service/ingest.py`), the SVG is aria-hidden, and the labels are rendered as
+  an `<ol>` underneath with each state named in words — a reader who never sees
+  the rail gets the same list.
+- `app/voices/_variants/RosterEmpty.tsx` (new, in `CharacterTable`) — the
+  full-tier empty state for a roster with no Characters at all: a recording (one
+  wave) fanning into an emotion scale where the baseline slot is drawn solid in
+  the accent and the rest are the dashed fallback, which is the same grammar
+  `CoverageBar` uses one row down. h = 110. The roster's existing sentence is
+  passed in as the `<Caption>` — the component authors no prose.
+- `app/voices/new/_signal/SelectionSweep.tsx` (new, in the casting board) — one
+  accent hairline drawing itself along a speaker row's base when that speaker is
+  ticked into the cast. Entrance-only by construction (the element exists only
+  while selected), `pointer-events-none`, and everything else on the row — play
+  button, seconds, utterance count, sample text, "Review this →" — is byte-for-
+  byte unchanged.
+- `vitest.setup.ts` — a default `window.matchMedia`. jsdom implements none, so
+  `useStillMotion` (which DESIGN.md requires on every drawn surface) crashed any
+  test that merely rendered a tree containing an illustration. The default is
+  the server's own answer, "motion is fine"; a test asserting the reduced-motion
+  branch still stubs it for itself.
+
+**Deliberately skipped**
+
+- **"No characters match."** — a filter result over a roster that exists is not
+  an empty state; a drawing there would be decoration next to data the user is
+  actively narrowing.
+- **The failed-read row** ("The character roster could not be loaded…") — a
+  failure surface is prose plus a retry. Teaching what a Character is, at the
+  moment we cannot say whether the user has any, would be answering a question
+  nobody asked.
+- **The `eq-bar` waveform in `WaveformLab`** — left exactly as it is. It already
+  IS the product's own medium, it is the surface's liveness signal, and
+  re-drawing it in `illus.tsx` primitives would have been a rewrite of working
+  geometry for no gain.
+- **Per-speaker play buttons / stats on the casting board** — a working tool
+  must not perform (restrained tier). The accent went on the state that changes,
+  and nowhere else.
