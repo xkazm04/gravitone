@@ -13,6 +13,7 @@ import { apiJson } from "@/lib/apiFetch";
 import { useCopyFeedback } from "@/lib/useCopyFeedback";
 import { useHealthPoll } from "@/lib/useHealthPoll";
 import { useMounted } from "@/lib/useMounted";
+import { useStillMotion } from "@/lib/useStillMotion";
 import { NEW_KEY_SLOT } from "@/lib/useAuth";
 import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
@@ -55,6 +56,8 @@ import ScriptScore from "./ScriptScore";
 // the take card stays exactly what it was until the user asks for the timeline.
 import PunchIn, { type CommitPayload } from "./PunchIn";
 import { dropVariants } from "./variantStore";
+// The playground's Signal accents — the restrained tier of web/DESIGN.md.
+import { EmptyTakes, RenderRail } from "./signal";
 
 function Bars({ peaks, progress = 0, active = false, className = "" }: { peaks: number[]; progress?: number; active?: boolean; className?: string }) {
   return (
@@ -143,9 +146,12 @@ function LiveProgress({ source, active = true, children }: {
  * that re-measures on every render. The clock only ever drew this one row, so
  * this is where its state belongs. Nothing about what is displayed changed.
  */
-function RenderStatus({ startedAt, etaSec, estAudioSec, etaBasisLabel, noEtaLabel, streamedSec, queued, inFlight, metricsUnavailable, healthStale }: {
+function RenderStatus({ startedAt, etaSec, estAudioSec, etaBasisLabel, noEtaLabel, streamedSec, queued, inFlight, metricsUnavailable, healthStale, still }: {
   startedAt: number | null; etaSec: number | null; estAudioSec: number;
   etaBasisLabel: string; noEtaLabel: string;
+  /** The visitor's reduced-motion preference, resolved once in the console and
+   *  passed down — never read per-component (DESIGN.md motion rules). */
+  still: boolean;
   // Seconds of audio ALREADY RECEIVED on a streaming render, or null when this
   // run is not streaming. An estimate is what you show when progress cannot be
   // observed; when it can, showing the estimate instead is a choice to guess in
@@ -172,11 +178,10 @@ function RenderStatus({ startedAt, etaSec, estAudioSec, etaBasisLabel, noEtaLabe
       className="glass-panel mb-2 rounded-xl px-5 py-4">
       <div className="flex items-center gap-4">
         <span className="font-jetbrains shrink-0 text-[11px] text-cyan-300">rendering</span>
-        <div className="flex h-8 flex-1 items-end gap-[2px]" aria-hidden>
-          {Array.from({ length: 48 }).map((_, i) => (
-            <span key={i} className="eq-bar w-[2px] rounded-full bg-cyan-300/60" style={{ height: "100%", animationDelay: `${(i % 7) * 0.08}s` }} />
-          ))}
-        </div>
+        {/* Was 48 `.eq-bar` spans: a keyframe pretending to be levels, which
+            reduced motion froze into a solid cyan block. A dash-draw of the
+            wave being written has an honest still frame. */}
+        <RenderRail still={still} />
         {/* The one MEASURED number on this row. */}
         <span className="font-jetbrains shrink-0 text-[12px] tabular-nums text-white/85" aria-live="off">
           {fmtElapsed(elapsedMs)}
@@ -232,6 +237,9 @@ function RenderStatus({ startedAt, etaSec, estAudioSec, etaBasisLabel, noEtaLabe
 }
 
 export default function PlaygroundConsole() {
+  // Resolved once, here, and passed down: framer's own hook cannot be trusted
+  // by anything server-rendered, and one reading keeps every accent in step.
+  const still = useStillMotion();
   const [text, setText] = useState(DEFAULT_TEXT);
   // The landing's teaser CTA links here with ?text=… . Nothing read it, so the
   // "Type it. Hear it." button dropped the visitor into the default composer
@@ -1707,9 +1715,12 @@ export default function PlaygroundConsole() {
         )}
         {reviewErr && <ErrorBanner className="mb-3">{reviewErr}</ErrorBanner>}
 
+        {/* The empty log TEACHES rather than states: a flat rail and the take
+            that is not on it (signal.tsx::EmptyTakes). The sentence is
+            unchanged — it is the drawing's caption now. */}
         {takes.length === 0 && !busy && (
-          <div className="rounded-2xl border border-dashed border-white/10 px-5 py-10 text-center text-sm text-white/60">
-            No takes yet — compose above and hit Generate.
+          <div className="rounded-2xl border border-dashed border-white/10 text-white/60">
+            <EmptyTakes still={still} />
           </div>
         )}
 
@@ -1718,7 +1729,7 @@ export default function PlaygroundConsole() {
             <RenderStatus key="rendering" startedAt={startedAt} etaSec={etaSec}
               estAudioSec={estAudioSec} etaBasisLabel={etaBasisLabel} noEtaLabel={noEtaLabel}
               streamedSec={streamedSec} queued={queued} inFlight={inFlight}
-              metricsUnavailable={metricsUnavailable} healthStale={healthStale} />
+              metricsUnavailable={metricsUnavailable} healthStale={healthStale} still={still} />
           )}
 
           {takes.map((t) => {

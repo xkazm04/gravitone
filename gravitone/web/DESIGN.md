@@ -144,3 +144,48 @@ glance mid-scroll (band)?* Compose for that distance.
 4. If a design decision here blocks something genuinely better, change this
    FILE in the same commit that breaks the rule — an undocumented exception is
    how languages rot.
+
+## Restrained-tier application log
+
+What the restrained tier actually looks like, surface by surface, so the next
+session copies a precedent instead of inventing a second dialect. Each entry
+names what was applied — and the candidates that were deliberately LEFT ALONE,
+because in this tier a skip is a design decision too.
+
+### Playground (`app/playground/**`) — 2026-08-07
+
+All accents live in one module, `app/playground/_variants/signal.tsx`, composed
+from `previews/illus.tsx`. `still` is resolved ONCE in `PlaygroundConsole`
+(`useStillMotion`) and passed down; no component in the playground reads the
+preference for itself.
+
+**Applied**
+
+- **Empty take log** → `signal.tsx::EmptyTakes`. The flat hairline rail is the
+  log's silence; the dashed cyan wave over it is the take that was never
+  recorded (dashed = "route not taken", the vocabulary's own idiom). The
+  existing sentence is unchanged and became the `<Caption>` — the copy is the
+  caption now, not a second voice beside the drawing. h = 104.
+- **Render-in-flight row** → `signal.tsx::RenderRail`, replacing 48 `.eq-bar`
+  spans. Two reasons, and the second is the real one: the bars claimed to be
+  levels while being a fixed keyframe, and `prefers-reduced-motion` (globals.css
+  kills every CSS animation) froze them into a solid block of 48 full-height
+  bars — the exact failure the "gate the animation, never drop the element" rule
+  exists to prevent. A dash-draw of the wave being written has an honest still
+  frame by construction. This is the ONE loop in the playground: a loader idles
+  by definition, so it pauses offscreen (`usePauseOffscreen`) and stops dead
+  under `still`. Every measured number on that row (elapsed, streamed seconds,
+  queue depth, staleness) is untouched.
+
+**Skipped, with reasons**
+
+- **`ScoreEditor`'s "No direction yet" line and its director's answer.** Both
+  sit inside the direction panel, millimetres from controls the user works
+  continuously, and the second is a live-region answer that changes on every
+  press. A drawing there is a performing illustration next to a control — the
+  thing the restrained tier exists to forbid.
+- **Script mode with no lines.** Unreachable: `removeLine` is disabled at one
+  line, so the surface has no empty state to teach.
+- **Section headers and dividers.** Audited, not touched — `border-white/8` +
+  uppercase mono `text-[11px]` already IS the landing's hairline/mono idiom.
+  Aligning them would have been a diff with no perceptual change.

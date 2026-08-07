@@ -155,6 +155,17 @@ function statusLine(): HTMLElement {
 }
 
 beforeEach(() => {
+  // The console resolves the visitor's reduced-motion preference once
+  // (useStillMotion) and passes `still` down to its Signal accents. jsdom ships
+  // no matchMedia, and the hook subscribes to it rather than guarding — which is
+  // the point: a component that server-renders must not branch on a preference
+  // it cannot read. "Motion is fine" is the same answer the server gives.
+  vi.stubGlobal("matchMedia", (query: string) => ({
+    matches: false,
+    media: query,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+  }));
   vi.stubGlobal("URL", Object.assign(URL, {
     createObjectURL: vi.fn(() => "blob:take"),
     revokeObjectURL: vi.fn(),
