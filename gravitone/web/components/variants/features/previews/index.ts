@@ -39,23 +39,41 @@ export type PreviewKey =
   | "agents"
   | "arm";
 
+export type PreviewBody = ComponentType<{ still: boolean }>;
+
+/** PROTOTYPING SCAFFOLD (throwaway). Three directional lenses on the same
+ *  mechanism: `steps` is what shipped (list-rows + copy), `signal` tells it in
+ *  waves and paths, `stage` as a spatial scene. Only `steps` is required — a
+ *  feature whose new variants are not built yet falls back to it, so partial
+ *  coverage renders instead of blanking. Deleted at consolidation, along with
+ *  the tab strip in FeatureSpotlight. */
+export const VARIANTS = ["steps", "signal", "stage"] as const;
+export type PreviewVariant = (typeof VARIANTS)[number];
+
 export type PreviewDef = {
   icon: ComponentType<{ className?: string }>;
-  /** Animated body. `still` is the visitor's reduced-motion preference, passed
-   *  down rather than read here so every preview resolves it identically. */
-  Body: ComponentType<{ still: boolean }>;
+  /** Animated bodies by lens. `still` is the visitor's reduced-motion
+   *  preference, passed down rather than read here so every preview resolves it
+   *  identically. */
+  bodies: { steps: PreviewBody; signal?: PreviewBody; stage?: PreviewBody };
 };
 
 export const PREVIEWS: Record<PreviewKey, PreviewDef> = {
-  compat: { icon: AudioLines, Body: CompatPreview },
-  cast: { icon: Users, Body: CastPreview },
-  sovereign: { icon: ShieldOff, Body: SovereignPreview },
-  score: { icon: Highlighter, Body: ScorePreview },
-  stream: { icon: Activity, Body: StreamPreview },
-  performance: { icon: ScrollText, Body: PerformancePreview },
-  agents: { icon: Radio, Body: AgentsPreview },
-  arm: { icon: Cpu, Body: ArmPreview },
+  compat: { icon: AudioLines, bodies: { steps: CompatPreview } },
+  cast: { icon: Users, bodies: { steps: CastPreview } },
+  sovereign: { icon: ShieldOff, bodies: { steps: SovereignPreview } },
+  score: { icon: Highlighter, bodies: { steps: ScorePreview } },
+  stream: { icon: Activity, bodies: { steps: StreamPreview } },
+  performance: { icon: ScrollText, bodies: { steps: PerformancePreview } },
+  agents: { icon: Radio, bodies: { steps: AgentsPreview } },
+  arm: { icon: Cpu, bodies: { steps: ArmPreview } },
 };
+
+/** The body to render, with the steps fallback applied. */
+export function previewBody(key: PreviewKey, variant: PreviewVariant): PreviewBody {
+  const b = PREVIEWS[key].bodies;
+  return b[variant] ?? b.steps;
+}
 
 export const PREVIEW_KEYS = Object.keys(PREVIEWS) as PreviewKey[];
 
