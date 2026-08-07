@@ -254,3 +254,31 @@ that shape for the next surface.
 - **Per-speaker play buttons / stats on the casting board** — a working tool
   must not perform (restrained tier). The accent went on the state that changes,
   and nowhere else.
+
+### keys — 2026-08-07
+
+**Applied**
+
+- `app/keys/_variants/KeysEmpty.tsx` (new, in `KeysLedger`) — the full-tier
+  empty state for a ledger that loaded with no keys in it. A caller's request is
+  a path, the deployment is a boundary, and a key is what decides whether the
+  path crosses. The keyed lane is the one accent.
+  **The second lane is the PROBE's verdict, not the idea.** `enforced` turns the
+  unkeyed request back; `open` sends it straight through beside the keyed one —
+  which is exactly what the rose posture banner two elements above says in
+  words; `unmeasured`/`unreachable` stop the lane AT the boundary and label
+  nothing, because absence is not reassurance. Drawing a refusal on an open box
+  would have contradicted a measurement on its own page, and there is a test per
+  branch.
+
+**Deliberately skipped**
+
+- **"Key list unavailable — this table is empty because the request failed…"** —
+  the failed-read body stays prose. It is the sentence that stops an empty table
+  being read as "you have no keys", and a picture next to it would dilute the
+  one thing it exists to say.
+- **The ledger table, the create bar, the scope chips, the posture strip** — all
+  untouched. The proven/declared chip grammar, the struck-through revoked rows
+  and the rose/amber severity contract are already this app's honesty language;
+  restyling them would have been change for its own sake, and every one of them
+  is a truthful thing a user reads.

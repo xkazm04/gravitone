@@ -14,6 +14,7 @@ import { Fragment, useEffect, useState } from "react";
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { Button, Eyebrow } from "@/components/ui/Primitives";
 import AgentBlocks from "./AgentBlocks";
+import KeysEmpty from "./KeysEmpty";
 import SecretReveal from "./SecretReveal";
 import { provenScopes, readAttestation, restate, type Attestation } from "./attestation";
 import type { Posture } from "./probes";
@@ -259,7 +260,16 @@ export default function KeysLedger() {
             {/* "No keys yet" is a CLAIM about the account, and a load that
                 failed cannot make it — an empty table under a red banner used
                 to say the user has no keys when the truth is nobody knows. */}
-            {!loading && keys.length === 0 && !error && <tr><td colSpan={6} className="px-3 py-8 text-center text-sm text-white/60">No keys yet — create one above.</td></tr>}
+            {/* A ledger that loaded and is empty is a fact about the account,
+                so it teaches: the drawing says what a key DOES here — and it
+                draws the unkeyed lane from the probe's own verdict, never from
+                the idea, because on an `open` deployment "without one → refused"
+                would be the exact lie the posture strip above just disproved. */}
+            {!loading && keys.length === 0 && !error && (
+              <tr><td colSpan={6} className="px-3 py-10 text-center text-sm text-white/60">
+                <KeysEmpty posture={posture}>No keys yet — create one above.</KeysEmpty>
+              </td></tr>
+            )}
             {!loading && keys.length === 0 && error && <tr><td colSpan={6} className="px-3 py-8 text-center text-sm text-rose-200/80">Key list unavailable — this table is empty because the request failed, not because you have no keys.</td></tr>}
             {keys.map((k) => (
               <Fragment key={k.id}>

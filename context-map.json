@@ -144,7 +144,8 @@
             "gravitone/web/app/keys/_variants/SecretReveal.tsx",
             "gravitone/web/app/keys/_variants/data.ts",
             "gravitone/web/app/api/keys/route.ts",
-            "gravitone/web/app/api/keys/[id]/route.ts"
+            "gravitone/web/app/api/keys/[id]/route.ts",
+            "gravitone/web/app/keys/_variants/KeysEmpty.tsx"
           ],
           "target": null,
           "apiRoutes": [
