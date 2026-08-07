@@ -40,6 +40,7 @@ import { makeRise } from "@/components/ui/tokens";
 import { useStillMotion } from "@/lib/useStillMotion";
 import { accentVar } from "./features/previews/illus";
 import PricingSignal from "./PricingSignal";
+import PricingBills from "./PricingBills";
 import {
   AssumptionChips,
   BenchmarksLink,
@@ -280,11 +281,7 @@ function VariantLens({ lens, armed, still }: { lens: Lens; armed: boolean; still
   );
 }
 
-/* Placeholders until each variant lands in its own commit. */
-function PricingBills({ still }: { still: boolean }) {
-  void still;
-  return <div className="aspect-[1160/560] w-full rounded-2xl border border-white/5 bg-white/[0.015]" />;
-}
+/* Placeholder until the variant lands in its own commit. */
 function PricingClimb({ still }: { still: boolean }) {
   void still;
   return <div className="aspect-[1160/560] w-full rounded-2xl border border-white/5 bg-white/[0.015]" />;
