@@ -9,7 +9,7 @@ import { Fragment, useCallback, useState } from "react";
 import { useVoicePreview, relTime, pickAudio, deleteVoiceQuestion, signalOf,
          derivedDonorLabel, loadRoster, type Slot } from "@/app/voices/_data/characters";
 import { checkEmotion } from "@/lib/slugs";
-import EmotionArt from "@/components/ui/EmotionArt";
+import EmotionIcon from "@/components/ui/EmotionIcon";
 import SignalChip from "@/app/voices/_variants/SignalChip";
 import EmotionAudition from "./EmotionAudition";
 
@@ -248,7 +248,7 @@ export default function EmotionRack({
                   <td className="px-3 py-2">
                     <div className="flex items-center gap-2.5">
                       <span className="grid h-9 w-9 shrink-0 place-items-center overflow-hidden rounded-lg border border-white/8 bg-black/40">
-                        <EmotionArt emotion={s.emotion} size={34} dim={!filled} />
+                        <EmotionIcon emotion={s.emotion} size={20} dim={!filled} />
                       </span>
                       <span className="text-sm font-medium text-white">{s.label}</span>
                       {filled && (
@@ -504,7 +504,7 @@ export default function EmotionRack({
                         <div className="flex items-center gap-2.5 pl-4">
                           <span className="font-jetbrains text-[12px] text-white/40">↳</span>
                           <span className="grid h-7 w-7 shrink-0 place-items-center overflow-hidden rounded-lg border border-white/8 bg-black/40">
-                            <EmotionArt emotion={s.emotion} size={26} dim />
+                            <EmotionIcon emotion={s.emotion} size={18} dim />
                           </span>
                           <span className="text-sm text-white/70">{s.label}</span>
                           {v.consent ? (

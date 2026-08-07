@@ -3,8 +3,8 @@
 // Emotion Wheel — reborn as a Playground helper. A radial picker (the Wheel
 // direction from the voices round) that DIRECTS the composer's current selection
 // — it hands the id to `onPick`, which places a region in the one emotion model
-// (shared.applyEmotion); nothing here writes markup. Each spoke is the emotion's
-// generated art; emotions the
+// (shared.applyEmotion); nothing here writes markup. Each spoke carries the
+// emotion's icon (lib/emotions::EMOTION_ICONS); emotions the
 // active Character lacks are dimmed and marked as substituted (the backend
 // picks the nearest recorded emotion first, and only then baseline).
 
@@ -12,7 +12,7 @@ import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import Link from "next/link";
 import { AnimatePresence, motion } from "framer-motion";
-import EmotionArt from "@/components/ui/EmotionArt";
+import EmotionIcon from "@/components/ui/EmotionIcon";
 import { EMOTION_IDS, emotionMeta } from "@/lib/emotions";
 import { useClientReady } from "@/lib/useMounted";
 import { EASE } from "@/components/ui/tokens";
@@ -264,13 +264,13 @@ export default function EmotionPicker({
                           className="pointer-events-none absolute inset-0 rounded-full opacity-0 transition-opacity duration-300 group-hover:opacity-100"
                           style={{ boxShadow: `0 0 26px hsl(${e.hue} 90% 60% / .65), inset 0 0 14px hsl(${e.hue} 90% 60% / .35)` }}
                         />
-                        {/* image dimmed at rest, brightens + saturates toward the emotion colour on hover */}
-                        <EmotionArt
-                          emotion={e.id}
-                          size={disc - 8}
-                          dim={!has}
-                          className={has ? "transition duration-300 [filter:saturate(.7)_brightness(.9)] group-hover:[filter:saturate(1.5)_brightness(1.3)]" : ""}
-                        />
+                        {/* The identifying mark. A stroke icon at half the
+                            disc, in the hue LIFTED to a foreground luminance —
+                            the sigil that used to sit here was hue-filled art
+                            that read as a smudge at this size. No brightness
+                            filter: the point of the lift is that the rest state
+                            is already readable. */}
+                        <EmotionIcon emotion={e.id} size={compact ? 22 : 30} dim={!has} />
                         {/* A GLYPH, not a tint: availability that survives both
                             a colourblind reader and a monochrome screenshot,
                             and the only availability mark that fits a compact

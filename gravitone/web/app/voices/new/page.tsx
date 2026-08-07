@@ -7,7 +7,7 @@ import dynamic from "next/dynamic";
 import AppFrame from "@/components/ui/AppFrame";
 import { Button, Eyebrow } from "@/components/ui/Primitives";
 import { useTransport } from "@/components/ui/useTransport";
-import EmotionArt from "@/components/ui/EmotionArt";
+import EmotionIcon from "@/components/ui/EmotionIcon";
 import { apiJson, readDetail } from "@/lib/apiFetch";
 import { EMOTION_IDS, emotionMeta } from "@/lib/emotions";
 import { useAuth } from "@/lib/useAuth";
@@ -1168,7 +1168,7 @@ export default function NewCharacterPage() {
                       <tr className={`border-b border-white/5 transition hover:bg-white/[0.03] ${on ? "" : "opacity-55"}`}>
                         <td className="px-3 py-2">
                           <span className="grid h-9 w-9 place-items-center overflow-hidden rounded-lg border border-white/8 bg-black/40">
-                            <EmotionArt emotion={st.emotion} size={30} dim={!on} />
+                            <EmotionIcon emotion={st.emotion} size={20} dim={!on} />
                           </span>
                         </td>
                         <td className="px-3 py-2">

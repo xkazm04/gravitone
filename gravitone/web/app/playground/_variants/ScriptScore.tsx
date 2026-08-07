@@ -24,7 +24,7 @@
 //  * A refusal is a sentence (`regionProblem`), never a silently dropped edit.
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import EmotionArt from "@/components/ui/EmotionArt";
+import EmotionIcon from "@/components/ui/EmotionIcon";
 import Region from "@/components/ui/Region";
 import Track from "@/components/ui/Track";
 import { emotionMeta } from "@/lib/emotions";
@@ -299,7 +299,7 @@ export default function ScriptScore({
                         count={p.regions.length}
                         selected={sel === index}
                         disabled={disabled}
-                        badge={<EmotionArt emotion={r.value} size={12} dim={!available.includes(r.value)} />}
+                        badge={<EmotionIcon emotion={r.value} size={16} dim={!available.includes(r.value)} />}
                         onSelect={() => { setSelected({ lineId: p.line.id, index }); setNotice(null); }}
                         onResize={(edge, to) => resize(i, index, edge, to)}
                         offsetAt={offsetAt}

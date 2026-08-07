@@ -17,7 +17,7 @@
 // cache) — all of which lives in ./audition.
 
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
-import EmotionArt from "@/components/ui/EmotionArt";
+import EmotionIcon from "@/components/ui/EmotionIcon";
 import { emotionMeta } from "@/lib/emotions";
 import type { Slot } from "@/app/voices/_data/characters";
 import {
@@ -170,7 +170,7 @@ export default function EmotionAudition({ name, slots }: {
             >
               <div className="flex items-center gap-2">
                 <span className="grid h-8 w-8 shrink-0 place-items-center overflow-hidden rounded-lg border border-white/8 bg-black/40">
-                  <EmotionArt emotion={t.emotion} size={30} dim={!ready} />
+                  <EmotionIcon emotion={t.emotion} size={20} dim={!ready} />
                 </span>
                 <span className="min-w-0 flex-1 truncate text-sm font-medium text-white">
                   {t.label}

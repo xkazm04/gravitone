@@ -30,7 +30,7 @@
 
 import { useMemo, useState } from "react";
 import { characterHue } from "@/app/playground/_variants/shared";
-import EmotionArt from "@/components/ui/EmotionArt";
+import EmotionIcon from "@/components/ui/EmotionIcon";
 import Region from "@/components/ui/Region";
 import Track, { clock } from "@/components/ui/Track";
 import { emotionMeta } from "@/lib/emotions";
@@ -187,7 +187,7 @@ export default function TakeScore({
         index={s.index}
         count={count}
         selected={selected === s.index}
-        badge={<EmotionArt emotion={s.segment.used} size={14} />}
+        badge={<EmotionIcon emotion={s.segment.used} size={16} />}
         onSelect={() => {
           setSelected((cur) => (cur === s.index ? null : s.index));
           // Selecting a span is also the most direct thing a visitor can mean

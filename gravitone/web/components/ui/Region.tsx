@@ -162,7 +162,9 @@ export default function Region({
         }}
       >
         {badge && (
-          <span aria-hidden className="grid h-4 w-4 shrink-0 place-items-center overflow-hidden rounded-full bg-black/50">
+          // 18px, and NOT clipped to a circle: a 16px stroke icon is the badge
+          // callers hand in now, and a 16px round mask cut its corners off.
+          <span aria-hidden className="grid h-[18px] w-[18px] shrink-0 place-items-center rounded-md bg-black/45">
             {badge}
           </span>
         )}

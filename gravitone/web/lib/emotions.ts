@@ -24,7 +24,47 @@ export const EMOTIONS: EmotionMeta[] = [
 export const BASELINE = "baseline";
 export const EMOTION_IDS = EMOTIONS.map((e) => e.id);
 
-import { hueFor } from "./glyphs/generate";
+import {
+  Aperture, CircleHelp, CloudRain, Drama, Feather, Flame, Gem, Minus, Orbit,
+  Smile, Sparkles, Volume1, Waves, Zap, type LucideIcon,
+} from "lucide-react";
+import { hueFor, sigilPick } from "./glyphs/generate";
+
+/**
+ * The emotion ICON table — one mapping, shared by every surface.
+ *
+ * The generated sigils (lib/glyphs) are hue-derived abstract art: legible as a
+ * 96px emblem, unreadable as a 12px badge on a dark panel, where they resolved
+ * to a mid-luminance smudge. Icons are a different job from art, so they are a
+ * different asset: a prebuilt, hinted, stroke-based pack (lucide-react) drawn in
+ * `currentColor`, which lets the caller pick a foreground that actually passes
+ * on this theme (see components/ui/EmotionIcon).
+ *
+ * Every surface that IDENTIFIES an emotion in a row, chip, badge or spoke reads
+ * this table. The large decorative emblems — the take page's playhead glyph and
+ * the guided recorder's hero — still render the baked art / procedural sigil,
+ * because at 52-72px that art is legible and is the product's visual signature.
+ */
+export const EMOTION_ICONS: Record<string, LucideIcon> = {
+  baseline: Minus,     // the ABSENCE of direction, drawn as a flat line
+  calm: Waves,
+  happy: Smile,
+  excited: Zap,
+  sad: CloudRain,
+  angry: Flame,
+  whisper: Volume1,    // a quiet voice — NOT VolumeX, which means muted
+  confused: CircleHelp,
+};
+
+/** A Character's custom slots have no semantic icon to pick, so they get a
+ *  deterministic one from the same name hash the hue comes from: "sarcastic"
+ *  looks like itself on every machine, and two custom slots rarely collide. */
+const CUSTOM_ICONS: LucideIcon[] = [Sparkles, Drama, Feather, Gem, Orbit, Aperture];
+
+/** The icon for any emotion, base or custom. Always returns a component. */
+export function emotionIcon(id: string): LucideIcon {
+  return EMOTION_ICONS[id] ?? CUSTOM_ICONS[sigilPick(id, CUSTOM_ICONS.length)];
+}
 
 /** True for the eight emotions that ship hand-traced art. */
 export function isBaseEmotion(id: string): boolean {

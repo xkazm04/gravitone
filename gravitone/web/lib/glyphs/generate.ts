@@ -34,6 +34,13 @@ export function hueFor(emotion: string): number {
   return hash(emotion) % 360;
 }
 
+/** Pick one of `n` alternatives for `emotion`, from the same stable hash the hue
+ *  comes from. Used by `emotionIcon` to give a custom slot a consistent icon,
+ *  so a name's identity — hue AND glyph — is decided in one place. */
+export function sigilPick(emotion: string, n: number): number {
+  return n > 0 ? hash(emotion) % n : 0;
+}
+
 const C = 512; // canvas centre (viewBox is 1024, matching the traced glyphs)
 
 /** A closed petal/blade from the centre, rotated to `angle`. */

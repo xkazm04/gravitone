@@ -24,7 +24,7 @@
 //    which one and why (shared.transformRegions).
 
 import { useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
-import EmotionArt from "@/components/ui/EmotionArt";
+import EmotionIcon from "@/components/ui/EmotionIcon";
 import Region from "@/components/ui/Region";
 import Track from "@/components/ui/Track";
 import { emotionMeta } from "@/lib/emotions";
@@ -523,7 +523,7 @@ export default function ScoreEditor({
                 selected={selected === i}
                 previewing={preview?.index === i}
                 disabled={disabled}
-                badge={<EmotionArt emotion={r.value} size={14} dim={!available.includes(r.value)} />}
+                badge={<EmotionIcon emotion={r.value} size={16} dim={!available.includes(r.value)} />}
                 onSelect={() => setSelected(i)}
                 onPreview={() => void playRegion(i)}
                 onResize={(edge, to) => resize(i, edge, to)}

@@ -27,7 +27,7 @@
 
 import { useCallback, useRef, useState } from "react";
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
-import EmotionArt from "@/components/ui/EmotionArt";
+import EmotionIcon from "@/components/ui/EmotionIcon";
 import { emotionMeta } from "@/lib/emotions";
 import { useMounted } from "@/lib/useMounted";
 import type { OutputFormat } from "@/lib/audioFormats";
@@ -239,7 +239,7 @@ export default function EmotionAB({
                   {side}
                 </span>
                 <span className="grid h-8 w-8 shrink-0 place-items-center overflow-hidden rounded-lg border border-white/8 bg-black/40">
-                  <EmotionArt emotion={s.emotion} size={30} dim={s.state !== "done"} />
+                  <EmotionIcon emotion={s.emotion} size={20} dim={s.state !== "done"} />
                 </span>
                 <select
                   value={s.emotion}

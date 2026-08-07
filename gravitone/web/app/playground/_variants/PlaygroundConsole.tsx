@@ -20,7 +20,7 @@ import { AnimatePresence, motion } from "framer-motion";
 import { Button, Eyebrow } from "@/components/ui/Primitives";
 import { EASE } from "@/components/ui/tokens";
 import { EMOTION_IDS, emotionMeta } from "@/lib/emotions";
-import EmotionArt from "@/components/ui/EmotionArt";
+import EmotionIcon from "@/components/ui/EmotionIcon";
 import {
   appendEdit, applyEmotion, composerLimit, composerWarnings, DEFAULT_EXPRESSION, DEFAULT_TEXT,
   editPlainText, isTimingBasis, MAX_SCRIPT_LINES, MAX_TEXT_CHARS, parseTags, readEdits,
@@ -1581,8 +1581,8 @@ export default function PlaygroundConsole() {
                     className={`font-jetbrains inline-flex items-center gap-1.5 rounded-full py-1 pl-1 pr-2.5 text-[11px] transition ${
                       has ? `border bg-white/5 text-white/85 ${custom ? "border-violet-400/30 hover:border-violet-400/60" : "border-white/15 hover:border-cyan-400/40"}`
                           : `border border-dashed text-white/60 ${custom ? "border-violet-400/20" : "border-white/12"}`}`}>
-                    <span className="grid h-5 w-5 place-items-center overflow-hidden rounded-full bg-black/50">
-                      <EmotionArt emotion={id} size={20} dim={!has} />
+                    <span className="grid h-5 w-5 place-items-center rounded-full bg-black/40">
+                      <EmotionIcon emotion={id} size={16} dim={!has} />
                     </span>
                     {clears ? "Clear region" : e.label}
                   </button>
