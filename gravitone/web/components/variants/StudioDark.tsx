@@ -14,6 +14,7 @@ import { MODULES } from "@/components/ui/AppFrame";
 import { makeRise } from "@/components/ui/tokens";
 import SwitchKit from "./SwitchKit";
 import HeroMicDemo from "./HeroMicDemo";
+import SectionRail from "./SectionRail";
 
 // The landing rises further and slower than a dense module panel — but the
 // curve comes from the design system, not a local copy of it (this file used to
@@ -238,6 +239,11 @@ export default function StudioDark() {
           <span className="font-jetbrains text-[11px] uppercase tracking-widest">runs on arm · self-hostable · mit</span>
         </footer>
       </div>
+
+      {/* The section rail rides the gutter beside the column above — outside it,
+          because it is `position: fixed` and belongs to the page, not the flow.
+          Shown to signed-out visitors too: these are marketing anchors. */}
+      <SectionRail />
     </div>
   );
 }
