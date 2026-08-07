@@ -55,6 +55,17 @@ offenders regress. Anti-shape: `subprocess.run`, multi-MB `write_bytes`,
 `hashlib` over a whole upload, or a blocking lock acquired directly in an
 `async def` route.
 
+### The Signal design language (web)
+
+`gravitone/web/DESIGN.md` is the house design language — read it before
+touching any `gravitone/web` UI. Short form: the picture carries the story
+(animated illustration from `components/variants/features/previews/illus.tsx`,
+one accent, one caption, honesty drawn to scale from source data); functional
+tools take the restrained tier (Signal accents in states/transitions, never a
+performing illustration); entrance-only motion, still-aware via
+`lib/useStillMotion`. Breaking a rule requires editing DESIGN.md in the same
+commit.
+
 ### Honest failure surfaces (web)
 
 Every user action and data read must represent its failure — no silent catch,

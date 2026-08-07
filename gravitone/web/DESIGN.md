@@ -1,0 +1,133 @@
+# Gravitone web — the Signal design language
+
+> Codified 2026-08-07, after the landing's feature-spotlight prototyping round
+> ("steps · signal · stage") ended with the owner's verdict: **Signal wins,
+> everywhere.** This document is what future sessions build within. It is not a
+> style guide for one page — it is the house language.
+
+## The one-sentence law
+
+**The picture carries the story; text is secondary.** If a surface explains a
+mechanism, the explanation is an animated illustration — waves, paths, pulses
+composing the concept — and prose is demoted to one caption. If you find
+yourself writing step-by-step rows of copy with icons, you are building the
+thing this language replaced.
+
+## Why "Signal"
+
+Gravitone's product IS audio: waveforms, streams, turns, cuts. The house
+illustration language draws every mechanism in that native medium — a request
+is a path, a payload is a wave, an event is a pulse travelling, a boundary is a
+line a signal turns back from. The metaphor is never decoration; it is the
+product's own physics made visible.
+
+## The vocabulary (use it, never fork it)
+
+`components/variants/features/previews/illus.tsx` is the single shared
+vocabulary. Compose from it; extend it (with a test) only when a primitive is
+genuinely missing — a second parallel vocabulary is the failure mode.
+
+- `Illus` — the canvas. Fixed viewBox, fluid on screen, `aria-hidden`,
+  height budget ≤ 380 user units.
+- `Draw` — a path drawing itself (`pathLength` dash-draw). The default verb.
+- `TravelPulse` — a dot riding a path's exact geometry. Events travel.
+- `WaveLine` — parametric waveform, morphable (`morphTo` must share `points`).
+  Waves are made with `wavePath()`, damped to the midline at both ends so a
+  segment boundary reads as silence.
+- `Label` (≤ 3 words) · `Node` — the only in-picture annotations.
+- `Caption` — **the one line of prose.** Two captions in one illustration means
+  the drawing is not carrying the story: fix the drawing.
+
+## Color discipline
+
+- Hairline near-monochrome (`HAIR`, white at low alpha) plus **ONE accent per
+  illustration.** The accent is the concept: the new route, the interruption,
+  the boundary acting. Everything that is not the point stays hairline.
+- Breaking the one-accent rule requires the CastSignal standard: color IS the
+  concept (speaker identity), and everything else goes hairline to compensate.
+  Say so in a comment.
+- Color literals live in `components/ui/tokens.ts` and nowhere else
+  (`accentVar()` / `--gt-*` in compositions). `tokens.test.ts` pins them — a
+  token change is a deliberate, tested act.
+
+## Honesty is drawn, not footnoted
+
+The claims discipline (`lib/content.ts:61-94`, `lib/switchkit.ts`) extends into
+the pictures:
+
+- A limit is part of the illustration: mp3-can't-stream is a lane arriving as
+  one block with a to-scale caliper on the gap; the missing emotion is the
+  region that visibly does NOT morph; replica scaling shows the measured
+  shortfall, not the linear fantasy.
+- **To scale, from source.** When a picture encodes a number, compute the
+  geometry from the source of truth (`lib/benchmarks.ts`, `lib/switchkit.ts`)
+  so a re-measured run moves the drawing. Never retype figures into SVG.
+- A changed thing is **struck in place**, never deleted — deleting says "that
+  never existed"; what happened is one thing changed.
+
+## Motion rules
+
+- **Entrance-only, never infinite.** Stories run once per open/scroll-into-view
+  (keyed remount replays them); ambient loops must pause offscreen
+  (`usePauseOffscreen`). This is the `lighter-shell` law and it survives Signal.
+- Pacing: a story reaches its caption in **≤ ~3 seconds**. Springs use the house
+  `EASE`/bounce vocabulary (`tokens.ts`, `pop`/`stamp` from previews/shared).
+- **Reduced motion: gate the animation, never drop the element.** Read the
+  preference once via `lib/useStillMotion` (SSR-safe — framer's hook lies to
+  the server) and pass `still` down. A stilled illustration is the END of its
+  story, complete. Tests sweep stilled renders for thinness; keep them.
+
+## Layout & chrome (unchanged by Signal, restated so it travels)
+
+- Three fonts only: Instrument Serif (display), Hanken Grotesk (body),
+  JetBrains Mono (labels/meta). Never a fourth.
+- `glass-panel` + hairline borders on `--gt-ink`; the aurora is the page's
+  atmosphere, not a component's.
+- Content column `max-w-6xl px-6`; section rhythm `py-14`/`mt-8`; panels `p-5`.
+  The voices/playground spacing pass (ec0563e) is the reference.
+- Modals: click to open, Escape/scrim/button to close, one gesture each way.
+  Content is designed to FIT (`max-h-[85vh]` at 1280×800); `.scroll-y`/`.scroll-x`
+  are the emergency net, not the plan. Affordance is a quiet symbol
+  (expand glyph), never a "click here" caption.
+- Icons: lucide-react via `EmotionIcon`-style wrappers — shape from the pack,
+  hue LIFTED to readable luminance (≥ 3:1 on ink). Generated sigil art is the
+  ≥ 48px emblem, never the icon.
+
+## Where Signal applies — and where it doesn't
+
+**Yes** (illustration-first): landing sections, feature/mechanism explanations,
+empty states that teach ("no takes yet" can draw what a take is), onboarding
+moments, section-scale loaders, the pricing story, docs-adjacent explainers.
+
+**Restrained** (Signal accents only — a drawn hairline, a pulse on completion,
+a dash-draw on first render): dense working tools — the playground console,
+casting board, keys table, ops. A tool the user operates eight hours a day must
+not perform; it may *speak Signal* in its transitions and states without
+becoming an illustration.
+
+**No**: never let an illustration replace a truthful number a user needs to
+read (tables/meters stay tables/meters, with the `<details>` accessible
+fallback pattern); never animate during text entry or audio playback where it
+competes with the content itself.
+
+## Anti-patterns (each earned its place here)
+
+- Step-by-step text rows with icons as "diagrams" — the thing Signal replaced.
+- Sticker-tilt / static rotation on dark glass — aliases hairlines over
+  backdrop-filter; reads as a rendering fault (rejected with reasons, 622591e).
+- Two captions; labels over 3 words; prose doing the picture's job.
+- Color as decoration; more than one accent without the CastSignal defense.
+- Infinite ambient motion; animation that re-runs on every re-render;
+  `useReducedMotion` from framer in anything the server renders.
+- Retyped figures in SVG; a drawn comparison without its stated assumption.
+
+## For future sessions
+
+1. Read this file before touching any `gravitone/web` UI.
+2. New mechanism to explain? Compose it from `illus.tsx` in the Signal rules
+   above. The 8 landing spotlights (`*Signal.tsx`) are the reference corpus.
+3. New functional surface? Take the restrained tier: house chrome + Signal
+   accents in states and transitions.
+4. If a design decision here blocks something genuinely better, change this
+   FILE in the same commit that breaks the rule — an undocumented exception is
+   how languages rot.
