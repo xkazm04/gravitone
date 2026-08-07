@@ -18,12 +18,16 @@ import {
   GROWTH_PCT,
   START_CHARS,
   TIMELINE_MONTHS,
+  assumptionChips,
   boxFor,
   boxUpgradeMonth,
   crossoverMonth,
+  cumulativeCrossoverMonth,
+  cumulativeSeries,
   fmtChars,
   growthSeries,
   growthTotals,
+  tierSteps,
   usageAt,
 } from "./pricingTimeline";
 
@@ -156,5 +160,86 @@ describe("pricingTimeline", () => {
     expect(fmtChars(500_000)).toBe("500k");
     expect(fmtChars(2_000_000)).toBe("2M");
     expect(fmtChars(1_500_000)).toBe("1.5M");
+  });
+});
+
+/*
+ * The accumulation helpers, added for the "two bills" direction. The one thing
+ * here that is easy to get wrong — and flattering when you do — is which month
+ * counts as the crossing, so it gets its own test.
+ */
+describe("pricingTimeline · accumulation", () => {
+  const CUM = cumulativeSeries(SERIES);
+
+  it("accumulates both bills month by month, keeping each month's increment", () => {
+    expect(CUM).toHaveLength(SERIES.length);
+    expect(CUM[0].el).toBeCloseTo(SERIES[0].el, 8);
+    expect(CUM[0].box).toBeCloseTo(SERIES[0].boxUsd, 8);
+    const last = CUM[CUM.length - 1];
+    expect(last.el).toBeCloseTo(growthTotals(SERIES).el, 8);
+    expect(last.box).toBeCloseTo(growthTotals(SERIES).box, 8);
+    // The increment is the month's own charge — theirs grows, ours never does.
+    expect(CUM.map((p) => p.elMonth)).toEqual(SERIES.map((p) => p.el));
+    expect(new Set(CUM.map((p) => p.boxMonth)).size).toBe(1);
+    // Monotone: neither bill ever refunds a month.
+    for (let i = 1; i < CUM.length; i++) {
+      expect(CUM[i].el).toBeGreaterThanOrEqual(CUM[i - 1].el);
+      expect(CUM[i].box).toBeGreaterThan(CUM[i - 1].box);
+    }
+  });
+
+  it("crosses the TOTALS later than the monthly bills cross", () => {
+    const monthly = crossoverMonth(SERIES)!;
+    const total = cumulativeCrossoverMonth(CUM)!;
+    // The machine spent the early months in front, so the debt outlives the
+    // month the monthly bills swap. Borrowing the earlier date for a running
+    // total would be the flattering lie this assertion exists to block.
+    expect(total).toBeGreaterThan(monthly);
+    const at = CUM[total - 1];
+    const before = CUM[total - 2];
+    expect(at.el).toBeGreaterThan(at.box);
+    expect(before.el).toBeLessThanOrEqual(before.box);
+  });
+});
+
+describe("pricingTimeline · the tier ladder", () => {
+  const STEPS = tierSteps(SERIES);
+
+  it("collapses the months into one step per published tier, in order", () => {
+    // Every month lands in exactly one step, and the steps tile the span.
+    expect(STEPS[0].fromMonth).toBe(1);
+    expect(STEPS[STEPS.length - 1].toMonth).toBe(TIMELINE_MONTHS);
+    for (let i = 1; i < STEPS.length; i++) {
+      expect(STEPS[i].fromMonth).toBe(STEPS[i - 1].toMonth + 1);
+      // A rising staircase: usage only grows, so the tier only climbs.
+      expect(STEPS[i].tier.usdPerMonth).toBeGreaterThan(STEPS[i - 1].tier.usdPerMonth);
+    }
+    // The names and prices are switchkit's, never retyped into the drawing.
+    for (const s of STEPS) expect(ELEVENLABS_TIERS).toContain(s.tier);
+    // The story starts inside the free allowance — the unflattering start.
+    expect(STEPS[0].tier.usdPerMonth).toBe(0);
+  });
+});
+
+describe("pricingTimeline · the assumption as chips", () => {
+  const CHIPS = assumptionChips(SERIES);
+
+  it("carries every fact the paragraph carried, derived", () => {
+    const flat = CHIPS.map((c) => `${c.k} ${c.v}`).join(" | ");
+    expect(flat).toContain(fmtChars(START_CHARS));
+    expect(flat).toContain(fmtChars(END_CHARS));
+    expect(flat).toContain(`+${GROWTH_PCT}%`);
+    expect(flat).toContain(`${TIMELINE_MONTHS} months`);
+    expect(flat).toContain(`${HOURS_PER_MONTH} h/mo`);
+    expect(flat).toContain(BOX.name);
+    // The capacity claim, and it must be the honest branch for this table.
+    expect(boxUpgradeMonth(SERIES)).toBeNull();
+    expect(flat).toContain("one box carries the span");
+  });
+
+  it("keeps every chip short enough to be a chip and not a sentence", () => {
+    // The whole point of the format: if a value grows into prose, the paragraph
+    // has quietly come back.
+    for (const c of CHIPS) expect(c.v.length).toBeLessThanOrEqual(72);
   });
 });

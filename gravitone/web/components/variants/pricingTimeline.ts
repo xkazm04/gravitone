@@ -26,7 +26,9 @@
 
 import {
   ARM_BOXES,
+  CHARS_PER_AUDIO_MINUTE,
   ELEVENLABS_TIERS,
+  HOURS_PER_MONTH,
   breakEvenChars,
   estimateMonthly,
   type ArmBox,
@@ -187,6 +189,107 @@ export const BREAK_EVEN_CHARS: number | null = breakEvenChars(BOX);
  */
 export const EL_CHEAPER_THROUGH_CHARS: number | null =
   ELEVENLABS_TIERS.filter((t) => t.usdPerMonth <= BOX_USD_MONTH).at(-1)?.charsPerMonth ?? null;
+
+/* ── accumulation: the same series read as two running bills ───────────────── */
+
+/** A month's RUNNING TOTALS, plus that month's own charge — what an odometer
+ *  reads at month N, and what the tick that just landed added to it. */
+export type CumulativePoint = {
+  month: number;
+  /** Everything ElevenLabs has billed through this month, inclusive. */
+  el: number;
+  /** Everything the machine has billed through this month, inclusive. */
+  box: number;
+  /** This month's charge on each side — the increment the odometer just took.
+   *  Theirs grows as the volume climbs tiers; ours is the same every month, and
+   *  that difference IS the story the accumulation tells. */
+  elMonth: number;
+  boxMonth: number;
+};
+
+export function cumulativeSeries(series: GrowthPoint[] = growthSeries()): CumulativePoint[] {
+  let el = 0;
+  let box = 0;
+  return series.map((p) => {
+    el += p.el;
+    box += p.boxUsd;
+    return { month: p.month, el, box, elMonth: p.el, boxMonth: p.boxUsd };
+  });
+}
+
+/**
+ * The month the SUBSCRIPTION'S RUNNING TOTAL passes the machine's.
+ *
+ * This is NOT `crossoverMonth`, and conflating the two would be a lie of the
+ * flattering kind. `crossoverMonth` is the month the two MONTHLY bills cross —
+ * from then on every further month is cheaper on the machine. But the machine
+ * spent the early months in front, so it is still ahead on the TOTAL for a while
+ * after that: this is the month the debt is actually repaid. A picture whose
+ * hero is a running total has to mark the running total's crossing, not borrow
+ * the monthly one's earlier date.
+ */
+export function cumulativeCrossoverMonth(
+  cum: CumulativePoint[] = cumulativeSeries(),
+): number | null {
+  return cum.find((p) => p.el > p.box)?.month ?? null;
+}
+
+/* ── the tier ladder, as spans rather than per-month repeats ────────────────── */
+
+/** One published tier and the run of months this timeline spends inside it —
+ *  the step of the staircase, with its width. */
+export type TierStep = {
+  tier: ElTier;
+  fromMonth: number;
+  toMonth: number;
+};
+
+/** The consecutive runs of months sharing one tier. Drawn as terrain, this is
+ *  the ladder; the tier names and prices on it are the citation, so they come
+ *  from switchkit's table and are never retyped into a drawing. */
+export function tierSteps(series: GrowthPoint[] = growthSeries()): TierStep[] {
+  const steps: TierStep[] = [];
+  for (const p of series) {
+    const last = steps[steps.length - 1];
+    if (last && last.tier === p.tier) last.toMonth = p.month;
+    else steps.push({ tier: p.tier, fromMonth: p.month, toMonth: p.month });
+  }
+  return steps;
+}
+
+/* ── the assumption, as data rather than as a sentence ─────────────────────── */
+
+/** A key→value micro-row. The growth assumption used to be a paragraph; it is
+ *  the same facts, formatted, because a landing reader scans chips and skips
+ *  prose — and a fact nobody reads is not a disclosure. */
+export type AssumptionChip = { k: string; v: string };
+
+/**
+ * Every assumption the comparison rests on, derived — nothing here is typed by
+ * hand. If the tier table, the growth rate, the box preset or the span moves,
+ * these rows move with it.
+ */
+export function assumptionChips(series: GrowthPoint[] = growthSeries()): AssumptionChip[] {
+  const last = series[series.length - 1];
+  const peak = estimateMonthly(last.chars, last.box);
+  const upgrade = boxUpgradeMonth(series);
+  const n = (v: number) => Math.round(v).toLocaleString("en-US");
+  return [
+    { k: "usage", v: `${fmtChars(START_CHARS)} → ${fmtChars(END_CHARS)} chars/mo` },
+    { k: "growth", v: `+${GROWTH_PCT}% every month` },
+    { k: "span", v: `${series.length} months` },
+    { k: "their price", v: "whichever published tier covers the month" },
+    { k: "our price", v: `${BOX.name}, billed all ${HOURS_PER_MONTH} h/mo` },
+    { k: "audio", v: `${n(CHARS_PER_AUDIO_MINUTE)} chars ≈ 1 audio-min` },
+    {
+      k: "headroom",
+      v:
+        upgrade === null
+          ? `peak ${n(peak.audioMinutes)} of ${n(peak.boxCapacityMinutes)} audio-min/mo — one box carries the span`
+          : `the box steps up to the larger preset in month ${upgrade}`,
+    },
+  ];
+}
 
 /** Compact volume label — "30k", "500k", "2M". */
 export function fmtChars(chars: number): string {

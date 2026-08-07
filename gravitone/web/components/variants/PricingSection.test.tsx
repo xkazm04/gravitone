@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { renderToStaticMarkup } from "react-dom/server";
 import PricingSection from "./PricingSection";
 import { ELEVENLABS_PRICING, ELEVENLABS_PRICING_NOTE } from "@/lib/switchkit";
@@ -7,6 +7,7 @@ import {
   BOX,
   EL_CHEAPER_THROUGH_CHARS,
   END_CHARS,
+  GROWTH_PCT,
   START_CHARS,
   TIMELINE_MONTHS,
   crossoverMonth,
@@ -136,5 +137,43 @@ describe("PricingSection", () => {
     expect(html).toContain("costs MORE than the ElevenLabs tier");
     // …and the story is readable without a single pixel of drawing.
     expect(html).toContain("<table");
+  });
+});
+
+/*
+ * PROTOTYPING SCAFFOLD (deleted at consolidation together with the lens strip).
+ * The one property worth asserting about a throwaway switcher is that it is
+ * throwaway: `current` is what a reader gets, so every test above still
+ * describes the shipping page.
+ */
+describe("PricingSection · the prototype lens strip", () => {
+  it("defaults to the shipping lens, so nothing changes on load", () => {
+    render(<PricingSection />);
+    const current = screen.getByRole("button", { name: "current" });
+    expect(current).toHaveAttribute("aria-pressed", "true");
+    for (const other of ["A", "B"]) {
+      expect(screen.getByRole("button", { name: other })).toHaveAttribute("aria-pressed", "false");
+    }
+  });
+
+  it("swaps the picture and drops the paragraphs, keeping the contracts", async () => {
+    render(<PricingSection />);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "A" }));
+    });
+
+    // The two paragraph blocks are the thing these variants exist to kill.
+    expect(screen.queryByText(/costs MORE than the ElevenLabs tier/)).toBeNull();
+    expect(screen.queryByText(/The assumption, plainly/)).toBeNull();
+
+    // Their facts survive as chips…
+    const chips = screen.getByLabelText("the assumptions this comparison rests on");
+    expect(chips).toHaveTextContent(`+${GROWTH_PCT}% every month`);
+    expect(chips).toHaveTextContent(`${TIMELINE_MONTHS} months`);
+    expect(chips).toHaveTextContent("730 h/mo");
+
+    // …and the two contracts are outside the lens, so no variant can lose them.
+    expect(screen.getByRole("link", { name: ELEVENLABS_PRICING.sourceLabel })).toBeTruthy();
+    expect(screen.getByRole("table").querySelectorAll("tbody tr").length).toBe(TIMELINE_MONTHS);
   });
 });
