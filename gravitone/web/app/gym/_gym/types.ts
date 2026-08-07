@@ -133,6 +133,28 @@ export type AgentsAnswer = {
   enabled: boolean;
 };
 
+/** One turn of a RECORDED conversation's transcript (recording.py::Turn).
+ *  This is the original call's own evidence — replay artifacts (GymTurn)
+ *  reproduce these numbers; the forensic room reads them directly. */
+export type RecordedTurn = {
+  role: "candidate" | "agent" | string;
+  text: string;
+  /** When this turn started, seconds from the top of the call — the seek
+   *  target for the two aligned audio tracks. */
+  at_s: number;
+  audio_s?: number | null;
+  transcribe_s?: number | null;
+  answer_s?: number | null;
+  interrupted?: boolean;
+};
+
+/** GET /v1/convai/conversations/{id} — the transcript as recorded. */
+export type TranscriptAnswer = {
+  conversation_id: string;
+  sample_rate?: number;
+  turns: RecordedTurn[];
+};
+
 export type ReplayOptions = {
   /** 0 = as fast as the loop can push; 1 = real time (what a latency claim needs). */
   pace: number;

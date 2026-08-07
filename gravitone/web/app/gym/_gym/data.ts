@@ -10,12 +10,17 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { ApiError, apiJson } from "@/lib/apiFetch";
 import { useMounted } from "@/lib/useMounted";
 
+import { loadRoster, type Character } from "@/app/voices/_data/characters";
+
+import { diagnose, type Finding } from "./diagnose";
 import type {
   AgentsAnswer,
   GymComparison,
   GymRun,
   RecordingsAnswer,
+  RecordingSummary,
   ReplayOptions,
+  TranscriptAnswer,
 } from "./types";
 
 /** Agents + recordings, loaded together. `error` is the read failure, shown —
@@ -55,6 +60,124 @@ export function useGymSetup() {
   }, [refresh]);
 
   return { agents, recordings, loading, error, refresh };
+}
+
+/** One session row of the forensic room: the recording, who spoke, what the
+ *  transcript shows, and what the rules found in it. */
+export type SessionRow = {
+  recording: RecordingSummary;
+  /** The Character whose voice the agent spoke with, when the roster knows
+   *  it. Absent for a voice no Character owns (e.g. a bare built-in). */
+  character: { character_id: string; name: string } | null;
+  voiceId: string | null;
+  /** null while status is in_progress, or when the transcript read failed —
+   *  transcriptError says which. */
+  transcript: TranscriptAnswer | null;
+  transcriptError: string | null;
+  findings: Finding[];
+};
+
+/** Everything phase 1–3 render: sessions joined to Characters, transcripts
+ *  loaded, findings derived. One fetch cycle, honest partial failure — a
+ *  session whose transcript could not be read still appears, and says so. */
+export function useForensics() {
+  const mounted = useMounted();
+  const [agents, setAgents] = useState<AgentsAnswer | null>(null);
+  const [recordings, setRecordings] = useState<RecordingsAnswer | null>(null);
+  const [roster, setRoster] = useState<Character[]>([]);
+  const [transcripts, setTranscripts] = useState<
+    Map<string, { transcript: TranscriptAnswer | null; error: string | null }>
+  >(new Map());
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const [a, r, cs] = await Promise.all([
+        apiJson<AgentsAnswer>("/api/gym/agents", undefined, "could not load the agent roster"),
+        apiJson<RecordingsAnswer>(
+          "/api/gym/recordings",
+          undefined,
+          "could not load recorded sessions",
+        ),
+        // A roster that fails must not take the whole room down — sessions
+        // are still listable and listenable without Character names.
+        loadRoster().catch(() => [] as Character[]),
+      ]);
+      if (!mounted.current) return;
+      setAgents(a);
+      setRecordings(r);
+      setRoster(cs);
+
+      const complete = r.conversations.filter((c) => c.status === "complete");
+      type TranscriptEntry = readonly [
+        string,
+        { transcript: TranscriptAnswer | null; error: string | null },
+      ];
+      const loaded = await Promise.all(
+        complete.map(async (c): Promise<TranscriptEntry> => {
+          try {
+            const t = await apiJson<TranscriptAnswer>(
+              `/api/gym/recordings/${encodeURIComponent(c.conversation_id)}`,
+              undefined,
+              "transcript unreadable",
+            );
+            return [c.conversation_id, { transcript: t, error: null }] as const;
+          } catch (e) {
+            return [
+              c.conversation_id,
+              {
+                transcript: null,
+                error: e instanceof Error ? e.message : "transcript unreadable",
+              },
+            ] as const;
+          }
+        }),
+      );
+      if (!mounted.current) return;
+      setTranscripts(new Map(loaded));
+    } catch (e) {
+      if (!mounted.current) return;
+      setError(e instanceof Error ? e.message : "could not reach the forensic room");
+    } finally {
+      if (mounted.current) setLoading(false);
+    }
+  }, [mounted]);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const sessions: SessionRow[] = useMemo(() => {
+    if (!recordings) return [];
+    const voiceOf = new Map<string, string>();
+    for (const agent of agents?.agents ?? []) {
+      if (agent.voice_id) voiceOf.set(agent.agent_id, agent.voice_id);
+    }
+    const characterOf = new Map<string, { character_id: string; name: string }>();
+    for (const c of roster) {
+      for (const v of c.voices) {
+        characterOf.set(v.voice_id, { character_id: c.character_id, name: c.name });
+      }
+    }
+    return recordings.conversations.map((rec) => {
+      const voiceId = rec.agent_id ? (voiceOf.get(rec.agent_id) ?? null) : null;
+      const entry = transcripts.get(rec.conversation_id);
+      const transcript = entry?.transcript ?? null;
+      return {
+        recording: rec,
+        voiceId,
+        character: voiceId ? (characterOf.get(voiceId) ?? null) : null,
+        transcript,
+        transcriptError: entry?.error ?? null,
+        findings: transcript ? diagnose(rec.conversation_id, transcript.turns) : [],
+      };
+    });
+  }, [recordings, agents, roster, transcripts]);
+
+  return { sessions, agents, recordings, roster, loading, error, refresh };
 }
 
 export type ReplayState =
