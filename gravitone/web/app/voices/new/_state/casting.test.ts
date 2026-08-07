@@ -291,19 +291,19 @@ describe("what was measured, and by whom", () => {
 
   it("tells a paid second opinion apart from the cheap first guess", () => {
     const paid = labelSource(seg({ i: 1, model: "gemini-3.1-pro-preview", escalation: "escalated" }))!;
-    const quick = labelSource(seg({ i: 1, model: "gemini-3.5-flash" }))!;
+    const quick = labelSource(seg({ i: 1, model: "gemini-3.6-flash" }))!;
     expect(paid.tone).toBe("paid");
     expect(paid.text).toMatch(/second opinion/);
     expect(quick.tone).toBe("quick");
-    expect(quick.title).toMatch(/gemini-3.5-flash/);
+    expect(quick.title).toMatch(/gemini-3.6-flash/);
   });
 
   it("says an unsure label was NOT re-checked, and why", () => {
     // Both halves the service records separately: the budget ran out, and the
     // escalation was attempted and failed. Either way the flash guess stands,
     // and either way that must not read like a confident answer.
-    const skipped = labelSource(seg({ i: 1, model: "gemini-3.5-flash", escalation: "skipped" }))!;
-    const failed = labelSource(seg({ i: 1, model: "gemini-3.5-flash", escalation: "failed" }))!;
+    const skipped = labelSource(seg({ i: 1, model: "gemini-3.6-flash", escalation: "skipped" }))!;
+    const failed = labelSource(seg({ i: 1, model: "gemini-3.6-flash", escalation: "failed" }))!;
     expect(skipped.tone).toBe("unsure");
     expect(skipped.title).toMatch(/budget/);
     expect(failed.tone).toBe("unsure");

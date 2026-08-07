@@ -6,7 +6,7 @@ CLOUD ("quality" — richest results, audio leaves the machine):
   1. INGEST   ffmpeg extracts audio.
   2. MAP      ElevenLabs Scribe → diarized words + timestamps → pick target speaker.
   3. ISOLATE  ElevenLabs Voice Isolator → clean studio track (timing preserved).
-  4. LABEL    Gemini 3.5-flash classifies segments into our emotion scale, a
+  4. LABEL    Gemini 3.6-flash classifies segments into our emotion scale, a
               BATCH of clips per request; low-confidence clips escalate to
               gemini-3.1-pro-preview within a per-job budget.
 
@@ -79,7 +79,7 @@ from service.voices import (
 
 ELEVEN_KEY = os.environ.get("ELEVEN_LABS_API_KEY", "")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
-FLASH_MODEL = os.environ.get("INGEST_FLASH_MODEL", "gemini-3.5-flash")
+FLASH_MODEL = os.environ.get("INGEST_FLASH_MODEL", "gemini-3.6-flash")
 PRO_MODEL = os.environ.get("INGEST_PRO_MODEL", "gemini-3.1-pro-preview")
 EMOTIONS = list(EMOTION_SCALE)
 
@@ -566,7 +566,14 @@ def _gemini(model: str, wavs: list[Path], spend: "Spend | None" = None) -> list[
                                       "data": base64.b64encode(wav.read_bytes()).decode()}})
     body = json.dumps({
         "contents": [{"parts": parts}],
-        "generationConfig": {"responseMimeType": "application/json", "temperature": 0},
+        # gemini-3.6-flash: `temperature` is accepted but silently IGNORED (the
+        # 3.6 changelog deprecated it), so the old `"temperature": 0` was a
+        # determinism knob that no longer turned anything — dropped rather than
+        # carried as a lie. `thinkingLevel: "low"` is the replacement cost lever
+        # (thinking tokens bill as output): classification needs no deep
+        # deliberation, and low keeps the reply cheap and fast.
+        "generationConfig": {"responseMimeType": "application/json",
+                             "thinkingConfig": {"thinkingLevel": "low"}},
     }).encode()
     req = urllib.request.Request(
         f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}",

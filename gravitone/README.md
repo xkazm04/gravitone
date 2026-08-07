@@ -612,7 +612,7 @@ also needs, in its env:
 
 ```bash
 ELEVEN_LABS_API_KEY=…   # Scribe diarization + Voice Isolator
-GEMINI_API_KEY=…        # emotion classification (gemini-3.5-flash → 3.1-pro escalate)
+GEMINI_API_KEY=…        # emotion classification (gemini-3.6-flash → 3.1-pro escalate)
 HF_TOKEN=…              # first-run only: gated pocket-tts voice-cloning weights
 ```
 
