@@ -14,7 +14,6 @@ import { useAuth } from "@/lib/useAuth";
 // existed), which is why this is exported rather than copied.
 export const MODULES = [
   { label: "Playground", href: "/playground" },
-  { label: "Studio", href: "/studio" },
   { label: "Voices", href: "/voices" },
   { label: "API keys", href: "/keys" },
   { label: "Gym", href: "/gym" },

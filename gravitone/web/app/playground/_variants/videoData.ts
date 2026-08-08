@@ -6,7 +6,7 @@
 // service/revoice_api.py's _PUBLIC_KEYS.
 
 import { useEffect, useRef, useState } from "react";
-import { apiJson } from "@/lib/apiFetch";
+import { apiJson, throwDetail } from "@/lib/apiFetch";
 
 export type StudioKind = "voiceover" | "revoice";
 
@@ -176,6 +176,56 @@ export function useStudioJob(kind: StudioKind, jobId: string | null) {
   }, [kind, jobId]);
 
   return { job, stalled };
+}
+
+// ── the written script, per scene ────────────────────────────────────────────
+
+export type ScriptLine = {
+  scene: number;
+  text: string;
+  emotion: string;
+  emotion_requested: string | null;
+  budget_words: number;
+  words: number;
+  seconds?: number;
+  error?: string;
+};
+
+/** The narration plan the brain wrote (script.json) — the editable artifact. */
+export async function loadScript(jobId: string): Promise<ScriptLine[]> {
+  return apiJson<ScriptLine[]>(
+    `/api/voiceover/${jobId}/media/script`, { cache: "no-store" },
+    "the narration script could not be loaded",
+  );
+}
+
+/** Re-perform one line through the SAME /api/speak the console uses — the
+ *  playground's own preview machinery, pointed at a scene. Emotion travels in
+ *  the metatag grammar; voice settings are the console's expression knobs. */
+export async function retakeLine(input: {
+  character_id: string;
+  emotion: string;
+  text: string;
+  voice_settings?: { temperature?: number; stability?: number; quality?: number };
+}): Promise<Blob> {
+  const body = {
+    character_id: input.character_id,
+    text: input.emotion && input.emotion !== "baseline"
+      ? `[${input.emotion}]${input.text}[/${input.emotion}]`
+      : input.text,
+    ...(input.voice_settings ? { voice_settings: input.voice_settings } : {}),
+  };
+  const r = await fetch("/api/speak?output_format=wav_24000", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    await throwDetail(r, r.status === 429
+      ? "the render queue is full — try again shortly"
+      : "the retake could not be rendered");
+  }
+  return r.blob();
 }
 
 // ── fit helpers both variants render from ────────────────────────────────────

@@ -5,7 +5,7 @@
 
 import { useEffect, useState } from "react";
 import { loadRoster, type Character } from "@/app/voices/_data/characters";
-import { fitVerdict, type RevoiceFit, type StudioJob, type VoiceoverFit } from "./data";
+import { fitVerdict, type RevoiceFit, type StudioJob, type VoiceoverFit } from "./videoData";
 
 /** The roster, once per mount, with the failure surfaced. */
 export function useRoster() {
