@@ -120,7 +120,10 @@ export function useReel({ characterId }: { characterId: string }) {
    *  the reel exactly where it is and says so. */
   const reset = useCallback(async () => {
     const id = jobId;
-    const running = job?.status === "running";
+    // Unknown counts as running: a job we cannot currently poll is still a job
+    // on the box, and dropping it locally without asking is the leak this
+    // whole path exists to close. A 404 answers it harmlessly.
+    const running = !job || job.status === "running";
     if (id && running) {
       if (cancelling) return;           // one cancel per click, not per press
       setCancelling(true);

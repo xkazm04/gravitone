@@ -120,7 +120,10 @@ export function useDub() {
    *  than drawing a fresh sheet over a render nobody stopped. */
   const reset = useCallback(async () => {
     const id = jobId;
-    const running = job?.status === "running";
+    // Unknown counts as running — see useReel.reset: a dub we cannot poll is
+    // still rendering, and releasing the sheet without asking the box would be
+    // the same silent claim.
+    const running = !job || job.status === "running";
     if (id && running) {
       if (cancelling) return;           // one cancel per click, not per press
       setCancelling(true);

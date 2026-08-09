@@ -26,39 +26,57 @@ export default function ReelDoor({ reel, characterName }: {
     : "no Character selected";
 
   // Loading / failed / expired: the same three answers in both shapes.
-  if (reel.jobId && reel.job) {
+  //
+  // The branch is on the JOB ID, not on having an answer about it: a reel that
+  // was accepted but whose first polls all failed used to fall through to the
+  // door below — an empty form, as though nothing had been submitted, while the
+  // box rendered. An unanswered job is a job, and it says so.
+  if (reel.jobId) {
     const j = reel.job;
     return (
       <div>
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0">
             <p className="font-jetbrains text-[11px] uppercase tracking-widest text-white/60">
-              {j.status === "running" ? "reading the picture" : "reel"}
+              {!j || j.status === "running" ? "reading the picture" : "reel"}
             </p>
-            <p className="mt-1 truncate text-base text-white">{j.source.title ?? reel.url}</p>
+            <p className="mt-1 truncate text-base text-white">{j?.source.title ?? reel.url}</p>
           </div>
           <button
             onClick={() => void reel.reset()}
             disabled={reel.cancelling}
             className="font-jetbrains shrink-0 cursor-pointer rounded-lg border border-white/15 px-3 py-1.5 text-[11px] text-white/70 transition hover:border-rose-400/40 hover:text-rose-200 disabled:opacity-40"
           >
-            {reel.cancelling ? "cancelling…" : j.status === "running" ? "cancel" : "new reel"}
+            {reel.cancelling ? "cancelling…"
+              : !j || j.status === "running" ? "cancel" : "new reel"}
           </button>
         </div>
-        {j.status === "running" && <div className="mt-4"><StepsRail job={j} stalled={reel.stalled} /></div>}
-        {j.status === "error" && <ErrorBanner>{j.error}</ErrorBanner>}
-        {j.status === "expired" && (
+        {!j && (
+          reel.stalled ? (
+            <ErrorBanner severity="warning" className="mt-3">
+              connection degraded — this reel was accepted and keeps rendering on the box;
+              this page will catch up
+            </ErrorBanner>
+          ) : (
+            <p className="font-jetbrains mt-3 text-[11px] text-white/55">
+              waiting for the box to report this reel&apos;s progress
+            </p>
+          )
+        )}
+        {j?.status === "running" && <div className="mt-4"><StepsRail job={j} stalled={reel.stalled} /></div>}
+        {j?.status === "error" && <ErrorBanner>{j.error}</ErrorBanner>}
+        {j?.status === "expired" && (
           <ErrorBanner>this reel aged out on the box — load it again</ErrorBanner>
         )}
         {/* A job the box marked cancelled — ours, or one abandoned from another
             tab. It is not a failure, so it is amber: nothing further will be
             rendered, and the state is stated instead of painting an empty panel. */}
-        {j.status === "cancelled" && (
+        {j?.status === "cancelled" && (
           <ErrorBanner severity="warning">
             this reel was cancelled — nothing further will be rendered for it
           </ErrorBanner>
         )}
-        {j.limits.length > 0 && j.status === "done" && (
+        {j && j.limits.length > 0 && j.status === "done" && (
           <ErrorBanner severity="warning">{j.limits.join(" · ")}</ErrorBanner>
         )}
         {/* the cancel above lives HERE, so its refusal has to be readable here

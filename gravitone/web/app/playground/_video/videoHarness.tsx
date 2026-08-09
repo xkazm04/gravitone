@@ -13,7 +13,7 @@ import { vi } from "vitest";
 import { useReel } from "./useReel";
 import { useDub, type DubLine } from "./useDub";
 import Marquee from "./Marquee";
-import { DubControls } from "./dubParts";
+import { DubControls, FitBadge } from "./dubParts";
 import type { RevoiceFit, StudioJob, VoiceoverFit } from "./videoData";
 
 export function VideoHarness({ draft = [] }: { draft?: DubLine[] }) {
@@ -23,6 +23,11 @@ export function VideoHarness({ draft = [] }: { draft?: DubLine[] }) {
     <>
       <Marquee reel={reel} dub={dub} draft={draft} characterName="Sarah" onStage={() => {}} />
       <DubControls dub={dub} lines={draft} />
+      {/* the script rows' verdict block, in miniature: a badge only for a line
+          that was actually sent (PlaygroundScriptRows:99-112) */}
+      {draft.map((l) => dub.fitFor(l.id) && (
+        <div key={l.id} data-testid={`fit-${l.id}`}><FitBadge fit={dub.fitFor(l.id)} /></div>
+      ))}
     </>
   );
 }

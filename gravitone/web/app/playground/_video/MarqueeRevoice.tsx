@@ -45,12 +45,27 @@ export default function RevoiceStage({ dub, draft, onStage }: {
           render. The box downloads it, replaces the speech and hands back one
           file — there is no preview of someone else's video to play in the
           meantime, and a black rectangle pretending otherwise would be worse. */}
-      {!j && (
+      {!j && !dub.jobId && (
         <p className="font-jetbrains mt-2 text-[11px] text-white/55">
           The picture arrives with the dub — this box fetches the video, replaces its
           speech and returns the finished file. The strip below is the sheet you are
           writing, drawn on its own clock.
         </p>
+      )}
+
+      {/* Accepted, but not yet answered for. This used to draw the copy above —
+          the sheet you are ABOUT to run — over a dub already rendering. */}
+      {!j && dub.jobId && (
+        dub.stalled ? (
+          <ErrorBanner severity="warning" className="mt-3">
+            connection degraded — this dub was accepted and keeps running on the box;
+            this page will catch up
+          </ErrorBanner>
+        ) : (
+          <p className="font-jetbrains mt-2 text-[11px] text-white/55">
+            waiting for the box to report this dub&apos;s progress
+          </p>
+        )
       )}
 
       {j?.status === "running" && <div className="mt-4"><StepsRail job={j} stalled={dub.stalled} /></div>}

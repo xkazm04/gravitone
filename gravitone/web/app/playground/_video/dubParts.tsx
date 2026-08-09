@@ -90,7 +90,10 @@ export function DubControls({ dub, lines, label = "Dub ▶" }: {
   label?: string;
 }) {
   const blocked = dub.blockedFor(lines);
-  const running = dub.job?.status === "running";
+  // A submitted job we have no answer about is treated as RUNNING: reading
+  // `job?.status` alone turned an unreachable poll back into a live "Dub ▶",
+  // which is a second render of the same sheet on a box already doing it.
+  const running = !!dub.jobId && (dub.job?.status ?? "running") === "running";
   return (
     <div>
       <div className="flex flex-wrap items-center gap-3">
