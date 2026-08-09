@@ -50,6 +50,24 @@ FRAME_QUALITY = int(os.environ.get("FRAMES_JPEG_Q", "") or 3)
 DETECT_TIMEOUT_S = float(os.environ.get("FRAMES_DETECT_TIMEOUT", "") or 600)
 CAPTURE_TIMEOUT_S = float(os.environ.get("FRAMES_CAPTURE_TIMEOUT", "") or 30)
 
+#: Visual signature: the same captured frame, also written out as a tiny
+#: grayscale raster (SIG_GRID²  bytes) by a SECOND output of the SAME ffmpeg
+#: invocation. No new dependency and no extra process — the pixels are already
+#: decoded, we just ask for a thumbnail of them too, and the arithmetic over
+#: 256 bytes is plain Python.
+SIG_GRID = int(os.environ.get("FRAMES_SIG_GRID", "") or 16)
+
+#: When two consecutive frames count as THE SAME SHOT. Deliberately mean:
+#: a false reuse narrates a scene from the wrong picture, a missed reuse costs
+#: one vision call, so the thresholds are set to pay. Both must hold —
+#: average difference under SIG_MEAN_MAX of 255 (≈1%, i.e. grain and a small
+#: talking head's motion), and at most SIG_CELL_MAX cells moving more than
+#: SIG_CELL_DELTA (so a whole new object entering a corner blocks reuse even
+#: when the frame average barely moves).
+SIG_MEAN_MAX = float(os.environ.get("FRAMES_SIG_MEAN_MAX", "") or 3.0)
+SIG_CELL_DELTA = int(os.environ.get("FRAMES_SIG_CELL_DELTA", "") or 24)
+SIG_CELL_MAX = int(os.environ.get("FRAMES_SIG_CELL_MAX", "") or 4)
+
 _run = subprocess.run  # the test seam, same convention as ingest_url
 
 _PTS_RE = re.compile(r"pts_time:\s*([0-9]+(?:\.[0-9]+)?)")
@@ -68,6 +86,13 @@ class Scene:
     frame: Path | None = None
     #: why there is no picture, when there is none. Never a silent None.
     frame_error: str | None = None
+    #: the tiny grayscale raster this scene's frame reduces to. On-box only.
+    signature: bytes | None = field(default=None, repr=False)
+    #: the index of the earlier scene whose frame is the SAME SHOT as this
+    #: one, when there is one. A downstream pass may describe this scene by
+    #: inheriting that one's description instead of buying a new look — but
+    #: only if it says so; an inherited description is not an observation.
+    repeat_of: int | None = None
 
     @property
     def dur(self) -> float:
@@ -79,7 +104,8 @@ class Scene:
         return {"i": self.i, "start": round(self.start, 2),
                 "end": round(self.end, 2), "dur": self.dur,
                 "has_frame": self.frame is not None,
-                "frame_error": self.frame_error}
+                "frame_error": self.frame_error,
+                "repeat_of": self.repeat_of}
 
 
 def probe_video(video: Path) -> dict:
@@ -180,6 +206,10 @@ def capture_frames(video: Path, scenes: list[Scene], dest: Path, *,
     A frame that fails to extract degrades THAT scene (`frame_error` names it)
     and the loop continues — one unreadable stretch of video must not cost the
     caller every other scene's picture.
+
+    The same invocation also emits a tiny grayscale raster of the frame on
+    stdout; `mark_repeats` uses it to tell consecutive scenes that are the
+    same shot from ones that are not.
     """
     dest.mkdir(parents=True, exist_ok=True)
     for s in scenes:
@@ -189,7 +219,10 @@ def capture_frames(video: Path, scenes: list[Scene], dest: Path, *,
         out = dest / f"scene_{s.i:03d}.jpg"
         cmd = ["ffmpeg", "-y", "-v", "error", "-ss", f"{mid:.3f}",
                "-i", str(video), "-frames:v", "1", "-q:v", str(quality),
-               "-vf", f"scale=-2:{height}", str(out)]
+               "-vf", f"scale=-2:{height}", str(out),
+               # second output, same decode: the signature raster
+               "-frames:v", "1", "-vf", f"scale={SIG_GRID}:{SIG_GRID}",
+               "-pix_fmt", "gray", "-f", "rawvideo", "-"]
         try:
             r = _run(cmd, capture_output=True, timeout=CAPTURE_TIMEOUT_S)
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -197,11 +230,72 @@ def capture_frames(video: Path, scenes: list[Scene], dest: Path, *,
                            mid, video.name, exc)
             s.frame_error = "frame extraction timed out"
             continue
-        if r.returncode != 0 or not out.is_file() or out.stat().st_size == 0:
+        # A written, non-empty JPEG is a usable picture even if the second
+        # output upset the tool — the picture is the product, the signature is
+        # an optimisation, and losing the optimisation must not lose the shot.
+        if not out.is_file() or out.stat().st_size == 0:
             logger.warning("frame capture refused at %.1fs of %s: %s",
                            mid, video.name, (r.stderr or b"")[-300:])
             out.unlink(missing_ok=True)
             s.frame_error = "no frame could be read at this scene's midpoint"
             continue
+        if r.returncode != 0:
+            logger.warning("frame capture at %.1fs of %s wrote a picture but "
+                           "returned %s: %s", mid, video.name, r.returncode,
+                           (r.stderr or b"")[-300:])
         s.frame = out
+        s.signature = _signature(getattr(r, "stdout", None))
+    return mark_repeats(scenes)
+
+
+# ── same shot, or a new one ───────────────────────────────────────────────────
+
+def _signature(raw: bytes | None) -> bytes | None:
+    """The raster ffmpeg wrote on stdout, or None when there isn't one.
+
+    None is not "identical" and not "different" — it is "unknown", and every
+    caller treats unknown as a reason to pay for a fresh look.
+    """
+    want = SIG_GRID * SIG_GRID
+    if not raw or len(raw) < want:
+        return None
+    return bytes(raw[:want])
+
+
+def frames_similar(a: bytes | None, b: bytes | None) -> bool:
+    """Whether two signatures are the same shot. Unknown is never the same."""
+    if not a or not b or len(a) != len(b):
+        return False
+    total = 0
+    loud = 0
+    for x, y in zip(a, b):
+        d = x - y if x > y else y - x
+        total += d
+        if d > SIG_CELL_DELTA:
+            loud += 1
+            if loud > SIG_CELL_MAX:
+                return False
+    return total / len(a) <= SIG_MEAN_MAX
+
+
+def mark_repeats(scenes: list[Scene]) -> list[Scene]:
+    """Stamp `repeat_of` on every scene that shows the same shot as the last
+    scene that did NOT repeat. Mutates and returns `scenes`.
+
+    Compared against the ANCHOR rather than the immediate predecessor on
+    purpose: chaining "each 1% different from the last" over thirty scenes
+    drifts a long way from the picture whose description would be inherited.
+    A scene with no signature breaks the run and becomes the next anchor
+    candidate — unknown is never a match.
+    """
+    anchor: Scene | None = None
+    for s in scenes:
+        s.repeat_of = None
+        if s.frame is None or s.signature is None:
+            anchor = None
+            continue
+        if anchor is not None and frames_similar(anchor.signature, s.signature):
+            s.repeat_of = anchor.i
+        else:
+            anchor = s
     return scenes

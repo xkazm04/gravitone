@@ -101,6 +101,9 @@ NO_FRAME = "no_frame"
 CANCELLED = "cancelled"
 UNREADABLE = "unreadable"
 OMITTED = "omitted_from_answer"
+#: described by inheritance: this scene is the same shot as an earlier one, so
+#: its description was NOT bought again. Never a fresh observation.
+REUSED = "reused"
 
 #: The statuses that mean the model never saw this scene.
 NEVER_ASKED = (NO_FRAME, CANCELLED)
@@ -116,6 +119,12 @@ def describe_scenes(scenes: list[dict], *, context: str = "",
     when a transcript exists) and `speaker` (the diarized voice). Entries
     whose frame is missing come back None without costing a call.
 
+    A scene `frames.mark_repeats` flagged as the same shot as an earlier one
+    (`repeat_of`) is NOT bought again: it inherits that scene's description,
+    marked `reused` + `reused_from`. Cost scales with visual novelty, not with
+    scene count — and nothing presents an inherited description as a fresh
+    observation.
+
     Returns a list the same length as `scenes`; None marks "no description".
     The REASON is not only logged: each scene dict is stamped with
     `description_status` (one of the constants above), so a caller can tell a
@@ -126,7 +135,9 @@ def describe_scenes(scenes: list[dict], *, context: str = "",
                           "is off on this box")
     out: list[dict | None] = [None] * len(scenes)
     status: list[str] = [NO_FRAME] * len(scenes)
-    todo = [k for k, s in enumerate(scenes) if _frame_of(s) is not None]
+    inherit = _inherit_map(scenes)
+    todo = [k for k, s in enumerate(scenes)
+            if _frame_of(s) is not None and k not in inherit]
     for lo in range(0, len(todo), BATCH):
         batch = todo[lo:lo + BATCH]
         if should_cancel and should_cancel():
@@ -145,8 +156,46 @@ def describe_scenes(scenes: list[dict], *, context: str = "",
         for k, desc in zip(batch, got):
             out[k] = desc
             status[k] = DESCRIBED if desc is not None else OMITTED
+    for k, anchor in sorted(inherit.items()):
+        src = out[anchor]
+        if src is None:
+            # the shot we would have inherited from is blind too — a repeat of
+            # nothing is nothing, and it carries the anchor's reason, not a
+            # softer one.
+            status[k] = status[anchor]
+            continue
+        out[k] = dict(src, reused=True,
+                      reused_from=scenes[anchor].get("i", anchor))
+        status[k] = REUSED
     _stamp(scenes, status)
     return out
+
+
+def _inherit_map(scenes: list[dict]) -> dict[int, int]:
+    """position → position of the earlier scene whose description it may use.
+
+    `repeat_of` is a scene INDEX (`i`); this resolves it to a list position and
+    refuses anything that is not a strictly earlier scene with a frame of its
+    own. A reuse decision is only ever as good as its anchor.
+    """
+    pos_by_i: dict[int, int] = {}
+    for k, s in enumerate(scenes):
+        if isinstance(s, dict) and isinstance(s.get("i"), int):
+            pos_by_i.setdefault(s["i"], k)
+    inherit: dict[int, int] = {}
+    for k, s in enumerate(scenes):
+        if not isinstance(s, dict) or _frame_of(s) is None:
+            continue
+        target = s.get("repeat_of")
+        if not isinstance(target, int):
+            continue
+        anchor = pos_by_i.get(target)
+        if anchor is None or anchor >= k or anchor in inherit:
+            continue
+        if _frame_of(scenes[anchor]) is None:
+            continue
+        inherit[k] = anchor
+    return inherit
 
 
 def _stamp(scenes: list[dict], status: list[str]) -> None:

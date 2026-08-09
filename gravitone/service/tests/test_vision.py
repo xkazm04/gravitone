@@ -188,6 +188,72 @@ class RepairTests(unittest.TestCase):
                          [vision.DESCRIBED, vision.CANCELLED, vision.CANCELLED])
 
 
+class ReuseTests(unittest.TestCase):
+    """The box does not pay twice to look at the same shot — and never
+    presents an inherited description as a fresh observation."""
+
+    @staticmethod
+    def _scenes(td: str, repeats: dict[int, int], n: int) -> list[dict]:
+        out = []
+        for i in range(n):
+            p = Path(td) / f"f{i}.jpg"
+            p.write_bytes(b"\xff\xd8")
+            out.append({"i": i, "start": 0, "end": 5, "frame": str(p),
+                        "repeat_of": repeats.get(i)})
+        return out
+
+    def _run(self, scenes: list[dict], answer=None):
+        asked: list[list[int]] = []
+
+        def fake_post(payload, *, spend):
+            texts = [c["text"] for c in payload["messages"][1]["content"]
+                     if c["type"] == "text"]
+            idx = [int(t.split()[1]) for t in texts if t.startswith("Scene ")]
+            asked.append(idx)
+            if answer is not None:
+                return answer(idx)
+            return _body([{"index": i, "caption": f"shot {i}"} for i in idx])
+
+        with mock.patch.dict("os.environ", {"QWEN_API_KEY": "sk-test"}), \
+                mock.patch.object(vision, "_post", fake_post):
+            out = vision.describe_scenes(scenes)
+        return out, asked
+
+    def test_a_repeated_shot_costs_no_call_and_says_it_was_inherited(self) -> None:
+        with TemporaryDirectory() as td:
+            scenes = self._scenes(td, {1: 0, 2: 0}, 3)
+            out, asked = self._run(scenes)
+        self.assertEqual(asked, [[0]])                  # only the anchor
+        self.assertEqual(out[1]["caption"], "shot 0")
+        self.assertTrue(out[1]["reused"])
+        self.assertEqual(out[1]["reused_from"], 0)
+        self.assertNotIn("reused", out[0])              # the anchor is fresh
+        self.assertEqual([s["description_status"] for s in scenes],
+                         [vision.DESCRIBED, vision.REUSED, vision.REUSED])
+
+    def test_scenes_that_are_not_repeats_are_all_asked_about(self) -> None:
+        with TemporaryDirectory() as td:
+            scenes = self._scenes(td, {}, 3)
+            out, asked = self._run(scenes)
+        self.assertEqual(asked, [[0, 1, 2]])
+        self.assertTrue(all(o is not None and "reused" not in o for o in out))
+
+    def test_a_repeat_of_a_blind_anchor_is_blind_for_the_same_reason(self) -> None:
+        with TemporaryDirectory() as td:
+            scenes = self._scenes(td, {1: 0}, 2)
+            out, _ = self._run(scenes, answer=lambda idx: _body([]))
+        self.assertEqual(out, [None, None])
+        self.assertEqual([s["description_status"] for s in scenes],
+                         [vision.OMITTED, vision.OMITTED])
+
+    def test_a_repeat_pointing_at_a_later_scene_is_ignored(self) -> None:
+        with TemporaryDirectory() as td:
+            scenes = self._scenes(td, {0: 1}, 2)     # backwards; never trusted
+            out, asked = self._run(scenes)
+        self.assertEqual(asked, [[0, 1]])
+        self.assertTrue(all("reused" not in o for o in out))
+
+
 class PostTests(unittest.TestCase):
     def test_429_retries_then_succeeds(self) -> None:
         good = io.BytesIO(json.dumps(_body([])).encode())
