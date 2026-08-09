@@ -6,105 +6,294 @@
   "version": "2.0.0",
   "groups": [
     {
-      "name": "TTS Service Core",
+      "name": "Speech Synthesis Core",
       "domain": "feature",
-      "type": null,
+      "type": "group",
       "color": "#3B82F6",
-      "icon": null,
+      "icon": "waveform",
       "contexts": [
         {
-          "name": "Voice & Emotion Library",
-          "description": "Catalog of available voices and emotion presets; parses emotion-tagged text segments and resolves them to voice/temperature settings for expressive synthesis.",
-          "businessFeature": "Voice & Emotion Library",
-          "category": "lib",
+          "name": "Synthesis HTTP Surface",
+          "description": "The ElevenLabs-shaped HTTP door: /v1/text-to-speech (buffered, streaming, with-timestamps), /v1/speak, models and the app wiring that mounts every router. Owns the one error voice (sanitized request-id 500s), CORS, runtime config and the def/async handler-mode discipline.",
+          "businessFeature": "Synthesis HTTP Surface",
+          "category": "api",
           "filePaths": [
-            "gravitone/service/voices.py",
-            "gravitone/service/emotions.py"
+            "gravitone/service/__init__.py",
+            "gravitone/service/app.py",
+            "gravitone/service/config.py",
+            "gravitone/service/errors.py",
+            "gravitone/service/tests/__init__.py",
+            "gravitone/service/tests/test_compat.py",
+            "gravitone/service/tests/test_cors.py",
+            "gravitone/service/tests/test_errors.py",
+            "gravitone/service/tests/test_handler_modes.py",
+            "gravitone/service/tests/test_private_surface.py",
+            "gravitone/service/tests/test_streaming.py"
           ],
           "target": null,
           "apiRoutes": [
-            "/v1/voices"
+            "/v1/text-to-speech/{voice_id}",
+            "/v1/text-to-speech/{voice_id}/stream",
+            "/v1/speak",
+            "/v1/models",
+            "/health"
           ]
         },
         {
-          "name": "Voice Cloning & Ingest Pipeline",
-          "description": "Turn a short reference clip into a reusable voice embedding: audio cleanup to 24kHz mono, speaker separation, emotion previews, export to safetensors served like any built-in voice.",
-          "businessFeature": "Voice Cloning & Ingest Pipeline",
+          "name": "Concurrency Engine & Admission",
+          "description": "The bounded pool of independent Pocket TTS model instances: admission permits, deadlines, drain/abandon, worker supervision and the single-flight result cache. Every job's future is always resolved and every permit released in a finally.",
+          "businessFeature": "Concurrency Engine & Admission",
+          "category": "lib",
+          "filePaths": [
+            "gravitone/service/cache.py",
+            "gravitone/service/engine.py",
+            "gravitone/service/tests/engine_conformance.py",
+            "gravitone/service/tests/fake_engine.py",
+            "gravitone/service/tests/test_abandon.py",
+            "gravitone/service/tests/test_admission_accounting.py",
+            "gravitone/service/tests/test_cache.py",
+            "gravitone/service/tests/test_deadline_engine.py",
+            "gravitone/service/tests/test_deadline_routes.py",
+            "gravitone/service/tests/test_determinism.py",
+            "gravitone/service/tests/test_drain.py",
+            "gravitone/service/tests/test_parallel.py",
+            "gravitone/service/tests/test_stats_concurrency.py",
+            "gravitone/service/tests/test_worker_supervision.py"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/stats"
+          ]
+        },
+        {
+          "name": "Engine Plane & Alternate Mouths",
+          "description": "Which mouth speaks: the engine plane's capability table, the Piper second engine for languages Pocket TTS cannot say, and the one-load stem exporter. Covers polyglot turns, zero-gap concatenation and long-form stability.",
+          "businessFeature": "Engine Plane & Alternate Mouths",
+          "category": "lib",
+          "filePaths": [
+            "gravitone/service/engines.py",
+            "gravitone/service/export_stems.py",
+            "gravitone/service/piper.py",
+            "gravitone/service/tests/test_engines.py",
+            "gravitone/service/tests/test_longform.py",
+            "gravitone/service/tests/test_piper.py",
+            "gravitone/service/tests/test_polyglot_turn.py",
+            "gravitone/service/tests/test_zero_gap.py"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/v1/engines"
+          ]
+        },
+        {
+          "name": "Voice & Character Registry",
+          "description": "Characters, Voices and the emotion scale on disk: the registry's atomic writes, cross-process mutation locks, builtin-collision rules, rollback on a failed write and emotion-tagged segment parsing.",
+          "businessFeature": "Voice & Character Registry",
+          "category": "lib",
+          "filePaths": [
+            "gravitone/service/atomicio.py",
+            "gravitone/service/emotions.py",
+            "gravitone/service/tests/test_builtin_collision.py",
+            "gravitone/service/tests/test_character_read.py",
+            "gravitone/service/tests/test_file_lock.py",
+            "gravitone/service/tests/test_parse_segments.py",
+            "gravitone/service/tests/test_registry_atomic.py",
+            "gravitone/service/tests/test_registry_cache.py",
+            "gravitone/service/tests/test_registry_integrity.py",
+            "gravitone/service/tests/test_registry_invariants.py",
+            "gravitone/service/tests/test_voice_rollback.py",
+            "gravitone/service/voices.py",
+            "gravitone/voices/.gitkeep"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/v1/voices",
+            "/v1/voices/{voice_id}",
+            "/v1/emotions",
+            "/v1/characters"
+          ]
+        },
+        {
+          "name": "Emotion Algebra & Prosody",
+          "description": "Does an emotion travel? The shared emotion basis (averaged residuals, per-emotion coherence, alpha), prosody measurement, fallback demand telemetry, and the operator tools that derive, A/B and backfill emotion slots.",
+          "businessFeature": "Emotion Algebra & Prosody",
+          "category": "lib",
+          "filePaths": [
+            "gravitone/service/demand.py",
+            "gravitone/service/emotion_basis.py",
+            "gravitone/service/prosody.py",
+            "gravitone/service/tests/test_derive_ab.py",
+            "gravitone/service/tests/test_derive_autofill.py",
+            "gravitone/service/tests/test_emotion_basis.py",
+            "gravitone/service/tests/test_emotion_derive.py",
+            "gravitone/service/tests/test_emotion_fallback.py",
+            "gravitone/service/tests/test_emotion_residuals.py",
+            "gravitone/service/tests/test_prosody.py",
+            "gravitone/service/tools/__init__.py",
+            "gravitone/service/tools/derive_ab.py",
+            "gravitone/service/tools/derive_autofill.py",
+            "gravitone/service/tools/emotion_residuals.py",
+            "gravitone/service/tools/prosody_backfill.py"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/v1/characters/{character_id}/emotions/{emotion}/derive"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Voice Cloning & Ingest",
+      "domain": "feature",
+      "type": "group",
+      "color": "#8B5CF6",
+      "icon": "microphone",
+      "contexts": [
+        {
+          "name": "Ingest Pipeline",
+          "description": "Character-from-recording: scan, review, commit. Job lifecycle, cancellation, drain, per-job budgets, cross-process exclusion and the measured truth a clone reports about itself.",
+          "businessFeature": "Ingest Pipeline",
           "category": "api",
           "filePaths": [
             "gravitone/service/ingest.py",
             "gravitone/service/ingest_api.py",
-            "gravitone/service/export_stems.py",
-            "gravitone/clone_test.sh"
+            "gravitone/service/tests/test_clone_path.py",
+            "gravitone/service/tests/test_corpus.py",
+            "gravitone/service/tests/test_direct_clone_consent.py",
+            "gravitone/service/tests/test_fidelity.py",
+            "gravitone/service/tests/test_ingest_audio.py",
+            "gravitone/service/tests/test_ingest_budget.py",
+            "gravitone/service/tests/test_ingest_cancel.py",
+            "gravitone/service/tests/test_ingest_drain.py",
+            "gravitone/service/tests/test_ingest_exclusion.py",
+            "gravitone/service/tests/test_ingest_lifecycle.py",
+            "gravitone/service/tests/test_ingest_measured.py",
+            "gravitone/service/tests/test_ingest_overlap.py",
+            "gravitone/service/tests/test_ingest_pipeline.py",
+            "gravitone/service/tests/test_ingest_sovereign.py",
+            "gravitone/service/tests/test_ingest_truth.py"
           ],
           "target": null,
           "apiRoutes": [
-            "/ingest"
+            "/v1/ingest/scan",
+            "/v1/ingest/{job}",
+            "/v1/ingest/{job}/commit"
           ]
         },
         {
-          "name": "Concurrency Engine & Metrics",
-          "description": "Bounded pool of independent Pocket TTS model instances with admission queue, HTTP 429 backpressure, and live metrics (in-flight, queue depth, latency percentiles, real-time factor); wav concat and mp3 encoding.",
-          "businessFeature": "Concurrency Engine & Metrics",
-          "category": "lib",
-          "filePaths": [
-            "gravitone/service/engine.py",
-            "gravitone/service/replicas.py"
-          ],
-          "target": null,
-          "apiRoutes": []
-        },
-        {
-          "name": "Conversation Gym & Replay",
-          "description": "Replay a recorded conversation as a deterministic test: stream user.wav back through the agent socket, emit a run artifact (turns, latency distributions, WER drift), score run B against run A with named checks, and run suites of golden recordings in CI.",
-          "businessFeature": "Conversation Gym & Replay",
+          "name": "Link Ingest",
+          "description": "A pasted link becomes the same audio file a drop would have been: URL probing, external fetch limits and the sovereignty rules on what may be pulled.",
+          "businessFeature": "Link Ingest",
           "category": "api",
           "filePaths": [
-            "gravitone/service/gym.py",
-            "gravitone/service/tests/test_gym.py"
+            "gravitone/service/ingest_url.py",
+            "gravitone/service/tests/test_ingest_external.py",
+            "gravitone/service/tests/test_ingest_link.py",
+            "gravitone/service/tests/test_ingest_link_limits.py"
           ],
           "target": null,
           "apiRoutes": [
-            "/v1/convai/replay",
-            "/v1/convai/compare"
+            "/v1/ingest/link-probe",
+            "/v1/ingest/scan-url"
           ]
         },
         {
-          "name": "Visual Scene Pipeline",
-          "description": "The studio's eyes and director brain: optional video-only download tier (yt-dlp), local scene segmentation with one frame per 5-30s scene (ffmpeg), Qwen3.8 vision descriptions over DashScope (key-gated), and the one-shot LLM provider seam (Claude CLI local, OpenAI-compat cloud presets) for narration direction.",
-          "businessFeature": "Visual Scene Pipeline",
+          "name": "Diarization, Casting & Voiceprints",
+          "description": "Who spoke when, locally: speaker diarization, the streaming voice-activity gate, one speaker embedding and the is-this-the-same-voice question that casting and auditions rest on.",
+          "businessFeature": "Diarization, Casting & Voiceprints",
+          "category": "lib",
+          "filePaths": [
+            "gravitone/service/diarize.py",
+            "gravitone/service/tests/test_audition.py",
+            "gravitone/service/tests/test_casting.py",
+            "gravitone/service/tests/test_diarize.py",
+            "gravitone/service/tests/test_ingest_cast.py",
+            "gravitone/service/tests/test_vad.py",
+            "gravitone/service/tests/test_voiceprint.py",
+            "gravitone/service/vad.py",
+            "gravitone/service/voiceprint.py"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/v1/ingest/{job}/speaker",
+            "/v1/ingest/{job}/cast"
+          ]
+        },
+        {
+          "name": "Speech-to-Text & Verification",
+          "description": "The ear the service never had: local transcription, plus the pure half of verified speech - did the audio actually say the words?",
+          "businessFeature": "Speech-to-Text & Verification",
+          "category": "lib",
+          "filePaths": [
+            "gravitone/service/stt.py",
+            "gravitone/service/tests/test_stt.py",
+            "gravitone/service/tests/test_stt_e2e.py",
+            "gravitone/service/tests/test_verify.py",
+            "gravitone/service/verify.py"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/v1/speech-to-text"
+          ]
+        },
+        {
+          "name": "Character Packs",
+          "description": "Portable, integrity-checked character bundles: pack origin provenance and the safety rules for importing someone else's voice.",
+          "businessFeature": "Character Packs",
+          "category": "lib",
+          "filePaths": [
+            "gravitone/service/packs.py",
+            "gravitone/service/tests/test_pack_origin.py",
+            "gravitone/service/tests/test_pack_safety.py"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/v1/characters/{character_id}/pack",
+            "/v1/characters/import"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Video Studio",
+      "domain": "feature",
+      "type": "group",
+      "color": "#F43F5E",
+      "icon": "film",
+      "contexts": [
+        {
+          "name": "Scene Vision Pipeline",
+          "description": "The studio's eyes, locally: scene segmentation and frame capture, then Qwen vision describing what is on the screen scene by scene.",
+          "businessFeature": "Scene Vision Pipeline",
           "category": "lib",
           "filePaths": [
             "gravitone/service/frames.py",
-            "gravitone/service/vision.py",
-            "gravitone/service/brain.py",
             "gravitone/service/tests/test_frames.py",
             "gravitone/service/tests/test_vision.py",
-            "gravitone/service/tests/test_brain.py"
+            "gravitone/service/vision.py"
           ],
           "target": null,
           "apiRoutes": []
         },
         {
           "name": "Silent-Video Voiceover",
-          "description": "Ability B of the studio: a video without usable audio plus one Character becomes a narrated mp4 — scenes described by Qwen, narration written per scene by the text brain against a spoken-word budget, spoken in the Character's emotion stems, assembled at scene starts with an honest per-line fit report (spill/clip/silence measured, never hidden), muxed with the video stream copied.",
+          "description": "Scenes in, a narrated video out: the voiceover job doors, registry and phase thread, and the media/frame assets a client polls.",
           "businessFeature": "Silent-Video Voiceover",
           "category": "api",
           "filePaths": [
+            "gravitone/service/tests/test_voiceover.py",
             "gravitone/service/voiceover.py",
-            "gravitone/service/voiceover_api.py",
-            "gravitone/service/tests/test_voiceover.py"
+            "gravitone/service/voiceover_api.py"
           ],
           "target": null,
           "apiRoutes": [
-            "/v1/voiceover/from-url",
-            "/v1/voiceover/upload",
+            "/v1/voiceover",
             "/v1/voiceover/{job}"
           ]
         },
         {
           "name": "Video Re-voice",
-          "description": "Ability A of the studio: replace the dialogue in an analyzed video with cloned Characters. Stateless door takes the source URL plus the studio's (possibly edited) scene lines with absolute timing; the brain composes one emotion per line from each Character's real stems; every line runs the fit ladder (verbatim -> atempo <=1.08 -> brain rewrite-to-budget -> honest spill) and the per-line fit report names what happened. Background bed is not preserved (stated limit).",
+          "description": "Replace the speech in an analyzed video line by line: the stateless door, the phase thread and the fit ladder that makes a new line land in the old gap.",
           "businessFeature": "Video Re-voice",
           "category": "api",
           "filePaths": [
@@ -119,21 +308,169 @@
           ]
         },
         {
-          "name": "Speech Synthesis API",
-          "description": "ElevenLabs-compatible HTTP endpoint: POST /v1/text-to-speech/{voice_id} returns wav/mp3/pcm audio with timing headers, plus /health and /metrics; optional xi-api-key auth and API-key management router.",
-          "businessFeature": "Speech Synthesis API",
-          "category": "api",
+          "name": "Audible Docs Narration",
+          "description": "Any page becomes a segmented narration plan - the server half of the narration dock.",
+          "businessFeature": "Audible Docs Narration",
+          "category": "lib",
           "filePaths": [
-            "gravitone/service/app.py",
-            "gravitone/service/config.py",
-            "gravitone/service/keys.py",
-            "gravitone/docs/SWITCH_FROM_ELEVENLABS.md"
+            "gravitone/service/narrate.py",
+            "gravitone/service/tests/test_narrate.py"
           ],
           "target": null,
           "apiRoutes": [
-            "/v1/text-to-speech/{voice_id}",
-            "/v1/voices",
-            "/health",
+            "/v1/narrate/{narration_id}"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Conversation Gym",
+      "domain": "feature",
+      "type": "group",
+      "color": "#06B6D4",
+      "icon": "message-circle",
+      "contexts": [
+        {
+          "name": "Conversational Agent Socket",
+          "description": "The ElevenLabs Agents WebSocket served locally: who the agent is and what it says next (dialog), the one-shot LLM completion seam (brain) and the protocol conformance around them.",
+          "businessFeature": "Conversational Agent Socket",
+          "category": "api",
+          "filePaths": [
+            "gravitone/service/brain.py",
+            "gravitone/service/convai.py",
+            "gravitone/service/dialog.py",
+            "gravitone/service/tests/test_brain.py",
+            "gravitone/service/tests/test_claude_cli_brain.py",
+            "gravitone/service/tests/test_convai_protocol.py",
+            "gravitone/service/tests/test_dialog.py"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/v1/convai/agents",
+            "/v1/convai/conversation/get-signed-url",
+            "/v1/convai/conversations"
+          ]
+        },
+        {
+          "name": "Gym Replay & Grading",
+          "description": "A recorded call replayed as a deterministic test: what a conversation left behind (two aligned WAVs and a transcript), the replay driver, and the diff primitive the ledger gates on.",
+          "businessFeature": "Gym Replay & Grading",
+          "category": "api",
+          "filePaths": [
+            "gravitone/service/compare.py",
+            "gravitone/service/gym.py",
+            "gravitone/service/recording.py",
+            "gravitone/service/tests/fixtures/gym/basic/suite.json",
+            "gravitone/service/tests/test_compare.py",
+            "gravitone/service/tests/test_gym.py",
+            "gravitone/service/tests/test_recording.py"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/v1/convai/replay",
+            "/v1/convai/compare"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Takes, Builds & Direction",
+      "domain": "feature",
+      "type": "group",
+      "color": "#EAB308",
+      "icon": "layers",
+      "contexts": [
+        {
+          "name": "Takes, Reviews & Lineage",
+          "description": "Persisted renders behind public pages: shared takes, review sets with first-writer-wins picks, and the lineage a take carries back to its score.",
+          "businessFeature": "Takes, Reviews & Lineage",
+          "category": "lib",
+          "filePaths": [
+            "gravitone/service/takes.py",
+            "gravitone/service/tests/test_takes_reviews.py"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/{take_id}",
+            "/{take_id}/audio",
+            "/{take_id}/lineage"
+          ]
+        },
+        {
+          "name": "Speech as a Build Artifact",
+          "description": "The identity function and the durable store that turn a render into a reproducible build, plus the promise the service measures itself against.",
+          "businessFeature": "Speech as a Build Artifact",
+          "category": "lib",
+          "filePaths": [
+            "gravitone/service/buildstore.py",
+            "gravitone/service/tests/test_buildstore.py",
+            "gravitone/service/tests/test_promise_measured.py"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/v1/build",
+            "/v1/build/plan",
+            "/v1/build/lock"
+          ]
+        },
+        {
+          "name": "Direction Telemetry",
+          "description": "What humans CHANGE when they re-perform a take - the signal that tells the product where its defaults are wrong.",
+          "businessFeature": "Direction Telemetry",
+          "category": "lib",
+          "filePaths": [
+            "gravitone/service/direction.py",
+            "gravitone/service/tests/test_direction.py"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/{take_id}/reperform"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Platform Security & Limits",
+      "domain": "infrastructure",
+      "type": "group",
+      "color": "#EF4444",
+      "icon": "shield",
+      "contexts": [
+        {
+          "name": "API Keys & Auth",
+          "description": "Central API-key enforcement for every router, plus issue / rotate / revoke with copy-once secrets and scoped capabilities.",
+          "businessFeature": "API Keys & Auth",
+          "category": "api",
+          "filePaths": [
+            "gravitone/service/auth.py",
+            "gravitone/service/keys.py",
+            "gravitone/service/tests/test_auth.py",
+            "gravitone/service/tests/test_auth_distinction.py",
+            "gravitone/service/tests/test_keys.py"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/scopes",
+            "/{kid}",
+            "/{kid}/rotate",
+            "/{kid}/revoke"
+          ]
+        },
+        {
+          "name": "Rate Limiting & Error Reporting",
+          "description": "The one per-IP limiter every public compute surface shares (shared across replicas), and error reporting that stays OFF until an operator names a DSN.",
+          "businessFeature": "Rate Limiting & Error Reporting",
+          "category": "lib",
+          "filePaths": [
+            "gravitone/service/observability.py",
+            "gravitone/service/ratelimit.py",
+            "gravitone/service/tests/test_observability.py",
+            "gravitone/service/tests/test_ratelimit.py",
+            "gravitone/service/tests/test_ratelimit_shared.py",
+            "gravitone/service/tests/test_telemetry_exclusion.py"
+          ],
+          "target": null,
+          "apiRoutes": [
             "/metrics"
           ]
         }
@@ -142,34 +479,129 @@
     {
       "name": "Performance & Deployment",
       "domain": "infrastructure",
-      "type": null,
+      "type": "group",
       "color": "#10B981",
-      "icon": null,
+      "icon": "gauge",
       "contexts": [
         {
-          "name": "Packaging & Deployment",
-          "description": "Containerized deployment of the CPU-only Arm-native service: Dockerfile, Python dependency pinning, and the hackathon-facing runbook.",
-          "businessFeature": "Packaging & Deployment",
-          "category": "config",
+          "name": "Load Testing & Workloads",
+          "description": "Ramp load-testing to find the concurrency cap before critical degradation, and the traffic shape (when requests arrive, what they say) the harness replays.",
+          "businessFeature": "Load Testing & Workloads",
+          "category": "test",
           "filePaths": [
-            "gravitone/Dockerfile",
-            "gravitone/requirements.txt",
-            "gravitone/README.md"
+            "gravitone/service/loadtest.py",
+            "gravitone/service/tests/test_arm_tuning.py",
+            "gravitone/service/tests/test_loadtest.py",
+            "gravitone/service/tests/test_workload.py",
+            "gravitone/service/workload.py"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/v1/performance"
+          ]
+        },
+        {
+          "name": "Benchmark Harness",
+          "description": "The Graviton/ARM benchmark scripts and the AWS runner behind the published cost-per-hour numbers.",
+          "businessFeature": "Benchmark Harness",
+          "category": "test",
+          "filePaths": [
+            "gravitone/aws/README.md",
+            "gravitone/aws/iam-policy.json",
+            "gravitone/aws/run_benchmark.sh",
+            "gravitone/benchmark_arm.sh",
+            "gravitone/benchmark_arm_ab.sh",
+            "gravitone/benchmark_t4g.sh",
+            "gravitone/clone_test.sh"
           ],
           "target": null,
           "apiRoutes": []
         },
         {
-          "name": "Load Testing & Benchmarks",
-          "description": "Ramp parallel requests against the service and report the degradation knee, throughput ceiling, latency percentiles, CPU/RAM — reproducible across Arm variants (Graviton, dev box).",
-          "businessFeature": "Load Testing & Benchmarks",
-          "category": "test",
+          "name": "Replicas & Deployment Compiler",
+          "description": "The real scaling story for a GIL-bound model: N single-worker processes behind SO_REUSEPORT, and the compiler that writes the artifact's own topology from a measurement.",
+          "businessFeature": "Replicas & Deployment Compiler",
+          "category": "config",
           "filePaths": [
-            "gravitone/service/loadtest.py",
-            "gravitone/benchmark_arm.sh",
-            "gravitone/benchmark_t4g.sh",
-            "gravitone/aws/run_benchmark.sh",
-            "gravitone/service/tests/test_loadtest.py"
+            "gravitone/service/plan.py",
+            "gravitone/service/replicas.py",
+            "gravitone/service/tests/test_plan.py",
+            "gravitone/service/tests/test_replicas.py"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Packaging & Host Deployment",
+          "description": "Container image, systemd unit, one-click AWS bootstrap, CloudFormation and rollback - how the service reaches a host.",
+          "businessFeature": "Packaging & Host Deployment",
+          "category": "config",
+          "filePaths": [
+            "gravitone/.env.example",
+            "gravitone/Dockerfile",
+            "gravitone/deploy/README.md",
+            "gravitone/deploy/aws-oneclick.sh",
+            "gravitone/deploy/bootstrap.sh",
+            "gravitone/deploy/cloudformation.yaml",
+            "gravitone/deploy/gravitone-unit.sh",
+            "gravitone/deploy/rollback.sh",
+            "gravitone/requirements.txt"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Kubernetes Helm Chart",
+          "description": "The Helm chart: deployment, service, PVC, secret, HPA and the KEDA scaled object that scales on real queue depth.",
+          "businessFeature": "Kubernetes Helm Chart",
+          "category": "config",
+          "filePaths": [
+            "gravitone/deploy/helm/gravitone/Chart.yaml",
+            "gravitone/deploy/helm/gravitone/README.md",
+            "gravitone/deploy/helm/gravitone/templates/NOTES.txt",
+            "gravitone/deploy/helm/gravitone/templates/_helpers.tpl",
+            "gravitone/deploy/helm/gravitone/templates/deployment.yaml",
+            "gravitone/deploy/helm/gravitone/templates/hpa.yaml",
+            "gravitone/deploy/helm/gravitone/templates/keda-scaledobject.yaml",
+            "gravitone/deploy/helm/gravitone/templates/pvc.yaml",
+            "gravitone/deploy/helm/gravitone/templates/secret.yaml",
+            "gravitone/deploy/helm/gravitone/templates/service.yaml",
+            "gravitone/deploy/helm/gravitone/values.yaml"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Sealed Appliance & Certification",
+          "description": "What this artifact IS, as a checkable fact: the sealed-appliance attestation, certify-your-box hardware certification and the airgap installer.",
+          "businessFeature": "Sealed Appliance & Certification",
+          "category": "config",
+          "filePaths": [
+            "gravitone/docs/DETERMINISM.md",
+            "gravitone/docs/SUPPORTED_HARDWARE.md",
+            "gravitone/docs/certifications/README.md",
+            "gravitone/docs/certifications/ledger.json",
+            "gravitone/scripts/airgap-install.sh",
+            "gravitone/service/appliance.py",
+            "gravitone/service/certify.py",
+            "gravitone/service/tests/test_appliance.py",
+            "gravitone/service/tests/test_certify.py"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/v1/appliance"
+          ]
+        },
+        {
+          "name": "CI Pipelines",
+          "description": "GitHub Actions: the live CI plus the sealed-build, audio-drift and performance-ledger workflow templates operators enable per deployment.",
+          "businessFeature": "CI Pipelines",
+          "category": "config",
+          "filePaths": [
+            ".github/workflows/audio-drift.yml.example",
+            ".github/workflows/ci.yml",
+            ".github/workflows/perf-ledger.yml.example",
+            ".github/workflows/sealed.yml.example"
           ],
           "target": null,
           "apiRoutes": []
@@ -177,215 +609,1149 @@
       ]
     },
     {
-      "name": "Web Studio",
-      "domain": "feature",
-      "type": null,
-      "color": "#EC4899",
-      "icon": null,
+      "name": "Agent & Toolchain Integrations",
+      "domain": "integration",
+      "type": "group",
+      "color": "#A855F7",
+      "icon": "plug",
       "contexts": [
         {
-          "name": "Auth & Profile",
-          "description": "Firebase-backed sign-in, session state via useAuth provider, user menu, and profile page.",
-          "businessFeature": "Auth & Profile",
-          "category": "ui",
+          "name": "MCP Server",
+          "description": "The Model Context Protocol server that hands agents Gravitone's tools: manifest, RPC framing, call routing and config.",
+          "businessFeature": "MCP Server",
+          "category": "api",
           "filePaths": [
-            "gravitone/web/app/profile/page.tsx",
-            "gravitone/web/lib/useAuth.tsx",
-            "gravitone/web/lib/firebase.ts",
-            "gravitone/web/components/ui/UserMenu.tsx"
+            "gravitone/agents/mcp-gravitone/README.md",
+            "gravitone/agents/mcp-gravitone/lib/call.mjs",
+            "gravitone/agents/mcp-gravitone/lib/config.mjs",
+            "gravitone/agents/mcp-gravitone/lib/manifest.mjs",
+            "gravitone/agents/mcp-gravitone/lib/rpc.mjs",
+            "gravitone/agents/mcp-gravitone/package.json",
+            "gravitone/agents/mcp-gravitone/server.mjs",
+            "gravitone/agents/mcp-gravitone/test/call.test.mjs",
+            "gravitone/agents/mcp-gravitone/test/fixture.mjs",
+            "gravitone/agents/mcp-gravitone/test/manifest.test.mjs",
+            "gravitone/agents/mcp-gravitone/test/rpc.test.mjs"
           ],
           "target": null,
           "apiRoutes": []
         },
         {
-          "name": "API Key Management",
-          "description": "Create, reveal once, and revoke API keys for programmatic access; ledger-style UI with secret reveal flow backed by keys API routes.",
-          "businessFeature": "API Key Management",
-          "category": "ui",
+          "name": "Build & Provisioning Scripts",
+          "description": "Node-side operator scripts: the reproducible build entry point and prove-keys, which proves a minted key actually works.",
+          "businessFeature": "Build & Provisioning Scripts",
+          "category": "config",
           "filePaths": [
-            "gravitone/web/app/keys/page.tsx",
-            "gravitone/web/app/keys/_variants/KeysLedger.tsx",
-            "gravitone/web/app/keys/_variants/SecretReveal.tsx",
-            "gravitone/web/app/keys/_variants/data.ts",
-            "gravitone/web/app/api/keys/route.ts",
-            "gravitone/web/app/api/keys/[id]/route.ts",
-            "gravitone/web/app/keys/_variants/KeysEmpty.tsx"
+            "gravitone/scripts/gravitone-build.mjs",
+            "gravitone/scripts/gravitone-build.test.mjs",
+            "gravitone/scripts/prove-keys.mjs"
           ],
           "target": null,
-          "apiRoutes": [
-            "/api/keys"
-          ]
+          "apiRoutes": []
         },
         {
-          "name": "Voice Creation Studio",
-          "description": "Upload/record a reference clip and create a new cloned voice: waveform lab UI plus ingest job API routes (scan, speaker pick, per-emotion preview, commit).",
-          "businessFeature": "Voice Creation Studio",
-          "category": "ui",
+          "name": "Product Documentation",
+          "description": "Operator- and buyer-facing docs: the ElevenLabs switch guide, deploy rehearsal, plus the repo and service READMEs.",
+          "businessFeature": "Product Documentation",
+          "category": "config",
           "filePaths": [
-            "gravitone/web/app/voices/new/page.tsx",
-            "gravitone/web/app/voices/new/_loaders/WaveformLab.tsx",
-            "gravitone/web/app/voices/new/_loaders/shared.tsx",
-            "gravitone/web/app/api/ingest/scan/route.ts",
-            "gravitone/web/app/api/ingest/[job]/route.ts",
-            "gravitone/web/app/api/ingest/[job]/commit/route.ts",
-            "gravitone/web/app/api/ingest/[job]/speaker/route.ts",
-            "gravitone/web/app/api/ingest/[job]/speaker-preview/[sid]/route.ts",
-            "gravitone/web/app/api/ingest/[job]/preview/[emotion]/route.ts",
-            "gravitone/web/app/voices/new/_loaders/StepRail.tsx",
-            "gravitone/web/app/voices/new/_signal/SelectionSweep.tsx"
+            "README.md",
+            "gravitone/README.md",
+            "gravitone/docs/DEPLOY_REHEARSAL.md",
+            "gravitone/docs/SWITCH_FROM_ELEVENLABS.md",
+            "mvp-passport.json"
           ],
           "target": null,
-          "apiRoutes": [
-            "/api/ingest/*"
-          ]
-        },
+          "apiRoutes": []
+        }
+      ]
+    },
+    {
+      "name": "Web BFF Routes",
+      "domain": "integration",
+      "type": "group",
+      "color": "#0EA5E9",
+      "icon": "server",
+      "contexts": [
         {
-          "name": "Character & Voice Management",
-          "description": "Browse and manage characters and their cloned voices: character table with tags, per-character emotion rack with audio previews, an audition matrix that renders every recorded emotion on one identical line, CRUD via characters/voices API routes.",
-          "businessFeature": "Character & Voice Management",
-          "category": "ui",
+          "name": "Speech & Voice Routes",
+          "description": "Browser-facing proxies for synthesis: /api/speak (buffered + stream), /api/tts, /api/stt and the voice listing.",
+          "businessFeature": "Speech & Voice Routes",
+          "category": "api",
           "filePaths": [
-            "gravitone/web/app/voices/page.tsx",
-            "gravitone/web/app/voices/_variants/CharacterTable.tsx",
-            "gravitone/web/app/voices/_variants/TagEditor.tsx",
-            "gravitone/web/app/voices/_variants/data.ts",
-            "gravitone/web/app/voices/[characterId]/page.tsx",
-            "gravitone/web/app/voices/[characterId]/CharacterVoices.tsx",
-            "gravitone/web/app/voices/[characterId]/_variants/EmotionRack.tsx",
-            "gravitone/web/app/voices/[characterId]/_variants/CastExport.tsx",
-            "gravitone/web/app/voices/_data/cast.ts",
-            "gravitone/web/app/voices/[characterId]/_variants/EmotionAudition.tsx",
-            "gravitone/web/app/voices/[characterId]/_variants/audition.ts",
-            "gravitone/web/app/api/characters/route.ts",
-            "gravitone/web/app/api/characters/[id]/route.ts",
-            "gravitone/web/app/api/voices/route.ts",
+            "gravitone/web/app/api/speak/route.test.ts",
+            "gravitone/web/app/api/speak/route.ts",
+            "gravitone/web/app/api/speak/stream/route.test.ts",
+            "gravitone/web/app/api/speak/stream/route.ts",
+            "gravitone/web/app/api/stt/route.test.ts",
+            "gravitone/web/app/api/stt/route.ts",
+            "gravitone/web/app/api/tts/route.test.ts",
+            "gravitone/web/app/api/tts/route.ts",
             "gravitone/web/app/api/voices/[id]/route.ts",
-            "gravitone/web/app/voices/_data/characters.ts",
-            "gravitone/web/app/voices/_variants/RosterEmpty.tsx"
+            "gravitone/web/app/api/voices/route.ts"
           ],
           "target": null,
           "apiRoutes": [
-            "/api/characters",
+            "/api/speak",
+            "/api/speak/stream",
+            "/api/tts",
+            "/api/stt",
             "/api/voices"
           ]
         },
         {
+          "name": "Character & Corpus Routes",
+          "description": "Character CRUD, corpus clips, emotion slots and derive, pack export and import - the studio's data door.",
+          "businessFeature": "Character & Corpus Routes",
+          "category": "api",
+          "filePaths": [
+            "gravitone/web/app/api/characters/[id]/corpus/[sha]/route.ts",
+            "gravitone/web/app/api/characters/[id]/corpus/route.test.ts",
+            "gravitone/web/app/api/characters/[id]/corpus/route.ts",
+            "gravitone/web/app/api/characters/[id]/emotions/[emotion]/derive/route.ts",
+            "gravitone/web/app/api/characters/[id]/emotions/[emotion]/route.ts",
+            "gravitone/web/app/api/characters/[id]/emotions/route.ts",
+            "gravitone/web/app/api/characters/[id]/pack/route.ts",
+            "gravitone/web/app/api/characters/[id]/route.ts",
+            "gravitone/web/app/api/characters/import/route.ts",
+            "gravitone/web/app/api/characters/route.ts"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/api/characters",
+            "/api/characters/{id}/corpus",
+            "/api/characters/{id}/emotions",
+            "/api/characters/{id}/pack"
+          ]
+        },
+        {
+          "name": "Ingest Routes",
+          "description": "The clone wizard's server half: scan, scan-url, link-probe, per-job polling, speaker preview, casting, audition, stems, scene and commit.",
+          "businessFeature": "Ingest Routes",
+          "category": "api",
+          "filePaths": [
+            "gravitone/web/app/api/ingest/[job]/audition/route.ts",
+            "gravitone/web/app/api/ingest/[job]/cast/route.ts",
+            "gravitone/web/app/api/ingest/[job]/commit/route.ts",
+            "gravitone/web/app/api/ingest/[job]/preview/[emotion]/route.ts",
+            "gravitone/web/app/api/ingest/[job]/route.test.ts",
+            "gravitone/web/app/api/ingest/[job]/route.ts",
+            "gravitone/web/app/api/ingest/[job]/scene/route.ts",
+            "gravitone/web/app/api/ingest/[job]/segment/[index]/route.test.ts",
+            "gravitone/web/app/api/ingest/[job]/segment/[index]/route.ts",
+            "gravitone/web/app/api/ingest/[job]/speaker-preview/[sid]/route.ts",
+            "gravitone/web/app/api/ingest/[job]/speaker/route.ts",
+            "gravitone/web/app/api/ingest/[job]/stems/route.ts",
+            "gravitone/web/app/api/ingest/link-probe/route.test.ts",
+            "gravitone/web/app/api/ingest/link-probe/route.ts",
+            "gravitone/web/app/api/ingest/modes/route.ts",
+            "gravitone/web/app/api/ingest/rederive/route.test.ts",
+            "gravitone/web/app/api/ingest/rederive/route.ts",
+            "gravitone/web/app/api/ingest/scan-url/route.test.ts",
+            "gravitone/web/app/api/ingest/scan-url/route.ts",
+            "gravitone/web/app/api/ingest/scan/route.ts"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/api/ingest/scan",
+            "/api/ingest/{job}",
+            "/api/ingest/{job}/commit",
+            "/api/ingest/link-probe"
+          ]
+        },
+        {
+          "name": "Key Routes & Well-Known",
+          "description": "Key minting, revocation, deployment manifests, live probes and the /.well-known/gravitone.json identity document.",
+          "businessFeature": "Key Routes & Well-Known",
+          "category": "api",
+          "filePaths": [
+            "gravitone/web/app/.well-known/gravitone.json/route.ts",
+            "gravitone/web/app/api/keys/[id]/manifest/route.test.ts",
+            "gravitone/web/app/api/keys/[id]/manifest/route.ts",
+            "gravitone/web/app/api/keys/[id]/revoke/route.ts",
+            "gravitone/web/app/api/keys/[id]/route.ts",
+            "gravitone/web/app/api/keys/deployment.ts",
+            "gravitone/web/app/api/keys/identity.ts",
+            "gravitone/web/app/api/keys/probe/route.test.ts",
+            "gravitone/web/app/api/keys/probe/route.ts",
+            "gravitone/web/app/api/keys/route.test.ts",
+            "gravitone/web/app/api/keys/route.ts",
+            "gravitone/web/app/api/keys/wellKnown.test.ts"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/api/keys",
+            "/api/keys/{id}/revoke",
+            "/api/keys/{id}/manifest",
+            "/.well-known/gravitone.json"
+          ]
+        },
+        {
+          "name": "Gym & ConvAI Routes",
+          "description": "Signed-url handshake for live calls, agent listing, recordings with per-track audio, care notes, replay and compare.",
+          "businessFeature": "Gym & ConvAI Routes",
+          "category": "api",
+          "filePaths": [
+            "gravitone/web/app/api/convai/agents/route.ts",
+            "gravitone/web/app/api/convai/signed-url/route.test.ts",
+            "gravitone/web/app/api/convai/signed-url/route.ts",
+            "gravitone/web/app/api/gym/agents/route.ts",
+            "gravitone/web/app/api/gym/compare/route.ts",
+            "gravitone/web/app/api/gym/recordings/[id]/audio/[track]/route.ts",
+            "gravitone/web/app/api/gym/recordings/[id]/care/route.ts",
+            "gravitone/web/app/api/gym/recordings/[id]/route.ts",
+            "gravitone/web/app/api/gym/recordings/route.ts",
+            "gravitone/web/app/api/gym/replay/route.ts"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/api/convai/signed-url",
+            "/api/gym/recordings",
+            "/api/gym/replay",
+            "/api/gym/compare"
+          ]
+        },
+        {
+          "name": "Video Routes",
+          "description": "Voiceover and re-voice job doors plus their frame and media assets, and the narration plan fetch.",
+          "businessFeature": "Video Routes",
+          "category": "api",
+          "filePaths": [
+            "gravitone/web/app/api/narrate/[id]/route.ts",
+            "gravitone/web/app/api/revoice/[job]/media/[asset]/route.ts",
+            "gravitone/web/app/api/revoice/[job]/route.ts",
+            "gravitone/web/app/api/revoice/route.ts",
+            "gravitone/web/app/api/voiceover/[job]/frame/[i]/route.ts",
+            "gravitone/web/app/api/voiceover/[job]/media/[asset]/route.ts",
+            "gravitone/web/app/api/voiceover/[job]/route.ts",
+            "gravitone/web/app/api/voiceover/from-url/route.ts"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/api/voiceover/{job}",
+            "/api/revoice/{job}",
+            "/api/narrate/{id}"
+          ]
+        },
+        {
+          "name": "Takes & Reviews Routes",
+          "description": "Persisting and serving shared takes, review sets and the first-writer-wins pick.",
+          "businessFeature": "Takes & Reviews Routes",
+          "category": "api",
+          "filePaths": [
+            "gravitone/web/app/api/reviews/[id]/pick/route.ts",
+            "gravitone/web/app/api/reviews/preferred/route.ts",
+            "gravitone/web/app/api/reviews/route.ts",
+            "gravitone/web/app/api/takes/[id]/audio/route.ts",
+            "gravitone/web/app/api/takes/[id]/route.ts",
+            "gravitone/web/app/api/takes/route.ts"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/api/takes",
+            "/api/takes/{id}",
+            "/api/reviews",
+            "/api/reviews/{id}/pick"
+          ]
+        },
+        {
+          "name": "Ops & Feedback Routes",
+          "description": "Health, metrics, performance and the rate-limited feedback intake behind the feedback dock.",
+          "businessFeature": "Ops & Feedback Routes",
+          "category": "api",
+          "filePaths": [
+            "gravitone/web/app/api/feedback/limits.ts",
+            "gravitone/web/app/api/feedback/route.test.ts",
+            "gravitone/web/app/api/feedback/route.ts",
+            "gravitone/web/app/api/health/route.ts",
+            "gravitone/web/app/api/metrics/route.ts",
+            "gravitone/web/app/api/performance/route.ts"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/api/health",
+            "/api/metrics",
+            "/api/performance",
+            "/api/feedback"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Studio - Voice Creation",
+      "domain": "feature",
+      "type": "group",
+      "color": "#EC4899",
+      "icon": "wand",
+      "contexts": [
+        {
+          "name": "Clone Wizard State Machine",
+          "description": "The wizard's brain: the stage machine, upload limits and probing, job polling with stall detection, backpressure, reset and the vault receipt.",
+          "businessFeature": "Clone Wizard State Machine",
+          "category": "lib",
+          "filePaths": [
+            "gravitone/web/app/voices/new/_state/failures.test.ts",
+            "gravitone/web/app/voices/new/_state/failures.ts",
+            "gravitone/web/app/voices/new/_state/machine.test.ts",
+            "gravitone/web/app/voices/new/_state/machine.ts",
+            "gravitone/web/app/voices/new/_state/uploadLimits.test.ts",
+            "gravitone/web/app/voices/new/_state/uploadLimits.ts",
+            "gravitone/web/app/voices/new/_state/uploadProbe.ts",
+            "gravitone/web/app/voices/new/_state/useBackpressure.ts",
+            "gravitone/web/app/voices/new/_state/useCloneRoster.ts",
+            "gravitone/web/app/voices/new/_state/useIngestActions.ts",
+            "gravitone/web/app/voices/new/_state/useIngestJob.test.ts",
+            "gravitone/web/app/voices/new/_state/useIngestJob.ts",
+            "gravitone/web/app/voices/new/_state/useIngestModes.ts",
+            "gravitone/web/app/voices/new/_state/useIngestReset.ts",
+            "gravitone/web/app/voices/new/_state/useLinkProbe.test.ts",
+            "gravitone/web/app/voices/new/_state/useLinkProbe.ts",
+            "gravitone/web/app/voices/new/_state/useVaultReceipt.ts"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Casting & Audition State",
+          "description": "Client-side casting: speaker selection, audition playback, corpus and scene derivation, clip transport.",
+          "businessFeature": "Casting & Audition State",
+          "category": "lib",
+          "filePaths": [
+            "gravitone/web/app/voices/new/_state/audition.test.ts",
+            "gravitone/web/app/voices/new/_state/audition.ts",
+            "gravitone/web/app/voices/new/_state/cast.test.ts",
+            "gravitone/web/app/voices/new/_state/cast.ts",
+            "gravitone/web/app/voices/new/_state/casting.test.ts",
+            "gravitone/web/app/voices/new/_state/casting.ts",
+            "gravitone/web/app/voices/new/_state/corpus.test.ts",
+            "gravitone/web/app/voices/new/_state/corpus.ts",
+            "gravitone/web/app/voices/new/_state/scene.test.ts",
+            "gravitone/web/app/voices/new/_state/scene.ts",
+            "gravitone/web/app/voices/new/_state/useAudition.ts",
+            "gravitone/web/app/voices/new/_state/useCasting.ts",
+            "gravitone/web/app/voices/new/_state/useClipTransport.ts"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Wizard Shell & Upload Stage",
+          "description": "Where a clone starts: the page shell, header, step rail, notices, mode panel, drop/link doors and the waveform lab plus scan report while it thinks.",
+          "businessFeature": "Wizard Shell & Upload Stage",
+          "category": "ui",
+          "filePaths": [
+            "gravitone/web/app/voices/new/_loaders/ScanReport.test.tsx",
+            "gravitone/web/app/voices/new/_loaders/ScanReport.tsx",
+            "gravitone/web/app/voices/new/_loaders/StepRail.test.tsx",
+            "gravitone/web/app/voices/new/_loaders/StepRail.tsx",
+            "gravitone/web/app/voices/new/_loaders/WaveformLab.tsx",
+            "gravitone/web/app/voices/new/_shell/VoiceNewBusyNotice.tsx",
+            "gravitone/web/app/voices/new/_shell/VoiceNewHeader.tsx",
+            "gravitone/web/app/voices/new/_shell/VoiceNewNotices.tsx",
+            "gravitone/web/app/voices/new/_shell/VoiceNewPanelLoading.tsx",
+            "gravitone/web/app/voices/new/_upload/VoiceNewLinkDoor.tsx",
+            "gravitone/web/app/voices/new/_upload/VoiceNewModePanel.tsx",
+            "gravitone/web/app/voices/new/_upload/VoiceNewUploadStage.tsx",
+            "gravitone/web/app/voices/new/page.tsx"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Speaker Casting UI",
+          "description": "The casting stage: speaker rows with previews, the cast panel and the casting-in-progress state.",
+          "businessFeature": "Speaker Casting UI",
+          "category": "ui",
+          "filePaths": [
+            "gravitone/web/app/voices/new/_speaker/VoiceNewCastPanel.tsx",
+            "gravitone/web/app/voices/new/_speaker/VoiceNewCastingStage.tsx",
+            "gravitone/web/app/voices/new/_speaker/VoiceNewSpeakerRow.tsx",
+            "gravitone/web/app/voices/new/_speaker/VoiceNewSpeakerStage.tsx"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Segment Review & Commit",
+          "description": "The review round: segment board and rows, audition panel, take list, ledger, the commit panel and every completion / expiry outcome.",
+          "businessFeature": "Segment Review & Commit",
+          "category": "ui",
+          "filePaths": [
+            "gravitone/web/app/voices/new/_complete/VoiceNewCastComplete.tsx",
+            "gravitone/web/app/voices/new/_complete/VoiceNewCommitComplete.tsx",
+            "gravitone/web/app/voices/new/_complete/VoiceNewCommittingStage.tsx",
+            "gravitone/web/app/voices/new/_complete/VoiceNewExpiredStage.tsx",
+            "gravitone/web/app/voices/new/_review/AuditionPanel.tsx",
+            "gravitone/web/app/voices/new/_review/OpenAsScene.test.tsx",
+            "gravitone/web/app/voices/new/_review/OpenAsScene.tsx",
+            "gravitone/web/app/voices/new/_review/SegmentBoard.tsx",
+            "gravitone/web/app/voices/new/_review/VoiceNewCommitPanel.tsx",
+            "gravitone/web/app/voices/new/_review/VoiceNewLedgerRow.tsx",
+            "gravitone/web/app/voices/new/_review/VoiceNewReviewStage.tsx",
+            "gravitone/web/app/voices/new/_review/VoiceNewSegmentRow.tsx",
+            "gravitone/web/app/voices/new/_review/VoiceNewTakeList.tsx",
+            "gravitone/web/app/voices/new/_signal/SelectionSweep.test.tsx",
+            "gravitone/web/app/voices/new/_signal/SelectionSweep.tsx"
+          ],
+          "target": null,
+          "apiRoutes": []
+        }
+      ]
+    },
+    {
+      "name": "Studio - Characters & Voices",
+      "domain": "feature",
+      "type": "group",
+      "color": "#F97316",
+      "icon": "users",
+      "contexts": [
+        {
+          "name": "Character Roster",
+          "description": "The roster table: coverage bars, signal chips, tag editing, bulk actions, cloning, collision prompts and the empty state.",
+          "businessFeature": "Character Roster",
+          "category": "ui",
+          "filePaths": [
+            "gravitone/web/app/voices/_data/cast.test.ts",
+            "gravitone/web/app/voices/_data/cast.ts",
+            "gravitone/web/app/voices/_data/characters.test.ts",
+            "gravitone/web/app/voices/_data/characters.ts",
+            "gravitone/web/app/voices/_data/fidelity.test.tsx",
+            "gravitone/web/app/voices/_data/slots.test.ts",
+            "gravitone/web/app/voices/_variants/CharacterCollisionPrompt.tsx",
+            "gravitone/web/app/voices/_variants/CharacterCoverageBar.tsx",
+            "gravitone/web/app/voices/_variants/CharacterRosterRow.tsx",
+            "gravitone/web/app/voices/_variants/CharacterRosterToolbar.tsx",
+            "gravitone/web/app/voices/_variants/CharacterTable.test.tsx",
+            "gravitone/web/app/voices/_variants/CharacterTable.tsx",
+            "gravitone/web/app/voices/_variants/RosterEmpty.test.tsx",
+            "gravitone/web/app/voices/_variants/RosterEmpty.tsx",
+            "gravitone/web/app/voices/_variants/SignalChip.tsx",
+            "gravitone/web/app/voices/_variants/TagEditor.tsx",
+            "gravitone/web/app/voices/_variants/characterTableHelpers.ts",
+            "gravitone/web/app/voices/_variants/data.ts",
+            "gravitone/web/app/voices/_variants/useCharacterRosterBulk.ts",
+            "gravitone/web/app/voices/_variants/useCharacterRosterClone.ts",
+            "gravitone/web/app/voices/page.tsx"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Character Detail & Corpus",
+          "description": "One character's page: header, corpus clips with deletion and rebuild, cast export and the API panel that shows how to call this voice.",
+          "businessFeature": "Character Detail & Corpus",
+          "category": "ui",
+          "filePaths": [
+            "gravitone/web/app/voices/[characterId]/CharacterVoices.test.tsx",
+            "gravitone/web/app/voices/[characterId]/CharacterVoices.tsx",
+            "gravitone/web/app/voices/[characterId]/_variants/ApiPanel.tsx",
+            "gravitone/web/app/voices/[characterId]/_variants/CastExport.tsx",
+            "gravitone/web/app/voices/[characterId]/_variants/CharacterHeader.tsx",
+            "gravitone/web/app/voices/[characterId]/_variants/CorpusClipRow.tsx",
+            "gravitone/web/app/voices/[characterId]/_variants/CorpusPanel.test.tsx",
+            "gravitone/web/app/voices/[characterId]/_variants/CorpusPanel.tsx",
+            "gravitone/web/app/voices/[characterId]/_variants/CorpusRebuildPanel.tsx",
+            "gravitone/web/app/voices/[characterId]/_variants/useCorpusDeletion.ts",
+            "gravitone/web/app/voices/[characterId]/_variants/useCorpusRebuild.ts",
+            "gravitone/web/app/voices/[characterId]/page.tsx"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Emotion Rack & Audition",
+          "description": "The emotion rack: slot rows and actions, shadow rows for derived slots, donor picking, the palette panel, blind audition tiles and the guided recorder that fills a slot.",
+          "businessFeature": "Emotion Rack & Audition",
+          "category": "ui",
+          "filePaths": [
+            "gravitone/web/app/voices/[characterId]/_variants/EmotionAudition.test.tsx",
+            "gravitone/web/app/voices/[characterId]/_variants/EmotionAudition.tsx",
+            "gravitone/web/app/voices/[characterId]/_variants/EmotionAuditionTile.tsx",
+            "gravitone/web/app/voices/[characterId]/_variants/EmotionDonorPicker.tsx",
+            "gravitone/web/app/voices/[characterId]/_variants/EmotionPalettePanel.tsx",
+            "gravitone/web/app/voices/[characterId]/_variants/EmotionRack.test.tsx",
+            "gravitone/web/app/voices/[characterId]/_variants/EmotionRack.tsx",
+            "gravitone/web/app/voices/[characterId]/_variants/EmotionShadowRow.tsx",
+            "gravitone/web/app/voices/[characterId]/_variants/EmotionSlotActions.tsx",
+            "gravitone/web/app/voices/[characterId]/_variants/EmotionSlotRow.tsx",
+            "gravitone/web/app/voices/[characterId]/_variants/GuidedRecorder.tsx",
+            "gravitone/web/app/voices/[characterId]/_variants/audition.test.ts",
+            "gravitone/web/app/voices/[characterId]/_variants/audition.ts",
+            "gravitone/web/app/voices/[characterId]/_variants/useEmotionRackDonors.ts",
+            "gravitone/web/app/voices/[characterId]/_variants/useGuidedRecorderCapture.ts"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Profile & My Voices",
+          "description": "The signed-in surface: the voices that are mine, their sign-off badges and the rows that own them.",
+          "businessFeature": "Profile & My Voices",
+          "category": "ui",
+          "filePaths": [
+            "gravitone/web/app/profile/MyVoices.test.tsx",
+            "gravitone/web/app/profile/MyVoices.tsx",
+            "gravitone/web/app/profile/MyVoicesRow.tsx",
+            "gravitone/web/app/profile/ProfileSignoffBadge.tsx",
+            "gravitone/web/app/profile/VoicesOfMine.tsx",
+            "gravitone/web/app/profile/page.tsx"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Consent Sign-off Flow",
+          "description": "The public /s/[voiceId] page a voice owner signs: the phrase recorder, the terms form, the gate that decides whether a sign-off counts, and the outcome.",
+          "businessFeature": "Consent Sign-off Flow",
+          "category": "ui",
+          "filePaths": [
+            "gravitone/web/app/s/[voiceId]/PhraseRecorder.tsx",
+            "gravitone/web/app/s/[voiceId]/SignoffFlow.test.tsx",
+            "gravitone/web/app/s/[voiceId]/SignoffFlow.tsx",
+            "gravitone/web/app/s/[voiceId]/SignoffOutcome.tsx",
+            "gravitone/web/app/s/[voiceId]/SignoffTermsForm.tsx",
+            "gravitone/web/app/s/[voiceId]/page.tsx",
+            "gravitone/web/app/s/[voiceId]/useSignoffGate.ts",
+            "gravitone/web/app/s/[voiceId]/useSignoffSubmit.ts"
+          ],
+          "target": null,
+          "apiRoutes": []
+        }
+      ]
+    },
+    {
+      "name": "Studio - Playground",
+      "domain": "feature",
+      "type": "group",
+      "color": "#D946EF",
+      "icon": "sliders",
+      "contexts": [
+        {
+          "name": "Playground Console & Composer",
+          "description": "The console shell: the character rail, compose bay, notices, render status and the composer state that survives a reload.",
+          "businessFeature": "Playground Console & Composer",
+          "category": "ui",
+          "filePaths": [
+            "gravitone/web/app/playground/_variants/PlaygroundCharacterRail.tsx",
+            "gravitone/web/app/playground/_variants/PlaygroundComposeBay.tsx",
+            "gravitone/web/app/playground/_variants/PlaygroundConsole.test.tsx",
+            "gravitone/web/app/playground/_variants/PlaygroundConsole.tsx",
+            "gravitone/web/app/playground/_variants/PlaygroundExpression.tsx",
+            "gravitone/web/app/playground/_variants/PlaygroundNotices.tsx",
+            "gravitone/web/app/playground/_variants/PlaygroundPrimitives.tsx",
+            "gravitone/web/app/playground/_variants/PlaygroundRenderStatus.tsx",
+            "gravitone/web/app/playground/_variants/PlaygroundScriptRows.tsx",
+            "gravitone/web/app/playground/_variants/playgroundEstimate.ts",
+            "gravitone/web/app/playground/_variants/playgroundHelpers.test.ts",
+            "gravitone/web/app/playground/_variants/playgroundHelpers.ts",
+            "gravitone/web/app/playground/_variants/usePlaygroundComposer.ts",
+            "gravitone/web/app/playground/_variants/usePlaygroundComposerDurability.ts",
+            "gravitone/web/app/playground/_variants/usePlaygroundRoster.ts",
+            "gravitone/web/app/playground/_variants/variantStore.ts",
+            "gravitone/web/app/playground/page.tsx"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Score Editor",
+          "description": "The score: markup, lanes, placement, the inspector, the director and the preview run - where direction is written before it is spoken.",
+          "businessFeature": "Score Editor",
+          "category": "ui",
+          "filePaths": [
+            "gravitone/web/app/playground/_variants/ScoreDirector.tsx",
+            "gravitone/web/app/playground/_variants/ScoreEditor.test.tsx",
+            "gravitone/web/app/playground/_variants/ScoreEditor.tsx",
+            "gravitone/web/app/playground/_variants/ScoreInspector.tsx",
+            "gravitone/web/app/playground/_variants/ScoreLane.tsx",
+            "gravitone/web/app/playground/_variants/ScoreMarkup.tsx",
+            "gravitone/web/app/playground/_variants/ScorePlacement.tsx",
+            "gravitone/web/app/playground/_variants/ScoreText.test.tsx",
+            "gravitone/web/app/playground/_variants/ScoreText.tsx",
+            "gravitone/web/app/playground/_variants/ScriptLane.tsx",
+            "gravitone/web/app/playground/_variants/ScriptScore.test.tsx",
+            "gravitone/web/app/playground/_variants/ScriptScore.tsx",
+            "gravitone/web/app/playground/_variants/score.test.ts",
+            "gravitone/web/app/playground/_variants/scoreEdits.ts",
+            "gravitone/web/app/playground/_variants/scoreRuns.ts",
+            "gravitone/web/app/playground/_variants/suggest.test.ts",
+            "gravitone/web/app/playground/_variants/suggest.ts",
+            "gravitone/web/app/playground/_variants/useScoreDirector.ts",
+            "gravitone/web/app/playground/_variants/useScorePreview.ts"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Emotion Picker & Wheel",
+          "description": "Choosing an emotion: chips, the spoke wheel with keyboard control, and the A/B comparison that proves the choice changed something.",
+          "businessFeature": "Emotion Picker & Wheel",
+          "category": "ui",
+          "filePaths": [
+            "gravitone/web/app/playground/_variants/EmotionAB.test.tsx",
+            "gravitone/web/app/playground/_variants/EmotionAB.tsx",
+            "gravitone/web/app/playground/_variants/EmotionAbSide.tsx",
+            "gravitone/web/app/playground/_variants/EmotionChips.tsx",
+            "gravitone/web/app/playground/_variants/EmotionPicker.test.tsx",
+            "gravitone/web/app/playground/_variants/EmotionPicker.tsx",
+            "gravitone/web/app/playground/_variants/EmotionSpoke.tsx",
+            "gravitone/web/app/playground/_variants/emotionCompare.ts",
+            "gravitone/web/app/playground/_variants/emotionWheel.ts",
+            "gravitone/web/app/playground/_variants/useEmotionWheelKeys.ts"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Takes, Punch-in & Playback",
+          "description": "What came out: the take log and cards, take codes, the timeline, punch-in lanes for re-recording a span, sharing and the audio player.",
+          "businessFeature": "Takes, Punch-in & Playback",
+          "category": "ui",
+          "filePaths": [
+            "gravitone/web/app/playground/_variants/PlaygroundTakeCard.tsx",
+            "gravitone/web/app/playground/_variants/PlaygroundTakeLog.tsx",
+            "gravitone/web/app/playground/_variants/PunchIn.tsx",
+            "gravitone/web/app/playground/_variants/PunchLanes.tsx",
+            "gravitone/web/app/playground/_variants/TakeCode.tsx",
+            "gravitone/web/app/playground/_variants/TakeTimeline.test.tsx",
+            "gravitone/web/app/playground/_variants/TakeTimeline.tsx",
+            "gravitone/web/app/playground/_variants/punchTypes.ts",
+            "gravitone/web/app/playground/_variants/signal.test.tsx",
+            "gravitone/web/app/playground/_variants/signal.tsx",
+            "gravitone/web/app/playground/_variants/useAudioPlayer.test.tsx",
+            "gravitone/web/app/playground/_variants/useAudioPlayer.ts",
+            "gravitone/web/app/playground/_variants/usePlaygroundSharing.ts",
+            "gravitone/web/app/playground/_variants/usePlaygroundTakeActions.ts",
+            "gravitone/web/app/playground/_variants/usePlaygroundTakes.ts",
+            "gravitone/web/app/playground/_variants/usePunchSession.ts"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Playground Engine Seam",
+          "description": "Which engine renders this line, what it will cost, and how generation is driven - the playground's side of the engine plane.",
+          "businessFeature": "Playground Engine Seam",
+          "category": "lib",
+          "filePaths": [
+            "gravitone/web/app/playground/_variants/playgroundEngine.test.ts",
+            "gravitone/web/app/playground/_variants/playgroundEngine.ts",
+            "gravitone/web/app/playground/_variants/usePlaygroundEngine.ts",
+            "gravitone/web/app/playground/_variants/usePlaygroundGenerate.ts"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Live Call Client",
+          "description": "The browser half of a live agent call: the mic worklet, PCM conversion, the call socket, the stage, controls and the running transcript.",
+          "businessFeature": "Live Call Client",
+          "category": "ui",
+          "filePaths": [
+            "gravitone/web/app/playground/_live/LiveControls.tsx",
+            "gravitone/web/app/playground/_live/LiveStage.test.tsx",
+            "gravitone/web/app/playground/_live/LiveStage.tsx",
+            "gravitone/web/app/playground/_live/LiveTranscript.tsx",
+            "gravitone/web/app/playground/_live/conversation.test.ts",
+            "gravitone/web/app/playground/_live/conversation.ts",
+            "gravitone/web/app/playground/_live/liveTurns.ts",
+            "gravitone/web/app/playground/_live/pcm.test.ts",
+            "gravitone/web/app/playground/_live/pcm.ts",
+            "gravitone/web/app/playground/_live/useLiveAgents.ts",
+            "gravitone/web/app/playground/_live/useLiveCall.ts",
+            "gravitone/web/app/playground/_live/worklet.ts"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Video Dub & Reel",
+          "description": "The video round inside the playground: the reel door, the marquee with its playhead, narrate and re-voice lanes, and the dub sheet where a line's takes live.",
+          "businessFeature": "Video Dub & Reel",
+          "category": "ui",
+          "filePaths": [
+            "gravitone/web/app/playground/_video/Marquee.tsx",
+            "gravitone/web/app/playground/_video/MarqueeNarrate.tsx",
+            "gravitone/web/app/playground/_video/MarqueePlayhead.tsx",
+            "gravitone/web/app/playground/_video/MarqueeRevoice.tsx",
+            "gravitone/web/app/playground/_video/ReelDoor.tsx",
+            "gravitone/web/app/playground/_video/dub.test.tsx",
+            "gravitone/web/app/playground/_video/dubParts.tsx",
+            "gravitone/web/app/playground/_video/marquee.test.tsx",
+            "gravitone/web/app/playground/_video/useDub.ts",
+            "gravitone/web/app/playground/_video/useReel.ts",
+            "gravitone/web/app/playground/_video/videoData.ts",
+            "gravitone/web/app/playground/_video/videoParts.tsx"
+          ],
+          "target": null,
+          "apiRoutes": []
+        }
+      ]
+    },
+    {
+      "name": "Studio - Operations & Sharing",
+      "domain": "feature",
+      "type": "group",
+      "color": "#14B8A6",
+      "icon": "activity",
+      "contexts": [
+        {
+          "name": "Gym Forensics UI",
+          "description": "The gym page as a forensic timeline: sessions, diagnosis, care, the replay drawer, per-turn inspection and track seeking.",
+          "businessFeature": "Gym Forensics UI",
+          "category": "ui",
+          "filePaths": [
+            "gravitone/web/app/gym/_forensics/CarePhase.tsx",
+            "gravitone/web/app/gym/_forensics/DiagnosisPhase.tsx",
+            "gravitone/web/app/gym/_forensics/GymReplayDrawer.tsx",
+            "gravitone/web/app/gym/_forensics/GymSessionTurns.tsx",
+            "gravitone/web/app/gym/_forensics/PhaseFrame.tsx",
+            "gravitone/web/app/gym/_forensics/SessionInspector.tsx",
+            "gravitone/web/app/gym/_forensics/SessionsPhase.tsx",
+            "gravitone/web/app/gym/_forensics/useGymTrackSeek.ts",
+            "gravitone/web/app/gym/_gym/data.ts",
+            "gravitone/web/app/gym/_gym/diagnose.ts",
+            "gravitone/web/app/gym/_gym/gymParts.tsx",
+            "gravitone/web/app/gym/_gym/types.ts",
+            "gravitone/web/app/gym/page.tsx"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Keys Console",
+          "description": "The key ledger: minting with a copy-once reveal, scope chips, revocation with honest rollback copy, agent blocks, the migration kit, attestation and the proving sweep.",
+          "businessFeature": "Keys Console",
+          "category": "ui",
+          "filePaths": [
+            "gravitone/web/app/keys/_variants/AgentBlocks.tsx",
+            "gravitone/web/app/keys/_variants/KeysEmpty.test.tsx",
+            "gravitone/web/app/keys/_variants/KeysEmpty.tsx",
+            "gravitone/web/app/keys/_variants/KeysLedger.test.tsx",
+            "gravitone/web/app/keys/_variants/KeysLedger.tsx",
+            "gravitone/web/app/keys/_variants/KeysLedgerRow.tsx",
+            "gravitone/web/app/keys/_variants/KeysPostureNote.tsx",
+            "gravitone/web/app/keys/_variants/KeysScopeChips.tsx",
+            "gravitone/web/app/keys/_variants/MigrationKit.tsx",
+            "gravitone/web/app/keys/_variants/ProvingSweep.tsx",
+            "gravitone/web/app/keys/_variants/SecretReveal.tsx",
+            "gravitone/web/app/keys/_variants/agentConfig.ts",
+            "gravitone/web/app/keys/_variants/attestation.ts",
+            "gravitone/web/app/keys/_variants/capabilities.test.ts",
+            "gravitone/web/app/keys/_variants/capabilities.ts",
+            "gravitone/web/app/keys/_variants/data.ts",
+            "gravitone/web/app/keys/_variants/probes.test.ts",
+            "gravitone/web/app/keys/_variants/probes.ts",
+            "gravitone/web/app/keys/_variants/serviceRoutes.ts",
+            "gravitone/web/app/keys/page.tsx"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
           "name": "Ops Transparency",
-          "description": "Live engine telemetry in the studio: polls the backend's /metrics through a server-side proxy and renders in-flight, queue depth, latency percentiles and realtime factor — with an explicit degraded-connection state and no fabricated zeros.",
+          "description": "What the box is doing right now: live tiles fed by the metrics poll, formatted for a human rather than a scraper.",
           "businessFeature": "Ops Transparency",
           "category": "ui",
           "filePaths": [
-            "gravitone/web/app/ops/page.tsx",
+            "gravitone/web/app/ops/OpsTiles.tsx",
             "gravitone/web/app/ops/OpsView.tsx",
-            "gravitone/web/app/api/metrics/route.ts",
-            "gravitone/web/lib/useMetricsPoll.ts"
+            "gravitone/web/app/ops/opsFormat.ts",
+            "gravitone/web/app/ops/page.tsx"
           ],
           "target": null,
-          "apiRoutes": [
-            "/api/metrics"
-          ]
+          "apiRoutes": []
         },
         {
-          "name": "Conversation Gym Studio",
-          "description": "The /gym forensic room: recorded sessions joined to Characters, findings derived through two lenses (internal — the Character needs care; external — indications for the brain's developers), a session inspector with aligned two-track listening and replay tools, and care/handoff actions.",
-          "businessFeature": "Conversation Gym Studio",
+          "name": "Benchmarks & Local Engine",
+          "description": "The published leaderboard, the cost bar, the planner and the local-engine panel that lets a visitor check the claim on their own hardware.",
+          "businessFeature": "Benchmarks & Local Engine",
           "category": "ui",
           "filePaths": [
-            "gravitone/web/app/gym/page.tsx",
-            "gravitone/web/app/gym/_gym/types.ts",
-            "gravitone/web/app/gym/_gym/data.ts",
-            "gravitone/web/app/gym/_gym/diagnose.ts",
-            "gravitone/web/app/gym/_gym/shared.tsx",
-            "gravitone/web/app/gym/_forensics/PhaseFrame.tsx",
-            "gravitone/web/app/gym/_forensics/SessionsPhase.tsx",
-            "gravitone/web/app/gym/_forensics/DiagnosisPhase.tsx",
-            "gravitone/web/app/gym/_forensics/CarePhase.tsx",
-            "gravitone/web/app/gym/_forensics/SessionInspector.tsx",
-            "gravitone/web/app/api/gym/agents/route.ts",
-            "gravitone/web/app/api/gym/recordings/route.ts",
-            "gravitone/web/app/api/gym/recordings/[id]/route.ts",
-            "gravitone/web/app/api/gym/recordings/[id]/audio/[track]/route.ts",
-            "gravitone/web/app/api/gym/recordings/[id]/care/route.ts",
-            "gravitone/web/app/api/gym/replay/route.ts",
-            "gravitone/web/app/api/gym/compare/route.ts"
+            "gravitone/web/app/benchmarks/BenchmarksLeaderboard.tsx",
+            "gravitone/web/app/benchmarks/BenchmarksPlanner.tsx",
+            "gravitone/web/app/benchmarks/BenchmarksView.tsx",
+            "gravitone/web/app/benchmarks/CostBar.test.tsx",
+            "gravitone/web/app/benchmarks/CostBar.tsx",
+            "gravitone/web/app/benchmarks/LocalEnginePanel.test.tsx",
+            "gravitone/web/app/benchmarks/LocalEnginePanel.tsx",
+            "gravitone/web/app/benchmarks/benchmarksRows.ts",
+            "gravitone/web/app/benchmarks/page.tsx"
           ],
           "target": null,
-          "apiRoutes": [
-            "/api/gym/*"
-          ]
+          "apiRoutes": []
         },
         {
-          "name": "TTS Playground",
-          "description": "Interactive console to type text, pick a voice and emotion, and hear synthesized speech; includes an emotion A/B that renders one line under two emotions side by side. Streams audio through server-side proxy routes that hide the backend and avoid CORS.",
-          "businessFeature": "TTS Playground",
+          "name": "Shared Take & Review Pages",
+          "description": "The public artifacts: /t/[id] take pages with score readout, lineage, re-perform and embed, and /r/[id] review pages where a client picks.",
+          "businessFeature": "Shared Take & Review Pages",
           "category": "ui",
           "filePaths": [
-            "gravitone/web/app/playground/page.tsx",
-            "gravitone/web/app/playground/_variants/PlaygroundConsole.tsx",
-            "gravitone/web/app/playground/_variants/EmotionPicker.tsx",
-            "gravitone/web/app/playground/_variants/EmotionAB.tsx",
-            "gravitone/web/app/playground/_variants/engine.ts",
-            "gravitone/web/app/playground/_variants/useAudioPlayer.ts",
-            "gravitone/web/app/playground/_variants/shared.ts",
-            "gravitone/web/app/api/tts/route.ts",
-            "gravitone/web/app/api/speak/route.ts"
+            "gravitone/web/app/r/[id]/ReviewPicker.tsx",
+            "gravitone/web/app/r/[id]/ReviewRevisionRequest.tsx",
+            "gravitone/web/app/r/[id]/actions.ts",
+            "gravitone/web/app/r/[id]/page.tsx",
+            "gravitone/web/app/t/[id]/Lineage.tsx",
+            "gravitone/web/app/t/[id]/OpenInRack.test.tsx",
+            "gravitone/web/app/t/[id]/OpenInRack.tsx",
+            "gravitone/web/app/t/[id]/RePerform.test.tsx",
+            "gravitone/web/app/t/[id]/RePerform.tsx",
+            "gravitone/web/app/t/[id]/TakeCard.tsx",
+            "gravitone/web/app/t/[id]/TakeScore.test.tsx",
+            "gravitone/web/app/t/[id]/TakeScore.tsx",
+            "gravitone/web/app/t/[id]/TakeScoreReadout.tsx",
+            "gravitone/web/app/t/[id]/TakeStage.test.tsx",
+            "gravitone/web/app/t/[id]/TakeStage.tsx",
+            "gravitone/web/app/t/[id]/embed/page.tsx",
+            "gravitone/web/app/t/[id]/page.tsx",
+            "gravitone/web/app/t/[id]/reperform/route.ts",
+            "gravitone/web/app/t/[id]/reperformLines.ts",
+            "gravitone/web/app/t/[id]/takeScoreLayout.ts",
+            "gravitone/web/app/t/[id]/useTakeTransport.ts"
           ],
           "target": null,
-          "apiRoutes": [
-            "/api/tts",
-            "/api/speak"
-          ]
+          "apiRoutes": []
         }
       ]
     },
     {
       "name": "Design System & Brand",
       "domain": "shared",
-      "type": null,
+      "type": "group",
       "color": "#F59E0B",
-      "icon": null,
+      "icon": "palette",
       "contexts": [
         {
-          "name": "App Shell & Landing",
-          "description": "Marketing landing page and root layout: hero, copy content, global styles, and Next.js configuration.",
-          "businessFeature": "App Shell & Landing",
+          "name": "App Shell & Navigation",
+          "description": "The frame every page sits in: root layout, app frame, mobile nav, user menu, global CSS and the edge middleware that fronts them.",
+          "businessFeature": "App Shell & Navigation",
           "category": "ui",
           "filePaths": [
-            "gravitone/web/app/page.tsx",
-            "gravitone/web/app/layout.tsx",
             "gravitone/web/app/globals.css",
-            "gravitone/web/lib/content.ts",
-            "gravitone/web/next.config.mjs",
-            "gravitone/web/package.json"
+            "gravitone/web/app/layout.tsx",
+            "gravitone/web/components/ui/AppFrame.tsx",
+            "gravitone/web/components/ui/MobileNav.tsx",
+            "gravitone/web/components/ui/UserMenu.tsx",
+            "gravitone/web/middleware.ts"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "UI Primitives & Tokens",
+          "description": "The Signal design language in code: primitives, tokens, regions and the ErrorBanner every honest failure surface uses.",
+          "businessFeature": "UI Primitives & Tokens",
+          "category": "ui",
+          "filePaths": [
+            "gravitone/web/DESIGN.md",
+            "gravitone/web/components/ui/ErrorBanner.test.tsx",
+            "gravitone/web/components/ui/ErrorBanner.tsx",
+            "gravitone/web/components/ui/GravitoneTokens.tsx",
+            "gravitone/web/components/ui/Primitives.tsx",
+            "gravitone/web/components/ui/Region.test.tsx",
+            "gravitone/web/components/ui/Region.tsx",
+            "gravitone/web/components/ui/tokens.test.ts",
+            "gravitone/web/components/ui/tokens.ts"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Audio Transport Components",
+          "description": "Shared listening surfaces: the audio bus and its analysis graph, tracks with playheads and seeking, the take player, the equalizer and the transport hook.",
+          "businessFeature": "Audio Transport Components",
+          "category": "ui",
+          "filePaths": [
+            "gravitone/web/components/ui/AudioBus.test.tsx",
+            "gravitone/web/components/ui/AudioBus.tsx",
+            "gravitone/web/components/ui/Equalizer.test.tsx",
+            "gravitone/web/components/ui/Equalizer.tsx",
+            "gravitone/web/components/ui/TakePlayer.test.tsx",
+            "gravitone/web/components/ui/TakePlayer.tsx",
+            "gravitone/web/components/ui/Track.test.tsx",
+            "gravitone/web/components/ui/Track.tsx",
+            "gravitone/web/components/ui/TrackPlayhead.tsx",
+            "gravitone/web/components/ui/audioBusAnalysis.ts",
+            "gravitone/web/components/ui/testFakes.ts",
+            "gravitone/web/components/ui/trackHelpers.ts",
+            "gravitone/web/components/ui/useAudioBusChannels.ts",
+            "gravitone/web/components/ui/useAudioBusGraph.ts",
+            "gravitone/web/components/ui/useTrackSeek.ts",
+            "gravitone/web/components/ui/useTransport.ts"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Narration Dock",
+          "description": "The product narrating itself: the dock, its narrator selection, highlight sync, synthesis, remote clips and transport - plus the baked narration the page ships with.",
+          "businessFeature": "Narration Dock",
+          "category": "ui",
+          "filePaths": [
+            "gravitone/web/components/ui/NarrationDock.test.tsx",
+            "gravitone/web/components/ui/NarrationDock.tsx",
+            "gravitone/web/components/ui/NarrationDockPanel.tsx",
+            "gravitone/web/components/ui/narrationDockHighlight.ts",
+            "gravitone/web/components/ui/narrationDockNarrator.ts",
+            "gravitone/web/components/ui/narrationDockState.ts",
+            "gravitone/web/components/ui/narrationDockStatus.ts",
+            "gravitone/web/components/ui/narrationDockSynthesis.ts",
+            "gravitone/web/components/ui/useNarrationDockClips.ts",
+            "gravitone/web/components/ui/useNarrationDockHighlight.ts",
+            "gravitone/web/components/ui/useNarrationDockNarrators.ts",
+            "gravitone/web/components/ui/useNarrationDockRemote.ts",
+            "gravitone/web/components/ui/useNarrationDockTransport.ts",
+            "gravitone/web/lib/bakeNarration.test.ts",
+            "gravitone/web/lib/narratable.test.ts",
+            "gravitone/web/lib/narratable.ts",
+            "gravitone/web/lib/narrateEmbed.test.ts",
+            "gravitone/web/lib/narrationCache.test.ts",
+            "gravitone/web/lib/narrationCache.ts",
+            "gravitone/web/public/narrate.js",
+            "gravitone/web/scripts/bake-narration.ts"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Feedback Dock",
+          "description": "The in-product feedback door and its panel, rate-limited on the way out.",
+          "businessFeature": "Feedback Dock",
+          "category": "ui",
+          "filePaths": [
+            "gravitone/web/components/ui/FeedbackDock.test.tsx",
+            "gravitone/web/components/ui/FeedbackDock.tsx",
+            "gravitone/web/components/ui/FeedbackDockPanel.tsx"
           ],
           "target": null,
           "apiRoutes": []
         },
         {
           "name": "Emotion Glyph Art",
-          "description": "Animated glyph artwork per emotion (happy, sad, angry, calm, excited, confused, whisper) rendered as EmotionGlyph/EmotionArt components; emotion metadata shared with the playground.",
+          "description": "Emotion as a picture: generated glyphs, the emotion icon set, the art component and the rendered emotion plates.",
           "businessFeature": "Emotion Glyph Art",
-          "category": "lib",
+          "category": "ui",
           "filePaths": [
-            "gravitone/web/lib/glyphs/index.ts",
             "gravitone/web/components/ui/EmotionArt.tsx",
-            "gravitone/web/lib/emotions.ts"
+            "gravitone/web/components/ui/EmotionIcon.test.tsx",
+            "gravitone/web/components/ui/EmotionIcon.tsx",
+            "gravitone/web/components/ui/GeneratedGlyph.tsx",
+            "gravitone/web/lib/glyphs/generate.ts",
+            "gravitone/web/lib/glyphs/index.ts",
+            "gravitone/web/public/emotions/angry.png",
+            "gravitone/web/public/emotions/baseline.png",
+            "gravitone/web/public/emotions/calm.png",
+            "gravitone/web/public/emotions/confused.png",
+            "gravitone/web/public/emotions/excited.png",
+            "gravitone/web/public/emotions/happy.png",
+            "gravitone/web/public/emotions/sad.png",
+            "gravitone/web/public/emotions/whisper.png"
           ],
           "target": null,
           "apiRoutes": []
         },
         {
-          "name": "UI Design System",
-          "description": "Shared visual language for the studio: app frame with navigation, primitives, design tokens, prototype tab switcher, and the StudioDark theme variant.",
-          "businessFeature": "UI Design System",
+          "name": "Landing Page & Hero",
+          "description": "The front door: the landing page, the hero mic demo, the studio-dark treatment, the section rail and the entrance motion that carries them.",
+          "businessFeature": "Landing Page & Hero",
           "category": "ui",
           "filePaths": [
-            "gravitone/web/components/ui/AppFrame.tsx",
-            "gravitone/web/components/ui/Primitives.tsx",
-            "gravitone/web/components/ui/tokens.ts",
+            "gravitone/web/app/page.tsx",
+            "gravitone/web/components/ui/SavingsTicker.tsx",
+            "gravitone/web/components/variants/HeroMicDemo.tsx",
+            "gravitone/web/components/variants/SectionRail.test.tsx",
+            "gravitone/web/components/variants/SectionRail.tsx",
             "gravitone/web/components/variants/StudioDark.tsx",
-            "gravitone/web/components/ui/MobileNav.tsx",
-            "gravitone/web/components/ui/Equalizer.tsx"
+            "gravitone/web/components/variants/useHeroMicDemo.ts",
+            "gravitone/web/components/variants/useStudioEnter.ts",
+            "gravitone/web/components/variants/useStudioPreview.ts"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Feature Signal Illustrations",
+          "description": "The animated illustrations that carry each feature's story - the preview set, its geometry helpers, the feature grid and spotlight.",
+          "businessFeature": "Feature Signal Illustrations",
+          "category": "ui",
+          "filePaths": [
+            "gravitone/web/components/variants/features/FeatureCardArt.tsx",
+            "gravitone/web/components/variants/features/FeatureGrid.test.tsx",
+            "gravitone/web/components/variants/features/FeatureGrid.tsx",
+            "gravitone/web/components/variants/features/FeatureSpotlight.tsx",
+            "gravitone/web/components/variants/features/previews/AgentsSignal.tsx",
+            "gravitone/web/components/variants/features/previews/ArmSignal.tsx",
+            "gravitone/web/components/variants/features/previews/CastSignal.tsx",
+            "gravitone/web/components/variants/features/previews/CompatSignal.tsx",
+            "gravitone/web/components/variants/features/previews/PerformanceSignal.tsx",
+            "gravitone/web/components/variants/features/previews/ScoreSignal.tsx",
+            "gravitone/web/components/variants/features/previews/SovereignSignal.tsx",
+            "gravitone/web/components/variants/features/previews/StreamSignal.tsx",
+            "gravitone/web/components/variants/features/previews/illus.test.ts",
+            "gravitone/web/components/variants/features/previews/illus.tsx",
+            "gravitone/web/components/variants/features/previews/illusGeometry.ts",
+            "gravitone/web/components/variants/features/previews/index.ts"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Pricing",
+          "description": "The pricing section: the bills animation and its odometer, the easing and timeline behind them, and the math that keeps the comparison honest.",
+          "businessFeature": "Pricing",
+          "category": "ui",
+          "filePaths": [
+            "gravitone/web/components/variants/PricingBills.tsx",
+            "gravitone/web/components/variants/PricingBillsOdometer.tsx",
+            "gravitone/web/components/variants/PricingSection.test.tsx",
+            "gravitone/web/components/variants/PricingSection.tsx",
+            "gravitone/web/components/variants/pricingBillsMath.ts",
+            "gravitone/web/components/variants/pricingEasing.ts",
+            "gravitone/web/components/variants/pricingShared.tsx",
+            "gravitone/web/components/variants/pricingTimeline.test.ts",
+            "gravitone/web/components/variants/pricingTimeline.ts",
+            "gravitone/web/components/variants/pricingVariants.test.tsx"
+          ],
+          "target": null,
+          "apiRoutes": []
+        }
+      ]
+    },
+    {
+      "name": "Web Platform Libraries",
+      "domain": "shared",
+      "type": "group",
+      "color": "#64748B",
+      "icon": "library",
+      "contexts": [
+        {
+          "name": "API Fetch & Backend Seam",
+          "description": "How the web talks to the service: apiFetch's throwDetail/apiJson contract, the backend base URL, service headers, the engine seam and engine probe.",
+          "businessFeature": "API Fetch & Backend Seam",
+          "category": "lib",
+          "filePaths": [
+            "gravitone/web/lib/apiFetch.test.ts",
+            "gravitone/web/lib/apiFetch.ts",
+            "gravitone/web/lib/authedFetch.ts",
+            "gravitone/web/lib/backend.test.ts",
+            "gravitone/web/lib/backend.ts",
+            "gravitone/web/lib/engineProbe.test.ts",
+            "gravitone/web/lib/engineProbe.ts",
+            "gravitone/web/lib/engineSeam.test.ts",
+            "gravitone/web/lib/engineSeam.ts",
+            "gravitone/web/lib/serviceHeaders.test.ts",
+            "gravitone/web/lib/serviceHeaders.ts"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Auth & Identity",
+          "description": "Firebase auth, the useAuth provider, ID-token handling, key minting from the browser and the consent record a clone requires.",
+          "businessFeature": "Auth & Identity",
+          "category": "lib",
+          "filePaths": [
+            "gravitone/web/lib/consent.ts",
+            "gravitone/web/lib/firebase.ts",
+            "gravitone/web/lib/idToken.test.ts",
+            "gravitone/web/lib/idToken.ts",
+            "gravitone/web/lib/mintKey.ts",
+            "gravitone/web/lib/useAuth.tsx"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Local Persistence Stores",
+          "description": "What survives a reload: the playground IndexedDB, the composer and take stores, server-side take reads and the voice vault.",
+          "businessFeature": "Local Persistence Stores",
+          "category": "lib",
+          "filePaths": [
+            "gravitone/web/lib/composerStore.test.ts",
+            "gravitone/web/lib/composerStore.ts",
+            "gravitone/web/lib/playgroundDb.ts",
+            "gravitone/web/lib/takeStore.test.ts",
+            "gravitone/web/lib/takeStore.ts",
+            "gravitone/web/lib/takes.server.ts",
+            "gravitone/web/lib/takes.test.ts",
+            "gravitone/web/lib/takes.ts",
+            "gravitone/web/lib/voiceVault.test.ts",
+            "gravitone/web/lib/voiceVault.ts"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Audio & Content Utilities",
+          "description": "WAV encoding, format negotiation, peak extraction, emotion scripts and vocabulary, slugs and marketing content.",
+          "businessFeature": "Audio & Content Utilities",
+          "category": "lib",
+          "filePaths": [
+            "gravitone/web/lib/audioFormats.ts",
+            "gravitone/web/lib/benchmarks.ts",
+            "gravitone/web/lib/content.ts",
+            "gravitone/web/lib/emotionScripts.ts",
+            "gravitone/web/lib/emotions.ts",
+            "gravitone/web/lib/peaks.ts",
+            "gravitone/web/lib/slugs.test.ts",
+            "gravitone/web/lib/slugs.ts",
+            "gravitone/web/lib/switchkit.test.ts",
+            "gravitone/web/lib/switchkit.ts",
+            "gravitone/web/lib/wavEncode.test.ts",
+            "gravitone/web/lib/wavEncode.ts"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Shared React Hooks",
+          "description": "The hooks every surface is supposed to reuse: useMounted, useCopyFeedback, the single health poll, the metrics poll and still-aware motion.",
+          "businessFeature": "Shared React Hooks",
+          "category": "lib",
+          "filePaths": [
+            "gravitone/web/lib/useCopyFeedback.test.ts",
+            "gravitone/web/lib/useCopyFeedback.ts",
+            "gravitone/web/lib/useHealthPoll.test.ts",
+            "gravitone/web/lib/useHealthPoll.ts",
+            "gravitone/web/lib/useMetricsPoll.test.ts",
+            "gravitone/web/lib/useMetricsPoll.ts",
+            "gravitone/web/lib/useMounted.ts",
+            "gravitone/web/lib/useStillMotion.ts"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Observability & Security Headers",
+          "description": "Sentry wiring on every runtime, the instrumentation hooks and the security headers the app sends.",
+          "businessFeature": "Observability & Security Headers",
+          "category": "lib",
+          "filePaths": [
+            "gravitone/web/instrumentation-client.ts",
+            "gravitone/web/instrumentation.ts",
+            "gravitone/web/lib/securityHeaders.test.ts",
+            "gravitone/web/lib/securityHeaders.ts",
+            "gravitone/web/lib/sentry.test.ts",
+            "gravitone/web/lib/sentry.ts",
+            "gravitone/web/sentry.edge.config.ts",
+            "gravitone/web/sentry.server.config.ts"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Web Build & Test Config",
+          "description": "Next, TypeScript, PostCSS and Vitest configuration plus the global test setup.",
+          "businessFeature": "Web Build & Test Config",
+          "category": "config",
+          "filePaths": [
+            "gravitone/web/.env.example",
+            "gravitone/web/next.config.mjs",
+            "gravitone/web/package.json",
+            "gravitone/web/postcss.config.mjs",
+            "gravitone/web/tsconfig.json",
+            "gravitone/web/vitest.config.mts",
+            "gravitone/web/vitest.setup.ts"
           ],
           "target": null,
           "apiRoutes": []
@@ -396,63 +1762,229 @@
   "ungrouped": [],
   "relationships": [
     {
-      "source": "TTS Service Core",
-      "target": "Web Studio",
+      "source": "Web BFF Routes",
+      "target": "Speech Synthesis Core",
       "type": "calls"
     },
     {
-      "source": "Web Studio",
+      "source": "Web BFF Routes",
+      "target": "Voice Cloning & Ingest",
+      "type": "calls"
+    },
+    {
+      "source": "Web BFF Routes",
+      "target": "Video Studio",
+      "type": "calls"
+    },
+    {
+      "source": "Web BFF Routes",
+      "target": "Conversation Gym",
+      "type": "calls"
+    },
+    {
+      "source": "Web BFF Routes",
+      "target": "Takes, Builds & Direction",
+      "type": "calls"
+    },
+    {
+      "source": "Web BFF Routes",
+      "target": "Platform Security & Limits",
+      "type": "uses"
+    },
+    {
+      "source": "Studio - Voice Creation",
+      "target": "Web BFF Routes",
+      "type": "calls"
+    },
+    {
+      "source": "Studio - Characters & Voices",
+      "target": "Web BFF Routes",
+      "type": "calls"
+    },
+    {
+      "source": "Studio - Playground",
+      "target": "Web BFF Routes",
+      "type": "calls"
+    },
+    {
+      "source": "Studio - Operations & Sharing",
+      "target": "Web BFF Routes",
+      "type": "calls"
+    },
+    {
+      "source": "Studio - Voice Creation",
+      "target": "Web Platform Libraries",
+      "type": "uses"
+    },
+    {
+      "source": "Studio - Characters & Voices",
+      "target": "Web Platform Libraries",
+      "type": "uses"
+    },
+    {
+      "source": "Studio - Playground",
+      "target": "Web Platform Libraries",
+      "type": "uses"
+    },
+    {
+      "source": "Studio - Operations & Sharing",
       "target": "Design System & Brand",
       "type": "uses"
     },
     {
-      "source": "TTS Service Core",
-      "target": "Performance & Deployment",
+      "source": "Studio - Playground",
+      "target": "Design System & Brand",
+      "type": "uses"
+    },
+    {
+      "source": "Studio - Voice Creation",
+      "target": "Design System & Brand",
+      "type": "uses"
+    },
+    {
+      "source": "Studio - Characters & Voices",
+      "target": "Design System & Brand",
+      "type": "uses"
+    },
+    {
+      "source": "Voice Cloning & Ingest",
+      "target": "Speech Synthesis Core",
+      "type": "uses"
+    },
+    {
+      "source": "Video Studio",
+      "target": "Speech Synthesis Core",
+      "type": "uses"
+    },
+    {
+      "source": "Video Studio",
+      "target": "Voice Cloning & Ingest",
+      "type": "uses"
+    },
+    {
+      "source": "Conversation Gym",
+      "target": "Speech Synthesis Core",
+      "type": "uses"
+    },
+    {
+      "source": "Takes, Builds & Direction",
+      "target": "Speech Synthesis Core",
+      "type": "uses"
+    },
+    {
+      "source": "Performance & Deployment",
+      "target": "Speech Synthesis Core",
+      "type": "measures"
+    },
+    {
+      "source": "Agent & Toolchain Integrations",
+      "target": "Speech Synthesis Core",
       "type": "calls"
     }
   ],
   "index": [
-    "TTS Service Core › Voice & Emotion Library [lib] — 2 files",
-    "TTS Service Core › Voice Cloning & Ingest Pipeline [api] — 4 files",
-    "TTS Service Core › Concurrency Engine & Metrics [lib] — 2 files",
-    "TTS Service Core › Conversation Gym & Replay [api] — 2 files",
-    "TTS Service Core › Speech Synthesis API [api] — 4 files",
-    "Performance & Deployment › Packaging & Deployment [config] — 3 files",
-    "Performance & Deployment › Load Testing & Benchmarks [test] — 5 files",
-    "Web Studio › Auth & Profile [ui] — 4 files",
-    "Web Studio › API Key Management [ui] — 6 files",
-    "Web Studio › Voice Creation Studio [ui] — 9 files",
-    "Web Studio › Character & Voice Management [ui] — 16 files",
-    "Web Studio › Ops Transparency [ui] — 4 files",
-    "Web Studio › Conversation Gym Studio [ui] — 17 files",
-    "Web Studio › TTS Playground [ui] — 9 files",
-    "Design System & Brand › App Shell & Landing [ui] — 6 files",
-    "Design System & Brand › Emotion Glyph Art [lib] — 3 files",
-    "Design System & Brand › UI Design System [ui] — 6 files"
+    "Speech Synthesis Core › Synthesis HTTP Surface [api] — 11 files",
+    "Speech Synthesis Core › Concurrency Engine & Admission [lib] — 14 files",
+    "Speech Synthesis Core › Engine Plane & Alternate Mouths [lib] — 8 files",
+    "Speech Synthesis Core › Voice & Character Registry [lib] — 13 files",
+    "Speech Synthesis Core › Emotion Algebra & Prosody [lib] — 15 files",
+    "Voice Cloning & Ingest › Ingest Pipeline [api] — 17 files",
+    "Voice Cloning & Ingest › Link Ingest [api] — 4 files",
+    "Voice Cloning & Ingest › Diarization, Casting & Voiceprints [lib] — 9 files",
+    "Voice Cloning & Ingest › Speech-to-Text & Verification [lib] — 5 files",
+    "Voice Cloning & Ingest › Character Packs [lib] — 3 files",
+    "Video Studio › Scene Vision Pipeline [lib] — 4 files",
+    "Video Studio › Silent-Video Voiceover [api] — 3 files",
+    "Video Studio › Video Re-voice [api] — 3 files",
+    "Video Studio › Audible Docs Narration [lib] — 2 files",
+    "Conversation Gym › Conversational Agent Socket [api] — 7 files",
+    "Conversation Gym › Gym Replay & Grading [api] — 7 files",
+    "Takes, Builds & Direction › Takes, Reviews & Lineage [lib] — 2 files",
+    "Takes, Builds & Direction › Speech as a Build Artifact [lib] — 3 files",
+    "Takes, Builds & Direction › Direction Telemetry [lib] — 2 files",
+    "Platform Security & Limits › API Keys & Auth [api] — 5 files",
+    "Platform Security & Limits › Rate Limiting & Error Reporting [lib] — 6 files",
+    "Performance & Deployment › Load Testing & Workloads [test] — 5 files",
+    "Performance & Deployment › Benchmark Harness [test] — 7 files",
+    "Performance & Deployment › Replicas & Deployment Compiler [config] — 4 files",
+    "Performance & Deployment › Packaging & Host Deployment [config] — 9 files",
+    "Performance & Deployment › Kubernetes Helm Chart [config] — 11 files",
+    "Performance & Deployment › Sealed Appliance & Certification [config] — 9 files",
+    "Performance & Deployment › CI Pipelines [config] — 4 files",
+    "Agent & Toolchain Integrations › MCP Server [api] — 11 files",
+    "Agent & Toolchain Integrations › Build & Provisioning Scripts [config] — 3 files",
+    "Agent & Toolchain Integrations › Product Documentation [config] — 5 files",
+    "Web BFF Routes › Speech & Voice Routes [api] — 10 files",
+    "Web BFF Routes › Character & Corpus Routes [api] — 10 files",
+    "Web BFF Routes › Ingest Routes [api] — 20 files",
+    "Web BFF Routes › Key Routes & Well-Known [api] — 12 files",
+    "Web BFF Routes › Gym & ConvAI Routes [api] — 10 files",
+    "Web BFF Routes › Video Routes [api] — 8 files",
+    "Web BFF Routes › Takes & Reviews Routes [api] — 6 files",
+    "Web BFF Routes › Ops & Feedback Routes [api] — 6 files",
+    "Studio - Voice Creation › Clone Wizard State Machine [lib] — 17 files",
+    "Studio - Voice Creation › Casting & Audition State [lib] — 13 files",
+    "Studio - Voice Creation › Wizard Shell & Upload Stage [ui] — 13 files",
+    "Studio - Voice Creation › Speaker Casting UI [ui] — 4 files",
+    "Studio - Voice Creation › Segment Review & Commit [ui] — 15 files",
+    "Studio - Characters & Voices › Character Roster [ui] — 21 files",
+    "Studio - Characters & Voices › Character Detail & Corpus [ui] — 12 files",
+    "Studio - Characters & Voices › Emotion Rack & Audition [ui] — 15 files",
+    "Studio - Characters & Voices › Profile & My Voices [ui] — 6 files",
+    "Studio - Characters & Voices › Consent Sign-off Flow [ui] — 8 files",
+    "Studio - Playground › Playground Console & Composer [ui] — 17 files",
+    "Studio - Playground › Score Editor [ui] — 19 files",
+    "Studio - Playground › Emotion Picker & Wheel [ui] — 10 files",
+    "Studio - Playground › Takes, Punch-in & Playback [ui] — 16 files",
+    "Studio - Playground › Playground Engine Seam [lib] — 4 files",
+    "Studio - Playground › Live Call Client [ui] — 12 files",
+    "Studio - Playground › Video Dub & Reel [ui] — 12 files",
+    "Studio - Operations & Sharing › Gym Forensics UI [ui] — 13 files",
+    "Studio - Operations & Sharing › Keys Console [ui] — 20 files",
+    "Studio - Operations & Sharing › Ops Transparency [ui] — 4 files",
+    "Studio - Operations & Sharing › Benchmarks & Local Engine [ui] — 9 files",
+    "Studio - Operations & Sharing › Shared Take & Review Pages [ui] — 21 files",
+    "Design System & Brand › App Shell & Navigation [ui] — 6 files",
+    "Design System & Brand › UI Primitives & Tokens [ui] — 9 files",
+    "Design System & Brand › Audio Transport Components [ui] — 16 files",
+    "Design System & Brand › Narration Dock [ui] — 21 files",
+    "Design System & Brand › Feedback Dock [ui] — 3 files",
+    "Design System & Brand › Emotion Glyph Art [ui] — 14 files",
+    "Design System & Brand › Landing Page & Hero [ui] — 9 files",
+    "Design System & Brand › Feature Signal Illustrations [ui] — 16 files",
+    "Design System & Brand › Pricing [ui] — 10 files",
+    "Web Platform Libraries › API Fetch & Backend Seam [lib] — 11 files",
+    "Web Platform Libraries › Auth & Identity [lib] — 6 files",
+    "Web Platform Libraries › Local Persistence Stores [lib] — 10 files",
+    "Web Platform Libraries › Audio & Content Utilities [lib] — 12 files",
+    "Web Platform Libraries › Shared React Hooks [lib] — 8 files",
+    "Web Platform Libraries › Observability & Security Headers [lib] — 8 files",
+    "Web Platform Libraries › Web Build & Test Config [config] — 7 files"
   ],
   "summary": {
-    "totalGroups": 4,
-    "totalContexts": 17,
-    "totalFiles": 102,
+    "totalGroups": 15,
+    "totalContexts": 77,
+    "totalFiles": 740,
     "categories": {
-      "lib": 3,
-      "api": 3,
-      "config": 1,
-      "test": 1,
-      "ui": 9
+      "api": 17,
+      "lib": 22,
+      "test": 2,
+      "config": 8,
+      "ui": 28
     },
     "domains": {
-      "feature": 2,
-      "infrastructure": 1,
-      "shared": 1
+      "feature": 9,
+      "infrastructure": 2,
+      "integration": 2,
+      "shared": 2
     }
   },
   "audit": {
     "ok": true,
-    "tier": "medium",
+    "tier": "high",
     "warnings": 0
   },
   "instructions": "Context map for Gravitone. Each group is a business domain (domain field); each context is a feature with its files (filePaths) + a technical category. Read this to learn which files belong to which feature BEFORE editing. When you change a context's files, update them here (or run Vibeman's refresh) to keep this fresh.",
-  "generatedAt": "2026-07-10T19:08:54.482Z",
-  "revision": "e1ec006db415"
+  "generatedAt": "2026-08-09T00:00:00.000Z",
+  "revision": "rescan-2026-08-09"
 }
