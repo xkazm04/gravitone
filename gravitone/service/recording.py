@@ -278,8 +278,16 @@ def listing(limit: int = 50) -> list[dict]:
     if not root.is_dir():
         return []
     out: list[dict] = []
+    # Newest first, ties broken by id. The tie is not hypothetical: two calls
+    # that end inside the same filesystem timestamp tick compare equal, and a
+    # sort on mtime ALONE is stable, so equal entries come back in whatever
+    # order `iterdir` happened to yield — which means the same two recordings
+    # can swap places between one refresh and the next, and a "newest first"
+    # list that reorders itself is lying to whoever is reading down it. The
+    # second key is arbitrary as a measure of time and deliberate as a measure
+    # of stability: it only ever decides between rows we cannot tell apart.
     for d in sorted((d for d in root.iterdir() if d.is_dir()),
-                    key=lambda d: d.stat().st_mtime, reverse=True)[:limit]:
+                    key=lambda d: (d.stat().st_mtime, d.name), reverse=True)[:limit]:
         entry = {"conversation_id": d.name,
                  "recorded_at": round(d.stat().st_mtime, 3),
                  "audio": sorted(p.name for p in d.glob("*.wav"))}
