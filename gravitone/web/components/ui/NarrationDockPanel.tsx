@@ -106,6 +106,10 @@ export function NarrationDockPanel({
           disabled={!canPlay}
           aria-label={state.phase === "playing" ? "Pause the narration" : "Play the narration"}
           aria-pressed={state.phase === "playing"}
+          // A live render can take seconds, and the only cue was the glyph
+          // turning into "…". aria-busy announces the same wait to a screen
+          // reader, in the window where nothing else is happening yet.
+          aria-busy={busy}
           className="grid h-10 w-10 shrink-0 cursor-pointer place-items-center rounded-full text-[13px] text-slate-950 transition hover:brightness-110 focus-visible:outline-2 focus-visible:outline-offset-2 disabled:cursor-not-allowed disabled:opacity-40"
           style={{ background: accent, outlineColor: accent }}
         >

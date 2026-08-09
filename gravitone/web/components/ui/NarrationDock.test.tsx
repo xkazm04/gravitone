@@ -147,6 +147,18 @@ describe("<NarrationDock />", () => {
     expect(container).toBeEmptyDOMElement();
   });
 
+  // The dock mounts app-wide from app/layout.tsx and self-nulls off the
+  // registry. The embed is the surface where an unexpected voice would be
+  // worst: it is a card a stranger frames on their own site, and the visitor
+  // never asked this deployment for anything. Silence there is a promise.
+  it("renders NOTHING on the embed surface — not even a pill", () => {
+    mockPath = "/t/tk_abc123/embed";
+    const fetchSpy = serveRoster([ALBA]);
+    const { container } = render(<NarrationDock />);
+    expect(container).toBeEmptyDOMElement();
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
   it("renders on /benchmarks too — both registry routes are wired", () => {
     mockPath = "/benchmarks";
     serveRoster([ALBA]);
@@ -203,6 +215,46 @@ describe("<NarrationDock />", () => {
     const panel = screen.getByRole("region", { name: /listen to this page/i });
     fireEvent.keyDown(panel, { key: "Escape" });
     await waitFor(() => expect(pill()).toBeInTheDocument());
+  });
+
+  // The <audio> element is shared by every sentence, and it fires `error` for
+  // reasons that have nothing to do with the reading — a src cleared on stop,
+  // a decode that lost its race with a new clip. The dock only reports one
+  // while it is actually trying to play something; this pins BOTH halves of
+  // that guard, including the idle→loading edge it implies.
+  it("ignores an audio error while idle, and names one once a clip is cueing", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(typeof input === "object" && "url" in input ? input.url : input);
+      if (url.includes("/api/characters")) {
+        return new Response(JSON.stringify([ALBA]), {
+          status: 200, headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url.includes("/narration/manifest.json")) return new Response("", { status: 404 });
+      // /api/speak never answers: the dock stays in `loading`, which is the
+      // window this test is about.
+      return new Promise<Response>(() => {});
+    });
+    const { container } = render(<NarrationDock />);
+    openDock();
+    await screen.findByRole("option", { name: "Alba" });
+    const audio = container.querySelector("audio") as HTMLAudioElement;
+
+    fireEvent.error(audio);
+    expect(screen.getByRole("status")).not.toHaveTextContent(/would not play/i);
+    expect(screen.getByRole("button", { name: /play the narration/i })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole("button", { name: /play the narration/i }));
+    await waitFor(() =>
+      expect(screen.getByRole("status")).toHaveTextContent(/cueing this sentence/i));
+    // The wait itself is announced — a live render can take seconds and the
+    // glyph alone says nothing to a screen reader.
+    expect(screen.getByRole("button", { name: /play the narration/i }))
+      .toHaveAttribute("aria-busy", "true");
+
+    fireEvent.error(audio);
+    await waitFor(() =>
+      expect(screen.getByRole("status")).toHaveTextContent(/would not play in this browser/i));
   });
 
   it("remembers the chosen narrator across mounts", async () => {
