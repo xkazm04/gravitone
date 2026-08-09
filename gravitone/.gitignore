@@ -28,6 +28,13 @@ emotion_demand.json
 /gym-runs/
 .worktrees/
 ingest_jobs/
+# The video pipeline's own job workdirs, same shape as ingest_jobs/: a fetched
+# video, its frames, a narration track and the muxed result. Megabytes per job,
+# reclaimed by their own GC — never source.
+voiceover_jobs/
+revoice_jobs/
+# Demo renders written by hand while verifying those two pipelines end to end.
+*_demo.mp4
 piper_voices/
 diarization_models/
 build_store/
