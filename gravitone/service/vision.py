@@ -14,9 +14,17 @@ Posture (mirrors the cloud half of ingest.py):
   * every request charges a `Spend` ledger when one is passed; retries respect
     the caller's retry budget and back off on 429/5xx/timeouts only. A
     permanent 4xx is an answer, not a retry.
+  * a MALFORMED answer is a different failure from an unreachable provider,
+    and is repaired the way the text brain repairs its own (`brain.py`
+    `complete_json`): the parse failure is quoted back once, at temperature 0.
+    Only after that does the batch degrade.
   * failures degrade PER BATCH to None entries; the caller decides whether a
     scene without a description is fatal. Raw response bodies go to the log,
     never to a response body of ours.
+  * every scene carries WHY it has no description (`description_status`, set
+    on the caller's own scene dict): "the model was never asked about this
+    shot" and "the model answered and we could not read it" are different
+    facts and a narrator would act differently on each.
 """
 from __future__ import annotations
 
@@ -83,6 +91,21 @@ _SYSTEM = (
 )
 
 
+#: Why a scene has no description. The split that matters: NO_FRAME and
+#: CANCELLED mean the model was never asked about this shot; UNREADABLE and
+#: OMITTED mean it answered and we could not use the answer. A narrator told
+#: "nobody looked" and a narrator told "we looked and could not read it"
+#: should not behave the same way, so the job's scene records carry which.
+DESCRIBED = "described"
+NO_FRAME = "no_frame"
+CANCELLED = "cancelled"
+UNREADABLE = "unreadable"
+OMITTED = "omitted_from_answer"
+
+#: The statuses that mean the model never saw this scene.
+NEVER_ASKED = (NO_FRAME, CANCELLED)
+
+
 def describe_scenes(scenes: list[dict], *, context: str = "",
                     spend=None,
                     should_cancel: Callable[[], bool] | None = None) -> list[dict | None]:
@@ -93,28 +116,46 @@ def describe_scenes(scenes: list[dict], *, context: str = "",
     when a transcript exists) and `speaker` (the diarized voice). Entries
     whose frame is missing come back None without costing a call.
 
-    Returns a list the same length as `scenes`; None marks "no description"
-    (missing frame, failed batch, unparseable member) — the reason is logged.
+    Returns a list the same length as `scenes`; None marks "no description".
+    The REASON is not only logged: each scene dict is stamped with
+    `description_status` (one of the constants above), so a caller can tell a
+    scene nobody looked at from a scene whose answer was unreadable.
     """
     if not available():
         raise VisionError("QWEN_API_KEY is not configured — the visual pass "
                           "is off on this box")
     out: list[dict | None] = [None] * len(scenes)
+    status: list[str] = [NO_FRAME] * len(scenes)
     todo = [k for k, s in enumerate(scenes) if _frame_of(s) is not None]
     for lo in range(0, len(todo), BATCH):
-        if should_cancel and should_cancel():
-            break
         batch = todo[lo:lo + BATCH]
+        if should_cancel and should_cancel():
+            for k in todo[lo:]:
+                status[k] = CANCELLED
+            break
         try:
             got = _describe_batch([scenes[k] for k in batch], context=context,
                                   spend=spend)
         except VisionError as exc:
             logger.warning("vision batch %s..%s degraded: %s",
                            batch[0], batch[-1], exc)
+            for k in batch:
+                status[k] = UNREADABLE
             continue
         for k, desc in zip(batch, got):
             out[k] = desc
+            status[k] = DESCRIBED if desc is not None else OMITTED
+    _stamp(scenes, status)
     return out
+
+
+def _stamp(scenes: list[dict], status: list[str]) -> None:
+    """Record on each scene WHY it does (not) have a description. Mutating the
+    caller's own record is deliberate: the fact belongs to the scene, and the
+    job persists scenes, not this function's return value."""
+    for s, why in zip(scenes, status):
+        if isinstance(s, dict):
+            s["description_status"] = why
 
 
 def _frame_of(scene: dict) -> Path | None:
@@ -125,7 +166,48 @@ def _frame_of(scene: dict) -> Path | None:
     return p if p.is_file() else None
 
 
+_REPAIR = (
+    "Your previous answer could not be parsed as the JSON that was asked for "
+    "({reason}). Answer again about the SAME scenes, with ONLY the valid JSON "
+    "document described in your instructions — no prose, no code fences, one "
+    "entry per scene, same indices."
+)
+
+
 def _describe_batch(scenes: list[dict], *, context: str, spend) -> list[dict | None]:
+    """One batch → one aligned answer, repaired once if it comes back malformed.
+
+    Same doctrine as `brain.complete_json`: a model fixes its own JSON far
+    more reliably than a regex fixes it for the model, so the parse failure is
+    quoted back and the question asked again at temperature 0. Exactly one
+    repair — a second malformed answer is an answer, and the caller degrades
+    the batch per scene rather than failing the job.
+    """
+    messages = _messages(scenes, context=context)
+    indices = [s["i"] for s in scenes]
+    body = _post(_payload(messages), spend=spend)
+    try:
+        return _align(body, indices)
+    except VisionError as first:
+        logger.warning("vision answer for scenes %s..%s unreadable (%s) — "
+                       "asking the model to repair it", indices[0],
+                       indices[-1], first)
+        repair = messages + [{"role": "user", "content": [
+            {"type": "text", "text": _REPAIR.format(reason=first)}]}]
+    body = _post(_payload(repair, temperature=0.0), spend=spend)
+    return _align(body, indices)
+
+
+def _payload(messages: list[dict], *, temperature: float = 0.2) -> dict:
+    return {
+        "model": MODEL,
+        "messages": messages,
+        "response_format": {"type": "json_object"},
+        "temperature": temperature,
+    }
+
+
+def _messages(scenes: list[dict], *, context: str) -> list[dict]:
     content: list[dict] = []
     if context:
         content.append({"type": "text", "text": f"Video context: {context}"})
@@ -141,15 +223,8 @@ def _describe_batch(scenes: list[dict], *, context: str, spend) -> list[dict | N
         b64 = base64.b64encode(frame.read_bytes()).decode("ascii")
         content.append({"type": "image_url", "image_url": {
             "url": f"data:image/jpeg;base64,{b64}"}})
-    payload = {
-        "model": MODEL,
-        "messages": [{"role": "system", "content": _SYSTEM},
-                     {"role": "user", "content": content}],
-        "response_format": {"type": "json_object"},
-        "temperature": 0.2,
-    }
-    body = _post(payload, spend=spend)
-    return _align(body, [s["i"] for s in scenes])
+    return [{"role": "system", "content": _SYSTEM},
+            {"role": "user", "content": content}]
 
 
 def _post(payload: dict, *, spend) -> dict:
@@ -193,17 +268,34 @@ def _post(payload: dict, *, spend) -> dict:
                       f"({type(last).__name__ if last else 'exhausted'})")
 
 
+def _members(body: dict) -> list:
+    """The answer's scene array, or `ValueError` saying what was wrong with it.
+
+    The reason is the whole point: it is what gets quoted back to the model in
+    the repair turn, so it must name the defect, not just report one."""
+    try:
+        text = body["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        raise ValueError("the answer carried no message content")
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"it is not valid JSON: {exc}")
+    members = parsed.get("scenes") if isinstance(parsed, dict) else parsed
+    if not isinstance(members, list):
+        raise ValueError('it has no "scenes" array')
+    return members
+
+
 def _align(body: dict, indices: list[int]) -> list[dict | None]:
     """Provider JSON → one entry per requested scene, by declared index."""
     try:
-        text = body["choices"][0]["message"]["content"]
-        parsed = json.loads(text)
-        members = parsed.get("scenes") if isinstance(parsed, dict) else parsed
-    except (KeyError, IndexError, TypeError, ValueError):
+        members = _members(body)
+    except ValueError as exc:
         logger.warning("qwen answer unparseable: %s", str(body)[:300])
-        raise VisionError("the vision answer could not be parsed")
+        raise VisionError(f"the vision answer could not be parsed — {exc}")
     by_index: dict[int, dict] = {}
-    for m in (members if isinstance(members, list) else []):
+    for m in members:
         if isinstance(m, dict) and isinstance(m.get("index"), int):
             by_index[m["index"]] = {
                 "setting": str(m.get("setting") or "").strip(),

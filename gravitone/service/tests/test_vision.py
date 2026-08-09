@@ -88,6 +88,106 @@ class DegradeTests(unittest.TestCase):
         self.assertEqual(out[1]["caption"], "ok")
 
 
+class RepairTests(unittest.TestCase):
+    """A malformed answer is quoted back once, brain.complete_json's shape."""
+
+    @staticmethod
+    def _scenes(td: str, n: int) -> list[dict]:
+        out = []
+        for i in range(n):
+            p = Path(td) / f"f{i}.jpg"
+            p.write_bytes(b"\xff\xd8")
+            out.append({"i": i, "start": 0, "end": 5, "frame": str(p)})
+        return out
+
+    def test_a_malformed_answer_is_repaired_on_the_second_ask(self) -> None:
+        posts: list[dict] = []
+
+        def fake_post(payload, *, spend):
+            posts.append(payload)
+            if len(posts) == 1:
+                return {"choices": [{"message": {"content": "sure! {oops"}}]}
+            return _body([{"index": 0, "caption": "a room"}])
+
+        with TemporaryDirectory() as td, \
+                mock.patch.dict("os.environ", {"QWEN_API_KEY": "sk-test"}), \
+                mock.patch.object(vision, "_post", fake_post):
+            scenes = self._scenes(td, 1)
+            out = vision.describe_scenes(scenes)
+        self.assertEqual(len(posts), 2)
+        self.assertEqual(out[0]["caption"], "a room")
+        self.assertEqual(scenes[0]["description_status"], vision.DESCRIBED)
+        # the repair turn quotes the parse failure back and stops guessing
+        repair = posts[1]["messages"][-1]["content"][0]["text"]
+        self.assertIn("could not be parsed", repair)
+        self.assertIn("valid JSON", repair)
+        self.assertEqual(posts[1]["temperature"], 0.0)
+
+    def test_two_malformed_answers_degrade_the_batch_and_name_why(self) -> None:
+        posts = {"n": 0}
+
+        def fake_post(payload, *, spend):
+            posts["n"] += 1
+            return {"choices": [{"message": {"content": "still not json"}}]}
+
+        with TemporaryDirectory() as td, \
+                mock.patch.dict("os.environ", {"QWEN_API_KEY": "sk-test"}), \
+                mock.patch.object(vision, "_post", fake_post):
+            scenes = self._scenes(td, 2)
+            out = vision.describe_scenes(scenes)
+        self.assertEqual(posts["n"], 2)              # exactly one repair, no loop
+        self.assertEqual(out, [None, None])          # degraded, not raised
+        self.assertEqual([s["description_status"] for s in scenes],
+                         [vision.UNREADABLE, vision.UNREADABLE])
+
+    def test_never_asked_and_unreadable_are_different_facts(self) -> None:
+        def fake_post(payload, *, spend):
+            return {"choices": [{"message": {"content": "nope"}}]}
+
+        with TemporaryDirectory() as td, \
+                mock.patch.dict("os.environ", {"QWEN_API_KEY": "sk-test"}), \
+                mock.patch.object(vision, "_post", fake_post):
+            scenes = self._scenes(td, 1) + [{"i": 1, "frame": None}]
+            vision.describe_scenes(scenes)
+        self.assertEqual(scenes[0]["description_status"], vision.UNREADABLE)
+        self.assertEqual(scenes[1]["description_status"], vision.NO_FRAME)
+        self.assertNotIn(scenes[0]["description_status"], vision.NEVER_ASKED)
+        self.assertIn(scenes[1]["description_status"], vision.NEVER_ASKED)
+
+    def test_a_scene_the_model_omitted_is_not_a_scene_it_never_saw(self) -> None:
+        def fake_post(payload, *, spend):
+            return _body([{"index": 0, "caption": "a"}])   # scene 1 missing
+
+        with TemporaryDirectory() as td, \
+                mock.patch.dict("os.environ", {"QWEN_API_KEY": "sk-test"}), \
+                mock.patch.object(vision, "_post", fake_post):
+            scenes = self._scenes(td, 2)
+            out = vision.describe_scenes(scenes)
+        # the surviving member still lands by its DECLARED index
+        self.assertEqual(out[0]["caption"], "a")
+        self.assertIsNone(out[1])
+        self.assertEqual([s["description_status"] for s in scenes],
+                         [vision.DESCRIBED, vision.OMITTED])
+
+    def test_cancelling_marks_the_rest_as_never_asked(self) -> None:
+        with TemporaryDirectory() as td, \
+                mock.patch.dict("os.environ", {"QWEN_API_KEY": "sk-test"}), \
+                mock.patch.object(vision, "BATCH", 1), \
+                mock.patch.object(vision, "_post",
+                                  lambda p, *, spend: _body(
+                                      [{"index": 0, "caption": "a"}])):
+            scenes = self._scenes(td, 3)
+            seen = {"n": 0}
+
+            def cancel_after_one() -> bool:
+                seen["n"] += 1
+                return seen["n"] > 1
+
+            vision.describe_scenes(scenes, should_cancel=cancel_after_one)
+        self.assertEqual([s["description_status"] for s in scenes],
+                         [vision.DESCRIBED, vision.CANCELLED, vision.CANCELLED])
+
+
 class PostTests(unittest.TestCase):
     def test_429_retries_then_succeeds(self) -> None:
         good = io.BytesIO(json.dumps(_body([])).encode())
