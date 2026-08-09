@@ -15,6 +15,9 @@ export default function RevoiceStage({ dub, draft, onStage }: {
   const [active, setActive] = useState<string | null>(null);
   const j = dub.job;
   const summary = j?.result?.summary;
+  // the finished track's own count where the box measured one; the ladder's
+  // estimate only for a run that was never measured
+  const spilling = summary?.spilling_in_track ?? summary?.spilling;
   // After a run the verdicts belong to the lines that produced them; before
   // one, the sheet being written is the only truth there is.
   const ribbon = dub.slots.length > 0
@@ -97,13 +100,28 @@ export default function RevoiceStage({ dub, draft, onStage }: {
                   : ""}
               </p>
             )}
-            {/* spilling = the dub rendered, with a caveat (warning · amber);
-                failed = lines that are NOT in the file (error · rose). One
-                banner component decides both, so the two can never swap hues. */}
-            {!!summary?.spilling && (
+            {/* Rendered-with-a-caveat is amber; not-in-the-file is rose. One
+                banner component decides both, so the two cannot swap hues.
+                Every count below is MEASURED against the finished track where
+                the box reported one (`spilling_in_track`), and falls back to
+                the ladder's estimate only for jobs that predate the mux
+                report — never both, never added together. */}
+            {!!spilling && (
               <ErrorBanner severity="warning" className="mt-1">
-                {summary.spilling} line{summary.spilling > 1 ? "s" : ""} still run past their slot — the
+                {spilling} line{spilling > 1 ? "s" : ""} still run past their slot — the
                 picture keeps playing under them
+              </ErrorBanner>
+            )}
+            {!!summary?.clipped && (
+              <ErrorBanner severity="warning" className="mt-1">
+                {summary.clipped} line{summary.clipped > 1 ? "s" : ""} are cut short where the video
+                ends — what is past the last frame is not in the file
+              </ErrorBanner>
+            )}
+            {!!summary?.silent_in_track && (
+              <ErrorBanner className="mt-1">
+                {summary.silent_in_track} line{summary.silent_in_track > 1 ? "s" : ""} are not audible
+                in the finished track at all — a line that failed to render is counted here too
               </ErrorBanner>
             )}
             {!!summary?.failed && (

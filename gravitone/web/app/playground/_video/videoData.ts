@@ -41,8 +41,37 @@ export type RevoiceFit = {
   method: "verbatim" | "atempo" | "rewrite" | "rewrite+atempo" | "spill" | null;
   atempo?: number | null;
   rewritten_text?: string | null;
+  /** the LADDER's estimate: spoken-vs-budget, computed per line in isolation
+   *  before anything was assembled. A prediction, and it can be wrong. */
   spill_seconds?: number;
+  // ── what is actually in the rendered mp4 (service/revoice_api.py::_measure)
+  // Optional on purpose: jobs from before the mux started reporting, and the
+  // voiceover half, do not carry them. Presence of `in_track` is the signal
+  // that this run was MEASURED — never infer it from a zero.
+  /** overrun measured against the assembled track */
+  track_spill_seconds?: number;
+  /** seconds of this line lost at the end of the video */
+  track_clipped_seconds?: number;
+  /** any of this line is audible in the finished file */
+  in_track?: boolean;
   error: string | null;
+};
+
+/** The run's counts, as the box summarises them. Loose by design (both halves
+ *  and older jobs contribute different keys) but the ones the UI reads are
+ *  named — including the pair that must never be conflated: `spilling` is the
+ *  ladder's estimate, `spilling_in_track` is the finished file. */
+export type RunSummary = {
+  [key: string]: number | undefined;
+  lines?: number;
+  verbatim?: number;
+  atempo?: number;
+  rewritten?: number;
+  spilling?: number;
+  spilling_in_track?: number;
+  clipped?: number;
+  silent_in_track?: number;
+  failed?: number;
 };
 
 export type StudioJob = {
@@ -66,7 +95,7 @@ export type StudioJob = {
   brain: { backend: string; model?: string } | null;
   limits: string[];
   result: {
-    summary: Record<string, number>;
+    summary: RunSummary;
     fit: (VoiceoverFit | RevoiceFit)[];
   } | null;
 };
@@ -259,22 +288,33 @@ export function fitVerdict(f: VoiceoverFit | RevoiceFit): {
 } {
   if (f.error) return { tone: "error", label: "failed" };
   if (isRevoiceFit(f)) {
-    switch (f.method) {
-      case "verbatim":
-        return { tone: "ok", label: "verbatim" };
-      case "atempo":
-        return { tone: "ok", label: `atempo ×${f.atempo ?? "?"}` };
-      case "rewrite":
-        return f.spill_seconds
-          ? { tone: "warn", label: `rewritten · spills ${f.spill_seconds}s` }
-          : { tone: "ok", label: "rewritten" };
-      case "rewrite+atempo":
-        return { tone: "ok", label: `rewritten ×${f.atempo ?? "?"}` };
-      case "spill":
-        return { tone: "warn", label: `spills ${f.spill_seconds ?? 0}s` };
-      default:
-        return { tone: "muted", label: "—" };
+    // MEASURED beats predicted. `in_track` present means the mux reported on
+    // this line; from there the track's numbers are the facts and the ladder's
+    // estimate is only the rung that explains HOW the line got there. The two
+    // are never added together and never silently swapped for one another.
+    const measured = f.in_track !== undefined;
+    if (measured && !f.in_track) {
+      return { tone: "error", label: "not in the track" };
     }
+    const spill = measured ? (f.track_spill_seconds ?? 0) : (f.spill_seconds ?? 0);
+    const clipped = f.track_clipped_seconds ?? 0;
+    const rung =
+      f.method === "verbatim" ? "verbatim"
+      : f.method === "atempo" ? `atempo ×${f.atempo ?? "?"}`
+      : f.method === "rewrite" ? "rewritten"
+      : f.method === "rewrite+atempo" ? `rewritten ×${f.atempo ?? "?"}`
+      : "";
+    const notes: string[] = [];
+    if (clipped) notes.push(`clipped ${clipped}s`);
+    if (spill) notes.push(`spills ${spill}s`);
+    if (notes.length) return { tone: "warn", label: [rung, ...notes].filter(Boolean).join(" · ") };
+    // The ladder gave up and let this one run long. Measured, the track says it
+    // did not overrun after all — that is the fact. Unmeasured, the ladder's
+    // verdict stands, without a number it does not have.
+    if (f.method === "spill") {
+      return measured ? { tone: "ok", label: "fits the track" } : { tone: "warn", label: "spills" };
+    }
+    return rung ? { tone: "ok", label: rung } : { tone: "muted", label: "—" };
   }
   if (f.silent) return { tone: "muted", label: "silent" };
   if (f.clipped_seconds) return { tone: "warn", label: `clipped ${f.clipped_seconds}s` };

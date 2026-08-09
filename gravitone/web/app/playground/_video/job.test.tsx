@@ -135,6 +135,56 @@ describe("the fit ladder, rung by rung", () => {
   });
 });
 
+describe("the estimate and the track truth", () => {
+  // The ladder's spill is computed per line in isolation BEFORE anything is
+  // assembled; the mux then measures what is really in the mp4. When they
+  // disagree the track is the fact — and an old payload that carries no track
+  // fields at all must still render its estimate rather than nothing.
+  it("renders the ladder's estimate for a job that was never measured", async () => {
+    await runDub(queued([DONE]));            // LADDER carries no track_* fields
+    expect(await screen.findByText("rewritten · spills 0.9s")).toBeTruthy();
+    expect(screen.getByText(/2 lines still run past their slot/)).toBeTruthy();
+  });
+
+  it("prefers the measured number when the two disagree", async () => {
+    await runDub(queued([revoiceJob({
+      status: "done",
+      result: {
+        summary: { lines: 2, verbatim: 2, atempo: 0, rewritten: 0,
+                   spilling: 2, spilling_in_track: 1, clipped: 1, silent_in_track: 0, failed: 0 },
+        fit: [
+          // the ladder predicted an overrun the assembled track does not have
+          revoiceFit({ i: 0, spill_seconds: 1.4, track_spill_seconds: 0,
+                       track_clipped_seconds: 0, in_track: true }),
+          // …and lost 2s of this one at the end of the video, which the ladder
+          // (which only ever compared the line to its own slot) never saw
+          revoiceFit({ i: 1, spill_seconds: 0, track_spill_seconds: 0,
+                       track_clipped_seconds: 2, in_track: true }),
+        ],
+      },
+    })]));
+    expect(await screen.findByText("verbatim")).toBeTruthy();      // not "spills 1.4s"
+    expect(screen.queryByText(/spills 1.4s/)).toBeNull();
+    expect(screen.getByText("verbatim · clipped 2s")).toBeTruthy();
+    expect(screen.getByText(/1 line still run past their slot/)).toBeTruthy();
+    expect(screen.getByText(/cut short where the video ends/)).toBeTruthy();
+  });
+
+  it("never lets a line that is not in the file read as a rendered one", async () => {
+    await runDub(queued([revoiceJob({
+      status: "done",
+      result: {
+        summary: { lines: 1, verbatim: 1, atempo: 0, rewritten: 0, spilling: 0,
+                   spilling_in_track: 0, clipped: 0, silent_in_track: 1, failed: 0 },
+        fit: [revoiceFit({ i: 0, method: "verbatim", in_track: false, track_clipped_seconds: 3.5 })],
+      },
+    })]));
+    expect(await screen.findByText("not in the track")).toBeTruthy();
+    expect(screen.queryByText("verbatim")).toBeNull();
+    expect(screen.getByText(/not audible in the finished track/)).toBeTruthy();
+  });
+});
+
 describe("the terminal branches", () => {
   it("shows the box's own error text", async () => {
     await runDub(queued([revoiceJob({ status: "error", error: "the video could not be fetched" })]));
