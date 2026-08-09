@@ -65,6 +65,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import dataclasses
 import hmac
 import inspect
@@ -644,6 +645,30 @@ def _interactive_kwargs(engine) -> dict:
             kwargs = {}
         _ADMISSION_KWARGS_CACHE[key] = kwargs
     return kwargs
+
+
+def _abandon(job) -> None:
+    """Tell the engine that nobody will ever read this job's audio.
+
+    What it buys, exactly (see ``engine.Job.abandoned`` and
+    ``TtsEngine._release_abandoned``): a job STILL IN THE QUEUE is skipped
+    un-run and its admission permit is handed back at this moment, so a
+    barge-in gives the box its capacity back instead of leaving a worker to
+    render a sentence the caller has already talked over. It does NOT stop a
+    generation that has started — ``generate_audio`` is one atomic call with no
+    cooperative cancel point — that job runs to completion and its bytes are
+    dropped on the floor.
+
+    Feature-detected, like ``_interactive_kwargs``: the doubles that stand in
+    for the engine in tests predate the abandon contract, and a turn that ends
+    with an AttributeError is worse than a turn that merely fails to reclaim a
+    permit. Same shape as ``app._await_result`` and
+    ``voiceover_api._engine_speak``, which are the other two halves of this
+    contract.
+    """
+    flag = getattr(job, "abandoned", None)
+    if flag is not None:
+        flag.set()
 
 
 class _Session:
@@ -1301,6 +1326,16 @@ class _Session:
             await self._close(_CLOSE_INTERNAL, str(exc)[:120])
         finally:
             renderer.cancel()
+            # AWAITED, not just cancelled: the renderer is the task holding this
+            # turn's engine job, and its cancellation is what retracts it
+            # (_engine_result). Firing and forgetting left a barge-in's job
+            # un-abandoned until the loop got round to the renderer — which is
+            # precisely the window in which the worker picks it up and renders a
+            # sentence nobody will hear. Cancelling an await that is already
+            # inside an executor still returns promptly, so this cannot wedge
+            # the teardown.
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await renderer
             self._last_activity = time.monotonic()
 
     async def _render(self, src: asyncio.Queue, dst: asyncio.Queue) -> None:
@@ -1489,12 +1524,33 @@ class _Session:
         engine = _engine_provider()
         if engine is None:
             raise RuntimeError("the synthesis engine is not running")
-        job = engine.submit(voice_id=voice, text=str(text), overrides={},
-                            **_interactive_kwargs(engine))
-        result = await asyncio.wait_for(asyncio.wrap_future(job.future),
-                                        timeout=SETTINGS.request_timeout_s)
+        result = await self._engine_result(engine, voice, str(text))
         return await asyncio.get_event_loop().run_in_executor(
             None, wav_to_pcm, result.wav_bytes, self.rate)
+
+    async def _engine_result(self, engine, voice: str, text: str):
+        """One sentence through the worker pool, RETRACTED if the turn dies.
+
+        A turn is cancelled whenever the caller talks over the agent
+        (``_on_speech_start`` -> ``_cancel_turn``), and cancelling the task only
+        stops this coroutine — the job it handed the engine would keep a worker
+        busy rendering audio that can no longer be sent. So every way out of the
+        await that is not a result signals the abandon contract: barge-in and
+        session teardown (CancelledError), the per-job deadline (TimeoutError),
+        and a failed render (the permit is already gone in that case, and the
+        flag is idempotent).
+
+        Submit and await are in the SAME try, with no await between them, so
+        there is no window where a submitted job is unaccounted for.
+        """
+        job = engine.submit(voice_id=voice, text=text, overrides={},
+                            **_interactive_kwargs(engine))
+        try:
+            return await asyncio.wait_for(asyncio.wrap_future(job.future),
+                                          timeout=SETTINGS.request_timeout_s)
+        except BaseException:
+            _abandon(job)
+            raise
 
     async def _emotion_mouth(self, voice: str, emotion: str) -> tuple[str, str | None, bool]:
         """The pocket-tts mouth for one emotion-carrying part.

@@ -209,6 +209,52 @@ class ConversationTests(unittest.TestCase):
             self.assertEqual(interruption["interruption_event"]["reason"],
                              "user_speech")
 
+    def test_a_barge_in_hands_the_queued_job_back_to_the_box(self) -> None:
+        """Being talked over must return the CAPACITY, not just the socket.
+
+        The engine is paused, so the agent's first sentence is sitting in the
+        queue rather than inside the model — which is the only state anything
+        can be done about (``generate_audio`` is atomic; a render that has
+        started runs to completion). Cancelling the turn's task used to leave
+        that job in the queue for a worker to pick up and render for nobody.
+        """
+        self._engine(paused=True)
+        with self.client.websocket_connect(self._url()) as ws:
+            self._init(ws)
+            ws.receive_json()                    # metadata
+            self._until(ws, "agent_response")    # the agent has the floor
+            self._speak(ws)                      # the caller takes it back
+            self._until(ws, "interruption")
+            self.assertTrue(self.engine.jobs, "the opening never reached the engine")
+            self.assertTrue(self.engine.jobs[0].abandoned.is_set(),
+                            "the interrupted turn's job was left for a worker")
+        self._settled()
+        # Everything this conversation submitted is accounted for: the turn that
+        # was interrupted AND the turn that was still queued when the caller hung
+        # up. Nothing was rendered, because nothing could have been heard.
+        for job in self.engine.jobs:
+            self.assertTrue(job.abandoned.is_set(), job.text)
+        self.engine.resume()
+        self._drained()
+        self.assertEqual(self.engine.executed, [],
+                         "a worker rendered audio no one could hear")
+
+    def _settled(self, timeout: float = 5.0) -> None:
+        """Wait for the session to finish tearing down."""
+        deadline = time.monotonic() + timeout
+        while convai._Sessions.active and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(convai._Sessions.active, 0, "the session slot leaked")
+
+    def _drained(self, timeout: float = 5.0) -> None:
+        """Wait for the fake pool to have looked at every job it was given."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if all(job._claimed for job in self.engine.jobs):
+                return
+            time.sleep(0.01)
+        raise AssertionError("the fake pool never drained")
+
     def test_a_client_override_re_prompts_the_agent(self) -> None:
         self._engine()
         with self.client.websocket_connect(self._url()) as ws:
