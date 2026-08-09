@@ -94,7 +94,14 @@ describe("running → done", () => {
     expect(download.getAttribute("href")).toBe("/api/revoice/rv1/media/video");
     expect(screen.getByText(/4 lines · 1 verbatim · 1 time-stretched · 2 rewritten/)).toBeTruthy();
     expect(screen.queryByText("re-performing every line")).toBeNull();
-  });
+    // This is the only test here that waits out a SECOND poll, so it pays the
+    // poller's real 1.5s first-step backoff (videoData.ts:144) on top of the
+    // console render every test in this file pays. Against vitest's 5000ms
+    // default that left the `timeout: 4000` above INERT — the test budget
+    // always expired first, so the assertion's own allowance could never fire
+    // and the test failed by the clock under parallel load. Sized to what it
+    // actually waits for, not nudged past one observed failure.
+  }, 15_000);
 
   it("names the lines that overrun without calling them failures", async () => {
     await runDub(queued([DONE]));

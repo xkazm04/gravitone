@@ -10,6 +10,7 @@ import ScoreText from "./ScoreText";
 import type { Character } from "@/app/voices/_data/characters";
 import type { Dub } from "../_video/useDub";
 import { FitBadge, SlotClock } from "../_video/dubParts";
+import { substitution } from "../_video/videoData";
 
 export function PlaygroundScriptRows({
   script, characters, activeLine, setActiveLine,
@@ -104,11 +105,21 @@ export function PlaygroundScriptRows({
                   spoken as “{dubState.fitFor(line.id)?.rewritten_text}”
                 </span>
               )}
-              {dubState.fitFor(line.id)?.emotion && (
-                <span className="font-jetbrains text-[11px] text-white/50">
-                  read as {dubState.fitFor(line.id)?.emotion}
-                </span>
-              )}
+              {/* The badge already names the emotion whenever the box
+                  SUBSTITUTED one ("asked for X · spoken Y"). Saying "read as Y"
+                  beside it prints the same emotion twice and buries which of
+                  the two is the request. So this row states the emotion only
+                  for the plain case the badge stays quiet about. */}
+              {dubState.fitFor(line.id)?.emotion &&
+                !substitution({
+                  requested: dubState.fitFor(line.id)?.emotion_requested,
+                  delivered: dubState.fitFor(line.id)?.emotion,
+                  stemFallback: dubState.fitFor(line.id)?.stem_fallback,
+                }) && (
+                  <span className="font-jetbrains text-[11px] text-white/50">
+                    read as {dubState.fitFor(line.id)?.emotion}
+                  </span>
+                )}
             </div>
           )}
         </div>
