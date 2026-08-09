@@ -5,7 +5,7 @@
 // the 409 busy refusal — are written once. A variant is a view over this state,
 // never its own fetch dialect.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { ApiError, apiJson } from "@/lib/apiFetch";
 import { useMounted } from "@/lib/useMounted";
@@ -211,20 +211,20 @@ export function useGymRuns() {
   const mounted = useMounted();
   const [runs, setRuns] = useState<SessionRun[]>([]);
   const [state, setState] = useState<ReplayState>({ phase: "idle" });
+  // The gate itself is a ref, NOT the rendered state. A functional setState
+  // updater looks like a gate and is not one: React only runs the updater
+  // eagerly while the queue is empty, so two calls landing in the SAME batch
+  // (a fast double-click, or any caller that fires twice before a commit) both
+  // read `phase: "idle"` and both fire — which is exactly the 409 this exists
+  // to prevent. A ref is decided at call time, before any render. Pinned by
+  // data.test.tsx; the state below still drives what the user sees.
+  const inFlight = useRef(false);
 
   const replay = useCallback(
     async (recording: string, opts: ReplayOptions): Promise<SessionRun | null> => {
-      // In-flight gate: a double-click must not become the 409 the backend
-      // would rightly answer it with.
-      let already = false;
-      setState((s) => {
-        if (s.phase === "running") {
-          already = true;
-          return s;
-        }
-        return { phase: "running", recording, startedAt: Date.now() };
-      });
-      if (already) return null;
+      if (inFlight.current) return null;
+      inFlight.current = true;
+      setState({ phase: "running", recording, startedAt: Date.now() });
       try {
         const answer = await apiJson<{ run: GymRun }>(
           "/api/gym/replay",
@@ -280,6 +280,10 @@ export function useGymRuns() {
           busy,
         });
         return null;
+      } finally {
+        // Every exit reopens the gate — including the unmounted early returns
+        // above, which leave no state behind to reopen it for them.
+        inFlight.current = false;
       }
     },
     [mounted, runs],
