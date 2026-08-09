@@ -177,11 +177,16 @@ class PlanTests(_PlanCase):
                                                 "in_sample": 3}})
         wanted, _ = self.plan({"sarah": {"angry": 9}})
         self.assertEqual(wanted[0].quality, 0.95)
+        self.assertEqual(wanted[0].state, eb.TRANSFER_MEASURED)
         self.assertIn("transfer 0.95", wanted[0].describe())
 
     def test_an_unmeasured_emotion_is_allowed_and_says_so(self) -> None:
         wanted, _ = self.plan({"sarah": {"angry": 9}})
         self.assertIsNone(wanted[0].quality)
+        # The state is carried as a NAME, not left to be inferred from the null:
+        # this candidate becomes a voice, and "nobody measured this" has to
+        # survive the trip.
+        self.assertEqual(wanted[0].state, eb.TRANSFER_UNMEASURED)
         self.assertIn("unmeasured transfer", wanted[0].describe())
 
     def test_no_basis_at_all_refuses_every_slot_by_name(self) -> None:

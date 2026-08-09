@@ -29,10 +29,11 @@ The four rules that make an automatic writer acceptable:
     ``--dry-run`` prints exactly what a real run would do, and two runs of the
     same cap cover the same slots in the same order.
 
-Run:
+Run (``python -m service.tools`` lists the whole pipeline and what each part
+needs; this is the last step of it):
 
-    python -m service.tools.derive_autofill --dry-run
-    python -m service.tools.derive_autofill --cap 5
+    python -m service.tools autofill --dry-run
+    python -m service.tools autofill --cap 5
 """
 from __future__ import annotations
 
@@ -105,6 +106,11 @@ class Candidate:
     demand: int
     coherence: float
     quality: float | None   # measured transfer quality, None = never measured
+    # The NAME of what `quality` is (emotion_basis.TRANSFER_STATES). Carried
+    # beside the number rather than derived from `quality is None` at each read
+    # site, for the same reason the derived row carries it: "nobody measured
+    # this" is a state, not a missing value.
+    state: str = emotion_basis.TRANSFER_UNMEASURED
 
     def describe(self) -> str:
         measured = ("unmeasured transfer" if self.quality is None
@@ -191,12 +197,12 @@ def plan(registry: dict, demand: dict, basis: emotion_basis.Basis | None, *,
                 best_skip = best_skip or Skip(cid, emotion, count, reason or
                                               "this emotion cannot be derived")
                 continue
-            measured, refusal = emotion_basis.transfer_gate(basis, emotion)
+            payload, refusal = emotion_basis.transfer_check(basis, emotion)
             if refusal is not None:
                 best_skip = best_skip or Skip(cid, emotion, count, refusal)
                 continue
             best = Candidate(cid, emotion, count, entry.coherence,
-                             None if measured is None else measured.quality)
+                             payload["quality"], payload["state"])
             break
         if best is not None:
             wanted.append(best)

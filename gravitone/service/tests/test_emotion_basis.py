@@ -285,5 +285,165 @@ class DonorDirectionTests(unittest.TestCase):
         self.assertIn("different models", reason)
 
 
+class TransferStateTests(unittest.TestCase):
+    """"Unmeasured" must never look like "measured and fine".
+
+    The transfer-quality gate is built and enforced, but the block it reads is
+    written by `service/tools/derive_ab.py`, which has zero callers -- so on
+    every install today `transfer` is empty and the gate says "never measured,
+    derive anyway". That policy is deliberate (see `transfer_gate`), and it is
+    only defensible if the derived row SAYS which of the three states it is in.
+    A null `quality` is not saying it: every consumer that coerces turns it into
+    0.0 or 1.0, and both are lies about a measurement that never happened.
+    """
+
+    def basis(self, **transfer: eb.TransferQuality) -> eb.Basis:
+        emotions = {name: eb.EmotionBasis(name, np.ones(4) / 2.0, 1.0, 0.9,
+                                          ("mary", "paul"), 2)
+                    for name in ("angry", "sad", "whisper")}
+        return eb.Basis(version=eb.BASIS_VERSION, created="now",
+                        layout=(("e", (4,)),), emotions=emotions,
+                        transfer=dict(transfer))
+
+    # -- measured and passing --------------------------------------------------
+    def test_measured_and_passing_derives_and_carries_its_number(self) -> None:
+        entry = eb.TransferQuality("angry", 0.91, 3, in_sample=2, measured="2026-01-01Z")
+        payload, refusal = eb.transfer_check(self.basis(angry=entry), "angry")
+        self.assertIsNone(refusal)
+        self.assertEqual(payload["state"], eb.TRANSFER_MEASURED)
+        self.assertEqual(payload["quality"], 0.91)
+        self.assertEqual(payload["speakers"], 3)
+        self.assertEqual(payload["in_sample"], 2)
+        self.assertEqual(payload["measured"], "2026-01-01Z")
+        self.assertEqual(payload["min_quality"], eb.MIN_TRANSFER_QUALITY)
+
+    def test_exactly_on_the_bar_passes(self) -> None:
+        entry = eb.TransferQuality("angry", eb.MIN_TRANSFER_QUALITY, 2)
+        payload, refusal = eb.transfer_check(self.basis(angry=entry), "angry")
+        self.assertIsNone(refusal)
+        self.assertEqual(payload["state"], eb.TRANSFER_MEASURED)
+
+    # -- measured and failing --------------------------------------------------
+    def test_measured_and_failing_refuses_naming_both_numbers_and_the_fix(self) -> None:
+        entry = eb.TransferQuality("angry", 0.2, 3)
+        payload, refusal = eb.transfer_check(self.basis(angry=entry), "angry")
+        self.assertIn("0.20", refusal)
+        self.assertIn("0.50", refusal)
+        self.assertIn("3 speaker(s)", refusal)
+        # the refusal names the command that would change the answer
+        self.assertIn("python -m service.tools ab", refusal)
+        # ...and the payload still states what it is, for anything that logs it
+        self.assertEqual(payload["state"], eb.TRANSFER_BELOW_BAR)
+        self.assertEqual(payload["quality"], 0.2)
+
+    # -- never measured --------------------------------------------------------
+    def test_never_measured_derives_but_is_named_not_nulled(self) -> None:
+        payload, refusal = eb.transfer_check(self.basis(), "angry")
+        self.assertIsNone(refusal, "the policy is allow-with-a-named-state")
+        self.assertEqual(payload["state"], eb.TRANSFER_UNMEASURED)
+        self.assertIsNone(payload["quality"])
+
+    def test_the_unmeasured_row_invents_no_number_for_a_measurement(self) -> None:
+        payload = eb.transfer_payload(None)
+        self.assertIsNone(payload["quality"])
+        self.assertNotIn(payload["quality"], (0.0, 1.0))
+        # `speakers: 0` is a COUNT of speakers actually tested, which is zero --
+        # not a stand-in for a quality.
+        self.assertEqual(payload["speakers"], 0)
+        self.assertEqual(payload["in_sample"], 0)
+        self.assertIsNone(payload["measured"])
+
+    def test_an_emotion_measured_elsewhere_does_not_lend_its_number(self) -> None:
+        basis = self.basis(sad=eb.TransferQuality("sad", 0.99, 4))
+        payload, refusal = eb.transfer_check(basis, "angry")
+        self.assertIsNone(refusal)
+        self.assertEqual(payload["state"], eb.TRANSFER_UNMEASURED)
+        self.assertEqual(eb.transfer_check(basis, "sad")[0]["state"],
+                         eb.TRANSFER_MEASURED)
+
+    # -- the shape itself ------------------------------------------------------
+    def test_all_three_states_publish_the_same_key_set(self) -> None:
+        keys = {"state", "quality", "speakers", "in_sample", "min_quality",
+                "measured", "version"}
+        basis = self.basis(angry=eb.TransferQuality("angry", 0.9, 2),
+                           sad=eb.TransferQuality("sad", 0.1, 2))
+        for emotion, expected in (("angry", eb.TRANSFER_MEASURED),
+                                  ("sad", eb.TRANSFER_BELOW_BAR),
+                                  ("whisper", eb.TRANSFER_UNMEASURED)):
+            with self.subTest(emotion=emotion):
+                payload, _refusal = eb.transfer_check(basis, emotion)
+                # No state may be inferable only from which keys are missing.
+                self.assertEqual(set(payload), keys)
+                self.assertEqual(payload["state"], expected)
+                self.assertIn(payload["state"], eb.TRANSFER_STATES)
+                self.assertEqual(payload["version"], eb.TRANSFER_VERSION)
+
+    def test_the_bar_the_state_was_decided_against_travels_with_it(self) -> None:
+        # A row stored today has to stay readable after MIN_TRANSFER_QUALITY
+        # moves: "measured" without the bar it cleared is not a fact.
+        entry = eb.TransferQuality("angry", 0.6, 2)
+        strict, refusal = eb.transfer_check(self.basis(angry=entry), "angry",
+                                            min_quality=0.9)
+        self.assertIsNotNone(refusal)
+        self.assertEqual(strict["state"], eb.TRANSFER_BELOW_BAR)
+        self.assertEqual(strict["min_quality"], 0.9)
+
+    def test_the_gate_and_the_payload_cannot_disagree(self) -> None:
+        for quality in (0.0, 0.49, 0.5, 0.51, 1.0):
+            with self.subTest(quality=quality):
+                entry = eb.TransferQuality("angry", quality, 2)
+                basis = self.basis(angry=entry)
+                _e, refusal = eb.transfer_gate(basis, "angry")
+                payload, check_refusal = eb.transfer_check(basis, "angry")
+                self.assertEqual(refusal, check_refusal)
+                self.assertEqual(payload["state"] == eb.TRANSFER_BELOW_BAR,
+                                 refusal is not None)
+
+
+class RefusalCopyTests(_SeamCase):
+    """A refusal that tells the operator how to stop being refused.
+
+    On a fresh checkout the derive endpoint's 422 was the end of the road: no
+    basis exists, none of the tools that build one has a caller, and the command
+    was documented nowhere the refused person would look.
+    """
+
+    def test_no_basis_names_the_command_its_deps_and_what_it_writes(self) -> None:
+        basis, reason = eb.load(self.root)
+        self.assertIsNone(basis)
+        self.assertIn("no emotion basis has been built", reason)
+        self.assertIn("python -m service.tools basis", reason)
+        self.assertIn("safetensors", reason)          # what it needs
+        self.assertIn("seconds to minutes", reason)   # roughly how long
+        self.assertIn("_basis.safetensors", reason)   # what it writes
+        self.assertIn("python -m service.tools residuals", reason)  # check first
+
+    def test_a_basis_from_another_version_says_how_to_rebuild_it(self) -> None:
+        self.seed(COHERENT)
+        eb.build(self.root)
+        path = self.root / eb.BASIS_JSON
+        raw = json.loads(path.read_text("utf-8"))
+        raw["version"] = eb.BASIS_VERSION + 1
+        path.write_text(json.dumps(raw), "utf-8")
+        _basis, reason = eb.load(self.root)
+        self.assertIn("different version", reason)
+        self.assertIn("python -m service.tools basis", reason)
+
+    def test_an_emotion_the_basis_lacks_says_what_would_add_it(self) -> None:
+        self.seed(COHERENT)
+        eb.build(self.root)
+        basis, _reason = eb.load(self.root)
+        entry, reason = eb.direction(basis, "whisper")
+        self.assertIsNone(entry)
+        self.assertIn("two or more characters", reason)
+        self.assertIn("python -m service.tools basis", reason)
+
+    def test_recording_transfer_against_nothing_says_how_to_build_it(self) -> None:
+        reason = eb.write_transfer(self.root, {"angry": {"quality": 0.9,
+                                                         "speakers": 2}})
+        self.assertIn("nothing to record transfer quality against", reason)
+        self.assertIn("python -m service.tools basis", reason)
+
+
 if __name__ == "__main__":
     unittest.main()

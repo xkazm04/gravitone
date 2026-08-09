@@ -67,6 +67,31 @@ TRANSFER_KEY = "transfer"
 # at most one noticeable step further away than the recording it stands in for.
 MIN_TRANSFER_QUALITY = 0.5
 
+# The three states a derive's transfer quality can be in, as NAMES. The number
+# alone cannot carry them. "Nobody measured this" has no honest number: 0.0 says
+# the derived voice was tested and lost, 1.0 says it was tested and matched, and
+# a bare `null` is indistinguishable from a field a client forgot to send --
+# every consumer that coerces (`quality || 0`, `Number(quality)`) turns it into
+# one of the two lies above. So the state is written down beside the number and
+# is ALWAYS present, on measured and unmeasured rows alike; a client that only
+# ever reads `state` is never wrong about which of the three it is holding.
+TRANSFER_MEASURED = "measured"      # measured, at or above MIN_TRANSFER_QUALITY
+TRANSFER_BELOW_BAR = "below-bar"    # measured, under the bar -- derive refuses
+TRANSFER_UNMEASURED = "unmeasured"  # derive_ab has never run for this emotion
+TRANSFER_STATES = (TRANSFER_MEASURED, TRANSFER_BELOW_BAR, TRANSFER_UNMEASURED)
+
+# What an operator has to run when this install has no basis yet, said in full:
+# the command, what it needs installed, roughly how long, and what it writes. A
+# refusal that only says "there is no basis" is correct and useless -- the person
+# reading it has no way to stop being refused. `service/tools/cli.py` is the one
+# entry point these commands live behind.
+BUILD_HINT = (
+    "run 'python -m service.tools basis' (needs numpy + safetensors, reads every "
+    "voice embedding in the registry, seconds to minutes, writes "
+    "voices/_basis.safetensors and voices/_basis.json); "
+    "'python -m service.tools residuals' first reports whether the recorded "
+    "emotions agree well enough for one to be built")
+
 # The same bar the measurement gate calls `go`. Named separately because THIS is
 # the one the product enforces: an emotion below it is refused at derive time
 # with its own number in the message.
@@ -104,6 +129,16 @@ class TransferQuality:
     speakers: int
     in_sample: int = 0
     measured: str = ""
+
+    def state(self, min_quality: float = MIN_TRANSFER_QUALITY) -> str:
+        """:data:`TRANSFER_MEASURED` or :data:`TRANSFER_BELOW_BAR`.
+
+        Never :data:`TRANSFER_UNMEASURED` -- this object only exists because
+        something was measured. The absence of one is the third state, and
+        :func:`transfer_payload` is where it gets its name.
+        """
+        return (TRANSFER_MEASURED if self.quality >= min_quality
+                else TRANSFER_BELOW_BAR)
 
 
 @dataclass(frozen=True)
@@ -294,9 +329,7 @@ def load(voices_dir: Path | str) -> tuple[Basis | None, str | None]:
     voices_dir = Path(voices_dir)
     tensors_path, json_path = paths(voices_dir)
     if not json_path.is_file() or not tensors_path.is_file():
-        return None, ("no emotion basis has been built for this install -- run "
-                      "'python -m service.emotion_basis' once the residual gate "
-                      "reports a go")
+        return None, f"no emotion basis has been built for this install -- {BUILD_HINT}"
     try:
         raw = json.loads(json_path.read_text("utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
@@ -304,7 +337,8 @@ def load(voices_dir: Path | str) -> tuple[Basis | None, str | None]:
     if not isinstance(raw, dict) or raw.get("version") != BASIS_VERSION:
         return None, (f"the emotion basis was built by a different version "
                       f"({raw.get('version') if isinstance(raw, dict) else 'unknown'}, "
-                      f"this service reads {BASIS_VERSION}) -- rebuild it")
+                      f"this service reads {BASIS_VERSION}) -- rebuild it: "
+                      f"{BUILD_HINT}")
     try:
         tensors = res.load_embedding(tensors_path)
     except TensorsUnavailable as exc:
@@ -330,7 +364,8 @@ def load(voices_dir: Path | str) -> tuple[Basis | None, str | None]:
         except (KeyError, TypeError, ValueError):
             continue  # one malformed entry, not the whole basis
     if not emotions:
-        return None, "the emotion basis contains no usable directions -- rebuild it"
+        return None, ("the emotion basis contains no usable directions -- "
+                      f"rebuild it: {BUILD_HINT}")
     return Basis(version=BASIS_VERSION, created=str(raw.get("created") or ""),
                  layout=layout, emotions=emotions,
                  transfer={e: q for e, q in transfer.items() if e in emotions}), None
@@ -387,7 +422,7 @@ def write_transfer(voices_dir: Path | str, results: dict[str, dict], *,
     _tensors_path, json_path = paths(voices_dir)
     if not json_path.is_file():
         return ("no emotion basis has been built for this install -- there is "
-                "nothing to record transfer quality against")
+                f"nothing to record transfer quality against; {BUILD_HINT}")
     try:
         raw = json.loads(json_path.read_text("utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
@@ -430,10 +465,18 @@ def transfer_gate(basis: Basis, emotion: str, *,
       * measured and good -> ``(entry, None)``: derive, and record the number.
       * measured and BAD  -> ``(entry, sentence)``: refuse, naming both numbers
         and what to do about it.
-      * never measured    -> ``(None, None)``: derive anyway. Absence of a
-        measurement is not evidence of a bad voice, and a bar that refused
-        everything until someone ran the harness would make the harness a
-        deployment prerequisite for a feature that works without it.
+      * never measured    -> ``(None, None)``: derive anyway, ON THE CONDITION
+        that the caller records :data:`TRANSFER_UNMEASURED` on the row (which
+        is why :func:`transfer_check` exists and is the shape callers should
+        use). The policy is ALLOW-WITH-A-NAMED-STATE, deliberately, and the
+        alternative was refusal: `derive_ab` needs the engine (torch +
+        pocket_tts), a corpus of speakers who have BOTH a recorded baseline and
+        a recorded, probed take of the emotion, and an operator who runs it, so
+        refusing until it has run would make an unattended maintenance script a
+        hard prerequisite for a feature that works without it and would take
+        `/derive` offline on every install in existence today. Absence of a
+        measurement is not evidence of a bad voice. It is not evidence of a good
+        one either -- which is exactly why it is not allowed to travel silently.
     """
     entry = basis.transfer.get(emotion)
     if entry is None:
@@ -443,8 +486,51 @@ def transfer_gate(basis: Basis, emotion: str, *,
             f"'{emotion}' was measured deriving worse than the recordings it "
             f"stands in for (transfer quality {entry.quality:.2f} across "
             f"{entry.speakers} speaker(s), needs {min_quality:.2f}) -- record "
-            f"this emotion, or improve the basis and re-run the A/B harness")
+            f"this emotion, or improve the basis and re-run the A/B harness "
+            f"('python -m service.tools ab --emotion {emotion}')")
     return entry, None
+
+
+def transfer_payload(entry: TransferQuality | None, *,
+                     min_quality: float = MIN_TRANSFER_QUALITY) -> dict:
+    """The ONE client-facing shape for "how well does this emotion travel?".
+
+    The same key set in all three states, so no consumer has to infer anything
+    from which keys are missing:
+
+    ``{"state", "quality", "speakers", "in_sample", "min_quality", "measured",
+    "version"}``
+
+    ``state`` is one of :data:`TRANSFER_STATES` and is the field to read.
+    ``quality`` is ``None`` -- and ONLY None -- when nothing was measured; the
+    unmeasured row does not invent a number for a measurement that never
+    happened, and its ``speakers: 0`` is a count of speakers actually tested,
+    not a stand-in for one. ``version`` is the schema of this block, so a row
+    written today can be told apart from one written by a future harness.
+    """
+    if entry is None:
+        return {"state": TRANSFER_UNMEASURED, "quality": None, "speakers": 0,
+                "in_sample": 0, "min_quality": min_quality, "measured": None,
+                "version": TRANSFER_VERSION}
+    return {"state": entry.state(min_quality), "quality": entry.quality,
+            "speakers": entry.speakers, "in_sample": entry.in_sample,
+            "min_quality": min_quality, "measured": entry.measured or None,
+            "version": TRANSFER_VERSION}
+
+
+def transfer_check(basis: Basis, emotion: str, *,
+                   min_quality: float = MIN_TRANSFER_QUALITY,
+                   ) -> tuple[dict, str | None]:
+    """:func:`transfer_gate`, with the state written down. ``(payload, refusal)``
+
+    What a derive path should call: the refusal is unchanged, and the payload is
+    the row to store, already carrying its state whether or not anything was
+    ever measured. Callers that build their own dict from the gate's entry end
+    up with a MEASURED row that has no ``state`` key and an unmeasured one that
+    does -- the asymmetry this function exists to remove.
+    """
+    entry, refusal = transfer_gate(basis, emotion, min_quality=min_quality)
+    return transfer_payload(entry, min_quality=min_quality), refusal
 
 
 def direction(basis: Basis, emotion: str, *,
@@ -458,12 +544,14 @@ def direction(basis: Basis, emotion: str, *,
     entry = basis.emotions.get(emotion)
     if entry is None:
         return None, (f"the emotion basis has no '{emotion}' direction "
-                      f"(it carries: {', '.join(sorted(basis.emotions)) or 'nothing'})")
+                      f"(it carries: {', '.join(sorted(basis.emotions)) or 'nothing'}) "
+                      f"-- record '{emotion}' on two or more characters, then "
+                      f"rebuild: 'python -m service.tools basis'")
     if entry.coherence < min_coherence:
         return None, (f"'{emotion}' does not transfer between speakers well enough "
                       f"to derive (coherence {entry.coherence:.2f}, needs "
                       f"{min_coherence:.2f}) -- record it, or add another speaker's "
-                      f"take and rebuild the basis")
+                      f"take and rebuild the basis ('python -m service.tools basis')")
     return entry, None
 
 
