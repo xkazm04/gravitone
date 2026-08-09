@@ -69,12 +69,23 @@ export type LiveTurn = {
   /** The user talked over this turn — only part of it was ever heard. */
   interrupted: boolean;
   at: number;
+  /** User turns only: this is what we think they are saying SO FAR, not what
+   *  they said. The service emits these under CONVAI_PARTIAL_DECODE and records
+   *  none of them; a consumer must render it as a guess and must not bank it. */
+  interim?: boolean;
 };
 
 export type ConversationHooks = {
   onStatus?: (status: LiveStatus) => void;
   onRefusal?: (refusal: LiveRefusal) => void;
-  /** A user transcript, or a COMPLETED agent turn (text + samples). */
+  /**
+   * A user transcript, or a COMPLETED agent turn (text + samples).
+   *
+   * UPSERT BY `id`. A user utterance can be announced several times — an
+   * interim guess, then the confirmed transcript — and every announcement of
+   * the same utterance carries the same id, so a consumer that appends blindly
+   * will show the same sentence two or three times over.
+   */
   onTurn?: (turn: LiveTurn) => void;
   /** The agent's reply text, the moment it arrives — before its audio. */
   onAgentText?: (text: string) => void;
@@ -117,6 +128,10 @@ export class LiveConversation {
   private nextAt = 0;
   private rate = DEFAULT_WIRE_RATE;
   private pending: PendingTurn | null = null;
+  /** The user's utterance in flight. Interim guesses UPDATE this row (same id);
+   *  the confirmed transcript replaces its text. Cleared when the agent answers,
+   *  because the next thing the user says is a different utterance. */
+  private userTurn: { id: string; text: string; final: boolean } | null = null;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private muted = false;
   private stopped = false;
@@ -461,17 +476,48 @@ export class LiveConversation {
         return;
       }
       case "user_transcript": {
-        const text = String(
-          (event<Record<string, unknown>>("user_transcription_event") ?? {}).user_transcript ?? "",
-        ).trim();
+        const evt = event<Record<string, unknown>>("user_transcription_event") ?? {};
+        const text = String(evt.user_transcript ?? "").trim();
+        // `is_final` is present ONLY on a guess: convai.py::_send_interim sends
+        // `is_final: false` while the caller is still talking (gated behind
+        // CONVAI_PARTIAL_DECODE), and the confirmed transcript carries no such
+        // field at all. So anything that is not an explicit `false` is a
+        // completed utterance — which is also why an old client that never read
+        // the flag still saw exactly the events it always saw.
+        if (evt.is_final === false) {
+          if (!text) return;
+          const held = this.userTurn;
+          if (held?.final) {
+            // A guess arriving after the confirmed transcript is either a
+            // duplicate of it (drop — the row is already right) or the start of
+            // the NEXT utterance, guessed before the agent got a word in.
+            if (held.text === text) return;
+            this.userTurn = null;
+          }
+          if (!this.userTurn) this.userTurn = { id: nextId(), text: "", final: false };
+          this.userTurn.text = text;
+          // Deliberately NO finalizeTurn(): a partial decode runs while the
+          // caller is mid-sentence, so banking here would cut the agent's reply
+          // in half for a sentence the service itself refuses to record.
+          this.hooks.onTurn?.({
+            id: this.userTurn.id, role: "user", text, rate: this.rate,
+            interrupted: false, at: Date.now(), interim: true,
+          });
+          return;
+        }
         // The user speaking ENDS the agent's turn: whatever the agent was
         // saying is over, so it is banked before the transcript is announced.
         this.finalizeTurn();
-        if (text) {
-          this.hooks.onTurn?.({
-            id: nextId(), role: "user", text, rate: this.rate, interrupted: false, at: Date.now(),
-          });
-        }
+        // An empty confirmed transcript says nothing; any guess already shown
+        // stays a guess rather than being replaced by silence.
+        if (!text) return;
+        if (this.userTurn?.final && this.userTurn.text === text) return; // a duplicate frame
+        const id = this.userTurn && !this.userTurn.final ? this.userTurn.id : nextId();
+        this.userTurn = { id, text, final: true };
+        this.hooks.onTurn?.({
+          id, role: "user", text, rate: this.rate, interrupted: false, at: Date.now(),
+          interim: false,
+        });
         return;
       }
       case "agent_response": {
@@ -479,6 +525,9 @@ export class LiveConversation {
           (event<Record<string, unknown>>("agent_response_event") ?? {}).agent_response ?? "",
         ).trim();
         this.finalizeTurn();
+        // The agent has answered, so whatever the user said is closed: the next
+        // transcript — guess or confirmed — belongs to a new utterance.
+        this.userTurn = null;
         this.pending = { text, chunks: [], interrupted: false, at: Date.now() };
         if (text) this.hooks.onAgentText?.(text);
         return;

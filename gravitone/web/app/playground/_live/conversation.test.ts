@@ -255,6 +255,63 @@ describe("protocol", () => {
     expect(h.turns[0]).toMatchObject({ role: "user", text: "hello there" });
   });
 
+  it("UPDATES the row for an interim transcript instead of banking a turn", async () => {
+    // CONVAI_PARTIAL_DECODE makes the service guess out loud while the caller is
+    // still talking (convai.py::_send_interim). Every guess used to be treated
+    // as a completed utterance: a row per guess, and the agent's reply cut off
+    // mid-sentence by a sentence the service does not even record.
+    const h = await dial();
+    h.ws.open();
+    speak(h.ws, "I am still talking here.");
+    h.ws.emit({ type: "user_transcript", user_transcription_event: { user_transcript: "so", is_final: false } });
+    h.ws.emit({ type: "user_transcript", user_transcription_event: { user_transcript: "so I", is_final: false } });
+
+    // The agent's turn is untouched: a guess never ends it.
+    expect(h.turns.filter((t) => t.role === "agent")).toHaveLength(0);
+    const guesses = h.turns.filter((t) => t.role === "user");
+    expect(guesses.map((t) => t.text)).toEqual(["so", "so I"]);
+    expect(guesses.every((t) => t.interim)).toBe(true);
+    // One utterance, one id — the consumer upserts, so this is one row.
+    expect(new Set(guesses.map((t) => t.id)).size).toBe(1);
+
+    // The confirmed transcript replaces that same row and NOW ends the agent's
+    // turn, exactly as it always did.
+    h.ws.emit({ type: "user_transcript", user_transcription_event: { user_transcript: "so I said no" } });
+    const final = h.turns.at(-1)!;
+    expect(final.id).toBe(guesses[0].id);
+    expect(final.interim).toBe(false);
+    expect(h.turns.filter((t) => t.role === "agent")).toHaveLength(1);
+  });
+
+  it("drops a duplicated transcript rather than printing it twice", async () => {
+    const h = await dial();
+    h.ws.open();
+    const say = (user_transcript: string, extra: Record<string, unknown> = {}) =>
+      h.ws.emit({ type: "user_transcript", user_transcription_event: { user_transcript, ...extra } });
+    say("hello there");
+    say("hello there");                      // the same frame again
+    say("hello there", { is_final: false }); // and a guess that arrived late
+    expect(h.turns.filter((t) => t.role === "user")).toHaveLength(1);
+
+    // A DIFFERENT sentence after that is a new utterance with its own id.
+    say("and another thing");
+    const users = h.turns.filter((t) => t.role === "user");
+    expect(users).toHaveLength(2);
+    expect(users[0].id).not.toBe(users[1].id);
+  });
+
+  it("starts a new row when the agent has answered in between", async () => {
+    const h = await dial();
+    h.ws.open();
+    h.ws.emit({ type: "user_transcript", user_transcription_event: { user_transcript: "yes" } });
+    speak(h.ws, "Understood.");
+    h.ws.emit({ type: "user_transcript", user_transcription_event: { user_transcript: "yes", is_final: false } });
+    const users = h.turns.filter((t) => t.role === "user");
+    expect(users).toHaveLength(2);
+    expect(users[1].id).not.toBe(users[0].id);
+    expect(users[1].interim).toBe(true);
+  });
+
   it("completes an agent turn on silence, carrying text AND its samples", async () => {
     const h = await dial();
     h.ws.open();
@@ -321,6 +378,22 @@ describe("refusals", () => {
     expect(h.refusals[0].message).toContain("conversation limit");
     // A refusal must not leave the microphone open.
     expect(h.mic.track.stop).toHaveBeenCalled();
+  });
+
+  it("says something, and releases the mic, when the socket dies mid-call", async () => {
+    // 1006 is the abnormal close a dropped network gives: no code was ever sent.
+    // Silence here is the failure mode that matters — a call that is over while
+    // the stage still looks live.
+    const h = await dial();
+    h.ws.open();
+    speak(h.ws, "Mid sentence when the wire went");
+    h.ws.serverClose(1006, "");
+    expect(h.refusals).toHaveLength(1);
+    expect(h.refusals[0].message).not.toBe("");
+    expect(h.mic.track.stop).toHaveBeenCalled();
+    expect(h.call.status).toBe("ended");
+    // The turn in flight is still banked: the user had that exchange.
+    expect(h.turns.filter((t) => t.role === "agent")).toHaveLength(1);
   });
 
   it("passes a policy close (1008) through in the service's own words", async () => {

@@ -33,6 +33,12 @@ export default function LiveTranscript({
                 {r.role === "agent" ? (characterName ?? "agent") : "you"}
               </span>
               {r.seconds ? <span>{r.seconds}s</span> : null}
+              {r.interim && (
+                <span className="rounded-full border border-white/15 px-2 py-0.5 text-white/50"
+                  title="Still being heard — this is what the service thinks you are saying, not what it recorded">
+                  hearing…
+                </span>
+              )}
               {r.interrupted && (
                 <span className="rounded-full border border-amber-400/25 bg-amber-400/5 px-2 py-0.5 text-amber-200/85"
                   title="You talked over this turn — the take holds the whole reply, but only part of it was heard">

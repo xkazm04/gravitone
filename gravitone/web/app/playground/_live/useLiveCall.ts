@@ -12,7 +12,7 @@ import { computePeaks } from "../_variants/playgroundEngine";
 import { DEFAULT_EXPRESSION, type Take } from "../_variants/playgroundHelpers";
 import { LiveConversation, type LiveRefusal, type LiveStatus, type LiveTurn } from "./conversation";
 import { encodeWav, pcmSeconds } from "./pcm";
-import type { Row } from "./liveTurns";
+import { upsertRow, type Row } from "./liveTurns";
 
 export function useLiveCall({ charId, character, agentId, onTake }: {
   charId: string;
@@ -93,7 +93,15 @@ export function useLiveCall({ charId, character, agentId, onTake }: {
   }, [charId, character, mounted, onTake]);
 
   const onTurn = useCallback((turn: LiveTurn) => {
-    setRows((list) => [...list, turn]);
+    // UPSERT, never append: an utterance can be announced as a guess and then
+    // as the confirmed transcript under the SAME id, and a duplicated frame
+    // carries the id it already used. Appending would print the same sentence
+    // twice and reorder nothing back into place.
+    setRows((list) => upsertRow(list, turn));
+    // A guess is not an announcement. Reading every partial decode into the
+    // live region would say the same half-sentence four times before the user
+    // finished it; the confirmed transcript is what gets spoken.
+    if (turn.interim) return;
     setAnnouncement(
       turn.role === "user"
         ? `You said: ${turn.text}`
