@@ -168,13 +168,21 @@ export function useForensics() {
       const voiceId = rec.agent_id ? (voiceOf.get(rec.agent_id) ?? null) : null;
       const entry = transcripts.get(rec.conversation_id);
       const transcript = entry?.transcript ?? null;
+      const character = voiceId ? (characterOf.get(voiceId) ?? null) : null;
       return {
         recording: rec,
         voiceId,
-        character: voiceId ? (characterOf.get(voiceId) ?? null) : null,
+        character,
         transcript,
         transcriptError: entry?.error ?? null,
-        findings: transcript ? diagnose(rec.conversation_id, transcript.turns) : [],
+        // The roster is what turns a voice_id into a name; the findings engine
+        // has only the transcript, so the name is handed to it. A roster that
+        // failed to load simply leaves internal findings naming the voice_id.
+        findings: transcript
+          ? diagnose(rec.conversation_id, transcript.turns, {
+              characterName: character?.name ?? null,
+            })
+          : [],
       };
     });
   }, [recordings, agents, roster, transcripts]);

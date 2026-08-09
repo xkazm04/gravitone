@@ -2,11 +2,15 @@
 // transcript, no fetch, no state. Every finding lands in one of two lenses:
 //
 //   internal — the Character's voice needs care (retraining, emotion work).
-//     Round 1 derives almost nothing here by design: per-turn emotion
-//     telemetry is not recorded yet, and inventing internal findings from
-//     numbers that cannot show them would be the fabricated-zero bug in a new
-//     costume. The internal lens is honest about that limit; the ear (the
-//     inspector's players) is the round-1 instrument.
+//     Derived from the recorder's per-turn mouth telemetry
+//     (`RecordedTurn.spoke`, written by service/recording.py::Turn.spoke and
+//     filled in service/convai.py::_synthesize): which voice spoke, which
+//     emotion the brain ASKED for, which slot actually answered, and whether
+//     that was a fallback. A turn whose request went unmet is exactly "this
+//     Character's voice needs care" — the missing take is named, not guessed.
+//     Recordings made before that telemetry landed carry no `spoke` at all;
+//     they derive nothing here rather than a fabricated clean bill, and the
+//     ear (the inspector's players) stays the instrument for them.
 //
 //   external — an indication for the developers of the brain/pipeline that
 //     something is breaking technically or logically. Indications, not fixes:
@@ -16,7 +20,7 @@
 // number or text that backs it, and a turn index + at_s so the inspector can
 // seek straight to the moment.
 
-import type { RecordedTurn } from "./types";
+import type { RecordedTurn, SpokeEntry } from "./types";
 
 export type Lens = "internal" | "external";
 
@@ -48,6 +52,22 @@ const MAX_AGENT_SENTENCES = 3;
 /** answer_s above this is a concern regardless of the session's median. */
 const SLOW_ANSWER_ABS_S = 8;
 
+/** Share of the session's agent turns an unmet emotion request must touch
+ *  before it stops being a notice and becomes a concern. Session-relative on
+ *  purpose: one substituted line in a forty-turn call is a coverage gap worth
+ *  knowing about; a quarter of the call speaking the wrong take is the
+ *  Character sounding wrong to the caller. */
+const UNMET_EMOTION_CONCERN_SHARE = 0.25;
+
+/** The internal-lens rules, in the order the board reads them. Exported so the
+ *  view groups by rule without inventing its own list. */
+export const INTERNAL_KINDS = [
+  "unmet-emotion",
+  "voiceless-emotion",
+  "derived-emotion",
+] as const;
+export type InternalKind = (typeof INTERNAL_KINDS)[number];
+
 const sentenceCount = (text: string): number =>
   (text.match(/[.!?]+(?=\s|$)/g) ?? []).length || (text.trim() ? 1 : 0);
 
@@ -58,19 +78,35 @@ const median = (xs: number[]): number | null => {
   return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
 };
 
+/** What the caller knows that the transcript alone does not: whose voice this
+ *  session's agent spoke with. Used only to NAME the Character in an internal
+ *  finding; absent, the finding names the raw voice_id it saw. */
+export type DiagnoseContext = { characterName?: string | null };
+
 /** Every finding the rules can see in one recorded conversation. */
-export function diagnose(session: string, turns: RecordedTurn[]): Finding[] {
+export function diagnose(
+  session: string,
+  turns: RecordedTurn[],
+  context: DiagnoseContext = {},
+): Finding[] {
   const out: Finding[] = [];
-  const push = (f: Omit<Finding, "id" | "session">) =>
-    out.push({ ...f, session, id: `${session}:${f.kind}:${f.turn ?? "s"}` });
+  const push = (f: Omit<Finding, "id" | "session">, discriminator?: string) =>
+    out.push({
+      ...f,
+      session,
+      id: `${session}:${f.kind}:${f.turn ?? "s"}${discriminator ? `:${discriminator}` : ""}`,
+    });
 
   const answers = turns
     .map((t) => t.answer_s)
     .filter((v): v is number => typeof v === "number");
   const answerMedian = median(answers);
+  const agentTurns = turns.filter((t) => t.role === "agent").length;
+  const mouths = new Map<string, MouthGroup>();
 
   turns.forEach((t, i) => {
     if (t.role === "agent") {
+      for (const entry of t.spoke ?? []) collectMouth(mouths, entry, i, t.at_s);
       if (t.interrupted) {
         push({
           lens: "external",
@@ -144,6 +180,36 @@ export function diagnose(session: string, turns: RecordedTurn[]): Finding[] {
     }
   });
 
+  for (const group of [...mouths.values()].sort(
+    (a, b) => a.turns[0] - b.turns[0] || a.kind.localeCompare(b.kind),
+  )) {
+    const who = context.characterName ?? group.voiceId;
+    const n = group.turns.length;
+    const share = agentTurns ? n / agentTurns : 0;
+    const scope = `${n} of ${agentTurns} agent turn${agentTurns === 1 ? "" : "s"}`;
+    push(
+      {
+        lens: "internal",
+        kind: group.kind,
+        // A derived slot DID speak the emotion asked for — it is a missing
+        // recording, never a wrong-sounding line. Only a substitution or a
+        // request nothing could answer scales to a concern.
+        severity:
+          group.kind !== "derived-emotion" && share >= UNMET_EMOTION_CONCERN_SHARE
+            ? "concern"
+            : "notice",
+        turn: group.turns[0],
+        at_s: group.firstAt,
+        summary: mouthSummary(group, who),
+        evidence:
+          group.kind === "unmet-emotion"
+            ? `${scope} · asked [${group.emotion}], ${group.used} spoke · voice ${group.voiceId}`
+            : `${scope} · asked [${group.emotion}] · ${group.tts} voice ${group.voiceId}`,
+      },
+      `${group.emotion}:${group.used ?? "none"}`,
+    );
+  }
+
   if (!turns.some((t) => t.role === "candidate")) {
     push({
       lens: "external",
@@ -164,6 +230,86 @@ function excerptAround(text: string, needle: string): string {
   return text.slice(Math.max(0, at - 12), at + needle.length + 12);
 }
 
-/** What the internal lens can honestly say per session in round 1. */
+// ---------------------------------------------------------------------------
+// The internal lens: what the mouth telemetry says about a Character's slots.
+// ---------------------------------------------------------------------------
+
+type MouthGroup = {
+  kind: InternalKind;
+  /** What the brain asked for. */
+  emotion: string;
+  /** The slot that actually spoke, when one resolved. */
+  used: string | null;
+  tts: string;
+  voiceId: string;
+  /** Every agent turn this group touched, in order. */
+  turns: number[];
+  firstAt?: number;
+};
+
+/** Which rule (if any) one `spoke` entry trips.
+ *
+ *  `fallback` is NOT simply "the request went unmet" — emotions.resolve sets it
+ *  true ALSO when the requested slot exists but is DERIVED (a computed stand-in
+ *  for a take nobody recorded), and that case has `used === emotion`. The three
+ *  kinds keep those apart, because accusing a Character of speaking the wrong
+ *  emotion when it spoke the right one would be a false finding:
+ *
+ *    unmet-emotion    — asked for X, slot Y spoke instead.
+ *    voiceless-emotion— asked for X and nothing resolved at all (no Character
+ *                       owns the voice, or the mouth has no emotion slots).
+ *    derived-emotion  — X was spoken, from a computed slot, not a recording.
+ */
+function mouthKind(entry: SpokeEntry): InternalKind | null {
+  if (!entry.fallback || !entry.emotion) return null;
+  if (entry.used === null) return "voiceless-emotion";
+  if (entry.used === entry.emotion) return "derived-emotion";
+  return "unmet-emotion";
+}
+
+function collectMouth(
+  groups: Map<string, MouthGroup>,
+  entry: SpokeEntry,
+  turn: number,
+  atS: number,
+): void {
+  const kind = mouthKind(entry);
+  if (!kind || !entry.emotion) return;
+  const key = `${kind}|${entry.voice_id}|${entry.emotion}|${entry.used ?? ""}`;
+  const group = groups.get(key);
+  if (!group) {
+    groups.set(key, {
+      kind,
+      emotion: entry.emotion,
+      used: entry.used,
+      tts: entry.tts,
+      voiceId: entry.voice_id,
+      turns: [turn],
+      firstAt: atS,
+    });
+    return;
+  }
+  // One turn can hold several parts on the same slot — count the TURN once.
+  if (group.turns[group.turns.length - 1] !== turn) group.turns.push(turn);
+}
+
+function mouthSummary(group: MouthGroup, who: string): string {
+  switch (group.kind) {
+    case "unmet-emotion":
+      return `The brain asked ${who} for [${group.emotion}] and the ${group.used} take spoke instead — ${who} has no ${group.emotion} recorded.`;
+    case "voiceless-emotion":
+      return `The brain asked ${who} for [${group.emotion}] and nothing could answer it — ${
+        group.tts === "piper"
+          ? "this is a Piper mouth, which has no emotion slots"
+          : "no Character owns this voice"
+      }, so the configured voice spoke it unchanged.`;
+    case "derived-emotion":
+      return `${who} spoke [${group.emotion}] from a derived slot — a computed stand-in, not a recorded take. Recording the real one is the upgrade.`;
+  }
+}
+
+/** What the internal lens can honestly say about a session whose recording
+ *  predates mouth telemetry: nothing, and it says so rather than reading as a
+ *  clean bill of health. */
 export const INTERNAL_LENS_LIMIT =
-  "Per-turn emotion telemetry is not recorded yet — the internal lens is your ear: open a session, listen, and judge the Character. Slot-level findings arrive with recorder enrichment.";
+  "These sessions were recorded before per-turn mouth telemetry landed, so the rules can see no emotion requests in them — that is a blind spot, not a clean result. Your ear is the instrument here: open a session and listen.";
