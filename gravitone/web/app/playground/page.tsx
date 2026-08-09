@@ -1,14 +1,25 @@
+"use client";
+
 import AppFrame from "@/components/ui/AppFrame";
+import PrototypeTabs from "@/components/ui/PrototypeTabs";
 import PlaygroundConsole from "./_variants/PlaygroundConsole";
 
-// Console won the playground prototype round; the Marquee won the video round
-// that extended it (the picture is a stage above the console, present in every
-// mode — see ../_video). Rendered directly, no switcher.
+// The RE-VOICE round. All three tabs are the same console with the same
+// marquee above it; the picture's second verb (replace this video's dialogue)
+// is in every one of them. What differs is only where a dub's LINES live —
+// reused from script mode, or on a bench of their own.
 export default function PlaygroundPage() {
   return (
     <AppFrame>
       <div className="py-10">
-        <PlaygroundConsole />
+        <PrototypeTabs
+          storageKey="proto-playground-dub"
+          variants={[
+            { id: "console", label: "Console", sub: "today, narrate only", node: <PlaygroundConsole /> },
+            { id: "script", label: "Dub sheet", sub: "script mode grows a clock", node: <PlaygroundConsole dub="script" /> },
+            { id: "bench", label: "Dub bench", sub: "a surface of its own", node: <PlaygroundConsole dub="bench" /> },
+          ]}
+        />
       </div>
     </AppFrame>
   );

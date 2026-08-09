@@ -3,7 +3,8 @@
 // The door into a reel: a link, a note to the writer, and the Character the
 // console already has selected. It is a BAR rather than a form because the
 // marquee it belongs to is a stage — the door has to occupy the same strip the
-// loaded picture will, or the console jumps when a reel lands.
+// loaded picture will, or the console jumps when a reel lands. The panel is
+// the marquee's; this only ever draws its contents.
 
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { StepsRail } from "./parts";
@@ -71,7 +72,7 @@ export default function ReelDoor({ reel, characterName }: {
   );
 
   return (
-    <div className="glass-panel rounded-2xl px-4 py-3">
+    <div>
       <div className="flex flex-wrap items-center gap-2">
         <span className="font-jetbrains text-[11px] uppercase tracking-widest text-white/60">picture</span>
         {inputs}
