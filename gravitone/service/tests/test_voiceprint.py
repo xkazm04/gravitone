@@ -3,13 +3,19 @@
 Three things are proven here, and the FIRST one is the reason the other two are
 written the way they are:
 
-  1. **The degrade path.** sherpa-onnx is not installed on the build box (and the
-     29 MB embedding model is not downloaded), so every runtime here takes the
-     unavailable branch. That must produce a payload that NAMES the reason and
-     changes nothing else: no dropped audio, no identity, no zeros standing in
-     for a measurement that never happened. This is also the shipped behaviour on
-     any box that has not run `python -m service.diarize --download`, so it is
-     the path most users are on — not an edge case.
+  1. **The degrade path**, which every test here STATES rather than borrows from
+     the machine. On a box without sherpa-onnx (or without the 29 MB embedding
+     model) every runtime takes the unavailable branch, and that must produce a
+     payload that NAMES the reason and changes nothing else: no dropped audio, no
+     identity, no zeros standing in for a measurement that never happened. It is
+     the shipped behaviour on any box that has not run
+     `python -m service.diarize --download`, so it is the path most users are on
+     — not an edge case. These tests used to rely on this box being such a box,
+     which meant they passed by accident until the models were installed here and
+     then failed — testing the environment instead of the branch. The absence is
+     patched in now, so the degrade path is proven on developer machines that CAN
+     run the real pipeline, which are precisely the ones that would otherwise
+     never exercise it.
   2. **The measurement itself**, with a stubbed sherpa (`_fake_sherpa`) for the
      plumbing — the extractor is built from `diarize.embedding_path()` with the
      configured thread budget, audio is handed over at 16 kHz float32, the load
@@ -37,6 +43,11 @@ import numpy as np
 
 from service import diarize, ingest, voiceprint
 from service.emotions import BASELINE
+
+#: The sentence a box without the embedder answers with. Stated here so the
+#: degrade path is tested by assertion rather than by whatever this machine
+#: happens to have installed.
+_ABSENT_REASON = ("the speaker embedding model is not installed on this box")
 
 DIM = 8
 
@@ -437,10 +448,19 @@ class PipelinePayloadTests(unittest.TestCase):
                                          partial=partials.append)
 
     def test_degraded_run_publishes_a_named_reason_and_no_numbers(self) -> None:
-        # No patching of voiceprint at all: this is the real box, where the
-        # embedder is genuinely absent — the shipped degrade path.
+        # The degrade path: no embedder, so the run must name WHY and publish
+        # no similarity numbers at all.
+        #
+        # This used to patch nothing and rely on the box itself lacking the
+        # model. That made it pass by accident on a bare machine and FAIL the
+        # moment the models were installed here — and, worse, it meant the
+        # degrade path went untested on exactly the developer boxes that can
+        # run the real pipeline. The absence is stated now, not borrowed from
+        # the environment, so this asserts the same thing everywhere.
         partials: list[dict] = []
-        with TemporaryDirectory() as td:
+        with mock.patch.object(voiceprint, "unavailable_reason",
+                               return_value=_ABSENT_REASON), \
+             TemporaryDirectory() as td:
             res = self._run(self._work(td, 5), partials)
         fid = res["fidelity"]
         self.assertFalse(fid["available"])
