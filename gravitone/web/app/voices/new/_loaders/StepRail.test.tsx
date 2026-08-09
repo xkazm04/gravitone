@@ -1,7 +1,7 @@
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import StepRail from "./StepRail";
-import type { LoaderStep } from "./shared";
+import type { LoaderStep } from "./ScanReport";
 
 // useStillMotion subscribes to a media query; jsdom ships no matchMedia.
 // "motion is fine" is the same answer the server gives.

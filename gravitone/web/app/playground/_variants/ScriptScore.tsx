@@ -22,20 +22,19 @@
 //    edges are ARIA sliders (from <Region>), and the inspector states the same
 //    offsets as numbers.
 //  * A refusal is a sentence (`regionProblem`), never a silently dropped edit.
+//
+// One lane is `ScriptLane`; this file is the SCENE around it — the list, the
+// roving focus that walks it, and every edit written back to the console's
+// strings.
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import EmotionIcon from "@/components/ui/EmotionIcon";
-import Region from "@/components/ui/Region";
-import Track from "@/components/ui/Track";
 import { emotionMeta } from "@/lib/emotions";
+import { resizeRegions, retagRegions } from "./scoreEdits";
+import ScriptLane from "./ScriptLane";
 import {
   characterHue, parseTags, regionProblem, scoreRegion, toTags,
   type ScoreRegion, type ScriptLine,
 } from "./shared";
-
-/** Lane height. Shorter than the solo lane: a 12-line scene has to stay one
- *  readable object, not twelve editors. */
-const LANE_HEIGHT = 34;
 
 /** Offered when neither the scale nor the line carries anything, so the
  *  placement control is never an empty dropdown beside an enabled button. */
@@ -88,7 +87,6 @@ export default function ScriptScore({
   const [pending, setPending] = useState<string>("");
 
   const laneRefs = useRef<Array<HTMLButtonElement | null>>([]);
-  const railRefs = useRef<Array<HTMLDivElement | null>>([]);
   const rowRefs = useRef<Array<HTMLDivElement | null>>([]);
 
   /** Each line as plain text + its regions. Recomputed from the strings the
@@ -165,31 +163,21 @@ export default function ScriptScore({
 
   function resize(i: number, index: number, edge: "start" | "end", to: number) {
     const p = parsed[i];
-    const r = p?.regions[index];
-    if (!p || !r) return;
-    const floor = index > 0 ? p.regions[index - 1].end : 0;
-    const ceil = index < p.regions.length - 1 ? p.regions[index + 1].start : p.text.length;
-    const next =
-      edge === "start"
-        ? scoreRegion(Math.max(floor, Math.min(to, r.end - 1)), r.end, r.value)
-        : scoreRegion(r.start, Math.min(ceil, Math.max(to, r.start + 1)), r.value);
-    if (next.start === r.start && next.end === r.end) return;
+    if (!p) return;
+    const next = resizeRegions(p.text, p.regions, index, edge, to);
+    if (!next) return;
     setNotice(null);
-    emit(i, p.regions.map((x, j) => (j === index ? next : x)));
+    emit(i, next);
   }
 
   function retag(i: number, index: number, value: string) {
     const p = parsed[i];
-    const r = p?.regions[index];
-    if (!p || !r) return;
-    const why = regionProblem(
-      p.text,
-      scoreRegion(r.start, r.end, value),
-      p.regions.filter((_, j) => j !== index),
-    );
+    if (!p) return;
+    const { regions: next, why } = retagRegions(p.text, p.regions, index, value);
     if (why) { setNotice(why); return; }
+    if (!next) return;
     setNotice(null);
-    emit(i, p.regions.map((x, j) => (j === index ? scoreRegion(x.start, x.end, value) : x)));
+    emit(i, next);
   }
 
   function remove(i: number, index: number) {
@@ -218,180 +206,33 @@ export default function ScriptScore({
         </span>
       </div>
 
-      {parsed.map((p, i) => {
-        const hue = characterHue(p.line.characterId);
-        const active = activeLineId === p.line.id;
-        const available = availableFor?.(p.line.characterId) ?? [];
-        const sel = selected?.lineId === p.line.id ? selected.index : null;
-        const chosen = sel !== null ? p.regions[sel] : undefined;
-
-        /** Rail x -> character offset for THIS lane, so a drag and an arrow key
-         *  move the same edge through the same coordinate space. */
-        const offsetAt = (clientX: number): number => {
-          const box = railRefs.current[i]?.getBoundingClientRect();
-          if (!box || box.width <= 0) return 0;
-          const f = Math.min(1, Math.max(0, (clientX - box.left) / box.width));
-          return Math.round(f * p.text.length);
-        };
-
-        return (
-          <div
-            key={p.line.id}
-            ref={(el) => { rowRefs.current[i] = el; }}
-            className={`rounded-xl border px-2.5 py-2 transition ${
-              active ? "border-cyan-400/25 bg-cyan-400/[0.03]" : "border-white/10 bg-white/[0.02]"
-            }`}
-          >
-            <div className="mb-1.5 flex items-center gap-2">
-              <button
-                type="button"
-                ref={(el) => { laneRefs.current[i] = el; }}
-                onClick={() => focusLine(i)}
-                onKeyDown={(e) => laneKeys(e, i)}
-                aria-label={`Line ${i + 1}, ${nameOf(p.line.characterId)}${onFocusLine ? " — focus it in the composer" : ""}`}
-                aria-current={active || undefined}
-                className="flex min-w-0 items-center gap-2 rounded-lg px-1 py-0.5 text-left transition hover:bg-white/5 focus-visible:outline-2 focus-visible:outline-offset-1"
-                style={{ outlineColor: `hsl(${hue} 85% 68%)` }}
-              >
-                <span className="font-jetbrains w-4 shrink-0 text-[11px] text-white/40">{i + 1}</span>
-                <span
-                  aria-hidden
-                  className="h-3.5 w-3.5 shrink-0 rounded-full"
-                  style={{ background: `radial-gradient(circle at 30% 30%, hsl(${hue} 90% 72%), hsl(${hue} 80% 45%))` }}
-                />
-                <span className="font-jetbrains truncate text-[11px] text-white/75">
-                  {nameOf(p.line.characterId)}
-                </span>
-              </button>
-              <span className="font-jetbrains ml-auto shrink-0 text-[10px] text-white/35">
-                {p.text.length} char{p.text.length === 1 ? "" : "s"}
-                {p.regions.length > 0 && ` · ${p.regions.length} directed`}
-              </span>
-            </div>
-
-            {p.text.length === 0 ? (
-              <p className="font-jetbrains rounded-lg border border-dashed border-white/10 px-2 py-1.5 text-[10px] text-white/40">
-                No words on this line yet — type it in the composer and its lane appears here.
-              </p>
-            ) : (
-              <div ref={(el) => { railRefs.current[i] = el; }}>
-                <Track
-                  label={`Line ${i + 1}, ${nameOf(p.line.characterId)} — ${p.regions.length} directed span${p.regions.length === 1 ? "" : "s"} over ${p.text.length} characters`}
-                  height={LANE_HEIGHT}
-                  hue={hue}
-                  bars={0}
-                >
-                  {p.regions.map((r, index) => {
-                    const m = emotionMeta(r.value);
-                    return (
-                      <Region
-                        // Keyed by POSITION, not by offsets — an offset key
-                        // remounts the region on every nudge and throws
-                        // keyboard focus off the handle mid-resize.
-                        key={index}
-                        start={r.start}
-                        end={r.end}
-                        total={p.text.length}
-                        hue={m.hue}
-                        label={m.label}
-                        text={p.text.slice(r.start, r.end)}
-                        index={index}
-                        count={p.regions.length}
-                        selected={sel === index}
-                        disabled={disabled}
-                        badge={<EmotionIcon emotion={r.value} size={16} dim={!available.includes(r.value)} />}
-                        onSelect={() => { setSelected({ lineId: p.line.id, index }); setNotice(null); }}
-                        onResize={(edge, to) => resize(i, index, edge, to)}
-                        offsetAt={offsetAt}
-                      />
-                    );
-                  })}
-                </Track>
-              </div>
-            )}
-
-            {/* Placement + the numeric path, for the lane you are ON only: a
-                scene of sixty lines must not be sixty inspectors. */}
-            {(active || sel !== null) && p.text.length > 0 && (
-              <div className="mt-1.5 flex flex-wrap items-center gap-2">
-                <select
-                  value={chosen ? chosen.value : emotion}
-                  disabled={disabled}
-                  onChange={(e) => (sel !== null ? retag(i, sel, e.target.value) : setPending(e.target.value))}
-                  aria-label={sel !== null ? `Emotion for the selected region on line ${i + 1}` : `Emotion to direct line ${i + 1} with`}
-                  className="font-jetbrains rounded-lg border border-white/15 bg-black/40 px-2 py-1 text-[11px] text-white/85 focus:border-cyan-400/40 focus:outline-none"
-                >
-                  {[...new Set([...(chosen ? [chosen.value] : []), ...choices])].map((id) => (
-                    <option key={id} value={id} className="bg-slate-900 text-white">
-                      {emotionMeta(id).label}
-                      {available.length > 0 && !available.includes(id) ? " (not recorded)" : ""}
-                    </option>
-                  ))}
-                </select>
-
-                {chosen && sel !== null ? (
-                  <>
-                    <label className="font-jetbrains flex items-center gap-1 text-[10px] text-white/50">
-                      from
-                      <input
-                        type="number"
-                        min={0}
-                        max={chosen.end - 1}
-                        value={chosen.start}
-                        disabled={disabled}
-                        onChange={(e) => resize(i, sel, "start", Number(e.target.value))}
-                        aria-label={`Region start on line ${i + 1}, character offset`}
-                        className="font-jetbrains w-14 rounded-lg border border-white/15 bg-black/40 px-1.5 py-1 text-[11px] text-white/85 focus:border-cyan-400/40 focus:outline-none"
-                      />
-                    </label>
-                    <label className="font-jetbrains flex items-center gap-1 text-[10px] text-white/50">
-                      to
-                      <input
-                        type="number"
-                        min={chosen.start + 1}
-                        max={p.text.length}
-                        value={chosen.end}
-                        disabled={disabled}
-                        onChange={(e) => resize(i, sel, "end", Number(e.target.value))}
-                        aria-label={`Region end on line ${i + 1}, character offset`}
-                        className="font-jetbrains w-14 rounded-lg border border-white/15 bg-black/40 px-1.5 py-1 text-[11px] text-white/85 focus:border-cyan-400/40 focus:outline-none"
-                      />
-                    </label>
-                    <button
-                      type="button"
-                      onClick={() => remove(i, sel)}
-                      disabled={disabled}
-                      className="font-jetbrains rounded-full border border-white/15 px-2.5 py-1 text-[10px] text-white/60 transition enabled:hover:border-rose-400/40 enabled:hover:text-rose-200 disabled:opacity-40"
-                    >
-                      delete
-                    </button>
-                    <span className="font-jetbrains text-[10px] text-white/35">
-                      {available.length > 0 && !available.includes(chosen.value)
-                        ? `${emotionMeta(chosen.value).label} is not recorded for ${nameOf(p.line.characterId)} — the nearest recorded emotion is used, then baseline.`
-                        : "drag an edge, nudge with the arrow keys, or type an offset"}
-                    </span>
-                  </>
-                ) : (
-                  <>
-                    <button
-                      type="button"
-                      onClick={() => addWholeLine(i)}
-                      disabled={disabled}
-                      className="font-jetbrains rounded-full border border-cyan-400/30 bg-cyan-400/5 px-2.5 py-1 text-[10px] text-cyan-200 transition enabled:hover:bg-cyan-400/10 disabled:opacity-40"
-                    >
-                      + direct this whole line
-                    </button>
-                    <span className="font-jetbrains text-[10px] text-white/35">
-                      then drag or nudge its edges in — or select words in the composer and use the
-                      solo score
-                    </span>
-                  </>
-                )}
-              </div>
-            )}
-          </div>
-        );
-      })}
+      {parsed.map((p, i) => (
+        <ScriptLane
+          key={p.line.id}
+          index={i}
+          text={p.text}
+          regions={p.regions}
+          name={nameOf(p.line.characterId)}
+          hue={characterHue(p.line.characterId)}
+          active={activeLineId === p.line.id}
+          available={availableFor?.(p.line.characterId) ?? []}
+          choices={choices}
+          emotion={emotion}
+          selected={selected?.lineId === p.line.id ? selected.index : null}
+          disabled={disabled}
+          focusable={!!onFocusLine}
+          rowRef={(el) => { rowRefs.current[i] = el; }}
+          laneRef={(el) => { laneRefs.current[i] = el; }}
+          onFocus={() => focusLine(i)}
+          onLaneKeys={(e) => laneKeys(e, i)}
+          onSelectRegion={(index) => { setSelected({ lineId: p.line.id, index }); setNotice(null); }}
+          onAddWholeLine={() => addWholeLine(i)}
+          onResize={(index, edge, to) => resize(i, index, edge, to)}
+          onRetag={(index, value) => retag(i, index, value)}
+          onRemove={(index) => remove(i, index)}
+          onPending={setPending}
+        />
+      ))}
 
       {/* One live region for every refusal and removal above. */}
       <p aria-live="polite" className="font-jetbrains min-h-[1rem] text-[11px] leading-relaxed text-amber-200/90">

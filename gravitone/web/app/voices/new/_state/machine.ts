@@ -10,7 +10,7 @@
 // privacy mode, which clip is playing, the cloned-character list) stays as
 // plain useState in the page — it isn't part of the flow's state graph.
 
-import type { Detection, LoaderStep, Partial as PartialData } from "../_loaders/shared";
+import type { Detection, LoaderStep, Partial as PartialData } from "../_loaders/ScanReport";
 
 export type Speaker = { id: string; utterances: number; seconds: number; sample_text: string };
 // `note` is the backend's statement about a stem that is not what its label

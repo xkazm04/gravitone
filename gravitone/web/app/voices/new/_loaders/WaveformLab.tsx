@@ -5,7 +5,7 @@
 // (bars coloured by the live tally), and the headline metric tracks the stage.
 // The waveform IS the data, not a spinner beside it.
 
-import { EmotionTally, segmentFailureNote, stateOf, usableCounts, type LoaderData } from "./shared";
+import { EmotionTally, segmentFailureNote, stateOf, usableCounts, type LoaderData } from "./ScanReport";
 import StepRail from "./StepRail";
 import { EMOTIONS } from "@/lib/emotions";
 

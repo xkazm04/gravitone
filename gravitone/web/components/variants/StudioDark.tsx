@@ -1,11 +1,8 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
 import { BRAND, HERO, STATS, PILLARS, VOICES, SAMPLE_TEXT, API_DOCS_URL } from "@/lib/content";
-import { useAuth } from "@/lib/useAuth";
 import UserMenu from "@/components/ui/UserMenu";
 import MobileNav from "@/components/ui/MobileNav";
 import Equalizer, { usePauseOffscreen } from "@/components/ui/Equalizer";
@@ -17,7 +14,8 @@ import HeroMicDemo from "./HeroMicDemo";
 import SectionRail from "./SectionRail";
 import FeatureGrid from "./features/FeatureGrid";
 import { FeatureSpotlight } from "./features/FeatureSpotlight";
-import type { PreviewKey } from "./features/previews";
+import { useStudioEnter } from "./useStudioEnter";
+import { useStudioPreview } from "./useStudioPreview";
 
 // The landing rises further and slower than a dense module panel — but the
 // curve comes from the design system, not a local copy of it (this file used to
@@ -25,57 +23,12 @@ import type { PreviewKey } from "./features/previews";
 const rise = makeRise({ y: 24, duration: 0.7, stagger: 0.08 });
 
 export default function StudioDark() {
-  const { user, signIn } = useAuth();
-  const router = useRouter();
+  // The two behaviours this page owns — the auth-gated CTA destination and the
+  // spotlight that renders at the page root — are ./useStudioEnter and
+  // ./useStudioPreview. Everything below is layout.
+  const { user, enter } = useStudioEnter();
   const aurora = usePauseOffscreen<HTMLDivElement>();
-
-  // Where the visitor was actually trying to go when they pressed a CTA.
-  //
-  // Both landing CTAs used to be plain <Link href="/playground">, and every
-  // module route is wrapped by AppFrame, which router.replace("/")s anyone who
-  // is not signed in. So the page's primary button returned the visitor to the
-  // page they were already on, by way of a "redirecting…" flash — the front
-  // door turning people around. Signed out, a CTA now opens sign-in and the
-  // destination waits here until auth actually lands (a click handler that
-  // navigated straight after `await signIn()` would race AppFrame's gate,
-  // which reads React state, not Firebase's).
-  const pending = useRef<string | null>(null);
-  useEffect(() => {
-    if (!user || !pending.current) return;
-    const to = pending.current;
-    pending.current = null;
-    router.push(to);
-  }, [user, router]);
-
-  const enter = (href: string) => {
-    if (user) { router.push(href); return; }
-    pending.current = href;
-    // signIn() reports its own failures through the auth context's banner; all
-    // this needs is to stop holding a destination nobody is travelling to.
-    void signIn().catch(() => { pending.current = null; });
-  };
-
-  // ── the feature spotlight ──────────────────────────────────────────────────
-  //
-  // This state lives here rather than in FeatureGrid because the modal renders
-  // at the PAGE root: inside the grid it would be a descendant of a card that
-  // has `overflow-hidden` (for the corner wash) and a hover transform, either of
-  // which would clip or re-anchor a fixed overlay.
-  //
-  // One state: a card click (or Enter) opens the modal; Escape, the scrim or
-  // the close button dismiss it. Hover-peek was retired by owner call.
-  const [preview, setPreview] = useState<PreviewKey | null>(null);
-  const closePreview = useCallback(() => setPreview(null), []);
-  const openPreview = useCallback((key: PreviewKey) => setPreview(key), []);
-
-  useEffect(() => {
-    if (!preview) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") closePreview();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [preview, closePreview]);
+  const { preview, openPreview, closePreview } = useStudioPreview();
 
   return (
     <div className="font-hanken relative min-h-screen overflow-hidden bg-[var(--gt-ink)] text-slate-200 grain">

@@ -33,7 +33,7 @@ import {
   accentVar,
 } from "@/components/variants/features/previews/illus";
 import { useStillMotion } from "@/lib/useStillMotion";
-import type { LoaderStep } from "./shared";
+import type { LoaderStep } from "./ScanReport";
 
 const W = 640;
 const H = 30;

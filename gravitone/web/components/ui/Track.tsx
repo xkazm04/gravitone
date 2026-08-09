@@ -22,41 +22,13 @@
 // handed numbers and hands back a fraction.
 
 import type { CSSProperties, ReactNode } from "react";
-import { useRef } from "react";
 import { EqBars } from "./Equalizer";
+import { Playhead } from "./TrackPlayhead";
+import { clamp01 } from "./trackHelpers";
+import { useTrackSeek } from "./useTrackSeek";
 
-/** How far one arrow press moves the playhead (fraction of the whole rail). */
-const STEP = 0.02;
-/** …and one Page press. */
-const PAGE = 0.1;
-
-const clamp01 = (n: number) => (Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : 0);
-
-/** m:ss for a duration in seconds. */
-export function clock(seconds: number): string {
-  if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
-  const s = Math.floor(seconds % 60);
-  return `${Math.floor(seconds / 60)}:${s < 10 ? "0" : ""}${s}`;
-}
-
-/**
- * The position line. Drawn only when the caller says there is a position to
- * draw — a line parked at 0 on every idle rail reads as a claim about where
- * playback is, which is the same lie the CSS-timer equalizer used to tell.
- */
-export function Playhead({ progress, hue = 190 }: { progress: number; hue?: number }) {
-  return (
-    <span
-      aria-hidden
-      className="pointer-events-none absolute inset-y-0 z-20 w-px transition-[left] duration-75 ease-linear"
-      style={{
-        left: `${clamp01(progress) * 100}%`,
-        background: `hsl(${hue} 90% 78%)`,
-        boxShadow: `0 0 6px hsl(${hue} 90% 70% / 0.8)`,
-      }}
-    />
-  );
-}
+export { clock } from "./trackHelpers";
+export { Playhead } from "./TrackPlayhead";
 
 export default function Track({
   peaks,
@@ -95,58 +67,10 @@ export default function Track({
   /** Spoken form of the current position, e.g. "0:12 of 0:40". */
   valueText?: (fraction: number) => string;
 }) {
-  const railRef = useRef<HTMLDivElement>(null);
   const at = clamp01(progress ?? 0);
   const seekable = !!onSeek;
-
-  /** Where in the rail (0..1) a client x coordinate falls. */
-  const fractionAt = (clientX: number): number => {
-    const box = railRef.current?.getBoundingClientRect();
-    if (!box || box.width <= 0) return 0;
-    return clamp01((clientX - box.left) / box.width);
-  };
-
-  const seekBy = (delta: number) => onSeek?.(clamp01(at + delta));
-
-  // Scrubbing. A rail that only takes discrete clicks is a rail you cannot
-  // sweep, and sweeping is how anyone finds a moment in a clip. Pointer capture
-  // keeps the drag alive past the rail's own edges.
-  const scrubbing = useRef(false);
-
-  function onPointerDown(e: React.PointerEvent<HTMLDivElement>) {
-    if (!onSeek || e.button !== 0) return;
-    scrubbing.current = true;
-    (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
-    onSeek(fractionAt(e.clientX));
-  }
-
-  function onPointerMove(e: React.PointerEvent<HTMLDivElement>) {
-    if (!scrubbing.current || !onSeek) return;
-    onSeek(fractionAt(e.clientX));
-  }
-
-  function endScrub(e: React.PointerEvent<HTMLDivElement>) {
-    if (!scrubbing.current) return;
-    scrubbing.current = false;
-    (e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId);
-  }
-
-  function onKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
-    if (!onSeek) return;
-    const move =
-      e.key === "ArrowRight" || e.key === "ArrowUp" ? STEP
-      : e.key === "ArrowLeft" || e.key === "ArrowDown" ? -STEP
-      : e.key === "PageUp" ? PAGE
-      : e.key === "PageDown" ? -PAGE
-      : 0;
-    if (move !== 0) {
-      e.preventDefault();
-      seekBy(move);
-      return;
-    }
-    if (e.key === "Home") { e.preventDefault(); onSeek(0); }
-    else if (e.key === "End") { e.preventDefault(); onSeek(1); }
-  }
+  const { railRef, fractionAt, onPointerDown, onPointerMove, endScrub, onKeyDown } =
+    useTrackSeek(at, onSeek);
 
   return (
     <div

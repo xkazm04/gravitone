@@ -29,18 +29,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { usePathname } from "next/navigation";
 
-import { MAX_MESSAGE_CHARS as FEEDBACK_MAX_CHARS } from "@/app/api/feedback/limits";
-import { readDetail } from "@/lib/apiFetch";
-import { useAuth } from "@/lib/useAuth";
-import { ErrorBanner } from "./ErrorBanner";
-
 // The counter warns before the round trip; the route is what enforces it. One
 // constant, imported — not a mirrored literal that can drift out of agreement
 // with the server that rejects it.
-/** Show the counter only once the note is long enough for the cap to be real. */
-const COUNTER_FROM = 1600;
-
-type Phase = "idle" | "sending" | "sent";
+import { MAX_MESSAGE_CHARS as FEEDBACK_MAX_CHARS } from "@/app/api/feedback/limits";
+import { readDetail } from "@/lib/apiFetch";
+import { useAuth } from "@/lib/useAuth";
+import { FeedbackDockPanel, type Phase } from "./FeedbackDockPanel";
 
 /** Routes that are not the studio: an embedded player is someone else's page,
  *  and app chrome has no business appearing inside it. */
@@ -134,89 +129,19 @@ function Dock() {
           Feedback
         </button>
       ) : (
-        <section
-          aria-label="Send feedback"
-          className="glass-panel pointer-events-auto w-[min(22rem,calc(100vw-2rem))] rounded-3xl p-4"
-        >
-          <div className="flex items-start justify-between gap-3">
-            <div className="min-w-0">
-              <div className="font-jetbrains text-[10px] uppercase tracking-[0.2em] text-cyan-300/80">
-                Feedback
-              </div>
-              <h2 className="font-instrument mt-0.5 text-lg leading-tight text-white">
-                Tell us what broke — or what should exist
-              </h2>
-            </div>
-            <button
-              type="button"
-              onClick={close}
-              aria-label="Close feedback"
-              className="shrink-0 cursor-pointer rounded-full border border-white/12 px-2 py-1 text-[12px] leading-none text-white/60 transition hover:bg-white/5 hover:text-white focus-visible:outline-2 focus-visible:outline-offset-2"
-            >
-              ✕
-            </button>
-          </div>
-
-          {phase === "sent" ? (
-            <div className="mt-3">
-              <p className="font-hanken text-[13px] leading-snug text-slate-300">
-                Filed. Thank you — it lands where we actually read it.
-              </p>
-              <div className="mt-3 flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => setPhase("idle")}
-                  className="font-jetbrains cursor-pointer rounded-full border border-white/15 px-4 py-2 text-[11px] uppercase tracking-[0.14em] text-white/85 transition hover:bg-white/5 focus-visible:outline-2 focus-visible:outline-offset-2"
-                >
-                  Send another
-                </button>
-                <button
-                  type="button"
-                  onClick={close}
-                  className="font-jetbrains cursor-pointer px-2 py-2 text-[11px] uppercase tracking-[0.14em] text-white/40 transition hover:text-white/70 focus-visible:outline-2 focus-visible:outline-offset-2"
-                >
-                  Done
-                </button>
-              </div>
-            </div>
-          ) : (
-            <>
-              <textarea
-                ref={areaRef}
-                value={message}
-                onChange={(e) => setMessage(e.target.value)}
-                rows={4}
-                maxLength={FEEDBACK_MAX_CHARS + 200}
-                placeholder="The emotion picker didn't…"
-                className="font-hanken mt-3 w-full resize-none rounded-2xl border border-white/8 bg-black/30 px-3 py-2.5 text-[13px] leading-snug text-white/85 placeholder:text-white/25 focus:border-cyan-400/40 focus:outline-none"
-              />
-
-              <div className="mt-2 flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => void send()}
-                  disabled={!canSend}
-                  className="cursor-pointer rounded-full bg-gradient-to-r from-cyan-300 to-cyan-200 px-4 py-2 text-[12px] font-semibold text-slate-950 transition hover:brightness-110 focus-visible:outline-2 focus-visible:outline-offset-2 disabled:cursor-not-allowed disabled:opacity-40"
-                >
-                  {phase === "sending" ? "Sending…" : "Send"}
-                </button>
-                <span
-                  className={`font-jetbrains ml-auto text-[10px] tabular-nums ${
-                    tooLong ? "text-rose-300" : "text-white/35"
-                  }`}
-                >
-                  {trimmed.length >= COUNTER_FROM ? `${trimmed.length} / ${FEEDBACK_MAX_CHARS}` : ""}
-                </span>
-              </div>
-
-              <p className="font-jetbrains mt-2 text-[10px] leading-relaxed text-white/30">
-                Sent with your account and the page you are on.
-              </p>
-
-              <ErrorBanner className="mt-3">{error}</ErrorBanner>
-            </>
-          )}
-        </section>
+        <FeedbackDockPanel
+          areaRef={areaRef}
+          message={message}
+          onMessage={setMessage}
+          phase={phase}
+          onCompose={() => setPhase("idle")}
+          onClose={close}
+          onSend={() => void send()}
+          canSend={canSend}
+          tooLong={tooLong}
+          length={trimmed.length}
+          error={error}
+        />
       )}
     </div>
   );

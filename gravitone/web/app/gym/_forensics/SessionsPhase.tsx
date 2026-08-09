@@ -13,7 +13,7 @@ import { rise } from "@/components/ui/tokens";
 
 import type { SessionRow } from "../_gym/data";
 import { fmtClock, fmtS } from "../_gym/data";
-import { GymEmpty } from "../_gym/shared";
+import { GymEmpty } from "../_gym/gymParts";
 
 const TH =
   "font-jetbrains py-2 text-left text-[11px] font-normal uppercase tracking-[0.18em] text-white/45";

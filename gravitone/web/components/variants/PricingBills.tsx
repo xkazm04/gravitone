@@ -1,7 +1,6 @@
 "use client";
 
-import { useEffect, useRef } from "react";
-import { animate, motion } from "framer-motion";
+import { motion } from "framer-motion";
 import { fmtUsd } from "@/lib/switchkit";
 import { EASE } from "@/components/ui/tokens";
 import {
@@ -9,14 +8,39 @@ import {
   BOX_USD_MONTH,
   END_CHARS,
   START_CHARS,
-  TIMELINE_MONTHS,
-  crossoverMonth,
-  cumulativeCrossoverMonth,
-  cumulativeSeries,
   fmtChars,
-  growthSeries,
 } from "./pricingTimeline";
-import { easedTimeFor } from "./pricingShared";
+import {
+  BOX_PATH,
+  BOX_SLAB,
+  BOX_STEPS,
+  D_RUN,
+  EL_PATH,
+  EL_SLAB,
+  EL_STEPS,
+  H,
+  MONTHLY_CROSS,
+  N,
+  SERIES,
+  TOP,
+  TOTALS,
+  TOTAL_CROSS,
+  T_CAP,
+  T_MONTHLY_CROSS,
+  T_RUN,
+  T_SWAP,
+  T_ZERO,
+  W,
+  X0,
+  X1,
+  ZERO,
+  at,
+  down,
+  r2,
+  short,
+  up,
+} from "./pricingBillsMath";
+import { Increment, Odometer } from "./PricingBillsOdometer";
 import { Caption, Draw, HAIR, Illus, Label, Node, TravelPulse, accentVar } from "./features/previews/illus";
 
 /*
@@ -52,146 +76,15 @@ import { Caption, Draw, HAIR, Illus, Label, Node, TravelPulse, accentVar } from 
  *
  * ONE ACCENT — cyan is the machine, everywhere on this page. Identity never
  * rests on it: both bills are named in words directly above their own number.
+ *
+ * The series, the coordinate space and the clock are derived in
+ * ./pricingBillsMath; the two counting numbers are ./PricingBillsOdometer. What
+ * is left here is the composition.
  */
 
-const W = 1160;
-const H = 250;
 const CYAN = accentVar("cyan");
 const OTHER = "rgba(255,255,255,0.62)";
 const EL_FILL = "rgba(255,255,255,0.05)";
-
-/* ── the numbers, once ─────────────────────────────────────────────────────── */
-
-const SERIES = growthSeries();
-const CUM = cumulativeSeries(SERIES);
-const N = TIMELINE_MONTHS;
-const MONTHLY_CROSS = crossoverMonth(SERIES);
-const TOTAL_CROSS = cumulativeCrossoverMonth(CUM);
-const TOTALS = CUM[CUM.length - 1];
-/** The two odometer tapes, hoisted: a fresh array on every render would restart
- *  the count mid-story. */
-const EL_STEPS = CUM.map((p) => p.el);
-const BOX_STEPS = CUM.map((p) => p.box);
-/** The tallest monthly charge on either side — the one scale both slabs use. */
-const MAX_MONTH = Math.max(...SERIES.map((p) => Math.max(p.el, p.boxUsd)));
-
-/** "Graviton t4g.small (2 vCPU)" → "t4g.small". */
-const short = (name: string) => name.replace(/^Graviton\s+/, "").replace(/\s*\(.*\)$/, "");
-
-/* ── geometry ──────────────────────────────────────────────────────────────── */
-
-const X0 = 46;
-const X1 = 1114;
-const ZERO = 170; // the $0 line — and the software's own price
-const TOP = 30; // y of the largest monthly charge in the span
-const at = (month: number) => X0 + ((month - 1) / (N - 1)) * (X1 - X0);
-const up = (usd: number) => ZERO - (usd / MAX_MONTH) * (ZERO - TOP);
-const down = (usd: number) => ZERO + (usd / MAX_MONTH) * (ZERO - TOP);
-const r2 = (v: number) => Math.round(v * 100) / 100;
-
-/** A monthly charge as a STAIRCASE: a tier is a price you are IN for a whole
- *  month and then step out of, so the riser sits exactly on the month. */
-function stair(value: (i: number) => number, project: (usd: number) => number) {
-  const parts = [`M${r2(at(1))} ${r2(project(value(0)))}`];
-  for (let i = 1; i < N; i++) {
-    parts.push(`L${r2(at(i + 1))} ${r2(project(value(i - 1)))}`, `L${r2(at(i + 1))} ${r2(project(value(i)))}`);
-  }
-  parts.push(`L${r2(X1)} ${r2(project(value(N - 1)))}`);
-  return parts.join(" ");
-}
-
-const EL_PATH = stair((i) => SERIES[i].el, up);
-const BOX_PATH = stair((i) => SERIES[i].boxUsd, down);
-/** The same envelopes closed back to the $0 line — the slab, whose area is the
- *  total. Nothing is redrawn here: it is the stroke plus two closing edges. */
-const EL_SLAB = `${EL_PATH} L${r2(X1)} ${ZERO} L${r2(X0)} ${ZERO} Z`;
-const BOX_SLAB = `${BOX_PATH} L${r2(X1)} ${ZERO} L${r2(X0)} ${ZERO} Z`;
-
-/* ── choreography ──────────────────────────────────────────────────────────── */
-
-const T_ZERO = 0.15;
-const T_RUN = 0.45; // both bills start billing
-const D_RUN = 2.0; // twenty-four months
-const T_CAP = T_RUN + D_RUN + 0.3; // the caption lands inside 3 seconds
-
-/** The delay at which the sweep reaches `month`. */
-const whenMonth = (month: number) => T_RUN + easedTimeFor((month - 1) / (N - 1)) * D_RUN;
-
-const T_MONTHLY_CROSS = MONTHLY_CROSS === null ? T_RUN : whenMonth(MONTHLY_CROSS);
-const T_SWAP = TOTAL_CROSS === null ? T_RUN + D_RUN : whenMonth(TOTAL_CROSS);
-
-/* ── the odometers ─────────────────────────────────────────────────────────── */
-
-/**
- * A running total, counting in MONTHLY STEPS.
- *
- * Stepped, not interpolated: a bill lands once a month, and a counter that
- * slides smoothly between two months is showing an amount neither party ever
- * charged. It writes through a ref rather than through state — sixty renders a
- * second of a whole landing section to move one number is not a trade worth
- * making — and the markup it ships with is the FINAL figure, so the server, a
- * stilled render and a failed animation all show a true total instead of a zero.
- */
-function Odometer({
-  steps,
-  still,
-  className,
-}: {
-  steps: number[];
-  still: boolean;
-  className: string;
-}) {
-  const ref = useRef<HTMLSpanElement>(null);
-  const final = fmtUsd(steps[steps.length - 1]);
-  useEffect(() => {
-    const node = ref.current;
-    if (still || !node) return;
-    node.textContent = fmtUsd(0);
-    const controls = animate(0, steps.length, {
-      delay: T_RUN,
-      duration: D_RUN,
-      ease: EASE,
-      onUpdate: (m) => {
-        const i = Math.min(steps.length, Math.max(1, Math.ceil(m))) - 1;
-        node.textContent = m <= 0 ? fmtUsd(0) : fmtUsd(steps[i]);
-      },
-      onComplete: () => {
-        node.textContent = final;
-      },
-    });
-    return () => controls.stop();
-    // `steps` is module-level and constant; re-running on `still` is the point.
-  }, [still, steps, final]);
-  return (
-    <span ref={ref} className={className}>
-      {final}
-    </span>
-  );
-}
-
-/** The step the odometer just took — theirs climbs the tiers, ours never moves. */
-function Increment({ still }: { still: boolean }) {
-  const ref = useRef<HTMLSpanElement>(null);
-  const final = `+${fmtUsd(SERIES[N - 1].el)} · ${SERIES[N - 1].tier.name}`;
-  useEffect(() => {
-    const node = ref.current;
-    if (still || !node) return;
-    const controls = animate(0, N, {
-      delay: T_RUN,
-      duration: D_RUN,
-      ease: EASE,
-      onUpdate: (m) => {
-        const p = SERIES[Math.min(N, Math.max(1, Math.ceil(m))) - 1];
-        node.textContent = `+${fmtUsd(p.el)} · ${p.tier.name}`;
-      },
-      onComplete: () => {
-        node.textContent = final;
-      },
-    });
-    return () => controls.stop();
-  }, [still, final]);
-  return <span ref={ref}>{final}</span>;
-}
 
 /**
  * One bill: who it is, what it has cost, and the step it takes each month.

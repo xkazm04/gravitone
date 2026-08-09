@@ -5,7 +5,7 @@
 // MediaRecorder output (webm/mp4) is fine — the backend ffmpeg-normalizes it.
 
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { AnimatePresence, motion } from "framer-motion";
 import { Button } from "@/components/ui/Primitives";
@@ -14,12 +14,9 @@ import EmotionArt from "@/components/ui/EmotionArt";
 import TakePlayer from "@/components/ui/TakePlayer";
 import { emotionMeta } from "@/lib/emotions";
 import { CAPTURE_ORDER, scriptFor } from "@/lib/emotionScripts";
-
-const MIN_SECONDS = 8;
-const TARGET_SECONDS = 20;
-const MAX_SECONDS = 45;
-
-type Phase = "idle" | "recording" | "preview" | "cloning" | "done";
+import {
+  useGuidedRecorderCapture, MIN_SECONDS, TARGET_SECONDS, MAX_SECONDS,
+} from "./useGuidedRecorderCapture";
 
 /** Next empty slot to record, walking the Character's FULL scale (base +
  *  custom). Base emotions keep their curated CAPTURE_ORDER; custom slots follow
@@ -50,69 +47,11 @@ export default function GuidedRecorder({
   onSwitch: (emotion: string) => void; // jump to the next slot in the session
 }) {
   const [mounted, setMounted] = useState(false);
-  const [phase, setPhase] = useState<Phase>("idle");
-  const [seconds, setSeconds] = useState(0);
-  const [error, setError] = useState<string | null>(null);
-  const [blob, setBlob] = useState<Blob | null>(null);
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
-
-  const recRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<BlobPart[]>([]);
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
   useEffect(() => setMounted(true), []);
 
-  const cleanup = useCallback(() => {
-    if (timerRef.current) clearInterval(timerRef.current);
-    timerRef.current = null;
-    recRef.current?.stream.getTracks().forEach((t) => t.stop());
-    recRef.current = null;
-  }, []);
-
-  // Reset per emotion; drop the mic and preview URL when leaving.
-  useEffect(() => {
-    setPhase("idle"); setSeconds(0); setError(null); setBlob(null);
-    setPreviewUrl((old) => { if (old) URL.revokeObjectURL(old); return null; });
-    return cleanup;
-  }, [emotion, cleanup]);
-
-  const start = useCallback(async () => {
-    setError(null);
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const rec = new MediaRecorder(stream);
-      chunksRef.current = [];
-      rec.ondataavailable = (e) => { if (e.data.size) chunksRef.current.push(e.data); };
-      rec.onstop = () => {
-        const b = new Blob(chunksRef.current, { type: rec.mimeType || "audio/webm" });
-        setBlob(b);
-        setPreviewUrl((old) => { if (old) URL.revokeObjectURL(old); return URL.createObjectURL(b); });
-        setPhase("preview");
-        cleanup();
-      };
-      recRef.current = rec;
-      rec.start();
-      setSeconds(0);
-      setPhase("recording");
-      let elapsed = 0;
-      timerRef.current = setInterval(() => {
-        // The auto-stop lives OUTSIDE the state updater: updaters must be pure,
-        // and React 19 StrictMode double-invokes them — calling rec.stop()
-        // in there could fire the stop twice.
-        elapsed += 1;
-        setSeconds(elapsed);
-        if (elapsed >= MAX_SECONDS) recRef.current?.stop();
-      }, 1000);
-    } catch {
-      setError("microphone unavailable — allow mic access and try again");
-    }
-  }, [cleanup]);
-
-  const stop = useCallback(() => {
-    if (timerRef.current) clearInterval(timerRef.current);
-    timerRef.current = null;
-    recRef.current?.stop();
-  }, []);
+  const {
+    phase, setPhase, seconds, error, setError, blob, previewUrl, cleanup, start, stop,
+  } = useGuidedRecorderCapture(emotion);
 
   const clone = useCallback(async () => {
     if (!emotion || !blob) return;
@@ -125,7 +64,7 @@ export default function GuidedRecorder({
       setError(e instanceof Error ? e.message : "clone failed");
       setPhase("preview");
     }
-  }, [emotion, blob, onClone]);
+  }, [emotion, blob, onClone, setPhase, setError]);
 
   if (!mounted) return null;
 

@@ -3,7 +3,7 @@ import { render, screen } from "@testing-library/react";
 import {
   DetectionFinding, SovereignLimits, segmentFailureNote, usableCounts,
   type Detection,
-} from "./shared";
+} from "./ScanReport";
 
 const base: Detection = {
   outcome: "spans", spans: 4, speech_seconds: 31.2,

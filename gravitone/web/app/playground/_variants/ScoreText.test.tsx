@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
-import ScoreText, { runs } from "./ScoreText";
+import ScoreText from "./ScoreText";
+import { runs } from "./scoreRuns";
 import { scoreRegion } from "./shared";
 
 // A highlight overlay is only worth having if it lands on the right characters.

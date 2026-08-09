@@ -5,28 +5,17 @@
 // deployment's /health metrics, the capacity planner, and the methodology
 // that makes every number reproducible.
 
-import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { motion } from "framer-motion";
 import { Wordmark } from "@/components/ui/Primitives";
-import { useCopyFeedback } from "@/lib/useCopyFeedback";
 import { useHealthPoll } from "@/lib/useHealthPoll";
-import {
-  BENCHMARKS,
-  boxCapacityAudPerS,
-  costPerAudioHour,
-  elCostPerAudioHour,
-  HARNESS,
-  planCapacity,
-  planEnvBlock,
-} from "@/lib/benchmarks";
+import { HARNESS } from "@/lib/benchmarks";
 import {
   ELEVENLABS_PRICING,
   ELEVENLABS_PRICING_NOTE,
-  ELEVENLABS_TIERS,
-  fmtUsd,
 } from "@/lib/switchkit";
-import CostBar from "./CostBar";
+import BenchmarksLeaderboard from "./BenchmarksLeaderboard";
+import BenchmarksPlanner from "./BenchmarksPlanner";
 import LocalEnginePanel from "./LocalEnginePanel";
 
 const ease = [0.22, 1, 0.36, 1] as const;
@@ -35,54 +24,11 @@ const rise = {
   show: (i = 0) => ({ opacity: 1, y: 0, transition: { duration: 0.7, ease, delay: i * 0.08 } }),
 };
 
-type Row = {
-  name: string;
-  detail: string;
-  usdPerAudioHour: number;
-  isGravitone: boolean;
-};
-
-function buildRows(): Row[] {
-  const g: Row[] = BENCHMARKS.filter((b) => b.instance && b.usdPerHour != null).map((b) => ({
-    name: `Gravitone · ${b.instance}`,
-    detail: `${b.platform} ${b.cpu} · ${boxCapacityAudPerS(b)} aud/s · ${b.notes}`,
-    usdPerAudioHour: costPerAudioHour(b)!,
-    isGravitone: true,
-  }));
-  const el: Row[] = ELEVENLABS_TIERS.map((t) => ({ t, c: elCostPerAudioHour(t.name) }))
-    .filter((x): x is { t: (typeof ELEVENLABS_TIERS)[number]; c: number } => x.c != null)
-    .map(({ t, c }) => ({
-      name: `ElevenLabs · ${t.name}`,
-      detail: `${fmtUsd(t.usdPerMonth)}/mo for ${(t.charsPerMonth / 1000).toLocaleString("en-US")}k chars (list price)`,
-      usdPerAudioHour: c,
-      isGravitone: false,
-    }));
-  return [...g, ...el].sort((a, b) => a.usdPerAudioHour - b.usdPerAudioHour);
-}
-
-// Bars span ~3 orders of magnitude — lay them out on a log scale.
-function logWidth(usd: number, min: number, max: number): number {
-  const lo = Math.log10(min), hi = Math.log10(max);
-  return 6 + 94 * ((Math.log10(usd) - lo) / (hi - lo || 1));
-}
-
 type Health = { status?: string; metrics?: { realtime_factor?: number | null; audio_seconds_total?: number } };
 
 export default function BenchmarksView() {
-  const rows = useMemo(buildRows, []);
-  const minC = rows[0].usdPerAudioHour;
-  const maxC = rows[rows.length - 1].usdPerAudioHour;
-  const cheapestEl = rows.filter((r) => !r.isGravitone)[0];
-
   // live proof strip — shared poller (SavingsTicker polls the same endpoint)
   const { health: live, stale: liveStale } = useHealthPoll();
-
-  // capacity planner
-  const [streams, setStreams] = useState(4);
-  const [dailyMin, setDailyMin] = useState(600);
-  const plan = useMemo(() => planCapacity(streams, dailyMin), [streams, dailyMin]);
-  const { copy: copyText, copied, failed } = useCopyFeedback();
-  const copyEnv = () => copyText(planEnvBlock(plan));
 
   return (
     <div className="font-hanken relative min-h-screen overflow-hidden bg-[#080a10] text-slate-200 grain">
@@ -131,97 +77,12 @@ export default function BenchmarksView() {
 
         {/* leaderboard */}
         <motion.section variants={rise} initial="hidden" whileInView="show" viewport={{ once: true, margin: "-60px" }} className="mt-12">
-          <h2 className="font-instrument text-2xl text-white">Cost per audio-hour (log scale)</h2>
-          <div className="glass-panel mt-4 rounded-3xl p-6">
-            <div className="space-y-4">
-              {rows.map((r) => {
-                const ratio = r.isGravitone ? cheapestEl.usdPerAudioHour / r.usdPerAudioHour : null;
-                return (
-                  <div key={r.name}>
-                    <div className="flex items-baseline justify-between gap-3">
-                      <span className={`text-sm ${r.isGravitone ? "text-cyan-100" : "text-white/75"}`}>{r.name}</span>
-                      <span className="font-jetbrains shrink-0 text-[12px] text-white/80">
-                        {r.usdPerAudioHour < 0.1 ? `$${r.usdPerAudioHour.toFixed(4)}` : fmtUsd(r.usdPerAudioHour)}/audio-h
-                        {ratio && ratio > 2 && (
-                          <span className="ml-2 rounded-full border border-emerald-400/25 bg-emerald-400/10 px-2 py-0.5 text-[10px] text-emerald-200">
-                            {Math.round(ratio).toLocaleString("en-US")}× under {cheapestEl.name.replace("ElevenLabs · ", "EL ")}
-                          </span>
-                        )}
-                      </span>
-                    </div>
-                    {/* Same log geometry, same source of truth — the bar now
-                        DRAWS itself once when the row comes into view instead
-                        of simply being there. The price above it is untouched. */}
-                    <CostBar
-                      rowKey={r.name}
-                      accent={r.isGravitone}
-                      pct={logWidth(r.usdPerAudioHour, minC, maxC)}
-                    />
-                    <div className="font-jetbrains mt-1 text-[11px] text-white/45">{r.detail}</div>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
+          <BenchmarksLeaderboard />
         </motion.section>
 
         {/* capacity planner */}
         <motion.section id="planner" variants={rise} initial="hidden" whileInView="show" viewport={{ once: true, margin: "-60px" }} className="mt-14">
-          <h2 className="font-instrument text-2xl text-white">What box do I need?</h2>
-          <p className="mt-2 max-w-2xl text-sm text-slate-300/80">
-            Sized from the measured knee data, using the scaling law the benchmarks surfaced: run
-            single-worker processes, not in-process threads.
-          </p>
-
-          <div className="mt-4 grid gap-4 lg:grid-cols-[0.9fr_1.1fr]">
-            <div className="glass-panel rounded-3xl p-6">
-              <label className="block">
-                <span className="font-jetbrains text-[11px] uppercase tracking-widest text-white/60">peak concurrent streams</span>
-                <input
-                  type="number" min={1} max={500} value={streams}
-                  onChange={(e) => setStreams(Math.max(1, Math.min(500, Number(e.target.value) || 1)))}
-                  className="font-jetbrains mt-2 w-full rounded-xl border border-white/12 bg-white/[0.03] px-4 py-2.5 text-base text-white focus:border-cyan-400/40 focus:outline-none"
-                />
-              </label>
-              <label className="mt-5 block">
-                <span className="font-jetbrains text-[11px] uppercase tracking-widest text-white/60">daily audio minutes</span>
-                <input
-                  type="number" min={0} max={1_000_000} value={dailyMin}
-                  onChange={(e) => setDailyMin(Math.max(0, Math.min(1_000_000, Number(e.target.value) || 0)))}
-                  className="font-jetbrains mt-2 w-full rounded-xl border border-white/12 bg-white/[0.03] px-4 py-2.5 text-base text-white focus:border-cyan-400/40 focus:outline-none"
-                />
-              </label>
-              <p className="font-jetbrains mt-4 text-[11px] leading-relaxed text-white/45">
-                Provisioned for max(streams, 4× the daily average arrival rate) = {plan.need.audPerS.toFixed(1)} audio-s/s.
-              </p>
-            </div>
-
-            <div className="glass-panel rounded-3xl p-6">
-              <div className="flex items-baseline justify-between">
-                <span className="font-instrument text-xl text-white">
-                  {plan.instances}× {plan.box.instance}
-                </span>
-                <span className="font-instrument text-2xl text-cyan-100">
-                  {fmtUsd(plan.monthlyUsd)}<span className="text-sm text-cyan-100/50">/mo 24·7</span>
-                </span>
-              </div>
-              <div className="font-jetbrains mt-1 text-[11px] text-white/55">
-                {plan.box.platform} {plan.box.cpu} · {plan.replicas} processes · {plan.headroomPct}% headroom
-                {plan.elMonthlyUsd != null && plan.elMonthlyUsd > plan.monthlyUsd && (
-                  <span className="ml-2 text-emerald-300">
-                    same volume ≈ {fmtUsd(plan.elMonthlyUsd)}/mo at ElevenLabs
-                  </span>
-                )}
-              </div>
-              <pre className="font-jetbrains mt-4 overflow-x-auto rounded-2xl border border-white/8 bg-black/40 p-4 text-[11px] leading-relaxed text-cyan-100/90">
-                {planEnvBlock(plan)}
-              </pre>
-              <button onClick={copyEnv}
-                className="font-jetbrains mt-3 cursor-pointer rounded-lg border border-white/15 px-3 py-1.5 text-[12px] text-white/85 transition hover:bg-white/5">
-                {failed ? "copy blocked — select it" : copied ? "✓ copied" : "copy env config"}
-              </button>
-            </div>
-          </div>
+          <BenchmarksPlanner />
         </motion.section>
 
         {/* methodology */}
