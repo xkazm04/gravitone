@@ -47,6 +47,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import AsyncIterator
 
+from service import errors
 from service.config import SETTINGS
 
 logger = logging.getLogger("gravitone.dialog")
@@ -62,8 +63,50 @@ _FORCE_FLUSH_CHARS = 220
 
 
 class DialogError(RuntimeError):
-    """The brain could not answer. Authored for an operator: the session closes
-    the socket with this text, so it has to say what actually broke."""
+    """The brain could not answer. TWO audiences, deliberately separated.
+
+    ``str(exc)`` is the OPERATOR's copy. It says what actually broke and may
+    quote what a remote provider or the CLI subprocess said, because that is the
+    thing worth reading at 3am. It goes to the log and nowhere else.
+
+    ``exc.reason`` is the CALLER's copy — the sentence ``convai`` closes the
+    socket with. It is authored, and when the operator's copy carries foreign
+    text it carries instead the request id that text was logged under
+    (``service.errors``), so a support question joins back to the log line. A
+    provider's response body can hold request ids, org names, quota details or
+    an echo of the prompt; none of that is ours to forward, and the one error
+    voice codified in ``.claude/CLAUDE.md`` says so.
+
+    ``reason`` defaults to the message, because every OTHER raise site in this
+    module writes a whole sentence for a human out of nothing but its own
+    knowledge — the ``errors.UserFacing`` case, stated here once.
+    """
+
+    def __init__(self, message: str, reason: str | None = None):
+        super().__init__(message)
+        self.reason = reason or message
+
+
+def close_reason(exc: BaseException) -> str:
+    """What a caller may be told about ``exc``.
+
+    ``getattr``, not ``exc.reason``: a DialogError is also raised by test
+    doubles and by anything that subclasses it, and a socket that dies with an
+    AttributeError instead of a reason is a worse failure than the one it was
+    reporting.
+    """
+    reason = getattr(exc, "reason", None)
+    return str(reason) if reason else str(exc)
+
+
+def _sanitized(action: str, raw: str) -> str:
+    """``action`` failed, plus the id ``raw`` was logged under.
+
+    The one sanitizer, reached the way ``errors.sanitize_detail`` reaches it —
+    ``sanitized_500`` takes a ``str`` cause precisely so a non-HTTP caller can
+    log foreign text against an id and hand out only the id.
+    """
+    return str(errors.sanitized_500(action, raw).detail)
 
 
 @dataclass(frozen=True)
@@ -774,18 +817,33 @@ class OpenAiCompatBackend(DialogBackend):
                 async with client.stream("POST", f"{self.base_url}/chat/completions",
                                          json=payload, headers=headers) as resp:
                     if resp.status_code >= 400:
-                        body = (await resp.aread()).decode(errors="ignore")[:300]
+                        body = (await resp.aread()).decode(
+                            errors="ignore")[:errors.DETAIL_LIMIT]
+                        # The body is the OPERATOR's, never the caller's: see
+                        # DialogError. The status code is ours to state — it is
+                        # a fact about the exchange, not content from the
+                        # provider — so the caller learns what kind of failure
+                        # this was without being handed the provider's prose.
                         raise DialogError(
                             f"the conversation model at {self.base_url} answered "
-                            f"{resp.status_code}: {body}")
+                            f"{resp.status_code}: {body}",
+                            reason=_sanitized(
+                                "the conversation model answered HTTP "
+                                f"{resp.status_code}; the turn", body))
                     async for line in resp.aiter_lines():
                         for sentence in buf.push(_sse_delta(line)):
                             yield sentence
         except httpx.HTTPError as exc:
+            # The transport error names the host, the port and whatever the
+            # proxy said — operator material. The advice that follows it is
+            # operator material too (an end user on a socket cannot set an env
+            # var), so the whole thing stays in the log behind an id.
             raise DialogError(
                 f"could not reach the conversation model at {self.base_url} "
                 f"({type(exc).__name__}: {exc}). Set CONVAI_LLM_BASE_URL, or use "
-                "CONVAI_LLM=scripted to run without one."
+                "CONVAI_LLM=scripted to run without one.",
+                reason=_sanitized("reaching the conversation model",
+                                  f"{type(exc).__name__}: {exc}")
             ) from exc
         except asyncio.CancelledError:
             raise
@@ -926,7 +984,12 @@ class ClaudeCliBackend(DialogBackend):
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 env=env)
         except (OSError, ValueError) as exc:
-            raise DialogError(f"could not start the Claude CLI ({exc})") from exc
+            # Same split: an OSError from a spawn names local paths and Windows
+            # error codes. Useful in the log, not something to read out to
+            # whoever is on the phone.
+            raise DialogError(
+                f"could not start the Claude CLI ({exc})",
+                reason=_sanitized("starting the Claude CLI", str(exc))) from exc
 
         buf = _SentenceBuffer()
         try:
@@ -974,8 +1037,16 @@ class ClaudeCliBackend(DialogBackend):
                 yield sentence
         code = await proc.wait()
         if code != 0 and not saw_text and not buf.pending():
-            detail = (await proc.stderr.read()).decode("utf-8", "replace")[:300]
-            raise DialogError(f"the Claude CLI exited {code}: {detail or 'no output'}")
+            detail = (await proc.stderr.read()).decode(
+                "utf-8", "replace")[:errors.DETAIL_LIMIT]
+            # Subprocess stderr is the textbook case the sanitized-500 contract
+            # exists for — it carries local paths, tokens and whatever the tool
+            # felt like printing. The operator's copy keeps it; the caller is
+            # told the exit code and the id it was logged under.
+            raise DialogError(
+                f"the Claude CLI exited {code}: {detail or 'no output'}",
+                reason=_sanitized(f"the Claude CLI exited {code}; the turn",
+                                  detail or "no output"))
 
 
 def _json_line(raw: bytes) -> dict | None:

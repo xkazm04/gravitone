@@ -84,7 +84,7 @@ from fastapi import APIRouter, HTTPException, Query, Request, WebSocket, WebSock
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from service import dialog, engines, piper, recording, stt
+from service import dialog, engines, errors, piper, recording, stt
 from service.cache import CachedPcm, SynthCache
 from service.config import SETTINGS
 from service.engine import resample_pcm16
@@ -798,8 +798,14 @@ class _Session:
         except WebSocketDisconnect:
             pass
         except Exception as exc:  # noqa: BLE001 - a dead session must SAY why
+            # An exception class name is a fact about our code, not an answer to
+            # the caller's "what do I do now?" — and one day it will be an
+            # exception whose NAME carries a path. The house voice for an
+            # unexpected failure is a request id (errors.sanitize_detail, the
+            # same contract the HTTP catch-all uses); the traceback stays here.
             logger.exception("convai %s failed", self.conversation_id)
-            await self._close(_CLOSE_INTERNAL, f"session error: {type(exc).__name__}")
+            await self._close(_CLOSE_INTERNAL,
+                              errors.sanitize_detail("the conversation", exc)[:120])
         finally:
             self._closing = True
             watchdog.cancel()
@@ -1322,8 +1328,13 @@ class _Session:
             # The brain is unreachable or refusing. That is not survivable the
             # way one bad sentence is, and a socket that stays open with a
             # silent agent is worse than one that says why it stopped.
+            #
+            # ``exc`` is the operator's copy and may quote what the provider or
+            # the CLI actually said — it goes HERE, into the log, against this
+            # conversation id. ``close_reason`` is the caller's copy: authored,
+            # and carrying the request id the quoted text was logged under.
             logger.error("convai %s: %s", self.conversation_id, exc)
-            await self._close(_CLOSE_INTERNAL, str(exc)[:120])
+            await self._close(_CLOSE_INTERNAL, dialog.close_reason(exc)[:120])
         finally:
             renderer.cancel()
             # AWAITED, not just cancelled: the renderer is the task holding this

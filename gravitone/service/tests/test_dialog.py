@@ -532,6 +532,9 @@ class OpenAiCompatOverHttpTests(unittest.TestCase):
         self.received = received
         chunks = ["Thanks", " for that.", " What", " did you", " build?"]
         self.status = 200
+        # The refusal body, settable per test: a real provider answers a 4xx/5xx
+        # with its own prose, and what happens to that prose is a contract.
+        self.error_body = b"model not found"
 
         outer = self
 
@@ -544,7 +547,7 @@ class OpenAiCompatOverHttpTests(unittest.TestCase):
                 if outer.status != 200:
                     self.send_response(outer.status)
                     self.end_headers()
-                    self.wfile.write(b"model not found")
+                    self.wfile.write(outer.error_body)
                     return
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
@@ -607,6 +610,39 @@ class OpenAiCompatOverHttpTests(unittest.TestCase):
             collect(self._backend(), agent, [])
         self.assertIn("404", str(caught.exception))
 
+    def test_a_providers_prose_is_not_our_error_voice(self) -> None:
+        """The body a provider returns is logged, never forwarded.
+
+        An upstream body carries request ids, org names, quota details and
+        sometimes an echo of the prompt. None of it is ours to hand to whoever
+        is on the socket — see the sanitized-500 contract in service/errors.py.
+        What the caller gets instead is the status code (a fact about the
+        exchange, not the provider's words) and the id the body was logged
+        under, so the two halves can still be joined.
+        """
+        self.status = 502
+        self.error_body = (b'{"error":{"message":"org acme-corp is out of quota",'
+                           b'"request_id":"req_LEAKCANARY42"}}')
+        agent = dialog.Agent(agent_id="a", name="A", prompt="p")
+        with self.assertLogs("gravitone", level="ERROR") as logs:
+            with self.assertRaises(dialog.DialogError) as caught:
+                collect(self._backend(), agent, [])
+
+        reason = dialog.close_reason(caught.exception)
+        for leak in ("LEAKCANARY42", "acme-corp", "quota", self.base_url):
+            self.assertNotIn(leak, reason, leak)
+        self.assertIn("502", reason)   # the caller still learns what happened
+        # The operator's half: the body IS in the log, under the id the caller
+        # was given. A message that merely deleted the evidence would be worse
+        # than the leak it fixed.
+        request_id = reason.split("request ")[1].rstrip(") ")
+        logged = "\n".join(logs.output)
+        self.assertIn("LEAKCANARY42", logged)
+        self.assertIn(request_id, logged)
+        # And the operator's copy of the exception keeps the whole story, which
+        # is what convai writes to the log against the conversation id.
+        self.assertIn("LEAKCANARY42", str(caught.exception))
+
     def test_an_unreachable_model_names_the_env_var_to_fix(self) -> None:
         agent = dialog.Agent(agent_id="a", name="A", prompt="p")
         dead = dialog.OpenAiCompatBackend(base_url="http://127.0.0.1:1/v1", model="m")
@@ -615,6 +651,64 @@ class OpenAiCompatOverHttpTests(unittest.TestCase):
         message = str(caught.exception)
         self.assertIn("CONVAI_LLM_BASE_URL", message)
         self.assertIn("scripted", message)  # and the way to run without one
+
+
+class ErrorVoiceTests(unittest.TestCase):
+    """Which half of a DialogError may be spoken to a caller."""
+
+    def test_an_authored_message_is_its_own_reason(self) -> None:
+        """The common case: a sentence written for a human, no id needed.
+
+        Every raise site that invents its own text — the tool guard, the CLI
+        timeout, the missing executable — is entitled to be read out verbatim,
+        and would be worse for being replaced by a request id.
+        """
+        exc = dialog.DialogError("the Claude CLI produced nothing for 90s")
+        self.assertEqual(dialog.close_reason(exc), str(exc))
+
+    def test_a_foreign_reason_replaces_the_operators_copy(self) -> None:
+        exc = dialog.DialogError("upstream said: SECRET", reason="it failed (request ab)")
+        self.assertEqual(dialog.close_reason(exc), "it failed (request ab)")
+        self.assertIn("SECRET", str(exc))
+
+    def test_anything_without_a_reason_still_closes_the_socket(self) -> None:
+        """convai closes on whatever it caught; a bare exception must not
+        become an AttributeError instead of a reason."""
+        self.assertEqual(dialog.close_reason(RuntimeError("boom")), "boom")
+
+
+class ClaudeCliStderrTests(unittest.TestCase):
+    """Subprocess stderr is the textbook thing not to put on a socket."""
+
+    def _backend(self, code: int, stderr: str) -> dialog.ClaudeCliBackend:
+        import sys
+
+        class _Exiting(dialog.ClaudeCliBackend):
+            # A REAL subprocess on the real streaming path — only the argv is
+            # swapped, so this exercises _stream's exit handling rather than a
+            # re-implementation of it.
+            def _argv(self, agent):
+                return [sys.executable, "-c",
+                        f"import sys; sys.stderr.write({stderr!r}); "
+                        f"sys.exit({code})"]
+
+        return _Exiting()
+
+    def test_a_failing_cli_reports_its_exit_code_and_hides_its_stderr(self) -> None:
+        agent = dialog.Agent(agent_id="a", name="A", prompt="p")
+        canary = "Traceback: C:\\Users\\someone\\.claude\\OAUTH_TOKEN_LEAKCANARY"
+        with self.assertLogs("gravitone", level="ERROR") as logs:
+            with self.assertRaises(dialog.DialogError) as caught:
+                collect(self._backend(9, canary), agent, [])
+
+        reason = dialog.close_reason(caught.exception)
+        self.assertNotIn("LEAKCANARY", reason)
+        self.assertNotIn("Users", reason)
+        self.assertIn("9", reason)   # the exit code is ours to state
+        request_id = reason.split("request ")[1].rstrip(") ")
+        logged = "\n".join(logs.output)
+        self.assertIn("LEAKCANARY", logged)
+        self.assertIn(request_id, logged)
 
 
 class SseParsingTests(unittest.TestCase):
