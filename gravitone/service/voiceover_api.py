@@ -24,11 +24,9 @@ from __future__ import annotations
 
 import json
 import logging
-import shutil
 import sys
 import threading
 import time
-import uuid
 from concurrent.futures import TimeoutError as FuturesTimeout
 from pathlib import Path
 
@@ -37,7 +35,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from service import brain as brain_mod
-from service import errors, frames, ingest_url, vision, voiceover
+from service import errors, frames, ingest_url, jobs, vision, voiceover
 from service.config import REPO_ROOT, _int, _str
 from service.emotions import resolve
 from service.ingest import Spend
@@ -90,130 +88,34 @@ _PUBLIC_KEYS = ("id", "status", "step", "steps", "partial", "error", "source",
 
 
 # ── registry plumbing ─────────────────────────────────────────────────────────
+# The bookkeeping is `service/jobs.py`'s (shared with revoice_api, which runs
+# the same job SHAPE and none of the same phases); the state it works on stays
+# right here, because this module is what a deployment repoints and what a test
+# patches. `_run_job` below is emphatically NOT shared.
+
+_REGISTRY = jobs.JobRegistry(__name__)
+
+_get = _REGISTRY.get
+_public = _REGISTRY.public
+_update = _REGISTRY.update
+_step = _REGISTRY.step
+_partial = _REGISTRY.partial
+_finish = _REGISTRY.finish
+_schedule_reap = _REGISTRY.schedule_reap
+_gc = _REGISTRY.gc
+_acquire_admission = _REGISTRY.acquire_admission
+_release_admission = _REGISTRY.release_admission
+#: This module's second door (upload) can also fail AFTER minting a job — over
+#: the byte ceiling — so it unwinds the same way its `except BaseException`
+#: does. revoice_api has one door and reaches the same method from it.
+_abandon_at_the_door = _REGISTRY.abandon_at_the_door
+
 
 def _new_job(source: dict, character_id: str, style: str,
              language: str, *, permit: bool = False) -> dict:
-    job_id = uuid.uuid4().hex[:12]
-    wd = WORK_DIR / job_id
-    wd.mkdir(parents=True, exist_ok=True)
-    job = {"id": job_id, "status": "running", "step": "fetch",
-           "steps": [{"key": k, "label": l, "state": "pending"}
-                     for k, l in STEPS],
-           "partial": {}, "error": None, "source": source,
-           "character_id": character_id, "style": style, "language": language,
-           "brain": None, "result": None, "limits": [],
-           "work_dir": str(wd), "cancel": False, "permit": bool(permit),
-           "created": time.time(), "touched": time.time()}
-    with _LOCK:
-        JOBS[job_id] = job
-    return job
-
-
-def _get(job_id: str) -> dict | None:
-    _gc()
-    with _LOCK:
-        job = JOBS.get(job_id)
-        if job is not None:
-            job["touched"] = time.time()
-        return job
-
-
-def _public(job: dict) -> dict:
-    return {k: job.get(k) for k in _PUBLIC_KEYS}
-
-
-def _update(job: dict, **fields) -> None:
-    with _LOCK:
-        job.update(fields)
-        job["touched"] = time.time()
-
-
-def _step(job: dict, key: str, state: str) -> None:
-    with _LOCK:
-        for s in job["steps"]:
-            if s["key"] == key:
-                s["state"] = state
-        if state == "active":
-            job["step"] = key
-
-
-def _partial(job: dict, d: dict) -> None:
-    with _LOCK:
-        job["partial"].update(d)
-
-
-def _finish(job: dict, status: str, **fields) -> None:
-    """Write a job's ONE terminal state — first writer wins.
-
-    `cancel()` may flip a running job to `cancelled` while the phase thread is
-    mid-mux; that thread then finishes muxing and used to stamp `done` over the
-    top, so a job could report two terminal states depending on who read it
-    when. A job leaves `running` exactly once.
-    """
-    with _LOCK:
-        if job["status"] != "running":
-            return
-        job.update(fields)
-        job["status"] = status
-        job["touched"] = time.time()
-
-
-def _schedule_reap(work_dir: str) -> None:
-    """Hand a work dir to `_gc`, `_REAP_GRACE_S` from now. Callers hold _LOCK."""
-    _REAP.append((time.time() + _REAP_GRACE_S, work_dir))
-
-
-def _gc() -> None:
-    now = time.time()
-    with _LOCK:
-        for job in list(JOBS.values()):
-            idle = now - job["touched"]
-            age = now - job["created"]
-            done = job["status"] in ("done", "error", "cancelled")
-            # `touched` keeps a watched job alive; `created` bounds a wedged
-            # run even when a poller keeps touching it — a job that has been
-            # "running" for two hours is not going to finish.
-            if (done and idle > _TTL_S) or age > _RUNNING_TTL_S:
-                _schedule_reap(JOBS.pop(job["id"])["work_dir"])
-        due = [w for deadline, w in _REAP if deadline <= now]
-        _REAP[:] = [(d, w) for d, w in _REAP if d > now]
-    for work_dir in due:
-        shutil.rmtree(work_dir, ignore_errors=True)
-
-
-def _acquire_admission() -> bool:
-    return _ADMIT.acquire(blocking=False)
-
-
-def _release_admission(job: dict) -> None:
-    """Hand back this job's permit, at most once.
-
-    Idempotent by construction: the flag is popped under the lock, so two
-    callers racing (a door that failed to start its thread, the worker's
-    `finally`) cannot double-release a BoundedSemaphore.
-    """
-    with _LOCK:
-        held = bool(job.pop("permit", False))
-    if held:
-        _ADMIT.release()
-
-
-def _abandon_at_the_door(job: dict | None) -> None:
-    """Undo a job the door built but never handed to a phase thread.
-
-    No `_run_job` will ever run its `finally` for it, so the door is the only
-    one left who can give the permit back. `job is None` means the failure beat
-    `_new_job` and the permit is the only thing to return. This is also the ONE
-    deletion that skips the reap grace: the job id was never returned to any
-    client, so no `FileResponse` can be streaming out of that dir.
-    """
-    if job is None:
-        _ADMIT.release()
-        return
-    with _LOCK:
-        JOBS.pop(job["id"], None)
-    _release_admission(job)
-    shutil.rmtree(job["work_dir"], ignore_errors=True)
+    return _REGISTRY.new_job(permit=permit, source=source,
+                             character_id=character_id, style=style,
+                             language=language, limits=[])
 
 
 def _busy() -> JSONResponse:
@@ -508,15 +410,7 @@ def status(job_id: str):
     return _public(job)
 
 
-def _artifact(job_id: str, name: str, media_type: str,
-              missing: str) -> FileResponse | JSONResponse:
-    job = _get(job_id)
-    if job is None:
-        return errors.job_expired()
-    path = Path(job["work_dir"]) / name
-    if not path.is_file():
-        return JSONResponse(status_code=409, content={"detail": missing})
-    return FileResponse(path, media_type=media_type)
+_artifact = _REGISTRY.artifact
 
 
 @router.get(VO + "/{job_id}/video")

@@ -10,9 +10,12 @@ rather than an ingest job id, deliberately:
     because the scan that produced its Characters aged out an hour ago.
 
 Same job discipline as voiceover_api (def handlers, one phase thread, 429
-admission, TTL GC, authored failures) — the registries stay separate because
-their lifecycles are: a narration is one render, a re-voice may be re-run
-line by line as the user punches in.
+admission, TTL GC, authored failures), and since the copies of that discipline
+had started drifting apart it is now literally the same code: `service/jobs.py`
+holds the bookkeeping, this module holds its own state and its own phases. The
+LIFECYCLES stay separate because they genuinely are — a narration is one
+render, a re-voice may be re-run line by line as the user punches in — so
+`_run_job` and the door are this module's alone.
 
 Steps: fetch → direct → speak → mux. `direct` is the brain assigning one
 emotion per line from the Character's real stems (skippable, `direct:false`);
@@ -23,18 +26,16 @@ from __future__ import annotations
 
 import json
 import logging
-import shutil
 import threading
 import time
-import uuid
 from pathlib import Path
 
 from fastapi import APIRouter
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from service import brain as brain_mod
-from service import errors, frames, ingest_url, revoice, voiceover
+from service import errors, frames, ingest_url, jobs, revoice, voiceover
 from service.config import REPO_ROOT, _int, _str
 from service.emotions import resolve
 from service.voiceover_api import _engine_speak
@@ -85,107 +86,39 @@ _LIMIT_BED = ("the original background (music, ambience) is not carried over "
               "needs source separation, which this box does not do")
 
 
-# ── registry plumbing (mirrors voiceover_api; small enough that sharing a
-#    base would couple two lifecycles for ~60 lines of dict bookkeeping) ─────
+# ── registry plumbing ─────────────────────────────────────────────────────────
+# This used to be ~90 lines copied from voiceover_api, under a comment arguing
+# that sharing a base "would couple two lifecycles for ~60 lines of dict
+# bookkeeping". That was honest when it was written and it has since inverted:
+# TEN methods were character-for-character identical except for the module
+# global they closed over, and the last two rounds exist partly because a defect
+# fixed on one side survived untouched in its twin and had to be ported by hand,
+# twice. The seam moved to where the copies actually were — `service/jobs.py`
+# takes the BOOKKEEPING (which knows nothing about either pipeline), and the
+# lifecycles stay uncoupled where they genuinely differ: `_run_job` is NOT
+# shared (four steps against six, a fit ladder against a cloud vision pass), and
+# neither are the doors. The state below stays in this module on purpose — it is
+# what a deployment repoints and what a test patches.
+
+_REGISTRY = jobs.JobRegistry(__name__)
+
+_get = _REGISTRY.get
+_public = _REGISTRY.public
+_update = _REGISTRY.update
+_step = _REGISTRY.step
+_partial = _REGISTRY.partial
+_finish = _REGISTRY.finish
+_schedule_reap = _REGISTRY.schedule_reap
+_gc = _REGISTRY.gc
+_acquire_admission = _REGISTRY.acquire_admission
+_release_admission = _REGISTRY.release_admission
+_abandon_at_the_door = _REGISTRY.abandon_at_the_door
+
 
 def _new_job(source: dict, lines: list[dict], options: dict,
              *, permit: bool = False) -> dict:
-    job_id = uuid.uuid4().hex[:12]
-    wd = WORK_DIR / job_id
-    wd.mkdir(parents=True, exist_ok=True)
-    job = {"id": job_id, "status": "running", "step": "fetch",
-           "steps": [{"key": k, "label": l, "state": "pending"}
-                     for k, l in STEPS],
-           "partial": {}, "error": None, "source": source, "lines": lines,
-           "options": options, "brain": None, "result": None,
-           "limits": [_LIMIT_BED],
-           "work_dir": str(wd), "cancel": False, "permit": bool(permit),
-           "created": time.time(), "touched": time.time()}
-    with _LOCK:
-        JOBS[job_id] = job
-    return job
-
-
-def _get(job_id: str) -> dict | None:
-    _gc()
-    with _LOCK:
-        job = JOBS.get(job_id)
-        if job is not None:
-            job["touched"] = time.time()
-        return job
-
-
-def _update(job: dict, **fields) -> None:
-    with _LOCK:
-        job.update(fields)
-        job["touched"] = time.time()
-
-
-def _step(job: dict, key: str, state: str) -> None:
-    with _LOCK:
-        for s in job["steps"]:
-            if s["key"] == key:
-                s["state"] = state
-        if state == "active":
-            job["step"] = key
-
-
-def _partial(job: dict, d: dict) -> None:
-    with _LOCK:
-        job["partial"].update(d)
-
-
-def _finish(job: dict, status: str, **fields) -> None:
-    """Write a job's ONE terminal state — first writer wins.
-
-    `cancel()` may flip a running job to `cancelled` while the phase thread is
-    mid-step; that thread then finishes its step and used to stamp `done` over
-    the top, so a job could report two terminal states depending on who read it
-    when. A job leaves `running` exactly once.
-    """
-    with _LOCK:
-        if job["status"] != "running":
-            return
-        job.update(fields)
-        job["status"] = status
-        job["touched"] = time.time()
-
-
-def _schedule_reap(work_dir: str) -> None:
-    """Hand a work dir to `_gc`, `_REAP_GRACE_S` from now. Callers hold _LOCK."""
-    _REAP.append((time.time() + _REAP_GRACE_S, work_dir))
-
-
-def _gc() -> None:
-    now = time.time()
-    with _LOCK:
-        for job in list(JOBS.values()):
-            idle = now - job["touched"]
-            age = now - job["created"]
-            done = job["status"] in ("done", "error", "cancelled")
-            if (done and idle > _TTL_S) or age > _RUNNING_TTL_S:
-                _schedule_reap(JOBS.pop(job["id"])["work_dir"])
-        due = [w for deadline, w in _REAP if deadline <= now]
-        _REAP[:] = [(d, w) for d, w in _REAP if d > now]
-    for work_dir in due:
-        shutil.rmtree(work_dir, ignore_errors=True)
-
-
-def _acquire_admission() -> bool:
-    return _ADMIT.acquire(blocking=False)
-
-
-def _release_admission(job: dict) -> None:
-    """Hand back this job's permit, at most once.
-
-    Idempotent by construction: the flag is popped under the lock, so two
-    callers racing (a door that failed to start its thread, the worker's
-    `finally`) cannot double-release a BoundedSemaphore.
-    """
-    with _LOCK:
-        held = bool(job.pop("permit", False))
-    if held:
-        _ADMIT.release()
+    return _REGISTRY.new_job(permit=permit, source=source, lines=lines,
+                             options=options, limits=[_LIMIT_BED])
 
 
 # ── the phase thread ──────────────────────────────────────────────────────────
@@ -430,23 +363,13 @@ def start(req: RevoiceReq):
     except BaseException:
         # No `_run_job` will ever run its `finally` for this job — the door is
         # the only one left who can hand the permit back.
-        if job is None:
-            _ADMIT.release()
-        else:
-            with _LOCK:
-                JOBS.pop(job["id"], None)
-            _release_admission(job)
-            shutil.rmtree(job["work_dir"], ignore_errors=True)
+        _abandon_at_the_door(job)
         raise
     return {"job_id": job["id"], "source": job["source"],
             "lines": len(lines)}
 
 
 # ── reading a job ─────────────────────────────────────────────────────────────
-
-def _public(job: dict) -> dict:
-    return {k: job.get(k) for k in _PUBLIC_KEYS}
-
 
 @router.get(RV + "/{job_id}")
 def status(job_id: str):
@@ -456,14 +379,7 @@ def status(job_id: str):
     return _public(job)
 
 
-def _artifact(job_id: str, name: str, media_type: str, missing: str):
-    job = _get(job_id)
-    if job is None:
-        return errors.job_expired()
-    path = Path(job["work_dir"]) / name
-    if not path.is_file():
-        return JSONResponse(status_code=409, content={"detail": missing})
-    return FileResponse(path, media_type=media_type)
+_artifact = _REGISTRY.artifact
 
 
 @router.get(RV + "/{job_id}/video")
