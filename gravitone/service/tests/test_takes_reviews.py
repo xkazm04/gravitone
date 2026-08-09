@@ -695,6 +695,142 @@ class ReviewsErrorTests(_TakesBase):
                                        "counts": {}})
 
 
+class CorruptRecordTests(_TakesBase):
+    """A damaged file names itself — the takes/reviews counterpart to
+    ``test_direction.test_corrupt_store_is_reported_not_silently_zeroed``.
+
+    Two rules, and they pull in opposite directions on purpose:
+
+      * A record a route was asked for BY NAME is reported, not disguised as a
+        404 (which would tell a publisher their share was evicted and send them
+        off to re-share a link that is really sitting on damaged disk).
+      * A record merely WALKED PAST — eviction, lineage, listings, the picks
+        histogram — is skipped and logged, because one bad file must never make
+        the whole store unreadable.
+    """
+
+    def _corrupt(self, path: Path) -> None:
+        path.write_text("{not json", "utf-8")
+
+    def _corrupt_take(self, take_id: str) -> str:
+        self._write_take(take_id)
+        self._corrupt(takes.TAKES_DIR / f"{take_id}.json")
+        return take_id
+
+    def _assert_named_failure(self, resp, needle: str) -> None:
+        self.assertEqual(resp.status_code, 500, resp.text)
+        detail = resp.json()["detail"]
+        # Named (it says which record and what is wrong with it), authored, and
+        # carrying the operator's handle — never the decode error itself.
+        self.assertIn(needle, detail)
+        self.assertIn("damaged", detail)
+        self.assertIn("request ", detail)
+        self.assertNotIn("Expecting", detail)  # no raw JSONDecodeError text
+        self.assertNotIn(str(takes.TAKES_DIR), detail)  # no server paths
+
+    def test_a_corrupt_take_is_named_not_a_generic_500(self) -> None:
+        tid = self._corrupt_take("corrupt001")
+        with self.assertLogs("service.takes", level="WARNING") as logs:
+            resp = self.client.get(f"/v1/takes/{tid}")
+        self._assert_named_failure(resp, tid)
+        self.assertTrue(any("corrupt" in line for line in logs.output))
+
+    def test_a_corrupt_take_is_not_reported_as_evicted(self) -> None:
+        tid = self._corrupt_take("corrupt002")
+        with self.assertLogs("service.takes", level="WARNING"):
+            resp = self.client.get(f"/v1/takes/{tid}")
+        self.assertNotEqual(resp.status_code, 404)
+        self.assertNotIn("evicted", resp.json()["detail"])
+
+    def test_a_corrupt_take_is_named_on_lineage_and_reperform(self) -> None:
+        tid = self._corrupt_take("corrupt003")
+        for path in (f"/v1/takes/{tid}/lineage",):
+            with self.subTest(path=path):
+                with self.assertLogs("service.takes", level="WARNING"):
+                    self._assert_named_failure(self.client.get(path), tid)
+        with self.assertLogs("service.takes", level="WARNING"):
+            self._assert_named_failure(
+                self.client.post(f"/v1/takes/{tid}/reperform",
+                                 json={"text": "New words."}), tid)
+
+    def test_a_corrupt_review_is_named(self) -> None:
+        t1, t2 = self._create_take("A."), self._create_take("A.")
+        review_id = self.client.post(
+            "/v1/reviews", json={"take_ids": [t1, t2]}).json()["review_id"]
+        self._corrupt(takes.REVIEWS_DIR / f"{review_id}.json")
+        for resp in (
+            self.client.get(f"/v1/reviews/{review_id}"),
+            self.client.post(f"/v1/reviews/{review_id}/pick", json={"take_id": t1}),
+            self.client.post(f"/v1/reviews/{review_id}/revise", json={"note": "x"}),
+        ):
+            with self.subTest(status=resp.status_code):
+                self._assert_named_failure(resp, review_id)
+
+    def test_a_review_cannot_be_minted_from_a_damaged_take(self) -> None:
+        # The review quotes its first take's script, so minting one over a
+        # damaged member would publish a guess as the client's script.
+        good = self._create_take("A.")
+        bad = self._corrupt_take("corrupt004")
+        with self.assertLogs("service.takes", level="WARNING"):
+            resp = self.client.post("/v1/reviews", json={"take_ids": [good, bad]})
+        self._assert_named_failure(resp, bad)
+
+    def test_one_damaged_member_does_not_take_the_review_down(self) -> None:
+        t1, t2 = self._create_take("A."), self._create_take("A.")
+        review_id = self.client.post(
+            "/v1/reviews", json={"take_ids": [t1, t2]}).json()["review_id"]
+        self._corrupt(takes.TAKES_DIR / f"{t2}.json")
+        with self.assertLogs("service.takes", level="WARNING"):
+            body = self.client.get(f"/v1/reviews/{review_id}").json()
+        self.assertEqual([t["id"] for t in body["takes"]], [t1])
+        # ...and the reviewer is told the fourth take is damaged rather than
+        # left believing the set was always three.
+        self.assertEqual(body["unreadable_take_ids"], [t2])
+
+    def test_one_corrupt_record_does_not_break_listing_or_eviction(self) -> None:
+        parent = self._write_take("parent0001", age=100)
+        child = self._write_take("child00001", parent_id=parent, age=50)
+        self._corrupt_take("corrupt005")
+        with self.assertLogs("service.takes", level="WARNING"):
+            body = self.client.get(f"/v1/takes/{parent}/lineage").json()
+        self.assertEqual([c["id"] for c in body["children"]], [child])
+
+        # Eviction walks every record; the bad one must not wedge the store.
+        orig, takes.MAX_TAKES = takes.MAX_TAKES, 3
+        try:
+            fresh = self._create_take("still works")
+        finally:
+            takes.MAX_TAKES = orig
+        self.assertEqual(self.client.get(f"/v1/takes/{fresh}").status_code, 200)
+
+    def test_a_corrupt_review_does_not_break_the_picks_histogram(self) -> None:
+        t1, t2 = self._create_take("A."), self._create_take("A.")
+        good = self.client.post(
+            "/v1/reviews", json={"take_ids": [t1, t2]}).json()["review_id"]
+        self.client.post(f"/v1/reviews/{good}/pick", json={"take_id": t1})
+        broken = self.client.post(
+            "/v1/reviews", json={"take_ids": [t1, t2]}).json()["review_id"]
+        self._corrupt(takes.REVIEWS_DIR / f"{broken}.json")
+
+        with self.assertLogs("service.takes", level="WARNING"):
+            body = self.client.get("/v1/reviews/preferred").json()
+        self.assertEqual(body["character_id"], "sarah")
+        self.assertEqual(body["picks"], 1)
+
+    def test_a_damaged_take_does_not_block_recording_a_pick(self) -> None:
+        t1, t2 = self._create_take("A."), self._create_take("A.")
+        review_id = self.client.post(
+            "/v1/reviews", json={"take_ids": [t1, t2]}).json()["review_id"]
+        self._corrupt(takes.TAKES_DIR / f"{t1}.json")
+        with self.assertLogs("service.takes", level="WARNING"):
+            resp = self.client.post(f"/v1/reviews/{review_id}/pick",
+                                    json={"take_id": t1})
+        # The decision is the reviewer's; the character was only telemetry.
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["take_id"], t1)
+        self.assertEqual(resp.json()["character_id"], "")
+
+
 class PackImportErrorTests(unittest.TestCase):
     def setUp(self) -> None:
         self.client = TestClient(appmod.app, raise_server_exceptions=False)

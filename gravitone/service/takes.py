@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import uuid
 from datetime import datetime, timezone
@@ -56,6 +57,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from service import direction
+from service import errors
 from service.atomicio import atomic_write_bytes, atomic_write_text, file_lock
 from service.config import SETTINGS
 # The one WAV joiner in the service (24 kHz mono 16-bit, no ffmpeg). A cast
@@ -63,6 +65,8 @@ from service.config import SETTINGS
 # no service module, so this is a leaf import and not the cycle app.py is.
 from service.engine import concat_wavs
 from service.ratelimit import per_ip_budget
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1/takes", tags=["takes"])
 reviews_router = APIRouter(prefix="/v1/reviews", tags=["reviews"])
@@ -139,11 +143,62 @@ def _read_meta(take_id: str) -> dict | None:
 
 
 def _read_meta_path(path: Path) -> dict | None:
+    """One record, or None if it cannot be read — the TOLERANT reader.
+
+    Used by every path that walks the store (eviction, lineage, listings): one
+    hand-edited or torn file must not make the whole store unreadable. A file
+    that exists but does not parse is still LOGGED, because "this record is
+    damaged" and "this record was evicted" are different operator facts and
+    only one of them is normal. Routes that were asked for exactly this record
+    use :func:`_load_record` instead, which reports the damage to the caller.
+    """
     try:
-        data = json.loads(path.read_text("utf-8"))
-    except (OSError, json.JSONDecodeError):
+        raw = path.read_text("utf-8")
+    except OSError:
         return None
-    return data if isinstance(data, dict) else None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        logger.warning("stored record %s is corrupt; skipping it (%s)", path, exc)
+        return None
+    if not isinstance(data, dict):
+        logger.warning("stored record %s is not an object; skipping it", path)
+        return None
+    return data
+
+
+def _load_record(path: Path, *, kind: str, record_id: str) -> dict:
+    """One record the caller asked for BY NAME, or a named failure.
+
+    A corrupt record is not a missing one. The three candidate answers, and why
+    this is the one:
+
+      * **404** would say "evicted, re-share it" — it hides disk damage from the
+        operator and tells the publisher a lie about their link.
+      * **410** would say "deliberately and permanently gone", inviting the
+        client to drop the link — but the file is still there and a restore
+        from backup makes this exact URL work again.
+      * **500**, sanitized: the server holds state it cannot read. Nothing the
+        caller sent is wrong, so it is not a 4xx; the request id in the detail
+        is the operator's handle on the real cause, which is logged (with the
+        path and the decode error) and never put in the response body.
+    """
+    action = f"reading {kind} '{record_id[:32]}' (its stored record is damaged)"
+    try:
+        raw = path.read_text("utf-8")
+    except OSError as exc:
+        logger.warning("stored record %s could not be read: %s", path, exc)
+        raise errors.sanitized_500(action, exc) from exc
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        logger.warning("stored record %s is corrupt: %s", path, exc)
+        raise errors.sanitized_500(action, exc) from exc
+    if not isinstance(data, dict):
+        logger.warning("stored record %s is not an object", path)
+        raise errors.sanitized_500(
+            action, f"expected a JSON object, found {type(data).__name__}")
+    return data
 
 
 def _parent_of(meta: dict | None) -> str:
@@ -385,12 +440,19 @@ def _write_take(record: dict, audio: bytes) -> None:
             direction.record_delta(parent_meta, record)
 
 
+def _asked_for_take(take_id: str) -> dict:
+    """The take a route was asked for: 404 when it is gone, a named failure
+    when it is there but damaged. The two are different answers and a caller
+    that is told "evicted" about a corrupt file will re-share for nothing."""
+    p = TAKES_DIR / f"{take_id}.json"
+    if not _valid_id(take_id) or not p.is_file():
+        raise HTTPException(404, "take not found (shares are evicted oldest-first)")
+    return _load_record(p, kind="take", record_id=take_id)
+
+
 @router.get("/{take_id}")
 def get_take(take_id: str) -> dict:
-    p = TAKES_DIR / f"{take_id}.json"
-    if not take_id.isalnum() or not p.is_file():
-        raise HTTPException(404, "take not found (shares are evicted oldest-first)")
-    return json.loads(p.read_text("utf-8"))
+    return _asked_for_take(take_id)
 
 
 @router.get("/{take_id}/lineage")
@@ -403,9 +465,7 @@ def get_lineage(take_id: str) -> dict:
     silently ending the chain, because "the parent is gone" and "there was no
     parent" are different sentences on a provenance line.
     """
-    meta = _read_meta(take_id)
-    if meta is None:
-        raise HTTPException(404, "take not found (shares are evicted oldest-first)")
+    meta = _asked_for_take(take_id)
 
     ancestors: list[dict] = []
     seen = {take_id}
@@ -523,9 +583,7 @@ async def reperform(take_id: str, req: ReperformReq) -> dict:
     published take, and inheriting the flag would turn one opt-in into an
     unbounded public render chain.
     """
-    parent = _read_meta(take_id)
-    if parent is None:
-        raise HTTPException(404, "take not found (shares are evicted oldest-first)")
+    parent = _asked_for_take(take_id)
     if not bool(parent.get("allow_reperform")):
         raise HTTPException(
             403, "not-published-for-reperform: whoever published this take did "
@@ -693,7 +751,7 @@ def _load_review(review_id: str) -> dict:
     p = _review_path(review_id)
     if not review_id.isalnum() or not p.is_file():
         raise HTTPException(404, "review not found (links are evicted oldest-first)")
-    return json.loads(p.read_text("utf-8"))
+    return _load_record(p, kind="review", record_id=review_id)
 
 
 @reviews_router.post("", status_code=201)
@@ -704,7 +762,10 @@ def create_review(req: ReviewReq) -> dict:
         p = TAKES_DIR / f"{tid}.json"
         if not tid.isalnum() or not p.is_file():
             raise HTTPException(404, f"take '{tid}' not found — share it first")
-        takes.append(json.loads(p.read_text("utf-8")))
+        # A review quotes the script of its first take, so a damaged member is
+        # a damaged review: refuse to mint the link rather than mint one whose
+        # script is a guess.
+        takes.append(_load_record(p, kind="take", record_id=tid))
 
     review_id = uuid.uuid4().hex[:10]
     record = {
@@ -739,11 +800,8 @@ def _revisions_of(review_id: str) -> list[dict]:
     if not REVIEWS_DIR.is_dir():
         return out
     for path in REVIEWS_DIR.glob("*.json"):
-        try:
-            other = json.loads(path.read_text("utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if not isinstance(other, dict):
+        other = _read_meta_path(path)
+        if other is None:
             continue
         src = other.get("derived_from") or {}
         if isinstance(src, dict) and src.get("review_id") == review_id:
@@ -766,12 +824,11 @@ def preferred() -> dict:
     latest: dict | None = None
     if REVIEWS_DIR.is_dir():
         for p in sorted(REVIEWS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime):
-            try:
-                r = json.loads(p.read_text("utf-8"))
-            except json.JSONDecodeError:
+            r = _read_meta_path(p)  # one damaged review ≠ no recommendation
+            if r is None:
                 continue
             pick = r.get("pick")
-            if not pick:
+            if not isinstance(pick, dict) or not pick:
                 continue
             cid = pick.get("character_id")
             if cid:
@@ -788,11 +845,22 @@ def preferred() -> dict:
 def get_review(review_id: str) -> dict:
     review = _load_review(review_id)
     takes = []
+    unreadable: list[str] = []
     for tid in review["take_ids"]:
         p = TAKES_DIR / f"{tid}.json"
-        if p.is_file():  # a take may have been evicted from the bounded store
-            takes.append(json.loads(p.read_text("utf-8")))
-    return {**review, "takes": takes, "revisions": _revisions_of(review_id)}
+        if not p.is_file():  # evicted from the bounded store — the normal loss
+            continue
+        member = _read_meta_path(p)
+        if member is None:
+            # One damaged member must not take the whole approval page down —
+            # the other takes are still pickable. But it is NAMED, not dropped:
+            # a reviewer seeing three of four takes deserves to know the fourth
+            # is damaged rather than believe the set was always three.
+            unreadable.append(tid)
+            continue
+        takes.append(member)
+    return {**review, "takes": takes, "revisions": _revisions_of(review_id),
+            "unreadable_take_ids": unreadable}
 
 
 @reviews_router.post("/{review_id}/revise", status_code=201)
@@ -865,7 +933,11 @@ def pick_take(review_id: str, req: PickReq) -> dict:
     take_meta = TAKES_DIR / f"{req.take_id}.json"
     character_id = ""
     if take_meta.is_file():
-        character_id = json.loads(take_meta.read_text("utf-8")).get("character_id", "")
+        # Best-effort enrichment: the character is what `preferred()` counts,
+        # not what the decision IS. A damaged take must not block a reviewer
+        # from recording the pick they already made — it costs one row of
+        # telemetry, and the damage is logged by the reader.
+        character_id = str((_read_meta_path(take_meta) or {}).get("character_id", ""))
 
     pick = {
         "take_id": req.take_id,
