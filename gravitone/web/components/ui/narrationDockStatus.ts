@@ -16,6 +16,7 @@ export const SOURCE_COPY: Record<ClipSource, string> = {
 
 export function dockStatus({
   state, notice, rosterError, total, roster, source, manifest, cached, bakeUnserved,
+  handoff,
 }: {
   state: DockState;
   /** A remote plan that would not load, from ?narration=<id>. */
@@ -28,6 +29,8 @@ export function dockStatus({
   cached: number;
   /** A clip the manifest promised did not arrive (useNarrationDockClips). */
   bakeUnserved?: boolean;
+  /** Set on the sentence where the auto narrator changed with the section. */
+  handoff?: { from: string; to: string } | null;
 }): string {
   if (state.phase === "error") return state.error ?? "narration failed";
   // A remote plan that failed to load is the FIRST thing to say: the visitor
@@ -39,6 +42,14 @@ export function dockStatus({
   // While LOADING, `source` still describes the sentence that just finished —
   // so it says nothing about this one. Claiming "cued" off a stale flag would
   // be the dock's one small lie.
+  // A voice changing mid-reading is a deliberate authoring choice (the block's
+  // characterHint) and, unexplained, is indistinguishable from a fault. Said
+  // once, on the sentence it happens, through the live region the listener is
+  // already being read status from.
+  if (handoff && (state.phase === "loading" || state.phase === "playing")) {
+    const where = state.phase === "loading" ? "cueing this sentence…" : SOURCE_COPY[source];
+    return `${where} — ${handoff.to} reads this section, after ${handoff.from}`;
+  }
   if (state.phase === "loading") return "cueing this sentence…";
   if (state.phase === "playing") return SOURCE_COPY[source];
   if (state.phase === "paused") return "paused";

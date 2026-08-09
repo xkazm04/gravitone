@@ -13,7 +13,7 @@ import { AUTO_NARRATOR, type Narrator } from "./narrationDockNarrator";
 import type { DockEvent, DockState } from "./narrationDockState";
 
 export function NarrationDockPanel({
-  title, accent, step, state, total, progress, busy, live, canPlay,
+  title, accent, step, reader, state, total, progress, busy, live, canPlay,
   status, rosterError, roster, chosen, cached, playRef,
   dispatch, onPlayPause, onCollapse, onChooseNarrator, onClearCache,
 }: {
@@ -21,6 +21,9 @@ export function NarrationDockPanel({
   /** The section's hue, already resolved — the panel does no colour thinking. */
   accent: string;
   step: NarrationStep | undefined;
+  /** Who reads THIS sentence, resolved by <Dock>. On "auto" the picker above
+   *  cannot say this, because the answer changes with the section. */
+  reader: string | null;
   state: DockState;
   total: number;
   progress: number;
@@ -69,7 +72,10 @@ export function NarrationDockPanel({
       {/* what is being said, right now */}
       <div className="mt-3 min-h-[3.5rem] rounded-2xl border border-white/8 bg-black/30 px-3 py-2.5">
         <div className="font-jetbrains flex items-center justify-between text-[10px] uppercase tracking-[0.16em] text-white/45">
-          <span className="truncate">{step?.block.label ?? "—"}</span>
+          <span className="truncate">
+            {step?.block.label ?? "—"}
+            {reader ? <span className="text-white/30">{` · read by ${reader}`}</span> : null}
+          </span>
           <span className="shrink-0 tabular-nums">
             {total ? `${Math.min(state.index + 1, total)}/${total}` : "0/0"}
           </span>

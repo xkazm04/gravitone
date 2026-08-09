@@ -34,7 +34,7 @@
 // the page), ./narrationDockStatus (what it says about itself), and the use*
 // hooks + ./NarrationDockPanel this file wires up.
 
-import { useCallback, useEffect, useMemo, useReducer, useRef } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { usePathname } from "next/navigation";
 
 import {
@@ -45,6 +45,7 @@ import { useAudioBus } from "./AudioBus";
 import { EqBars } from "./Equalizer";
 import { NarrationDockPanel } from "./NarrationDockPanel";
 import { HIGHLIGHT_CSS, ROLE_HUE } from "./narrationDockHighlight";
+import { pickNarrator } from "./narrationDockNarrator";
 import { INITIAL_DOCK, reduceDock } from "./narrationDockState";
 import { dockStatus } from "./narrationDockStatus";
 import { useNarrationDockClips } from "./useNarrationDockClips";
@@ -189,10 +190,43 @@ function Dock({ route, notice }: { route: NarratableRoute; notice?: string | nul
     toggleOpen,
   });
 
+  // ── who is reading, and when that changes ─────────────────────────────────
+  //
+  // On "auto" the narrator is matched PER BLOCK from the section's
+  // characterHint, so a single reading of the landing page can legitimately
+  // change voice between the hero and the feature cards. That is an authoring
+  // feature, not a fault — but a voice that changes mid-page with nothing said
+  // reads as a glitch. So the dock states who is reading at all times, and NAMES
+  // the handover in its live region on the sentence where it happens. Disclosure
+  // only: the selection itself is untouched.
+  const reader = useMemo(
+    () => (step && roster?.length ? pickNarrator(roster, chosen, step.block.characterHint) : null),
+    [step, roster, chosen],
+  );
+  const readerName = reader?.name ?? null;
+  const [handoff, setHandoff] = useState<{ from: string; to: string } | null>(null);
+  const lastReader = useRef<string | null>(null);
+  useEffect(() => {
+    // Not reading: there is no "previous voice" to hand over from, and any
+    // pending announcement is stale.
+    if (!live) {
+      lastReader.current = null;
+      setHandoff(null);
+      return;
+    }
+    if (!readerName) return;
+    const previous = lastReader.current;
+    lastReader.current = readerName;
+    // Runs per sentence (state.index is a dep), so the announcement lasts
+    // exactly the sentence the change happened on.
+    setHandoff(previous && previous !== readerName ? { from: previous, to: readerName } : null);
+  }, [live, readerName, state.index]);
+
   // ── copy the dock says out loud ────────────────────────────────────────────
   const canPlay = !!roster?.length && total > 0;
   const status = dockStatus({
     state, notice, rosterError, total, roster, source, manifest, cached, bakeUnserved,
+    handoff,
   });
 
   const progress = total > 0 ? (state.index + (live ? 1 : 0)) / total : 0;
@@ -243,6 +277,7 @@ function Dock({ route, notice }: { route: NarratableRoute; notice?: string | nul
               title={route.title}
               accent={accent}
               step={step}
+              reader={readerName}
               state={state}
               total={total}
               progress={progress}
