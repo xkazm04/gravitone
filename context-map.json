@@ -365,15 +365,13 @@
         },
         {
           "name": "Gym Replay & Grading",
-          "description": "A recorded call replayed as a deterministic test: what a conversation left behind (two aligned WAVs and a transcript), the replay driver, and the diff primitive the ledger gates on.",
+          "description": "A recorded call replayed as a deterministic test: what a conversation left behind (two aligned WAVs and a transcript), the replay driver that feeds it back through the real app, and the grading in gym.py::compare that a baseline is judged against. Turn STRUCTURE is sample-count driven; turn DETECTION rides wall-clock politeness timers, which is where a loaded box can legitimately disagree with itself.",
           "businessFeature": "Gym Replay & Grading",
           "category": "api",
           "filePaths": [
-            "gravitone/service/compare.py",
             "gravitone/service/gym.py",
             "gravitone/service/recording.py",
             "gravitone/service/tests/fixtures/gym/basic/suite.json",
-            "gravitone/service/tests/test_compare.py",
             "gravitone/service/tests/test_gym.py",
             "gravitone/service/tests/test_recording.py"
           ],
@@ -497,12 +495,14 @@
       "contexts": [
         {
           "name": "Load Testing & Workloads",
-          "description": "Ramp load-testing to find the concurrency cap before critical degradation, and the traffic shape (when requests arrive, what they say) the harness replays.",
+          "description": "Ramp load-testing to find the concurrency cap before critical degradation, the traffic shape (when requests arrive, what they say) the harness replays, and compare.py - the diff the performance ledger gates on, which REFUSES comparisons it cannot make honestly (cache-mode and fast-math basis mismatches) rather than quietly producing a number.",
           "businessFeature": "Load Testing & Workloads",
           "category": "test",
           "filePaths": [
+            "gravitone/service/compare.py",
             "gravitone/service/loadtest.py",
             "gravitone/service/tests/test_arm_tuning.py",
+            "gravitone/service/tests/test_compare.py",
             "gravitone/service/tests/test_loadtest.py",
             "gravitone/service/tests/test_workload.py",
             "gravitone/service/workload.py"
@@ -1911,13 +1911,13 @@
     "Video Studio › Audible Docs Narration [lib] — 2 files",
     "Video Studio › Media Job Registry [lib] — 2 files",
     "Conversation Gym › Conversational Agent Socket [api] — 7 files",
-    "Conversation Gym › Gym Replay & Grading [api] — 7 files",
+    "Conversation Gym › Gym Replay & Grading [api] — 5 files",
     "Takes, Builds & Direction › Takes, Reviews & Lineage [lib] — 2 files",
     "Takes, Builds & Direction › Speech as a Build Artifact [lib] — 3 files",
     "Takes, Builds & Direction › Direction Telemetry [lib] — 2 files",
     "Platform Security & Limits › API Keys & Auth [api] — 5 files",
     "Platform Security & Limits › Rate Limiting & Error Reporting [lib] — 6 files",
-    "Performance & Deployment › Load Testing & Workloads [test] — 5 files",
+    "Performance & Deployment › Load Testing & Workloads [test] — 7 files",
     "Performance & Deployment › Benchmark Harness [test] — 7 files",
     "Performance & Deployment › Replicas & Deployment Compiler [config] — 4 files",
     "Performance & Deployment › Packaging & Host Deployment [config] — 9 files",
@@ -1999,5 +1999,5 @@
   },
   "instructions": "Context map for Gravitone. Each group is a business domain (domain field); each context is a feature with its files (filePaths) + a technical category. Read this to learn which files belong to which feature BEFORE editing. When you change a context's files, update them here (or run Vibeman's refresh) to keep this fresh.",
   "generatedAt": "2026-08-09T00:00:00.000Z",
-  "revision": "rescan-2026-08-09+jobs"
+  "revision": "rescan-2026-08-09+jobs+compare"
 }
