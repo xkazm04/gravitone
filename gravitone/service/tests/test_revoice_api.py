@@ -1,23 +1,40 @@
-"""The re-voice JOB layer — the admission door and the reclamation of a
-job's work dir.
+"""The re-voice JOB layer — `_run_job` end to end with every seam stubbed
+(no network, no engine, no ffmpeg, no brain), plus the admission door.
 
-`test_revoice.py` covers the pure fit ladder; this file covers the lifecycle
-around it. What it pins: admission is a HELD permit that comes back on every
-exit path (including a worker killed by a BaseException, which reaches no
-`except` clause), the 429 refusal costs nothing, and no door deletes a work dir
-that a `FileResponse` may still be streaming out of.
+`test_revoice.py` covers the pure fit ladder; this file covers the thing that
+CALLS it. What it pins, mirroring test_voiceover.py's JobRunTests: step order,
+exactly one terminal state, the artifacts on disk — and then the failure modes
+that only exist up here: a mux that dies after a full (expensive) speak pass,
+a run where every line refused, a cancel arriving mid-speak, and the admission
+permit, which must come back even when the worker dies without an `except`.
 """
 from __future__ import annotations
 
+import io
 import json
 import threading
 import time
 import unittest
+import wave
+from contextlib import ExitStack
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
-from service import revoice_api
+import numpy as np
+
+from service import revoice_api, voiceover
+
+
+def _wav(seconds: float, rate: int = voiceover.RATE) -> bytes:
+    pcm = (np.ones(int(seconds * rate)) * 0.25 * 32767).astype("<i2")
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(pcm.tobytes())
+    return buf.getvalue()
 
 
 class _Mind:
@@ -30,6 +47,176 @@ class _Mind:
 
     def complete(self, prompt, **kw):
         return "shorter"
+
+
+class JobRunTests(unittest.TestCase):
+    """One whole `_run_job`, every seam stubbed."""
+
+    LINES = [(0.0, 4.0), (5.0, 9.0)]
+
+    def _job(self, td: str, *, lines=None, options=None) -> dict:
+        wd = Path(td) / "job"
+        wd.mkdir(exist_ok=True)
+        bounds = lines if lines is not None else self.LINES
+        return {"id": "t1", "status": "running", "step": "fetch",
+                "steps": [{"key": k, "label": l, "state": "pending"}
+                          for k, l in revoice_api.STEPS],
+                "partial": {}, "error": None,
+                "source": {"kind": "url", "url": "https://x/v", "title": "clip"},
+                "lines": [{"i": i, "character_id": "ada", "text": f"line {i}",
+                           "start": a, "end": b, "emotion": "baseline"}
+                          for i, (a, b) in enumerate(bounds)],
+                "options": options or {"direct": True, "rewrite": True},
+                "brain": None, "result": None, "limits": [],
+                "work_dir": str(wd), "cancel": False, "permit": False,
+                "created": time.time(), "touched": time.time()}
+
+    def _stubs(self, *, speak=None, mux=None, duration=20.0):
+        def _download(url, wd, **kw):
+            p = Path(wd) / "in.mp4"
+            p.write_bytes(b"video")
+            return p
+
+        return dict(
+            download=mock.patch.object(revoice_api.ingest_url, "download_video",
+                                       side_effect=_download),
+            probe=mock.patch.object(revoice_api.frames, "probe_video",
+                                    return_value={"duration": duration,
+                                                  "width": 640, "height": 360}),
+            brain=mock.patch.object(revoice_api.brain_mod, "make_brain",
+                                    return_value=_Mind()),
+            emap=mock.patch.object(revoice_api, "emotion_map",
+                                   return_value={"baseline": "v1"}),
+            pmap=mock.patch.object(revoice_api, "prosody_map",
+                                   return_value={}),
+            resolve=mock.patch.object(revoice_api, "resolve",
+                                      return_value=("v1", "baseline", False)),
+            speak=mock.patch.object(
+                revoice_api, "_engine_speak",
+                **({"side_effect": speak} if speak
+                   else {"return_value": (_wav(2.0), 2.0)})),
+            mux=mock.patch.object(
+                revoice_api.voiceover, "mux",
+                side_effect=mux or (lambda v, t, o: Path(o).write_bytes(b"mp4"))),
+        )
+
+    def _run(self, job, stubs):
+        with ExitStack() as stack:
+            for p in stubs.values():
+                stack.enter_context(p)
+            revoice_api._run_job(job)
+        return job
+
+    # ── the happy path ────────────────────────────────────────────────────
+    def test_the_happy_path_lands_done_with_artifacts(self) -> None:
+        with TemporaryDirectory() as td:
+            job = self._run(self._job(td), self._stubs())
+            self.assertIsNone(job["error"])
+            self.assertEqual(job["status"], "done")
+            self.assertEqual([s["state"] for s in job["steps"]], ["done"] * 4)
+            wd = Path(job["work_dir"])
+            for name in ("track.wav", "fit.json", "revoiced.mp4"):
+                self.assertTrue((wd / name).is_file(), name)
+            self.assertEqual(job["brain"], {"backend": "test"})
+            self.assertEqual(job["result"]["summary"]["lines"], 2)
+            self.assertEqual(job["result"]["summary"]["failed"], 0)
+
+    def test_the_steps_run_in_their_declared_order(self) -> None:
+        seen: list[str] = []
+        real_step = revoice_api._step
+
+        def spy(job, key, state):
+            if state == "active":
+                seen.append(key)
+            real_step(job, key, state)
+
+        with TemporaryDirectory() as td, \
+                mock.patch.object(revoice_api, "_step", spy):
+            self._run(self._job(td), self._stubs())
+        self.assertEqual(seen, [k for k, _ in revoice_api.STEPS])
+
+    def test_fit_json_on_disk_is_the_polled_report(self) -> None:
+        with TemporaryDirectory() as td:
+            job = self._run(self._job(td), self._stubs())
+            on_disk = json.loads(
+                (Path(job["work_dir"]) / "fit.json").read_text("utf-8"))
+        self.assertEqual(on_disk, job["result"]["fit"])
+
+    # ── the expensive failures ────────────────────────────────────────────
+    def test_a_mux_that_dies_after_a_full_speak_pass_is_an_error(self) -> None:
+        def boom(v, t, o):
+            raise voiceover.VoiceoverError(
+                "the narrated video could not be assembled")
+
+        with TemporaryDirectory() as td:
+            job = self._run(self._job(td), self._stubs(mux=boom))
+        self.assertEqual(job["status"], "error")
+        self.assertIsNone(job["result"])
+        self.assertIn("could not be assembled", job["error"])
+        self.assertNotIn("Traceback", job["error"])
+
+    def test_every_line_failing_is_never_a_healthy_done(self) -> None:
+        def refuse(voice_id, text):
+            raise RuntimeError("engine sad")
+
+        with TemporaryDirectory() as td:
+            job = self._run(self._job(td), self._stubs(speak=refuse))
+            self.assertFalse((Path(job["work_dir"]) / "revoiced.mp4").exists())
+        self.assertEqual(job["status"], "error")
+        self.assertIn("not one line", job["error"])
+        self.assertNotIn("engine sad", job["error"])
+
+    def test_one_failed_line_still_produces_the_video(self) -> None:
+        calls = {"n": 0}
+
+        def flaky(voice_id, text):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("engine sad")
+            return _wav(2.0), 2.0
+
+        with TemporaryDirectory() as td:
+            job = self._run(self._job(td), self._stubs(speak=flaky))
+        self.assertEqual(job["status"], "done")
+        self.assertEqual(job["result"]["summary"]["failed"], 1)
+        self.assertEqual(job["result"]["fit"][0]["error"],
+                         "this line could not be re-performed")
+
+    # ── cancel ────────────────────────────────────────────────────────────
+    def test_cancel_mid_speak_stops_before_the_mux(self) -> None:
+        job_ref: dict = {}
+
+        def speak(voice_id, text):
+            job_ref["job"]["cancel"] = True
+            return _wav(2.0), 2.0
+
+        with TemporaryDirectory() as td:
+            job = self._job(td)
+            job_ref["job"] = job
+            self._run(job, self._stubs(speak=speak))
+            self.assertFalse((Path(job["work_dir"]) / "revoiced.mp4").exists())
+        self.assertEqual(job["status"], "cancelled")
+        self.assertIsNone(job["result"])
+        self.assertIsNone(job["error"])
+
+    def test_a_cancel_during_mux_is_not_overwritten_by_done(self) -> None:
+        """Terminal-state uniqueness: the real DELETE door fires while the
+        phase thread is inside mux; the thread must not stamp `done` over it."""
+        with TemporaryDirectory() as td:
+            job = self._job(td)
+            with revoice_api._LOCK:
+                revoice_api.JOBS[job["id"]] = job
+            try:
+                def late_cancel(v, t, o):
+                    Path(o).write_bytes(b"mp4")
+                    revoice_api.cancel(job["id"])
+
+                self._run(job, self._stubs(mux=late_cancel))
+            finally:
+                with revoice_api._LOCK:
+                    revoice_api.JOBS.pop(job["id"], None)
+        self.assertEqual(job["status"], "cancelled")
+        self.assertIsNone(job["result"])
 
 
 class AdmissionTests(unittest.TestCase):

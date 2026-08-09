@@ -274,6 +274,12 @@ def _run_job(job: dict) -> None:
                 "atempo": fitted["atempo"],
                 "rewritten_text": fitted["rewritten_text"],
                 "spill_seconds": fitted["spill_seconds"], "error": None})
+        if fit_report and all(f.get("error") for f in fit_report):
+            # Every single line refused. Muxing here would hand the user a
+            # `done` video with a silent track — the expensive lie. Name it.
+            raise errors.UserFacing(
+                "not one line could be re-performed, so the re-voiced video "
+                "would be silent — the service log says why each line failed")
         _step(job, "speak", "done")
 
         # ── mux ───────────────────────────────────────────────────────────
