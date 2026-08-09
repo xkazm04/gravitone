@@ -20,6 +20,7 @@ import { DEFAULT_EXPRESSION } from "@/app/playground/_variants/playgroundHelpers
 import { saveComposer, setRemixParent } from "@/lib/composerStore";
 import { useMounted } from "@/lib/useMounted";
 import type { SharedTake } from "@/lib/takes";
+import { ErrorBanner } from "@/components/ui/ErrorBanner";
 
 /** The take id the next publish should be minted as a CHILD of. It lives in
  *  lib/composerStore beside the composer hand-off it travels with — this page
@@ -114,7 +115,7 @@ export default function OpenInRack({ take }: { take: SharedTake }) {
       <p className="font-jetbrains mt-3 text-[11px] text-white/45">
         This replaces whatever is currently in your composer.
       </p>
-      {error && <p className="mt-2 text-sm text-rose-300">{error}</p>}
+      {error && <ErrorBanner className="mt-2">{error}</ErrorBanner>}
     </div>
   );
 }
