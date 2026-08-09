@@ -4,6 +4,7 @@
 // final; this opens the NEXT round, seeded from the approved take.
 
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
+import { useMounted } from "@/lib/useMounted";
 import { useState } from "react";
 import Link from "next/link";
 import { requestRevision } from "./actions";
@@ -22,6 +23,7 @@ export default function ReviewRevisionRequest({
   const [reviseBusy, setReviseBusy] = useState(false);
   const [reviseErr, setReviseErr] = useState<string | null>(null);
   const [nextRound, setNextRound] = useState<{ id: string; round: number } | null>(null);
+  const mounted = useMounted();
 
   async function revise() {
     if (reviseBusy || !reviseNote.trim()) return;
@@ -30,6 +32,9 @@ export default function ReviewRevisionRequest({
       const result = await requestRevision(reviewId, {
         note: reviseNote, reviewer, direction: reviseDirection,
       });
+      // The round is MINTED whether or not this panel is still on screen — the
+      // link is on the review it was opened from.
+      if (!mounted.current) return;
       if (result.ok) {
         setNextRound({ id: result.reviewId, round: result.round });
         setReviseNote(""); setReviseDirection("");
@@ -40,9 +45,9 @@ export default function ReviewRevisionRequest({
       // The action itself failed to reach the server (offline, deploy in
       // flight). Saying nothing would leave the button spinning on a request
       // that is never coming back.
-      setReviseErr("the request did not reach the studio — nothing was sent");
+      if (mounted.current) setReviseErr("the request did not reach the studio — nothing was sent");
     } finally {
-      setReviseBusy(false);
+      if (mounted.current) setReviseBusy(false);
     }
   }
 

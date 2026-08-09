@@ -6,6 +6,7 @@
 // decision. First pick is final.
 
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
+import { useMounted } from "@/lib/useMounted";
 import { useState } from "react";
 import Link from "next/link";
 import TakeCard, { type SharedTake } from "@/app/t/[id]/TakeCard";
@@ -33,6 +34,7 @@ export default function ReviewPicker({ review }: { review: Review }) {
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const mounted = useMounted();
 
   const take = review.takes[active];
   const decided = !!pick;
@@ -50,10 +52,11 @@ export default function ReviewPicker({ review }: { review: Review }) {
       });
       const body = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(body?.detail ?? "could not record the pick");
+      if (!mounted.current) return; // the decision is RECORDED either way
       setPick(body);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "could not record the pick");
-    } finally { setBusy(false); }
+      if (mounted.current) setError(e instanceof Error ? e.message : "could not record the pick");
+    } finally { if (mounted.current) setBusy(false); }
   }
 
   return (

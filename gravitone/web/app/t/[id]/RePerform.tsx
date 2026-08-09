@@ -22,6 +22,7 @@ import { useState } from "react";
 import Link from "next/link";
 import { type SharedTake } from "@/lib/takes";
 import { readDetail } from "@/lib/apiFetch";
+import { useMounted } from "@/lib/useMounted";
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import {
   castLines, MAX_REPERFORM_LINES, MAX_REPERFORM_TEXT, type CastLine,
@@ -61,6 +62,10 @@ export default function RePerform({ take }: { take: SharedTake }) {
   const [error, setError] = useState<string | null>(null);
   const [child, setChild] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // A render is up to three minutes long — the longest await on this page by an
+  // order of magnitude, and the one most likely to outlive the visitor's
+  // interest in it. The sibling useTakeTransport has always guarded its own.
+  const mounted = useMounted();
 
   // The publisher's decision. Absent (every take published before the toggle
   // existed) reads as NO — an unanswered consent question is not a yes.
@@ -102,21 +107,23 @@ export default function RePerform({ take }: { take: SharedTake }) {
         const wait = r.status === 429 && retryAfter
           ? ` Try again in ${retryAfter}s.`
           : "";
+        if (!mounted.current) return;
         setError((detail ?? (r.status === 503
           ? "Gravitone backend unreachable"
           : "this re-perform could not be rendered")) + wait);
         return;
       }
       const body = (await r.json()) as Result;
+      if (!mounted.current) return;
       setChild(body.take_id);
       // The service says whether the result really is one voice, and why. A
       // legacy take flattened into its one named Character is exactly the
       // event this sentence exists for.
       setNotice(body.notice ?? null);
     } catch {
-      setError("this re-perform could not be sent — the studio may be offline");
+      if (mounted.current) setError("this re-perform could not be sent — the studio may be offline");
     } finally {
-      setBusy(false);
+      if (mounted.current) setBusy(false);
     }
   }
 

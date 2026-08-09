@@ -18,6 +18,7 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { DEFAULT_EXPRESSION } from "@/app/playground/_variants/playgroundHelpers";
 import { saveComposer, setRemixParent } from "@/lib/composerStore";
+import { useMounted } from "@/lib/useMounted";
 import type { SharedTake } from "@/lib/takes";
 
 /** The take id the next publish should be minted as a CHILD of. It lives in
@@ -50,6 +51,9 @@ export default function OpenInRack({ take }: { take: SharedTake }) {
   const [owner, setOwner] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // The handoff ends in router.push, so the await it guards is one this
+  // component is EXPECTED to be navigated away from.
+  const mounted = useMounted();
 
   useEffect(() => { setOwner(hasStudioSession()); }, []);
 
@@ -66,6 +70,9 @@ export default function OpenInRack({ take }: { take: SharedTake }) {
         charId: take.character_id,
         activeLine: 0,
       });
+      // NOT guarded: neither of these is component state. The stamp and the
+      // navigation are the handoff the user asked for, and a user who moved on
+      // mid-await still gets the composer they clicked for.
       // The fork still works when storage refuses; only its lineage stamp is
       // lost. Not worth refusing the edit over — but not worth claiming either.
       setRemixParent(take.id);
@@ -74,6 +81,7 @@ export default function OpenInRack({ take }: { take: SharedTake }) {
       // saveComposer throws when the composer could NOT be stored. Navigating
       // anyway would drop the user into an untouched composer with no
       // explanation, which is the failure this branch exists to prevent.
+      if (!mounted.current) return;
       const why = e instanceof Error ? e.message : "storage unavailable";
       setError(`This take could not be loaded into the rack (${why}). Your studio is fine — try opening the playground directly.`);
       setBusy(false);
