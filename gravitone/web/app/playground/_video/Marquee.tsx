@@ -29,43 +29,38 @@ type Verb = "narrate" | "revoice";
 
 export default function Marquee({ reel, dub, draft, characterName, onStage }: {
   reel: Reel;
-  /** Present only while the re-voice round is open. Absent = the marquee that
-   *  shipped: one verb, no switch, byte-for-byte the narrate stage. */
-  dub?: Dub;
-  /** The sheet being written, wherever it lives — the stage draws it on the
-   *  clock before a run so gaps and overlaps are visible while they can still
-   *  be fixed. After a run the submitted slots take over, because those are
-   *  the ones the verdicts belong to. */
-  draft?: DubLine[];
+  dub: Dub;
+  /** The dub sheet being written (script mode's lines, on their clock) — the
+   *  stage draws it before a run so gaps and overlaps are visible while they
+   *  can still be fixed. After a run the submitted slots take over, because
+   *  those are the ones the verdicts belong to. */
+  draft: DubLine[];
   characterName: string | null;
   /** load these words into the console's own composer */
   onStage: (text: string) => void;
 }) {
   const [verb, setVerb] = useState<Verb>("narrate");
-  const showing: Verb = dub ? verb : "narrate";
 
   return (
     <div className="glass-panel rounded-2xl p-4">
-      {dub && (
-        <div className="mb-3 flex items-center gap-1">
-          {(["narrate", "revoice"] as const).map((v) => (
-            <button key={v} onClick={() => setVerb(v)} aria-pressed={showing === v}
-              title={v === "narrate"
-                ? "Silent footage — read the picture and write a narration for it"
-                : "A video whose dialogue you have — replace it with these Characters"}
-              className={`font-jetbrains rounded-full border px-2.5 py-0.5 text-[11px] uppercase tracking-widest transition ${
-                showing === v
-                  ? "border-cyan-400/30 bg-cyan-400/10 text-cyan-200"
-                  : "border-transparent text-white/50 hover:text-white/80"
-              }`}>
-              {v === "narrate" ? "narrate" : "re-voice"}
-            </button>
-          ))}
-        </div>
-      )}
-      {showing === "narrate"
+      <div className="mb-3 flex items-center gap-1">
+        {(["narrate", "revoice"] as const).map((v) => (
+          <button key={v} onClick={() => setVerb(v)} aria-pressed={verb === v}
+            title={v === "narrate"
+              ? "Silent footage — read the picture and write a narration for it"
+              : "A video whose dialogue you have — replace it with these Characters"}
+            className={`font-jetbrains rounded-full border px-2.5 py-0.5 text-[11px] uppercase tracking-widest transition ${
+              verb === v
+                ? "border-cyan-400/30 bg-cyan-400/10 text-cyan-200"
+                : "border-transparent text-white/50 hover:text-white/80"
+            }`}>
+            {v === "narrate" ? "narrate" : "re-voice"}
+          </button>
+        ))}
+      </div>
+      {verb === "narrate"
         ? <NarrateStage reel={reel} characterName={characterName} onStage={onStage} />
-        : <RevoiceStage dub={dub!} draft={draft ?? []} onStage={onStage} />}
+        : <RevoiceStage dub={dub} draft={draft} onStage={onStage} />}
     </div>
   );
 }

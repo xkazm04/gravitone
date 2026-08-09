@@ -66,30 +66,14 @@ import { EmptyTakes, RenderRail, TakeArrival } from "./signal";
 // remain the only way words are written and rendered here.
 import { useReel } from "../_video/useReel";
 import Marquee from "../_video/Marquee";
-// RE-VOICE ROUND (open). The marquee's second verb replaces the dialogue of a
-// video instead of narrating a silent one, and the open question is where its
-// LINES live — see `DubDirection`. Everything below is inert without the prop.
+// THE DUB SHEET — the marquee's second verb (re-voice: replace a video's
+// dialogue) won its round against a bench of its own, on this thesis: a dub is
+// a multi-character script whose lines are pinned to someone else's clock, and
+// this console already HAS a multi-character script composer. So script mode
+// grows a clock rather than gaining a rival. One composer, two exits: Generate
+// makes a take, Dub makes a film.
 import { useDub, type DubLine } from "../_video/useDub";
-import DubBench from "../_video/DubBench";
 import { DubControls, FitBadge, SlotClock } from "../_video/dubParts";
-
-/**
- * Where a dub's lines live. A dub is a multi-character script whose lines are
- * pinned to someone else's clock — and this console already HAS a
- * multi-character script composer, which is exactly what makes the choice
- * interesting:
- *
- *   "script" — REUSE. Script mode grows a clock: every line gains an in/out
- *              and, after a run, the verdict the fit ladder gave it. One
- *              composer, two render targets (Generate makes a take, Dub makes
- *              a film). The cost is that a plain script now carries dubbing
- *              furniture it may not want.
- *   "bench"  — SEPARATE. Dubbing gets its own surface under the picture, where
- *              the clock sits beside the words instead of inside a composer
- *              built for something else. The cost is a second place to write
- *              lines in a console that already has one.
- */
-export type DubDirection = "script" | "bench";
 
 function Bars({ peaks, progress = 0, active = false, className = "" }: { peaks: number[]; progress?: number; active?: boolean; className?: string }) {
   return (
@@ -268,7 +252,7 @@ function RenderStatus({ startedAt, etaSec, estAudioSec, etaBasisLabel, noEtaLabe
   );
 }
 
-export default function PlaygroundConsole({ dub }: { dub?: DubDirection } = {}) {
+export default function PlaygroundConsole() {
   // Resolved once, here, and passed down: framer's own hook cannot be trusted
   // by anything server-rendered, and one reading keeps every accent in step.
   const still = useStillMotion();
@@ -653,25 +637,19 @@ export default function PlaygroundConsole({ dub }: { dub?: DubDirection } = {}) 
   // The dub. Same posture as the reel: one hook, idle until a job exists, and
   // the lines are supplied by whoever owns them at `run` time.
   const dubState = useDub();
-  // Direction "bench" keeps its sheet here rather than inside the bench, so
-  // the marquee can draw the sheet on its clock either way — the picture must
-  // not have to know which direction is being trialled.
-  const [benchLines, setBenchLines] = useState<DubLine[]>([]);
   // One map for the whole script, not one rebuilt per row: `slotsFor` walks
   // every line to fill the gaps deterministically, and calling it inside the
   // row loop made rendering a script quadratic in its own length.
   const dubSlots = useMemo(
-    () => (dub === "script" ? dubState.slotsFor(script.map((l) => l.id)) : {}),
-    [dub, script, dubState],
+    () => dubState.slotsFor(script.map((l) => l.id)),
+    [script, dubState],
   );
-  const dubDraft = useMemo<DubLine[]>(() => {
-    if (dub === "bench") return benchLines;
-    if (dub !== "script") return [];
-    // Script mode's own lines, on the clock. The words are the PLAIN ones:
-    // `[emotion]` tags are this console's grammar for switching Voices mid-take
-    // and the dub's read is composed per line instead, so sending the markup
-    // would only give the engine brackets to say out loud.
-    return script
+  /** The sheet: script mode's own lines, on the clock. The words are the PLAIN
+   *  ones — `[emotion]` tags are this console's grammar for switching Voices
+   *  mid-take, and a dub's read is composed per line instead, so sending the
+   *  markup would only give the engine brackets to say out loud. */
+  const dubDraft = useMemo<DubLine[]>(
+    () => script
       .filter((l) => l.text.trim())
       .map((l) => ({
         id: l.id,
@@ -679,8 +657,9 @@ export default function PlaygroundConsole({ dub }: { dub?: DubDirection } = {}) 
         text: stripTags(l.text),
         start: dubSlots[l.id]?.start ?? 0,
         end: dubSlots[l.id]?.end ?? 0,
-      }));
-  }, [dub, benchLines, script, dubSlots]);
+      })),
+    [script, dubSlots],
+  );
   // The active Character's palette: base scale + its custom slots.
   const scale = useMemo(
     () => (character?.scale?.length ? character.scale : EMOTION_IDS),
@@ -1450,15 +1429,8 @@ export default function PlaygroundConsole({ dub }: { dub?: DubDirection } = {}) 
           below stays the one place words are written. */}
       <div className="mt-8">
         <Marquee reel={reel} characterName={character?.name ?? null} onStage={stageLine}
-          dub={dub ? dubState : undefined} draft={dubDraft} />
+          dub={dubState} draft={dubDraft} />
       </div>
-
-      {/* DIRECTION B — the dub gets a bench of its own, under the picture it
-          is dubbing and above the console it leaves alone. */}
-      {dub === "bench" && (
-        <DubBench dub={dubState} lines={benchLines} onLines={setBenchLines}
-          characters={characters} onStage={stageLine} />
-      )}
 
       {/* character rail */}
       <div className="mt-8">
@@ -1590,18 +1562,16 @@ export default function PlaygroundConsole({ dub }: { dub?: DubDirection } = {}) 
                         <option key={c.character_id} value={c.character_id} className="bg-slate-900 text-white">{c.name}</option>
                       ))}
                     </select>
-                    {/* DIRECTION A — the clock the line has to fit, in the row
-                        that holds the line. This is the direction's whole
-                        claim and its whole cost: a script line is now also a
-                        slot, on every script whether it is being dubbed or not. */}
-                    {dub === "script" && (
-                      <SlotClock
-                        start={dubSlots[line.id]?.start ?? 0}
-                        end={dubSlots[line.id]?.end ?? 0}
-                        onChange={(p) => dubState.patchTiming(line.id, p)}
-                        compact
-                      />
-                    )}
+                    {/* The clock the line has to fit, in the row that holds
+                        the line. This is the dub sheet's whole claim, and its
+                        whole cost: a script line is also a slot, on every
+                        script, whether or not it is being dubbed. */}
+                    <SlotClock
+                      start={dubSlots[line.id]?.start ?? 0}
+                      end={dubSlots[line.id]?.end ?? 0}
+                      onChange={(p) => dubState.patchTiming(line.id, p)}
+                      compact
+                    />
                     <div className="flex shrink-0 items-center gap-1">
                       <button onClick={() => moveLine(i, -1)} disabled={i === 0} aria-label="Move line up"
                         className="grid h-6 w-6 place-items-center rounded-md border border-white/12 text-[11px] text-white/60 transition enabled:hover:bg-white/5 disabled:opacity-25">↑</button>
@@ -1637,7 +1607,7 @@ export default function PlaygroundConsole({ dub }: { dub?: DubDirection } = {}) 
                       to. A verdict is only shown for a line that was actually
                       sent: editing after a run must not make a badge describe
                       words that never produced it. */}
-                  {dub === "script" && dubState.fitFor(line.id) && (
+                  {dubState.fitFor(line.id) && (
                     <div className="mt-2 flex flex-wrap items-center gap-2">
                       <FitBadge fit={dubState.fitFor(line.id)} />
                       {dubState.fitFor(line.id)?.rewritten_text && (
@@ -1710,11 +1680,10 @@ export default function PlaygroundConsole({ dub }: { dub?: DubDirection } = {}) 
             </div>
           )}
 
-          {/* DIRECTION A — the second render target. The same script that
-              Generate turns into a take, the dub turns into a film; putting it
-              here is the direction's argument that they are one composer's two
-              exits rather than two crafts. */}
-          {dub === "script" && mode === "script" && (
+          {/* The second render target. The same script that Generate turns
+              into a take, the dub turns into a film — one composer's two
+              exits, which is the argument this sheet won on. */}
+          {mode === "script" && (
             <div className="border-t border-white/8 px-5 py-3">
               <p className="font-jetbrains mb-2 text-[11px] uppercase tracking-widest text-white/60">
                 dub — this script, into the picture above

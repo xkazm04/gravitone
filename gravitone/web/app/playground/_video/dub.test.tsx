@@ -2,10 +2,15 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { Character } from "@/app/voices/_data/characters";
 
-// The RE-VOICE round. Both directions put the same second verb on the marquee
-// and differ only in where a dub's lines live, so what is pinned here is the
-// part a design comparison rests on: the verb is shared, each direction's home
-// for lines is where it says it is, and the console keeps working either way.
+// THE DUB SHEET — the marquee's second verb, and the thing it won its round
+// on: a dub is a multi-character script pinned to someone else's clock, and
+// this console already has a multi-character script composer, so script mode
+// grows a clock instead of gaining a rival surface.
+//
+// What is pinned here is what that decision promised: the clock lives on the
+// line, the dub is a second exit from the same composer rather than a
+// replacement for the first, and nothing is claimed about a line that was not
+// actually dubbed.
 
 const engineMocks = vi.hoisted(() => ({
   speak: vi.fn(),
@@ -54,9 +59,9 @@ function stubFetch() {
   }));
 }
 
-async function mount(node: React.ReactElement) {
+async function mountConsole() {
   stubFetch();
-  const view = render(node);
+  const view = render(<PlaygroundConsole />);
   await screen.findByRole("button", { name: /Sarah/, pressed: true });
   return view;
 }
@@ -73,75 +78,64 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-describe("the verb is shared, and absent from the console that shipped", () => {
-  it("offers no re-voice verb without a direction", async () => {
-    await mount(<PlaygroundConsole />);
-    expect(screen.queryByRole("button", { name: "re-voice" })).toBeNull();
-    // …and the narrate stage is untouched
-    expect(screen.getByLabelText("Footage link")).toBeTruthy();
+describe("one picture, two verbs", () => {
+  it("offers re-voice beside narrate on the same stage", async () => {
+    await mountConsole();
+    expect(screen.getByRole("button", { name: "narrate" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "re-voice" }));
+    await waitFor(() => expect(screen.getByLabelText("Dialogue video link")).toBeTruthy());
   });
 
-  for (const direction of ["script", "bench"] as const) {
-    it(`puts the same verb on the marquee in the ${direction} direction`, async () => {
-      await mount(<PlaygroundConsole dub={direction} />);
-      const verb = screen.getByRole("button", { name: "re-voice" });
-      fireEvent.click(verb);
-      await waitFor(() => expect(screen.getByLabelText("Dialogue video link")).toBeTruthy());
-      // the source cannot be shown before the render, and the stage says so
-      // rather than drawing an empty player
-      expect(screen.getByText(/The picture arrives with the dub/)).toBeTruthy();
-    });
-  }
+  it("says the source cannot be shown before the render instead of drawing a dead player", async () => {
+    await mountConsole();
+    fireEvent.click(screen.getByRole("button", { name: "re-voice" }));
+    await waitFor(() =>
+      expect(screen.getByText(/The picture arrives with the dub/)).toBeTruthy());
+  });
 });
 
-describe("dub sheet — the lines are script mode's, on a clock", () => {
+describe("the sheet is script mode, on a clock", () => {
   it("gives every script line an in and an out", async () => {
-    await mount(<PlaygroundConsole dub="script" />);
+    await mountConsole();
     await toScript();
     // switching to script seeds the two-line demo; each line is now a slot
     expect(screen.getAllByLabelText("Slot in, seconds").length).toBe(2);
     expect(screen.getAllByLabelText("Slot out, seconds").length).toBe(2);
   });
 
-  it("offers the dub as a second exit from the same composer", async () => {
-    await mount(<PlaygroundConsole dub="script" />);
+  it("adds no sheet of its own — the composer IS the sheet", async () => {
+    await mountConsole();
     await toScript();
-    expect(screen.getByRole("button", { name: /Dub/ })).toBeTruthy();
-    // …beside the one that makes a take, not instead of it
-    expect(screen.getByRole("button", { name: /Generate/ })).toBeTruthy();
-  });
-
-  it("adds no sheet of its own", async () => {
-    await mount(<PlaygroundConsole dub="script" />);
     expect(screen.queryByText("dub sheet")).toBeNull();
+    expect(screen.queryByRole("button", { name: /add slot/ })).toBeNull();
   });
 
   it("keeps the clock out of solo mode, which has no slots", async () => {
-    await mount(<PlaygroundConsole dub="script" />);
+    await mountConsole();
     expect(screen.queryAllByLabelText("Slot in, seconds").length).toBe(0);
   });
 });
 
-describe("dub bench — the lines are its own", () => {
-  it("stands under the picture with an empty sheet and says what a slot is", async () => {
-    await mount(<PlaygroundConsole dub="bench" />);
-    expect(screen.getByText("dub sheet")).toBeTruthy();
-    expect(screen.getByText(/A slot is a stretch of the video/)).toBeTruthy();
-  });
-
-  it("adds slots without touching script mode", async () => {
-    await mount(<PlaygroundConsole dub="bench" />);
-    fireEvent.click(screen.getByRole("button", { name: /add slot/ }));
-    await waitFor(() => expect(screen.getByLabelText("Words for slot 1")).toBeTruthy());
-    expect(screen.getByLabelText("Slot in, seconds")).toBeTruthy();
-    // script mode is left exactly as it was
+describe("the dub is a second exit, not a replacement", () => {
+  it("stands beside Generate rather than instead of it", async () => {
+    await mountConsole();
     await toScript();
-    expect(screen.queryAllByLabelText("Slot out, seconds").length).toBe(1); // the bench's, not a line's
+    expect(screen.getByRole("button", { name: /Dub/ })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Generate/ })).toBeTruthy();
   });
 
-  it("refuses to run and says which thing is missing", async () => {
-    await mount(<PlaygroundConsole dub="bench" />);
+  it("refuses to run and names the thing that is missing", async () => {
+    await mountConsole();
+    await toScript();
+    // the demo script has words, so the source link is what is missing
     expect(screen.getByText(/paste a link to the video/)).toBeTruthy();
     expect(screen.getByRole("button", { name: /Dub/ })).toBeDisabled();
+  });
+
+  it("claims nothing about a line that was never dubbed", async () => {
+    await mountConsole();
+    await toScript();
+    expect(screen.queryByText("not dubbed yet")).toBeNull();
+    expect(screen.queryByText(/spoken as/)).toBeNull();
   });
 });
