@@ -15,7 +15,7 @@ import {
 import { cacheAvailable, clearClips, countClips, getClip, putClip } from "@/lib/narrationCache";
 import { pickNarrator, type Narrator } from "./narrationDockNarrator";
 import {
-  NarrationError, fetchBaked, synthesize, type ClipSource,
+  NarrationError, fetchBaked, recordNarrationTrace, synthesize, type ClipSource,
 } from "./narrationDockSynthesis";
 import type { DockEvent, DockPhase } from "./narrationDockState";
 
@@ -34,6 +34,11 @@ export function useNarrationDockClips({
   const [source, setSource] = useState<ClipSource>("live");
   const [cached, setCached] = useState(0);
   const [manifest, setManifest] = useState<BakeManifest | null>(null);
+  // "This deployment HAS a bake and cannot serve it." Latched, because one
+  // proven miss is enough to stop the status line claiming this page costs no
+  // engine — the claim is false from that clip onward, not intermittently.
+  const [bakeUnserved, setBakeUnserved] = useState(false);
+  const onPromisedMiss = useCallback(() => setBakeUnserved(true), []);
 
   const urlRef = useRef<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -77,7 +82,7 @@ export function useNarrationDockClips({
       const key = clipKey(narrator.character_id, target.block, target.sentence);
       const hit = await getClip(key);
       if (hit) return { blob: hit.blob, from: "cache" };
-      const baked = await fetchBaked(manifest, key, signal);
+      const baked = await fetchBaked(manifest, key, signal, onPromisedMiss);
       if (baked) {
         await putClip(key, baked);
         return { blob: baked, from: "baked" };
@@ -86,7 +91,7 @@ export function useNarrationDockClips({
       await putClip(key, blob);
       return { blob, from: "live" };
     },
-    [roster, chosen, manifest],
+    [roster, chosen, manifest, onPromisedMiss],
   );
 
   // ── the loader: the only place that starts audio ───────────────────────────
@@ -136,13 +141,26 @@ export function useNarrationDockClips({
   // Renders the NEXT sentence into the cache while this one plays, so the gap
   // between sentences is a beat and not a round-trip. Skipped when the cache is
   // unavailable, where it would spend a synth slot on audio nothing can keep.
+  //
+  // Its failures stay invisible to the visitor — a refused prefetch costs the
+  // beat between sentences, and the sentence itself will be fetched again on
+  // its own turn — but they are TRACED. A 429 here is the first evidence that
+  // this page's reading is outrunning the engine, and a bare `catch(() => {})`
+  // threw that evidence away.
   useEffect(() => {
     if (phase !== "playing" || !cacheAvailable()) return;
     const next = plan[index + 1];
     if (!next) return;
     const ctrl = new AbortController();
     const timer = setTimeout(() => {
-      void ensureClip(next, ctrl.signal).catch(() => {});
+      void ensureClip(next, ctrl.signal).catch((e: unknown) => {
+        if ((e as { name?: string } | null)?.name === "AbortError") return;
+        recordNarrationTrace({
+          kind: "prefetch-failed",
+          detail: `the lookahead for sentence ${index + 2} failed: ${
+            (e as Error)?.message || "unknown reason"}`,
+        });
+      });
     }, 400);
     return () => {
       clearTimeout(timer);
@@ -164,5 +182,5 @@ export function useNarrationDockClips({
     void clearClips().then(() => setCached(0));
   }, []);
 
-  return { source, cached, manifest, clearCache };
+  return { source, cached, manifest, bakeUnserved, clearCache };
 }

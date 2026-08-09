@@ -96,7 +96,7 @@ function Dock({ route, notice }: { route: NarratableRoute; notice?: string | nul
   const focusNext = useRef(false);
 
   const { roster, rosterError, chosen, chooseNarrator } = useNarrationDockNarrators(state.open);
-  const { source, cached, manifest, clearCache } = useNarrationDockClips({
+  const { source, cached, manifest, bakeUnserved, clearCache } = useNarrationDockClips({
     open: state.open,
     plan,
     phase: state.phase,
@@ -192,7 +192,7 @@ function Dock({ route, notice }: { route: NarratableRoute; notice?: string | nul
   // ── copy the dock says out loud ────────────────────────────────────────────
   const canPlay = !!roster?.length && total > 0;
   const status = dockStatus({
-    state, notice, rosterError, total, roster, source, manifest, cached,
+    state, notice, rosterError, total, roster, source, manifest, cached, bakeUnserved,
   });
 
   const progress = total > 0 ? (state.index + (live ? 1 : 0)) / total : 0;

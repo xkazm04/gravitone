@@ -15,7 +15,7 @@ export const SOURCE_COPY: Record<ClipSource, string> = {
 };
 
 export function dockStatus({
-  state, notice, rosterError, total, roster, source, manifest, cached,
+  state, notice, rosterError, total, roster, source, manifest, cached, bakeUnserved,
 }: {
   state: DockState;
   /** A remote plan that would not load, from ?narration=<id>. */
@@ -26,6 +26,8 @@ export function dockStatus({
   source: ClipSource;
   manifest: BakeManifest | null;
   cached: number;
+  /** A clip the manifest promised did not arrive (useNarrationDockClips). */
+  bakeUnserved?: boolean;
 }): string {
   if (state.phase === "error") return state.error ?? "narration failed";
   // A remote plan that failed to load is the FIRST thing to say: the visitor
@@ -43,6 +45,13 @@ export function dockStatus({
   // Stated BEFORE the cache warning, and instead of it: "every listen
   // re-renders" is simply false on a baked page, and a warning that is false
   // is worse than no warning.
+  // A bake this deployment cannot actually serve: the reading is unaffected
+  // (live synthesis covers it) so there is no banner and no alarm — but the
+  // "costs no engine" sentence below is now FALSE, and repeating it would be
+  // the dock telling the visitor something it has already disproved.
+  if (manifest && bakeUnserved) {
+    return "ready — this page's baked audio is not being served here, so each listen renders live";
+  }
   if (manifest) {
     return `ready — this page was baked with ${manifest.character_name}, so it costs no engine`;
   }
