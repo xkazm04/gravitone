@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import io
 import json
+import threading
+import time
 import unittest
 import wave
 from pathlib import Path
@@ -231,6 +233,130 @@ class JobRunTests(unittest.TestCase):
             self.assertEqual(job["status"], "error")
             self.assertIn("vision pass failed", job["error"])
             self.assertNotIn("Traceback", job["error"])
+
+    def test_a_cancel_during_mux_is_not_overwritten_by_done(self) -> None:
+        """Terminal-state uniqueness: the real DELETE door fires while the
+        phase thread is inside mux; the thread must not stamp `done` over it."""
+        with TemporaryDirectory() as td:
+            job = self._job(td)
+            job["created"] = job["touched"] = time.time()
+            with voiceover_api._LOCK:
+                voiceover_api.JOBS[job["id"]] = job
+            try:
+                def late_cancel(v, t, o):
+                    Path(o).write_bytes(b"mp4")
+                    voiceover_api.cancel(job["id"])
+
+                stubs = self._stubs()
+                stubs["mux"] = mock.patch.object(voiceover_api.voiceover, "mux",
+                                                 side_effect=late_cancel)
+                self._run(job, stubs)
+            finally:
+                with voiceover_api._LOCK:
+                    voiceover_api.JOBS.pop(job["id"], None)
+        self.assertEqual(job["status"], "cancelled")
+        self.assertIsNone(job["result"])
+
+
+class AdmissionTests(unittest.TestCase):
+    """The door is a HELD permit. A worker that dies without reaching an
+    `except` must not leave MAX_ACTIVE shut for the whole running-TTL."""
+
+    def setUp(self) -> None:
+        admit = mock.patch.object(voiceover_api, "_ADMIT",
+                                  threading.BoundedSemaphore(1))
+        admit.start()
+        self.addCleanup(admit.stop)
+
+    def _job(self, td: str) -> dict:
+        wd = Path(td) / "job"
+        wd.mkdir(exist_ok=True)
+        return {"id": "a1", "status": "running", "step": "fetch",
+                "steps": [{"key": k, "label": l, "state": "pending"}
+                          for k, l in voiceover_api.STEPS],
+                "partial": {}, "error": None,
+                "source": {"kind": "upload", "title": "clip",
+                           "path": str(wd / "in.mp4")},
+                "character_id": "ada", "style": "", "language": "",
+                "brain": None, "result": None, "limits": [],
+                "work_dir": str(wd), "cancel": False, "permit": True,
+                "created": 0.0, "touched": 0.0}
+
+    def test_a_worker_killed_by_a_base_exception_frees_the_door(self) -> None:
+        self.assertTrue(voiceover_api._acquire_admission())
+        with TemporaryDirectory() as td:
+            job = self._job(td)
+            with mock.patch.object(voiceover_api.brain_mod, "make_brain",
+                                   side_effect=KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    voiceover_api._run_job(job)
+            # the job is still wedged at "running" — that is exactly why the
+            # door may not be derived from job status
+            self.assertEqual(job["status"], "running")
+        self.assertTrue(voiceover_api._acquire_admission(),
+                        "the permit was not returned by the finally")
+
+    def test_the_permit_comes_back_exactly_once(self) -> None:
+        self.assertTrue(voiceover_api._acquire_admission())
+        with TemporaryDirectory() as td:
+            job = self._job(td)
+            voiceover_api._release_admission(job)
+            voiceover_api._release_admission(job)  # a no-op, not a boom
+        self.assertTrue(voiceover_api._acquire_admission())
+        self.assertFalse(voiceover_api._acquire_admission())
+
+
+class ReapTests(unittest.TestCase):
+    """Cancelling a finished job must not pull narrated.mp4 out from under a
+    download that is already streaming: deletion is deferred to `_gc`."""
+
+    def setUp(self) -> None:
+        reap = mock.patch.object(voiceover_api, "_REAP", [])
+        reap.start()
+        self.addCleanup(reap.stop)
+
+    def test_cancel_on_a_terminal_job_defers_the_delete(self) -> None:
+        with TemporaryDirectory() as td:
+            wd = Path(td) / "job"
+            wd.mkdir()
+            (wd / "narrated.mp4").write_bytes(b"mp4")
+            job = {"id": "v1", "status": "done", "work_dir": str(wd),
+                   "cancel": False, "created": time.time(),
+                   "touched": time.time()}
+            with voiceover_api._LOCK:
+                voiceover_api.JOBS[job["id"]] = job
+            try:
+                voiceover_api.cancel("v1")
+                self.assertNotIn("v1", voiceover_api.JOBS)
+                self.assertTrue((wd / "narrated.mp4").is_file(),
+                                "the artifact was deleted under a live reader")
+                self.assertEqual(len(voiceover_api._REAP), 1)
+                voiceover_api._REAP[:] = [(0.0, str(wd))]
+                voiceover_api._gc()
+                self.assertFalse(wd.exists())
+            finally:
+                with voiceover_api._LOCK:
+                    voiceover_api.JOBS.pop("v1", None)
+
+    def test_cancel_on_a_running_job_never_touches_its_work_dir(self) -> None:
+        with TemporaryDirectory() as td:
+            wd = Path(td) / "job"
+            wd.mkdir()
+            (wd / "track.wav").write_bytes(b"wav")
+            job = {"id": "v2", "status": "running", "work_dir": str(wd),
+                   "cancel": False, "created": time.time(),
+                   "touched": time.time()}
+            with voiceover_api._LOCK:
+                voiceover_api.JOBS[job["id"]] = job
+            try:
+                voiceover_api.cancel("v2")
+                self.assertEqual(job["status"], "cancelled")
+                self.assertTrue(job["cancel"])
+                self.assertTrue((wd / "track.wav").is_file())
+                self.assertEqual(voiceover_api._REAP, [])
+            finally:
+                with voiceover_api._LOCK:
+                    voiceover_api.JOBS.pop("v2", None)
 
 
 def frames_scene(i: int, start: float, end: float):

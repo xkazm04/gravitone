@@ -9,8 +9,8 @@ discipline ingest has, scaled to its simpler life:
     voiceover is a render, not an hour of a user's curation; re-running it
     costs a click, so the honest TTL answer after a restart is "expired".
   * every handler is `def` (threadpool), the phase work runs on ONE thread
-    per job, and admission is a bounded counter that answers 429 — never a
-    queue.
+    per job, and admission is a HELD PERMIT that answers 429 — never a queue,
+    and never a count derived from job status (see `_ADMIT`).
   * failures reach the client as authored sentences; everything else is
     sanitized through `errors.sanitize_detail` and logged against the job.
 
@@ -55,9 +55,26 @@ LINE_TIMEOUT_S = float(_str("VOICEOVER_LINE_TIMEOUT", "") or 120)
 
 _TTL_S = 30 * 60          # idle terminal jobs
 _RUNNING_TTL_S = 120 * 60  # a wedged run must not hold its slot forever
+#: A work dir is NEVER deleted the instant its job dies: a `FileResponse` for
+#: narrated.mp4 / track.wav / script.json may still be streaming out of it.
+#: Every deletion of a dir whose id a client has seen is deferred by this grace
+#: and performed by `_gc` — one reclamation path, so no door has to reason
+#: about who might be reading.
+_REAP_GRACE_S = 60
 
 JOBS: dict[str, dict] = {}
 _LOCK = threading.Lock()
+#: (deadline, work_dir) — the ONLY place a live job's work dir leaves disk.
+_REAP: list[tuple[float, str]] = []
+
+#: Admission is a HELD PERMIT, not a count derived from job status — the same
+#: discipline `engine.py` runs on, and the same fix `revoice_api` took. A count
+#: says "the door is free" the moment a worker stops writing `running`, which a
+#: worker killed by process exit or a BaseException never gets to do: the old
+#: `_active()` left MAX_ACTIVE=1 shut for the whole _RUNNING_TTL_S window.
+#: `_run_job` releases in a `finally`, so every exit path — return, exception,
+#: BaseException, cancel — frees it.
+_ADMIT = threading.BoundedSemaphore(max(MAX_ACTIVE, 0))
 
 STEPS = (("fetch", "fetching the video"),
          ("scenes", "cutting it into scenes"),
@@ -74,7 +91,7 @@ _PUBLIC_KEYS = ("id", "status", "step", "steps", "partial", "error", "source",
 # ── registry plumbing ─────────────────────────────────────────────────────────
 
 def _new_job(source: dict, character_id: str, style: str,
-             language: str) -> dict:
+             language: str, *, permit: bool = False) -> dict:
     job_id = uuid.uuid4().hex[:12]
     wd = WORK_DIR / job_id
     wd.mkdir(parents=True, exist_ok=True)
@@ -84,7 +101,7 @@ def _new_job(source: dict, character_id: str, style: str,
            "partial": {}, "error": None, "source": source,
            "character_id": character_id, "style": style, "language": language,
            "brain": None, "result": None, "limits": [],
-           "work_dir": str(wd), "cancel": False,
+           "work_dir": str(wd), "cancel": False, "permit": bool(permit),
            "created": time.time(), "touched": time.time()}
     with _LOCK:
         JOBS[job_id] = job
@@ -124,9 +141,29 @@ def _partial(job: dict, d: dict) -> None:
         job["partial"].update(d)
 
 
+def _finish(job: dict, status: str, **fields) -> None:
+    """Write a job's ONE terminal state — first writer wins.
+
+    `cancel()` may flip a running job to `cancelled` while the phase thread is
+    mid-mux; that thread then finishes muxing and used to stamp `done` over the
+    top, so a job could report two terminal states depending on who read it
+    when. A job leaves `running` exactly once.
+    """
+    with _LOCK:
+        if job["status"] != "running":
+            return
+        job.update(fields)
+        job["status"] = status
+        job["touched"] = time.time()
+
+
+def _schedule_reap(work_dir: str) -> None:
+    """Hand a work dir to `_gc`, `_REAP_GRACE_S` from now. Callers hold _LOCK."""
+    _REAP.append((time.time() + _REAP_GRACE_S, work_dir))
+
+
 def _gc() -> None:
     now = time.time()
-    doomed: list[dict] = []
     with _LOCK:
         for job in list(JOBS.values()):
             idle = now - job["touched"]
@@ -136,14 +173,46 @@ def _gc() -> None:
             # run even when a poller keeps touching it — a job that has been
             # "running" for two hours is not going to finish.
             if (done and idle > _TTL_S) or age > _RUNNING_TTL_S:
-                doomed.append(JOBS.pop(job["id"]))
-    for job in doomed:
-        shutil.rmtree(job["work_dir"], ignore_errors=True)
+                _schedule_reap(JOBS.pop(job["id"])["work_dir"])
+        due = [w for deadline, w in _REAP if deadline <= now]
+        _REAP[:] = [(d, w) for d, w in _REAP if d > now]
+    for work_dir in due:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
-def _active() -> int:
+def _acquire_admission() -> bool:
+    return _ADMIT.acquire(blocking=False)
+
+
+def _release_admission(job: dict) -> None:
+    """Hand back this job's permit, at most once.
+
+    Idempotent by construction: the flag is popped under the lock, so two
+    callers racing (a door that failed to start its thread, the worker's
+    `finally`) cannot double-release a BoundedSemaphore.
+    """
     with _LOCK:
-        return sum(1 for j in JOBS.values() if j["status"] == "running")
+        held = bool(job.pop("permit", False))
+    if held:
+        _ADMIT.release()
+
+
+def _abandon_at_the_door(job: dict | None) -> None:
+    """Undo a job the door built but never handed to a phase thread.
+
+    No `_run_job` will ever run its `finally` for it, so the door is the only
+    one left who can give the permit back. `job is None` means the failure beat
+    `_new_job` and the permit is the only thing to return. This is also the ONE
+    deletion that skips the reap grace: the job id was never returned to any
+    client, so no `FileResponse` can be streaming out of that dir.
+    """
+    if job is None:
+        _ADMIT.release()
+        return
+    with _LOCK:
+        JOBS.pop(job["id"], None)
+    _release_admission(job)
+    shutil.rmtree(job["work_dir"], ignore_errors=True)
 
 
 def _busy() -> JSONResponse:
@@ -275,16 +344,22 @@ def _run_job(job: dict) -> None:
         voiceover.dump_script(wd / "script.json", lines)
         voiceover.mux(video, wd / "track.wav", wd / "narrated.mp4")
         _step(job, "mux", "done")
-        _update(job, status="done",
+        _finish(job, "done",
                 result={"summary": voiceover.summarize(fit), "fit": fit})
     except _Cancelled:
         logger.info("voiceover job %s: abandoned (cancelled)", job["id"])
+        _finish(job, "cancelled")
     except _AUTHORED as exc:
-        _update(job, status="error", error=str(exc))
+        _finish(job, "error", error=str(exc))
     except Exception as exc:  # noqa: BLE001 - the boundary; sanitize and log
         logger.exception("voiceover job %s failed", job["id"])
-        _update(job, status="error",
+        _finish(job, "error",
                 error=errors.sanitize_detail("narrating this video", exc))
+    finally:
+        # The permit is released HERE and only here for a started job: a
+        # BaseException (or a worker torn down mid-flight) skips every `except`
+        # above but never this.
+        _release_admission(job)
 
 
 class _Cancelled(Exception):
@@ -336,15 +411,20 @@ def from_url(req: FromUrlReq):
         return JSONResponse(status_code=422, content={"detail": (
             f"that video is under {MIN_SECONDS:.0f} seconds — there is "
             "nothing to narrate")})
-    if _active() >= MAX_ACTIVE:
+    if not _acquire_admission():
         return _busy()
     trimmed = info.duration > MAX_SECONDS
-    job = _new_job({"kind": "url", "url": url, "title": info.title,
-                    "trimmed": trimmed,
-                    "clip_seconds": min(info.duration, MAX_SECONDS)},
-                   req.character_id, req.style, req.language)
-    threading.Thread(target=_run_job, args=(job,),
-                     name=f"voiceover-{job['id']}", daemon=True).start()
+    job = None
+    try:
+        job = _new_job({"kind": "url", "url": url, "title": info.title,
+                        "trimmed": trimmed,
+                        "clip_seconds": min(info.duration, MAX_SECONDS)},
+                       req.character_id, req.style, req.language, permit=True)
+        threading.Thread(target=_run_job, args=(job,),
+                         name=f"voiceover-{job['id']}", daemon=True).start()
+    except BaseException:
+        _abandon_at_the_door(job)
+        raise
     return {"job_id": job["id"], "source": job["source"]}
 
 
@@ -357,33 +437,36 @@ def upload(video: UploadFile = File(...), character_id: str = Form(...),
     refused = _refuse_unready(character_id)
     if refused is not None:
         return refused
-    if _active() >= MAX_ACTIVE:
+    if not _acquire_admission():
         return _busy()
-    job = _new_job({"kind": "upload",
-                    "title": video.filename or "uploaded video"},
-                   character_id, style, language)
-    wd = Path(job["work_dir"])
-    dst = wd / "upload-src.bin"
-    cap = ingest_url.VIDEO_MAX_BYTES
-    written = 0
-    with dst.open("wb") as out:
-        while True:
-            chunk = video.file.read(1 << 20)
-            if not chunk:
-                break
-            written += len(chunk)
-            if written > cap:
-                out.close()
-                shutil.rmtree(wd, ignore_errors=True)
-                with _LOCK:
-                    JOBS.pop(job["id"], None)
-                return JSONResponse(status_code=413, content={"detail": (
-                    f"that file is over the {cap // (1024 * 1024)} MB "
-                    "ceiling for uploaded video")})
-            out.write(chunk)
-    job["source"]["path"] = str(dst)
-    threading.Thread(target=_run_job, args=(job,),
-                     name=f"voiceover-{job['id']}", daemon=True).start()
+    job = None
+    try:
+        job = _new_job({"kind": "upload",
+                        "title": video.filename or "uploaded video"},
+                       character_id, style, language, permit=True)
+        wd = Path(job["work_dir"])
+        dst = wd / "upload-src.bin"
+        cap = ingest_url.VIDEO_MAX_BYTES
+        written = 0
+        with dst.open("wb") as out:
+            while True:
+                chunk = video.file.read(1 << 20)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > cap:
+                    out.close()
+                    _abandon_at_the_door(job)
+                    return JSONResponse(status_code=413, content={"detail": (
+                        f"that file is over the {cap // (1024 * 1024)} MB "
+                        "ceiling for uploaded video")})
+                out.write(chunk)
+        job["source"]["path"] = str(dst)
+        threading.Thread(target=_run_job, args=(job,),
+                         name=f"voiceover-{job['id']}", daemon=True).start()
+    except BaseException:
+        _abandon_at_the_door(job)
+        raise
     return {"job_id": job["id"], "source": {"kind": "upload",
                                             "title": job["source"]["title"]}}
 
@@ -446,13 +529,17 @@ def cancel(job_id: str):
         return errors.job_expired()
     with _LOCK:
         job["cancel"] = True
-        running = job["status"] == "running"
-        if running:
-            # the phase thread sees the flag at its next boundary and stops;
-            # its workdir is reclaimed by _gc, not yanked from under it.
+        job["touched"] = time.time()
+        if job["status"] == "running":
+            # The phase thread sees the flag at its next boundary and stops. It
+            # keeps its admission permit until it actually does — the box IS
+            # still busy until then — and its work dir is reclaimed by `_gc`,
+            # never yanked from under it.
             job["status"] = "cancelled"
         else:
+            # Terminal already: the artifacts may be mid-download. Drop the job
+            # from the registry (so the next poll is an honest 404) but let the
+            # reap grace expire before the bytes go.
             JOBS.pop(job_id, None)
-    if not running:
-        shutil.rmtree(job["work_dir"], ignore_errors=True)
+            _schedule_reap(job["work_dir"])
     return {"status": "cancelled"}
