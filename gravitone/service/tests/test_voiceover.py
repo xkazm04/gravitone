@@ -94,6 +94,48 @@ class BuildTrackTests(unittest.TestCase):
         _, fit = voiceover.build_track(lines, scenes, video_seconds=8)
         self.assertAlmostEqual(fit[0]["clipped_seconds"], 4.0, places=1)
 
+    def test_spill_names_the_scenes_it_steps_on(self) -> None:
+        """A 12s line at a 5s scene plays over the two scenes that follow it.
+        The aggregate says HOW MUCH; the attribution says ON WHOM."""
+        scenes = _scenes((0, 5), (5, 10), (10, 15), (15, 20))
+        lines = [{"scene": 0, "text": "long", "emotion": "baseline",
+                  "wav": _wav(12.0), "seconds": 12.0}]
+        lines += [{"scene": i, "text": "", "emotion": "baseline"}
+                  for i in (1, 2, 3)]
+        _, fit = voiceover.build_track(lines, scenes, video_seconds=20)
+        self.assertAlmostEqual(fit[0]["spill_seconds"], 7.0, places=1)
+        self.assertEqual(fit[0]["spills_into"],
+                         [{"scene": 1, "seconds": 5.0},
+                          {"scene": 2, "seconds": 2.0}])
+        self.assertEqual(fit[1]["spilled_over_by"],
+                         [{"scene": 0, "seconds": 5.0}])
+        self.assertEqual(fit[2]["spilled_over_by"],
+                         [{"scene": 0, "seconds": 2.0}])
+        self.assertEqual(fit[3]["spilled_over_by"], [])
+        self.assertEqual(voiceover.summarize(fit)["spilled_on"], 2)
+
+    def test_a_line_that_fits_steps_on_nobody(self) -> None:
+        scenes = _scenes((0, 10), (10, 20))
+        lines = [{"scene": 0, "text": "ok", "emotion": "baseline",
+                  "wav": _wav(3.0), "seconds": 3.0},
+                 {"scene": 1, "text": "", "emotion": "baseline"}]
+        _, fit = voiceover.build_track(lines, scenes, video_seconds=20)
+        self.assertEqual(fit[0]["spills_into"], [])
+        self.assertEqual(fit[1]["spilled_over_by"], [])
+        self.assertEqual(voiceover.summarize(fit)["spilled_on"], 0)
+
+    def test_attribution_stops_at_the_video_end_like_the_audio_does(self) -> None:
+        """Only what is IN the track is attributed: seconds clipped off the end
+        of the video never played over anything."""
+        scenes = _scenes((0, 5), (5, 10))
+        lines = [{"scene": 0, "text": "long", "emotion": "baseline",
+                  "wav": _wav(12.0), "seconds": 12.0},
+                 {"scene": 1, "text": "", "emotion": "baseline"}]
+        _, fit = voiceover.build_track(lines, scenes, video_seconds=10)
+        self.assertAlmostEqual(fit[0]["clipped_seconds"], 2.0, places=1)
+        self.assertEqual(fit[0]["spills_into"],
+                         [{"scene": 1, "seconds": 5.0}])
+
     def test_a_failed_line_is_a_named_entry_not_a_hole(self) -> None:
         scenes = _scenes((0, 10))
         lines = [{"scene": 0, "text": "x", "emotion": "baseline",

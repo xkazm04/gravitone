@@ -245,17 +245,25 @@ def build_track(lines: list[dict], scenes: list[dict], *,
     NOT clipped — it spills into the next scene (that is how human narration
     behaves) and the spill is measured. Overlapping spill is mixed, not
     truncated, then soft-clipped back into range.
+
+    Spill is reported TWICE, because it is two different facts. `spill_seconds`
+    is the line's own overrun against its own budget — true, but it names no
+    victim. `spills_into` / `spilled_over_by` say which scenes the audio
+    actually plays across, measured off what was written into the track. See
+    `_attribute_spill`.
     """
     total = int(round(video_seconds * rate))
     track = np.zeros(total, dtype=np.float64)
     by_scene = {s["i"]: s for s in scenes}
     fit: list[dict] = []
+    spans: list[tuple[dict, int, int]] = []
     for line in lines:
         entry = {"scene": line["scene"], "text": line["text"],
                  "emotion": line.get("emotion_used") or line["emotion"],
                  "stem_fallback": line.get("stem_fallback", False),
                  "seconds": line.get("seconds"),
                  "budget_seconds": None, "spill_seconds": 0.0,
+                 "spills_into": [], "spilled_over_by": [],
                  "clipped_seconds": 0.0, "silent": not line["text"],
                  "error": line.get("error")}
         s = by_scene.get(line["scene"])
@@ -273,6 +281,7 @@ def build_track(lines: list[dict], scenes: list[dict], *,
             fit.append(entry)
             continue
         track[start:end] += samples[:end - start]
+        spans.append((entry, start, end))
         clipped = (len(samples) - (end - start)) / rate
         if clipped > 0.01:
             entry["clipped_seconds"] = round(clipped, 2)
@@ -281,6 +290,7 @@ def build_track(lines: list[dict], scenes: list[dict], *,
         if spoken > budget + 0.05:
             entry["spill_seconds"] = round(spoken - budget, 2)
         fit.append(entry)
+    _attribute_spill(fit, spans, scenes, rate)
     peak = float(np.max(np.abs(track))) if total else 0.0
     if peak > 1.0:  # spill overlaps can sum past full scale; keep it honest audio
         track /= peak
@@ -292,6 +302,58 @@ def build_track(lines: list[dict], scenes: list[dict], *,
         w.setframerate(rate)
         w.writeframes(pcm.tobytes())
     return buf.getvalue(), fit
+
+
+#: Seconds of overlap below which "it plays over that scene" is a rounding
+#: artefact, not something a narrator would act on. Same epsilon the own-budget
+#: spill test uses.
+_SPILL_EPSILON_S = 0.05
+
+
+def _scene_bounds(s: dict) -> tuple[float, float]:
+    start = float(s["start"])
+    if s.get("end") is not None:
+        return start, float(s["end"])
+    return start, start + float(s.get("dur") or 0.0)
+
+
+def _attribute_spill(fit: list[dict], spans: list[tuple[dict, int, int]],
+                     scenes: list[dict], rate: int) -> None:
+    """Name the scenes a line's overrun actually steps on.
+
+    `spill_seconds` measures a line against its OWN scene's budget. That is a
+    true number and it names no victim — which is the one thing a narrator
+    fixing the script needs to know, since lines are placed at their scene's
+    true start, are never compressed, and are additively mixed. A long line
+    audibly plays across whatever follows it.
+
+    So this walks the spans actually written into the track — post-clipping,
+    against the real scene bounds — and records every overlap in BOTH
+    directions: `spills_into` on the line that ran long, `spilled_over_by` on
+    the scene that has someone else's narration playing over it. Nothing here
+    changes what is rendered; it makes the existing behaviour legible.
+    """
+    if not spans:
+        return
+    bounds = [(s["i"], *_scene_bounds(s)) for s in scenes]
+    by_scene: dict[int, dict] = {}
+    for entry in fit:
+        by_scene.setdefault(entry["scene"], entry)
+    for entry, a, b in spans:
+        for i, s_start, s_end in bounds:
+            if i == entry["scene"]:
+                continue
+            lo = max(a, int(round(s_start * rate)))
+            hi = min(b, int(round(s_end * rate)))
+            seconds = (hi - lo) / rate
+            if seconds <= _SPILL_EPSILON_S:
+                continue
+            seconds = round(seconds, 2)
+            entry["spills_into"].append({"scene": i, "seconds": seconds})
+            victim = by_scene.get(i)
+            if victim is not None:
+                victim["spilled_over_by"].append(
+                    {"scene": entry["scene"], "seconds": seconds})
 
 
 def _wav_to_float(wav_bytes: bytes, rate: int) -> np.ndarray:
@@ -334,6 +396,9 @@ def summarize(fit: list[dict]) -> dict:
         "failed": sum(1 for f in fit if f.get("error")),
         "stem_fallbacks": sum(1 for f in fit if f.get("stem_fallback")),
         "spilling": sum(1 for f in fit if f["spill_seconds"]),
+        # How many scenes are being NARRATED OVER — the other half of
+        # `spilling`, which only counts the lines doing it.
+        "spilled_on": sum(1 for f in fit if f.get("spilled_over_by")),
         "clipped": sum(1 for f in fit if f["clipped_seconds"]),
         "narration_seconds": round(sum(f["seconds"] or 0.0 for f in spoken), 1),
     }
