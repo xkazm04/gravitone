@@ -2,13 +2,12 @@
 
 import AppFrame from "@/components/ui/AppFrame";
 import PrototypeTabs from "@/components/ui/PrototypeTabs";
-import DirectorConsole from "./_variants/DirectorConsole";
 import PlaygroundConsole from "./_variants/PlaygroundConsole";
-import Storyboard from "./_variants/Storyboard";
 
-// Round 2 of the playground loop: the Console (round-one winner) stays the
-// baseline tab; two new variants fuse its TTS direction with the video side
-// (scenes, frames, fit) on the voiceover backend.
+// The video round. All three tabs are THE SAME console — same character rail,
+// same score, same emotion wheel, same expression knobs, same take log — so
+// what is being compared is only the thing under review: where the picture
+// belongs in a console that already works.
 export default function PlaygroundPage() {
   return (
     <AppFrame>
@@ -16,9 +15,9 @@ export default function PlaygroundPage() {
         <PrototypeTabs
           storageKey="proto-playground-video"
           variants={[
-            { id: "console", label: "Console", sub: "round-one winner", node: <PlaygroundConsole /> },
-            { id: "director", label: "Director cut", sub: "one scene under the needle", node: <DirectorConsole /> },
-            { id: "storyboard", label: "Storyboard", sub: "every scene on the desk", node: <Storyboard /> },
+            { id: "console", label: "Console", sub: "today, no picture", node: <PlaygroundConsole /> },
+            { id: "bay", label: "Reel bay", sub: "picture inside the composer", node: <PlaygroundConsole video="bay" /> },
+            { id: "marquee", label: "Marquee", sub: "picture above everything", node: <PlaygroundConsole video="marquee" /> },
           ]}
         />
       </div>
