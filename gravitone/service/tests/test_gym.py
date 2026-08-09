@@ -14,8 +14,10 @@ import contextlib
 import dataclasses
 import io
 import json
+import os
 import shutil
 import tempfile
+import threading
 import time
 import unittest
 import wave
@@ -440,6 +442,21 @@ class CompareTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "pass")
         self.assertEqual(result["thresholds"]["answer_s_regression_abs_max_s"], 5.0)
 
+    def test_a_wrong_schema_artifact_fails_rather_than_scoring_nothing(self) -> None:
+        """The CLI and the suite call compare() directly - the 422 on the HTTP
+        surface never sees them. A comparison handed in where a run belongs has
+        no turns, so every other check passes vacuously."""
+        result = gym.compare(make_run(), {"schema": gym.COMPARE_SCHEMA})
+        self.assertEqual(result["verdict"], "fail")
+        self.assertIn("comparable_schema", self._failed(result))
+        self.assertIn(gym.COMPARE_SCHEMA, result["checks"][0]["got"])
+
+    def test_an_older_run_schema_on_the_baseline_side_fails_too(self) -> None:
+        stale = make_run()
+        stale["schema"] = "gravitone-gym-run/0"
+        self.assertIn("comparable_schema",
+                      self._failed(gym.compare(stale, make_run())))
+
     def test_two_pacings_are_not_compared_on_latency(self) -> None:
         """A run streamed in real time and one blasted in are two experiments."""
         slower = make_run(pace=1.0)
@@ -463,6 +480,168 @@ class CompareTests(unittest.TestCase):
     @staticmethod
     def _failed(result: dict) -> list[str]:
         return [c["check"] for c in result["checks"] if not c["pass"]]
+
+
+class BaselineWriteTests(unittest.TestCase):
+    """A baseline is written the way `recording.save_care` writes care marks:
+    atomically, and behind a cross-process lock. Two suite runners (two CI
+    shards, or a studio replay racing a CI job) are not hypothetical."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_a_written_baseline_carries_its_stamp(self) -> None:
+        path = self.tmp / "baselines" / "case.json"
+        gym.write_baseline(path, make_run(), gym.THRESHOLDS)
+        stored = json.loads(path.read_text("utf-8"))
+        self.assertEqual(stored["schema"], gym.RUN_SCHEMA)
+        stamp = stored["baseline"]
+        self.assertEqual(stamp["schema"], gym.BASELINE_SCHEMA)
+        self.assertEqual(stamp["check_set"], gym.CHECK_SET)
+        self.assertEqual(stamp["thresholds"], sorted(gym.THRESHOLDS))
+        self.assertGreater(stamp["written_at"], 0)
+        # A stamped baseline is still a run artifact compare() will score.
+        self.assertEqual(gym.compare(stored, make_run())["verdict"], "pass")
+        self.assertIsNone(gym.baseline_staleness(stored, gym.THRESHOLDS))
+
+    def test_concurrent_writers_serialize_and_leave_one_whole_file(self) -> None:
+        """The lock is the claim, so the test watches for OVERLAP rather than
+        only for a readable result: an unlocked writer usually still leaves
+        valid JSON (os.replace is atomic), which is exactly why a corruption
+        check alone would pass on the bug this guards."""
+        path = self.tmp / "baselines" / "case.json"
+        inside = 0
+        overlaps = []
+        real = gym.atomic_write_text
+        guard = threading.Lock()
+
+        def watched(target, text, encoding="utf-8"):
+            nonlocal inside
+            with guard:
+                inside += 1
+                if inside > 1:
+                    overlaps.append(inside)
+            time.sleep(0.02)      # widen the window a lock has to close
+            real(target, text, encoding)
+            with guard:
+                inside -= 1
+
+        gym.atomic_write_text = watched
+        self.addCleanup(setattr, gym, "atomic_write_text", real)
+
+        errors: list[BaseException] = []
+
+        def write(n: int) -> None:
+            try:
+                gym.write_baseline(path, make_run(n=n), gym.THRESHOLDS)
+            except BaseException as exc:   # noqa: BLE001 - reported, not hidden
+                errors.append(exc)
+
+        threads = [threading.Thread(target=write, args=(i,)) for i in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(overlaps, [], "two writers were inside the write at once")
+        stored = json.loads(path.read_text("utf-8"))   # whole, not torn
+        self.assertIn(stored["run_id"], {f"r{i}" for i in range(6)})
+        self.assertEqual(stored["baseline"]["check_set"], gym.CHECK_SET)
+        # The lock file is released, not leaked - the next runner must not wait
+        # out `LOCK_STALE_S` for a lock nobody holds.
+        self.assertFalse((path.parent / f".{path.name}.lock").exists())
+
+
+class BaselineStalenessTests(unittest.TestCase):
+    def test_a_current_baseline_is_not_stale(self) -> None:
+        written = dict(make_run(), baseline=gym.baseline_stamp(gym.THRESHOLDS))
+        self.assertIsNone(gym.baseline_staleness(written, gym.THRESHOLDS))
+
+    def test_a_baseline_with_no_stamp_is_stale(self) -> None:
+        """Everything written before this stamp existed. Unknown provenance is
+        treated as wrong provenance, because the alternative is a verdict."""
+        why = gym.baseline_staleness(make_run(), gym.THRESHOLDS)
+        self.assertIsNotNone(why)
+        self.assertIn("no baseline stamp", why)
+
+    def test_an_older_check_set_is_stale(self) -> None:
+        written = dict(make_run(), baseline=dict(
+            gym.baseline_stamp(gym.THRESHOLDS), check_set="gravitone-gym-checks/0"))
+        why = gym.baseline_staleness(written, gym.THRESHOLDS)
+        self.assertIn("gravitone-gym-checks/0", why)
+        self.assertIn(gym.CHECK_SET, why)
+
+    def test_a_new_threshold_makes_an_old_baseline_stale_by_name(self) -> None:
+        """A check added since the baseline was minted was never scored on it."""
+        older = {k: v for k, v in gym.THRESHOLDS.items() if k != "wer_drift_max"}
+        written = dict(make_run(), baseline=gym.baseline_stamp(older))
+        why = gym.baseline_staleness(written, gym.THRESHOLDS)
+        self.assertIn("wer_drift_max", why)
+
+    def test_a_retuned_threshold_value_is_not_staleness(self) -> None:
+        """Editing a bar in suite.json is a decision about the current run."""
+        written = dict(make_run(), baseline=gym.baseline_stamp(gym.THRESHOLDS))
+        self.assertIsNone(gym.baseline_staleness(
+            written, dict(gym.THRESHOLDS, wer_drift_max=0.5)))
+
+    def test_a_non_run_document_is_stale_before_anything_else(self) -> None:
+        why = gym.baseline_staleness({"schema": gym.SUITE_SCHEMA}, gym.THRESHOLDS)
+        self.assertIn(gym.RUN_SCHEMA, why)
+
+
+class RetentionTests(unittest.TestCase):
+    """`gym-runs` is CI scratch and gets a retention pass of its own, in the
+    shape `recording.evict_oldest` established."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.runs = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    def make_runs(self, count: int) -> list[Path]:
+        made = []
+        for i in range(count):
+            d = self.runs / f"conv{i:03d}"
+            d.mkdir()
+            (d / "transcript.json").write_text("{}", "utf-8")
+            (d / "user.wav").write_bytes(b"RIFF")
+            os.utime(d, (1_700_000_000 + i, 1_700_000_000 + i))
+            made.append(d)
+        return made
+
+    def test_the_oldest_runs_go_and_the_newest_stay(self) -> None:
+        made = self.make_runs(8)
+        self.assertEqual(gym.evict_runs(self.runs, limit=3), 5)
+        self.assertEqual(sorted(d.name for d in self.runs.iterdir()),
+                         [d.name for d in made[-3:]])
+
+    def test_under_the_limit_nothing_is_touched(self) -> None:
+        self.make_runs(3)
+        self.assertEqual(gym.evict_runs(self.runs, limit=gym.MAX_RUNS), 0)
+        self.assertEqual(len(list(self.runs.iterdir())), 3)
+
+    def test_a_directory_that_does_not_exist_is_not_an_error(self) -> None:
+        self.assertEqual(gym.evict_runs(self.runs / "never", limit=1), 0)
+
+
+class ReplayRetentionTests(_GymCase):
+    def test_a_replay_evicts_the_runs_before_it(self) -> None:
+        """Symmetric with `recording.close()`: the run that just finished is the
+        newest, so it is never the one evicted."""
+        self.runs.mkdir(parents=True, exist_ok=True)
+        stale = self.runs / "ancient"
+        stale.mkdir()
+        (stale / "transcript.json").write_text("{}", "utf-8")
+        original = gym.MAX_RUNS
+        gym.MAX_RUNS = 1
+        self.addCleanup(setattr, gym, "MAX_RUNS", original)
+
+        run = self.replay(self.golden())
+        self.assertFalse(stale.exists())
+        self.assertTrue((self.runs / run["conversation_id"]).is_dir())
 
 
 class RealComparisonTests(_GymCase):
@@ -548,6 +727,77 @@ class SuiteTests(_GymCase):
         self.assertEqual([c["verdict"] for c in result["cases"]],
                          ["error", "pass"])
         self.assertEqual(result["verdict"], "fail")
+
+    def one_case_dir(self) -> Path:
+        """The same fixture trimmed to one case - a suite test that only needs
+        the baseline machinery should not pay for two replays."""
+        root = self.suite_dir()
+        suite = json.loads((root / "suite.json").read_text("utf-8"))
+        suite["cases"] = suite["cases"][:1]
+        (root / "suite.json").write_text(json.dumps(suite), "utf-8")
+        return root
+
+    def test_the_written_baseline_is_stamped_with_its_check_set(self) -> None:
+        root = self.one_case_dir()
+        gym.run_suite(root, app=appmod.app, work_dir=self.runs,
+                      update_baselines=True)
+        stamp = json.loads((root / "baselines" / "two-turns.json")
+                           .read_text("utf-8"))["baseline"]
+        self.assertEqual(stamp["check_set"], gym.CHECK_SET)
+        self.assertEqual(stamp["run_schema"], gym.RUN_SCHEMA)
+
+    def test_a_stale_baseline_is_refused_rather_than_scored(self) -> None:
+        """A baseline minted under an older check set answers a different
+        question. Comparing it anyway produces a verdict that looks like
+        evidence, which is worse than no verdict at all."""
+        root = self.one_case_dir()
+        gym.run_suite(root, app=appmod.app, work_dir=self.runs,
+                      update_baselines=True)
+        path = root / "baselines" / "two-turns.json"
+        baseline = json.loads(path.read_text("utf-8"))
+        baseline["baseline"]["check_set"] = "gravitone-gym-checks/0"
+        path.write_text(json.dumps(baseline), "utf-8")
+
+        result = gym.run_suite(root, app=appmod.app, work_dir=self.runs)
+        self.assertEqual(result["verdict"], "fail")
+        case = result["cases"][0]
+        self.assertNotIn("comparison", case)   # never silently scored
+        failed = [c for c in case["checks"] if not c["pass"]]
+        self.assertEqual([c["check"] for c in failed], ["baseline_current"])
+        self.assertIn("gravitone-gym-checks/0", case["baseline"])
+        self.assertIn("--update-baselines", failed[0]["got"])
+
+    def test_a_baseline_from_before_the_stamp_existed_is_stale(self) -> None:
+        """The migration case: every baseline on disk today has no stamp."""
+        root = self.one_case_dir()
+        gym.run_suite(root, app=appmod.app, work_dir=self.runs,
+                      update_baselines=True)
+        path = root / "baselines" / "two-turns.json"
+        baseline = json.loads(path.read_text("utf-8"))
+        baseline.pop("baseline")
+        path.write_text(json.dumps(baseline), "utf-8")
+
+        result = gym.run_suite(root, app=appmod.app, work_dir=self.runs)
+        self.assertEqual(result["verdict"], "fail")
+        self.assertIn("no baseline stamp", result["cases"][0]["baseline"])
+
+    def test_update_baselines_replaces_a_stale_one_and_says_so(self) -> None:
+        root = self.one_case_dir()
+        gym.run_suite(root, app=appmod.app, work_dir=self.runs,
+                      update_baselines=True)
+        path = root / "baselines" / "two-turns.json"
+        baseline = json.loads(path.read_text("utf-8"))
+        baseline["baseline"]["check_set"] = "gravitone-gym-checks/0"
+        path.write_text(json.dumps(baseline), "utf-8")
+
+        result = gym.run_suite(root, app=appmod.app, work_dir=self.runs,
+                               update_baselines=True)
+        self.assertEqual(result["verdict"], "pass", result["cases"])
+        case = result["cases"][0]
+        self.assertIn("re-baselined", case["baseline"])
+        self.assertNotIn("comparison", case)
+        self.assertEqual(json.loads(path.read_text("utf-8"))["baseline"]
+                         ["check_set"], gym.CHECK_SET)
 
     def test_a_suite_with_no_cases_is_refused(self) -> None:
         root = self.tmp / "hollow"
@@ -684,6 +934,35 @@ class CliTests(_GymCase):
         path = self.tmp / name
         path.write_text(json.dumps(run), "utf-8")
         return str(path)
+
+    def _captured_run(self, argv) -> dict:
+        """`run` with the driver stubbed - what matters here is the ARGUMENTS
+        the CLI decided on, not another minute of replaying."""
+        seen: dict = {}
+        real = gym.replay
+
+        def fake(source, **kwargs):
+            seen.update(kwargs, source=source)
+            return make_run()
+
+        gym.replay = fake
+        try:
+            self._run_cli(argv)
+        finally:
+            gym.replay = real
+        return seen
+
+    def test_run_defaults_to_the_same_pace_the_api_and_library_use(self) -> None:
+        """One default experiment everywhere. A CLI that quietly ran in real
+        time produced runs nobody could compare with the baselines the suite
+        and POST /v1/convai/replay mint at pace 0."""
+        self.assertEqual(self._captured_run(["run", "x"])["pace"], 0.0)
+        self.assertEqual(gym.ReplayRequest(recording="x").pace, 0.0)
+        self.assertEqual(gym.replay.__kwdefaults__["pace"], 0.0)
+
+    def test_run_still_takes_real_time_when_it_is_asked_to(self) -> None:
+        self.assertEqual(
+            self._captured_run(["run", "x", "--pace", "1"])["pace"], 1.0)
 
     def test_compare_exits_zero_on_a_match(self) -> None:
         a = self._artifact("a.json", make_run())

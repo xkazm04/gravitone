@@ -50,9 +50,28 @@ reproduce the recording's interruptions instead of manufacturing its own. Set
 test barge-in behaviour on purpose. `compare()` refuses to score latency across
 two different pacings rather than quietly averaging them.
 
+One default pace, everywhere: the library, `POST /v1/convai/replay` and
+`python -m service.gym run` all default to `pace=0.0`, and real time is the
+thing you ask for. They disagreed once - the CLI defaulted to 1.0 - and the
+result was that a person who forgot `--pace 0` ran a different experiment from
+the one the suite mints baselines with, then compared the two. `compare()`
+catches that (`comparable_pacing`) rather than averaging it, but a default that
+needs a check to catch it is a default in the wrong place.
+
+**Baselines.** A suite baseline is a run artifact plus a `baseline` stamp
+saying which run schema, which CHECK SET and which threshold NAMES it was
+minted under. `run_suite` refuses to score a baseline whose stamp does not
+match the running gym: a baseline recorded to answer a different question
+cannot produce a verdict about this one, and "no comparison" reported as a pass
+is the silent apples-to-oranges the stamp exists to prevent. `--update-baselines`
+replaces a stale baseline and says so. Baselines are written through
+`atomicio.atomic_write_text` behind a `file_lock`, for `recording.save_care`'s
+reason: two CI shards (or a studio replay racing a CI job) are two processes,
+and `os.replace` prevents a torn file, never a lost update.
+
 CLI::
 
-    python -m service.gym run <recording> [--agent ID] [--out run.json]
+    python -m service.gym run <recording> [--agent ID] [--pace 1] [--out run.json]
     python -m service.gym compare before.json after.json
     python -m service.gym suite <dir> [--update-baselines]
 
@@ -82,6 +101,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from service import dialog, recording
+from service.atomicio import atomic_write_text, file_lock
 from service.config import SETTINGS
 
 logger = logging.getLogger("gravitone.gym")
@@ -93,6 +113,15 @@ router = APIRouter(tags=["convai"])
 RUN_SCHEMA = "gravitone-gym-run/1"
 COMPARE_SCHEMA = "gravitone-gym-compare/1"
 SUITE_SCHEMA = "gravitone-gym-suite/1"
+# The stamp a suite puts on a baseline it writes. A baseline is a run artifact
+# PLUS the question it was minted to answer, and the second half is what makes
+# it safe to compare against months later.
+BASELINE_SCHEMA = "gravitone-gym-baseline/1"
+# The version of the CHECK SET - bump this whenever a check is added, removed
+# or given different arithmetic. A baseline minted under an older check set was
+# recorded to answer a different question, and scoring it silently is how a
+# suite reports "pass" about checks that did not exist yet.
+CHECK_SET = "gravitone-gym-checks/1"
 
 # One frame is 100 ms of audio, which is what a browser client sends.
 FRAME_MS = 100
@@ -132,6 +161,15 @@ SPEECH_LEVEL = 500
 QUIET_FRAMES_TO_YIELD = 10
 # Whole-replay ceiling. A hung brain must fail the run, not the CI job.
 DEADLINE_S = 180.0
+# How many replay artifact directories `gym-runs` keeps. Symmetric with
+# `recording.MAX_CONVERSATIONS`, and smaller on purpose: a replay's leftovers
+# are the evidence for ONE CI job, not an archive, and a suite of a dozen cases
+# run on every push fills a directory far faster than live calls do. The
+# recorder's own `evict_oldest` does incidentally reach in here (a replay
+# redirects `recording.SETTINGS` at this directory), but only at 200, only when
+# the recording closed cleanly, and only as a side effect of somebody else's
+# retention policy - which is not a policy this module can be said to have.
+MAX_RUNS = 50
 
 # The regression bar. Every number is a DELTA between two runs, never an
 # absolute quality claim: this file cannot tell you whether the agent is good,
@@ -486,6 +524,10 @@ def replay(source: str | Path, *, agent_id: str | None = None,
                 polite_quiet_ms=polite_quiet_ms, override=override)
         recorded = _read_json(runs_dir / conversation_id / "transcript.json") \
             if conversation_id else None
+        # Inside the replay lock, and after the artifact has been read back:
+        # eviction must never race the run that is still being written, and
+        # this run's own directory is the newest, so it is never a candidate.
+        evict_runs(runs_dir, MAX_RUNS)
 
     events, turns, timings_source = _turns(wire, recorded)
     artifact = {
@@ -892,7 +934,22 @@ def compare(run_a: dict, run_b: dict, thresholds: dict | None = None) -> dict:
     comparable = pace_a == pace_b
 
     checks = [
-        # FIRST, because every latency number under it depends on it: two runs
+        # FIRST of all, because it is the check that says the other checks were
+        # computed over the right kind of document. `compare_runs` (the HTTP
+        # surface) rejects a wrong-schema artifact with a 422, but the CLI and
+        # the suite call compare() directly - and those are the two paths a CI
+        # job actually uses. Without this, a baseline written by an older gym
+        # (or a comparison handed in where a run belongs) scores two empty turn
+        # lists against each other and reports a confident "pass" about
+        # nothing. It is a failing CHECK rather than an exception because the
+        # verdict is the product here: a suite must be able to name which case
+        # holds an unreadable baseline and keep going.
+        _check("comparable_schema",
+               f"both runs are {RUN_SCHEMA} artifacts",
+               f"a={run_a.get('schema')!r} b={run_b.get('schema')!r}",
+               run_a.get("schema") == RUN_SCHEMA
+               and run_b.get("schema") == RUN_SCHEMA),
+        # THEN, because every latency number under it depends on it: two runs
         # streamed at different pacings are two different experiments, and a
         # delta between them is arithmetic rather than evidence.
         _check("comparable_pacing", "the same wire pace in both runs",
@@ -1064,6 +1121,94 @@ def _case_expectations(run: dict, expect: dict | None) -> list[dict]:
     return checks
 
 
+def baseline_stamp(thresholds: dict) -> dict:
+    """What a baseline has to remember about the question it was minted for.
+
+    A run artifact says what happened. A BASELINE additionally has to say what
+    it was recorded to be compared against, or the next suite silently scores
+    it under arithmetic that did not exist when it was written.
+    """
+    return {
+        "schema": BASELINE_SCHEMA,
+        "run_schema": RUN_SCHEMA,
+        "check_set": CHECK_SET,
+        "thresholds": sorted(thresholds),
+        "written_at": round(time.time(), 3),
+    }
+
+
+def baseline_staleness(baseline: dict, thresholds: dict) -> str | None:
+    """Why this baseline cannot be compared against today's suite, or None.
+
+    Three ways to be stale, and each one produces a verdict that LOOKS like
+    evidence: a run artifact of another schema, a stamp from an older check
+    set, or a threshold NAME set that no longer matches (a check was added, so
+    the baseline was never scored on it). Threshold VALUES are deliberately not
+    compared - retuning a bar in `suite.json` is a decision about the current
+    run, not a reason to throw away the record of the old one.
+    """
+    if baseline.get("schema") != RUN_SCHEMA:
+        return (f"it is not a {RUN_SCHEMA} artifact "
+                f"(schema: {baseline.get('schema')!r})")
+    stamp = baseline.get("baseline")
+    if not isinstance(stamp, dict):
+        return ("it carries no baseline stamp, so which check set it was "
+                "minted under is unknown")
+    if stamp.get("check_set") != CHECK_SET:
+        return (f"it was minted under check set {stamp.get('check_set')!r}, "
+                f"and this gym scores {CHECK_SET}")
+    if list(stamp.get("thresholds") or []) != sorted(thresholds):
+        missing = sorted(set(thresholds) - set(stamp.get("thresholds") or []))
+        return ("its threshold set differs from this suite's"
+                + (f" (never scored on: {', '.join(missing)})" if missing else ""))
+    return None
+
+
+def write_baseline(path: Path, run: dict, thresholds: dict) -> dict:
+    """Write a run as a baseline: stamped, atomic, and cross-process exclusive.
+
+    The `file_lock` and not merely the atomic write, for `recording.save_care`'s
+    reason: this service ships as N single-worker processes, and two suite
+    runners (two CI shards, or a studio replay racing a CI job) doing
+    read-baseline-then-write-baseline must serialize on the whole sequence -
+    `os.replace` prevents a torn file, never a lost update.
+    """
+    payload = dict(run, baseline=baseline_stamp(thresholds))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with file_lock(path.parent / f".{path.name}.lock"):
+        atomic_write_text(path, json.dumps(payload, indent=2))
+    return payload
+
+
+def evict_runs(runs_dir: Path, limit: int = MAX_RUNS) -> int:
+    """Drop the oldest replay artifacts past ``limit``. Returns how many went.
+
+    Deliberately the same shape as `recording.evict_oldest` - oldest by mtime,
+    one directory of files, an OSError on a directory somebody still holds open
+    is a debug line and not a failed run. It is a SEPARATE pass because the two
+    directories answer to different policies: recordings are a privacy-gated
+    archive of real callers, gym runs are CI scratch.
+    """
+    if not runs_dir.is_dir():
+        return 0
+    try:
+        dirs = sorted((d for d in runs_dir.iterdir() if d.is_dir()),
+                      key=lambda d: d.stat().st_mtime)
+    except OSError as exc:
+        logger.debug("could not list %s for eviction (%s)", runs_dir, exc)
+        return 0
+    removed = 0
+    for old in dirs[:max(0, len(dirs) - max(0, limit))]:
+        try:
+            for child in old.iterdir():
+                child.unlink()
+            old.rmdir()
+            removed += 1
+        except OSError as exc:  # a run still being written, or held open
+            logger.debug("could not evict run %s (%s)", old.name, exc)
+    return removed
+
+
 def run_suite(directory: str | Path, *, app: Any = None,
               update_baselines: bool = False, pace: float | None = None,
               work_dir: str | Path | None = None) -> dict:
@@ -1096,17 +1241,32 @@ def run_suite(directory: str | Path, *, app: Any = None,
 
         baseline_path = root / (spec.get("baseline")
                                 or f"baselines/{name}.json")
+        case_thresholds = dict(thresholds, **(spec.get("thresholds") or {}))
         baseline = _read_json(baseline_path)
-        if baseline is not None:
-            entry["comparison"] = compare(baseline, run,
-                                          dict(thresholds,
-                                               **(spec.get("thresholds") or {})))
+        stale = (baseline_staleness(baseline, case_thresholds)
+                 if baseline is not None else None)
+        if baseline is not None and stale is None:
+            entry["comparison"] = compare(baseline, run, case_thresholds)
             entry["checks"] += entry["comparison"]["checks"]
-        else:
+        elif baseline is None:
             entry["baseline"] = f"none yet at {baseline_path}"
+        elif update_baselines:
+            # Loudly RE-baseline. The operator asked for the record to be
+            # rewritten, so the stale one is replaced and the case says so -
+            # this is the one path where a mismatch is not a finding.
+            entry["baseline"] = f"stale, re-baselined: {stale}"
+        else:
+            # Refuse. A baseline recorded to answer a different question cannot
+            # produce a verdict about this one, and "no comparison" reported as
+            # a pass is exactly the silence this direction exists to remove.
+            entry["baseline"] = f"stale at {baseline_path}: {stale}"
+            entry["checks"].append(_check(
+                "baseline_current",
+                f"a baseline minted under {CHECK_SET}",
+                f"{stale} - re-run with --update-baselines once you have "
+                "decided the current behaviour is the new record", False))
         if update_baselines:
-            baseline_path.parent.mkdir(parents=True, exist_ok=True)
-            baseline_path.write_text(json.dumps(run, indent=2), "utf-8")
+            write_baseline(baseline_path, run, case_thresholds)
             entry["baseline_written"] = str(baseline_path)
         if any(not c["pass"] for c in entry["checks"]):
             entry["verdict"] = "fail"
@@ -1298,8 +1458,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     run_cmd = sub.add_parser("run", help="replay one recording")
     run_cmd.add_argument("recording")
     run_cmd.add_argument("--agent", default=None)
-    run_cmd.add_argument("--pace", type=float, default=1.0,
-                         help="1.0 = real time (default); 0 = as fast as possible")
+    run_cmd.add_argument("--pace", type=float, default=0.0,
+                         help="0 = as fast as the loop can push (default, and "
+                              "the same default the library and POST "
+                              "/v1/convai/replay use); 1.0 = real time, which "
+                              "is what a latency claim needs")
     run_cmd.add_argument("--barge-in", action="store_true",
                          help="do not pause the feed while the agent is talking "
                               "(an unpaced replay will then talk over it)")
