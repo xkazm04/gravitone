@@ -84,6 +84,11 @@ export type StudioJob = {
     scenes?: number;
     frames?: number;
     described?: number;
+    /** how many of `described` the vision model was actually SHOWN. The rest
+     *  inherited their description from an earlier scene of the same shot —
+     *  real descriptions, but not fresh observations, and the two must never
+     *  be reported as one number. */
+    looked_at?: number;
     lines?: number;
     words?: number;
     directed?: number;

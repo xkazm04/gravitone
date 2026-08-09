@@ -104,7 +104,16 @@ function ProgressNote({ job, step }: { job: StudioJob; step: string }) {
       ? `${p.scenes} scenes · ${p.frames} frames`
       : `${p.scenes} scenes`;
   }
-  if (step === "look" && p.described != null) note = `${p.described}/${p.scenes ?? "?"} described`;
+  // The box does not buy a description twice for the same shot: a scene that
+  // repeats its predecessor INHERITS one. Both are described, but only
+  // `looked_at` were actually shown to the model, and a rail that folded the
+  // two together would report an observation that never happened.
+  if (step === "look" && p.described != null) {
+    const inherited = p.looked_at != null ? p.described - p.looked_at : 0;
+    note = inherited > 0
+      ? `${p.described}/${p.scenes ?? "?"} described · ${inherited} the same shot`
+      : `${p.described}/${p.scenes ?? "?"} described`;
+  }
   if (step === "write" && p.words) note = `${p.lines ?? 0} lines · ${p.words} words`;
   if (step === "speak" && p.spoken_total) {
     note = `${Math.min((p.spoken_done ?? 0) + 1, p.spoken_total)}/${p.spoken_total}`;

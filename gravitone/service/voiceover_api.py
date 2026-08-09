@@ -317,7 +317,19 @@ def _run_job(job: dict) -> None:
         if blind:
             job["limits"].append(f"{blind} of {len(scenes)} scenes could not "
                                  "be described and were narrated blind")
+        # `vision` is careful never to present an INHERITED description as a
+        # fresh observation (it stamps `reused` on a scene that shows the same
+        # shot as its anchor). That care is undone here if the count the studio
+        # renders lumps the two together — so it does not. `described` stays
+        # the honest total of scenes that carry a description, and `looked_at`
+        # says how many of them the model was actually shown.
+        # NB: the flag lives on the DESCRIPTION `vision` returns, not on the
+        # scene — `vision.REUSED` is the status string, which happens to spell
+        # the same word and is a different namespace. Reading the scene here
+        # would count zero forever and read as "nothing was ever inherited".
+        reused = sum(1 for d in described if d and d.get("reused"))
         _partial(job, {"described": len(scenes) - blind,
+                       "looked_at": len(scenes) - blind - reused,
                        "spend": spend.snapshot()})
         _step(job, "look", "done")
         if cancelled():
