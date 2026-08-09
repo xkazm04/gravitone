@@ -326,7 +326,7 @@ export default function PlaygroundConsole() {
       {liveOn && (
         <LiveStage characters={characters} charId={charId} generateBusy={busy} onTake={addTake}
           onScript={(lines) => { setScript(lines); setMode("script"); }} scriptLines={script}
-          onActiveChange={setLiveActive} />
+          onActiveChange={setLiveActive} still={still} />
       )}
 
       {/* takes log */}
