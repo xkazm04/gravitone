@@ -10,8 +10,8 @@ import { Button } from "@/components/ui/Primitives";
 
 import { fmtClock } from "../_gym/data";
 import type { ReplayState, SessionRun } from "../_gym/data";
-import type { ReplayOptions } from "../_gym/types";
-import { ReplayKnobs, RunTotals, Verdict, DriftNote } from "../_gym/gymParts";
+import type { GymComparison, ReplayOptions } from "../_gym/types";
+import { ChecksTable, ReplayKnobs, RunTotals, Verdict, DriftNote } from "../_gym/gymParts";
 import { MONO_LABEL } from "./GymSessionTurns";
 
 export default function GymReplayDrawer({
@@ -111,10 +111,59 @@ export default function GymReplayDrawer({
               <div className="mt-3">
                 <RunTotals run={r.run} />
               </div>
+              {r.comparison && (
+                <div className="mt-4 space-y-5 border-t border-white/8 pt-4">
+                  <div>
+                    <h4 className={`${MONO_LABEL} text-white/45`}>checks</h4>
+                    <div className="mt-1">
+                      <ChecksTable checks={r.comparison.checks} />
+                    </div>
+                  </div>
+                  <AgentTextDiff agentText={r.comparison.agent_text} />
+                </div>
+              )}
             </div>
           ))}
           {runs.length > 0 && <DriftNote />}
         </div>
+      )}
+    </div>
+  );
+}
+
+/** WHICH agent turns changed, and to what. A verdict of "fail" on
+ *  agent_text_stable tells you the replay diverged; without the lines, the only
+ *  way to see HOW is to diff two transcripts by eye — in a forensics tool.
+ *  `i` indexes the AGENT turns of the run (gym.py::_texts), not the transcript,
+ *  and a null side means that run had no such turn at all. */
+function AgentTextDiff({ agentText }: { agentText: GymComparison["agent_text"] }) {
+  const { changed, unchanged } = agentText;
+  return (
+    <div>
+      <h4 className={`${MONO_LABEL} text-white/45`}>agent text</h4>
+      <p className="font-jetbrains mt-1 text-[11px] text-white/45">
+        {changed.length} changed · {unchanged} held
+      </p>
+      {changed.length === 0 ? (
+        <p className="font-hanken mt-2 text-[13px] text-slate-400">
+          Every agent turn came back word for word.
+        </p>
+      ) : (
+        <ul className="mt-3 space-y-3">
+          {changed.map((c) => (
+            <li key={c.i} className="border-l border-white/10 pl-3">
+              <div className={`${MONO_LABEL} text-white/45`}>agent turn {c.i}</div>
+              <p className="font-hanken mt-1 text-[13px] text-slate-500">
+                <span className={`${MONO_LABEL} mr-2 text-white/35`}>was</span>
+                {c.a ?? <em className="text-slate-500">no such turn in the baseline run</em>}
+              </p>
+              <p className="font-hanken mt-1 text-[13px] text-slate-200">
+                <span className={`${MONO_LABEL} mr-2 text-cyan-300/70`}>now</span>
+                {c.b ?? <em className="text-slate-500">no such turn in this run</em>}
+              </p>
+            </li>
+          ))}
+        </ul>
       )}
     </div>
   );
