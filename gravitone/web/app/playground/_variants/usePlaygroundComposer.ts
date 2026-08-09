@@ -10,7 +10,7 @@ import { useMemo, useRef, useState } from "react";
 import {
   applyEmotion, DEFAULT_EXPRESSION, DEFAULT_TEXT, editPlainText, parseTags, stripTags,
   wrappedAnnouncement, type Expression, type ScriptLine,
-} from "./shared";
+} from "./playgroundHelpers";
 import type { ScoreEditorHandle } from "./ScoreEditor";
 import type { Character } from "@/app/voices/_data/characters";
 

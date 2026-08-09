@@ -27,7 +27,7 @@ import type { Character } from "@/app/voices/_data/characters";
 import TakeTimeline from "./TakeTimeline";
 import PunchLanes from "./PunchLanes";
 import { usePunchSession } from "./usePunchSession";
-import { type Take } from "./shared";
+import { type Take } from "./playgroundHelpers";
 import { LANES, MAX_LANES_PER_REGION } from "./variantStore";
 import type { CommitPayload } from "./punchTypes";
 

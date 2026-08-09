@@ -5,8 +5,8 @@
 // how a verdict, a slot or a clock is rendered.
 
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
-import { fitVerdict, type RevoiceFit } from "./data";
-import { tc } from "./parts";
+import { fitVerdict, type RevoiceFit } from "./videoData";
+import { tc } from "./videoParts";
 import type { Dub, DubLine } from "./useDub";
 
 /** A colour per Character, the same hash the console's rail and script rows

@@ -6,7 +6,7 @@
 import { useEffect, useState } from "react";
 import { apiJson } from "@/lib/apiFetch";
 import type { useMounted } from "@/lib/useMounted";
-import { isAbort } from "./engine";
+import { isAbort } from "./playgroundEngine";
 // ONE character-list data layer, shared with the voices module — the playground
 // used to fetch /api/characters itself, so the app had two truths about the
 // roster (and two places to fix when it went stale).

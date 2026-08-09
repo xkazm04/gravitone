@@ -12,7 +12,7 @@
 // exactly as app/t/[id]/OpenInRack does — the playground restores a session, as
 // it always has, and the session happens to be this recording's dialogue.
 
-import { DEFAULT_EXPRESSION, DEFAULT_TEXT } from "@/app/playground/_variants/shared";
+import { DEFAULT_EXPRESSION, DEFAULT_TEXT } from "@/app/playground/_variants/playgroundHelpers";
 import type { ComposerState } from "@/lib/composerStore";
 
 export type SceneLine = { speaker: string; character_id: string; text: string };

@@ -8,7 +8,7 @@
 // Same mechanism as takes (lib/playgroundDb: one IndexedDB, one store each), so
 // there is one durability story in the playground rather than two.
 
-import { DEFAULT_EXPRESSION, type Expression, type ScriptLine } from "@/app/playground/_variants/shared";
+import { DEFAULT_EXPRESSION, type Expression, type ScriptLine } from "@/app/playground/_variants/playgroundHelpers";
 import { COMPOSER_STORE, getRecord, openDb, runTx } from "@/lib/playgroundDb";
 
 const KEY = "current";

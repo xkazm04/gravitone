@@ -8,8 +8,8 @@
 import { useEffect, useRef, useState } from "react";
 import type { useMounted } from "@/lib/useMounted";
 import { putTake, getRecentTakes } from "@/lib/takeStore";
-import { refinePeaks } from "./engine";
-import type { Take } from "./shared";
+import { refinePeaks } from "./playgroundEngine";
+import type { Take } from "./playgroundHelpers";
 
 export function usePlaygroundTakes(mounted: ReturnType<typeof useMounted>) {
   const [takes, setTakes] = useState<Take[]>([]);

@@ -5,7 +5,7 @@
 // touches the DOM, which is why it can be tested exhaustively.
 
 import { emotionMeta } from "@/lib/emotions";
-import type { ScoreRegion } from "./shared";
+import type { ScoreRegion } from "./playgroundHelpers";
 
 /** One painted run of the surface: a slice of the text that is uniformly
  *  directed (or not), uniformly PROPOSED (or not), and uniformly selected (or

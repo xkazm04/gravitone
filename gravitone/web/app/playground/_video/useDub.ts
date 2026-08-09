@@ -11,7 +11,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiError } from "@/lib/apiFetch";
-import { cancelJob, submitRevoice, useStudioJob, type RevoiceFit } from "./data";
+import { cancelJob, submitRevoice, useStudioJob, type RevoiceFit } from "./videoData";
 
 export type DubLine = {
   id: string;

@@ -13,7 +13,7 @@ import { ApiError } from "@/lib/apiFetch";
 import {
   cancelJob, loadScript, submitVoiceover, useStudioJob,
   type ScriptLine, type VoiceoverFit,
-} from "./data";
+} from "./videoData";
 
 /** A scene as the console works with it: the picture's slot, the words that
  *  go in it, and how the last render fitted. */

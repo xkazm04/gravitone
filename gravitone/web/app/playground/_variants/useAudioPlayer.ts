@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { busRegister } from "@/components/ui/AudioBus";
-import { stripTags, type Take } from "./shared";
+import { stripTags, type Take } from "./playgroundHelpers";
 
 /**
  * Playback position, as something you SUBSCRIBE to rather than something the

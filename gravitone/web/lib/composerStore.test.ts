@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { loadComposer, reconcileCharacters, sanitizeComposer, saveComposer, type ComposerState } from "./composerStore";
-import { DEFAULT_EXPRESSION } from "@/app/playground/_variants/shared";
+import { DEFAULT_EXPRESSION } from "@/app/playground/_variants/playgroundHelpers";
 
 const base: ComposerState = {
   text: "hello", script: [], expr: DEFAULT_EXPRESSION, mode: "solo",

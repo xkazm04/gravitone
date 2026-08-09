@@ -11,7 +11,7 @@
 import type { ReactNode } from "react";
 import { AnimatePresence } from "framer-motion";
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
-import type { Take } from "./shared";
+import type { Take } from "./playgroundHelpers";
 // The playground's Signal accents — the restrained tier of web/DESIGN.md.
 import { EmptyTakes } from "./signal";
 import { PlaygroundTakeCard, type PlaygroundTakeCardShared } from "./PlaygroundTakeCard";

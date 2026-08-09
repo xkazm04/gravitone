@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { deleteTake, getRecentTakes, putTake } from "./takeStore";
-import { DEFAULT_EXPRESSION, type Take } from "@/app/playground/_variants/shared";
+import { DEFAULT_EXPRESSION, type Take } from "@/app/playground/_variants/playgroundHelpers";
 
 const take: Take = {
   id: "take-1", text: "hi", characterId: "sarah", characterName: "Sarah",

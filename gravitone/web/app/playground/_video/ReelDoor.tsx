@@ -7,7 +7,7 @@
 // the marquee's; this only ever draws its contents.
 
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
-import { StepsRail } from "./parts";
+import { StepsRail } from "./videoParts";
 import type { Reel } from "./useReel";
 
 export default function ReelDoor({ reel, characterName }: {

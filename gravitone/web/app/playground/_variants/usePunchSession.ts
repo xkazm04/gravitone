@@ -11,8 +11,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { EMOTION_IDS } from "@/lib/emotions";
 import type { Character } from "@/app/voices/_data/characters";
-import { isAbort, speak, spliceRegion } from "./engine";
-import { segmentRegions, type Region, type Take } from "./shared";
+import { isAbort, speak, spliceRegion } from "./playgroundEngine";
+import { segmentRegions, type Region, type Take } from "./playgroundHelpers";
 import {
   dropVariants, getVariants, nextLane, putVariant, variantId,
   type Variant,

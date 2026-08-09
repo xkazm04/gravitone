@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { useAudioPlayer, usePlaybackProgress } from "./useAudioPlayer";
-import type { Take } from "./shared";
+import type { Take } from "./playgroundHelpers";
 
 // The playhead ticks ~4×/s. It used to be state in the console, so those ticks
 // re-rendered a 1,700-line component whose take log is a list of layout-animated

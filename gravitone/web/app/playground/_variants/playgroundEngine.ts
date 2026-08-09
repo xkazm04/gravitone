@@ -16,7 +16,7 @@ import {
 import {
   scaleSegmentSeconds, segmentRegions, stripTags, waveHeights,
   type Expression, type PerfLine, type Segment, type Take,
-} from "./shared";
+} from "./playgroundHelpers";
 
 /**
  * Best-effort real waveform for a take that is ALREADY on screen.
@@ -108,7 +108,7 @@ export async function uploadTake(t: Take,
 // vocabulary now belongs to the engine seam (lib/engineSeam), because deciding
 // which of the three happened is the ENGINE's knowledge; deciding to speak the
 // line in a browser voice anyway is the PLAYGROUND's policy, and that policy
-// still lives here. Re-exported so every existing importer of "./engine" is
+// still lives here. Re-exported so every existing importer of "./playgroundEngine" is
 // unchanged.
 export { EngineBusyError, isAbort, type FallbackReason } from "@/lib/engineSeam";
 

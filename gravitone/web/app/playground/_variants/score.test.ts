@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   applyEmotion, editPlainText, normalizeRegions, parseTags, regionProblem, scoreRegion, toTags,
   transformRegions, type ScoreRegion,
-} from "./shared";
+} from "./playgroundHelpers";
 
 // The score model's whole job is to be a LOSSLESS view of a string the engine
 // already understands. If the round-trip is wrong the user does not get a

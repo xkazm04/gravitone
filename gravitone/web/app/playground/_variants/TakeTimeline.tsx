@@ -15,7 +15,7 @@
 
 import { useRef } from "react";
 import { emotionMeta } from "@/lib/emotions";
-import type { Region, Take } from "./shared";
+import type { Region, Take } from "./playgroundHelpers";
 
 /** Narrowest a region may draw. A one-word segment inside a 60-second
  *  performance is otherwise a sub-pixel target nobody can hit. */

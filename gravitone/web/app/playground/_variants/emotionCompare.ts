@@ -3,7 +3,7 @@
 // comparison is worth anything. All pure — the panel does the rendering, the
 // tile does the drawing, and neither has to re-derive these.
 
-import { stripTags, type Take } from "./shared";
+import { stripTags, type Take } from "./playgroundHelpers";
 
 export const AB_SIDES = ["A", "B"] as const;
 export type AbSide = (typeof AB_SIDES)[number];

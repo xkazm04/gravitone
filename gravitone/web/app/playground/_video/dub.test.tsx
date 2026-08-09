@@ -22,8 +22,8 @@ const engineMocks = vi.hoisted(() => ({
 
 vi.mock("@/lib/useAuth", () => ({ useAuth: () => ({ user: null }) }));
 vi.mock("@/lib/voiceVault", () => ({ recordVoiceOwnership: async () => ({ saved: 0, failed: 0 }) }));
-vi.mock("../_variants/engine", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../_variants/engine")>()),
+vi.mock("../_variants/playgroundEngine", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../_variants/playgroundEngine")>()),
   ...engineMocks,
 }));
 vi.mock("@/lib/takeStore", () => ({

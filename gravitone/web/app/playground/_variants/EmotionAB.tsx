@@ -30,8 +30,8 @@ import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { emotionMeta } from "@/lib/emotions";
 import { useMounted } from "@/lib/useMounted";
 import type { OutputFormat } from "@/lib/audioFormats";
-import { EngineBusyError, isAbort, speak } from "./engine";
-import { stripTags, type Expression, type Take } from "./shared";
+import { EngineBusyError, isAbort, speak } from "./playgroundEngine";
+import { stripTags, type Expression, type Take } from "./playgroundHelpers";
 import EmotionAbSide from "./EmotionAbSide";
 import {
   AB_SIDES, emptySide, sameVoiceWarning, spokenVoice, taggedFor,

@@ -29,7 +29,7 @@
 //     and say so: that is a picture of the ORDER, not of the timing.
 
 import { useMemo, useState } from "react";
-import { characterHue } from "@/app/playground/_variants/shared";
+import { characterHue } from "@/app/playground/_variants/playgroundHelpers";
 import EmotionIcon from "@/components/ui/EmotionIcon";
 import Region from "@/components/ui/Region";
 import Track, { clock } from "@/components/ui/Track";

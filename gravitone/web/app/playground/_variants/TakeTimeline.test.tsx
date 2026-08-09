@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import TakeTimeline from "./TakeTimeline";
-import { DEFAULT_EXPRESSION, segmentRegions, type Segment, type Take } from "./shared";
+import { DEFAULT_EXPRESSION, segmentRegions, type Segment, type Take } from "./playgroundHelpers";
 
 const seg = (text: string, seconds: number, over: Partial<Segment> = {}): Segment => ({
   text, requested: "baseline", used: "baseline", fallback: false,

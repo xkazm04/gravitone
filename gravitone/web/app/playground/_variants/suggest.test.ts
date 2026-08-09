@@ -3,7 +3,7 @@ import {
   accept, asRegion, fallbackNote, heuristicDirector, propose, proposalSummary, REASONS,
   reject, retag, reviewText, sentences, type Director, type Suggestion,
 } from "./suggest";
-import { DEFAULT_TEXT, parseTags, scoreRegion } from "./shared";
+import { DEFAULT_TEXT, parseTags, scoreRegion } from "./playgroundHelpers";
 
 // This pass reads punctuation, capitals and brackets. It does not read MEANING,
 // and the tests are written to hold it to exactly that: every assertion below

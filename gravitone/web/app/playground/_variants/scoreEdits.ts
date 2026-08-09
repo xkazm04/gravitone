@@ -10,7 +10,7 @@
 // that should replace the ones handed in, or with nothing at all, and the
 // caller decides what to say about it.
 
-import { regionProblem, scoreRegion, type ScoreRegion } from "./shared";
+import { regionProblem, scoreRegion, type ScoreRegion } from "./playgroundHelpers";
 
 /** Move one edge of region `i` to offset `to`, clamped by its neighbours and by
  *  its own opposite edge. Null when there is no such region or when the clamp

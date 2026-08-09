@@ -31,7 +31,7 @@
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { runs, runStyle } from "./scoreRuns";
-import type { ScoreRegion } from "./shared";
+import type { ScoreRegion } from "./playgroundHelpers";
 
 /** Typography and box shared, character for character, by the two layers. The
  *  single source of the mirror's fidelity — change it in one place or not at

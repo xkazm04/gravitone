@@ -15,7 +15,7 @@ import { motion } from "framer-motion";
 import { EASE } from "@/components/ui/tokens";
 import { EMOTION_IDS, emotionMeta } from "@/lib/emotions";
 import { formatMeta } from "@/lib/audioFormats";
-import { readEdits, type Take } from "./shared";
+import { readEdits, type Take } from "./playgroundHelpers";
 import { Bars, LiveProgress } from "./PlaygroundPrimitives";
 import { TakeArrival } from "./signal";
 import TakeCode from "./TakeCode";

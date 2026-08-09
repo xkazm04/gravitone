@@ -25,7 +25,7 @@
 // "dismiss all" forever.
 
 import { emotionMeta } from "@/lib/emotions";
-import { applyEmotion, scoreRegion, type ScoreRegion } from "./shared";
+import { applyEmotion, scoreRegion, type ScoreRegion } from "./playgroundHelpers";
 
 /** Why a span was proposed. Shown to the user verbatim (via `REASONS`) — the
  *  rule IS the explanation, because there is no deeper one. */

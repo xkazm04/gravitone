@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { useState } from "react";
 import ScriptScore from "./ScriptScore";
-import { characterHue, type ScriptLine } from "./shared";
+import { characterHue, type ScriptLine } from "./playgroundHelpers";
 
 // A scene is N strings the console owns. Every test here asserts on the STRINGS
 // that come back out — if the lanes and the script ever disagree, the user

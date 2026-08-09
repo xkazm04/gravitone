@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import ScoreText from "./ScoreText";
 import { runs } from "./scoreRuns";
-import { scoreRegion } from "./shared";
+import { scoreRegion } from "./playgroundHelpers";
 
 // A highlight overlay is only worth having if it lands on the right characters.
 // The two things that can go wrong are (a) the partition is wrong, so colour is

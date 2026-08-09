@@ -12,7 +12,7 @@ import type { RefObject } from "react";
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { Button } from "@/components/ui/Primitives";
 import { OUTPUT_FORMATS, type OutputFormat } from "@/lib/audioFormats";
-import { MAX_TEXT_CHARS, MAX_SCRIPT_LINES, type ComposerWarning } from "./shared";
+import { MAX_TEXT_CHARS, MAX_SCRIPT_LINES, type ComposerWarning } from "./playgroundHelpers";
 import EmotionChips from "./EmotionChips";
 import ScoreEditor from "./ScoreEditor";
 import ScriptScore from "./ScriptScore";

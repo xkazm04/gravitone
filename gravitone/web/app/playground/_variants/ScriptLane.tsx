@@ -17,7 +17,7 @@ import EmotionIcon from "@/components/ui/EmotionIcon";
 import Region from "@/components/ui/Region";
 import Track from "@/components/ui/Track";
 import { emotionMeta } from "@/lib/emotions";
-import type { ScoreRegion } from "./shared";
+import type { ScoreRegion } from "./playgroundHelpers";
 
 /** Lane height. Shorter than the solo lane: a 12-line scene has to stay one
  *  readable object, not twelve editors. */

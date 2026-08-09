@@ -13,7 +13,7 @@ import { getStoredKey } from "@/lib/mintKey";
 import { useCopyFeedback } from "@/lib/useCopyFeedback";
 import { DEFAULT_BASE_URL, KEY_PLACEHOLDER, SNIPPET_LANGS, type SnippetLang } from "@/lib/switchkit";
 import { formatMeta } from "@/lib/audioFormats";
-import { readEdits, type EditRegion, type Take } from "./shared";
+import { readEdits, type EditRegion, type Take } from "./playgroundHelpers";
 
 const voiceSettings = (t: Take) => ({
   temperature: t.expr.temperature,

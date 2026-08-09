@@ -9,8 +9,8 @@ import { useEffect, useRef, useState } from "react";
 import { apiJson } from "@/lib/apiFetch";
 import { useCopyFeedback } from "@/lib/useCopyFeedback";
 import type { useMounted } from "@/lib/useMounted";
-import { uploadTake } from "./engine";
-import type { Take } from "./shared";
+import { uploadTake } from "./playgroundEngine";
+import type { Take } from "./playgroundHelpers";
 
 export function usePlaygroundSharing({ takes, mounted }: {
   takes: Take[];

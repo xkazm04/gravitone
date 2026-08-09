@@ -3,8 +3,8 @@
 // ── narrate ──────────────────────────────────────────────────────────────────
 
 import { useRef } from "react";
-import { frameUrl, mediaUrl } from "./data";
-import { FitMeter, tc } from "./parts";
+import { frameUrl, mediaUrl } from "./videoData";
+import { FitMeter, tc } from "./videoParts";
 import MarqueePlayhead from "./MarqueePlayhead";
 import ReelDoor from "./ReelDoor";
 import type { Reel, Scene } from "./useReel";

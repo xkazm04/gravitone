@@ -11,7 +11,7 @@ import EmotionIcon from "@/components/ui/EmotionIcon";
 import Region from "@/components/ui/Region";
 import Track from "@/components/ui/Track";
 import { emotionMeta } from "@/lib/emotions";
-import type { ScoreRegion } from "./shared";
+import type { ScoreRegion } from "./playgroundHelpers";
 
 /** How the lane is drawn. A STRIP attached to the text, not a section under it:
  *  40px with its own heading and its own empty-state box read as a second

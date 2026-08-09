@@ -12,7 +12,7 @@ import { useEffect, useRef, useState, type Dispatch, type SetStateAction } from 
 import type { useMounted } from "@/lib/useMounted";
 // Composer durability — the same IndexedDB mechanism the take log uses.
 import { loadComposer, reconcileCharacters, saveComposer, type ComposerState } from "@/lib/composerStore";
-import { DEFAULT_EXPRESSION, DEFAULT_TEXT, MAX_TEXT_CHARS, type Expression, type ScriptLine } from "./shared";
+import { DEFAULT_EXPRESSION, DEFAULT_TEXT, MAX_TEXT_CHARS, type Expression, type ScriptLine } from "./playgroundHelpers";
 import type { Character } from "@/app/voices/_data/characters";
 
 export function usePlaygroundComposerDurability({

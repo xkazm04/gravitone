@@ -16,7 +16,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { DEFAULT_EXPRESSION } from "@/app/playground/_variants/shared";
+import { DEFAULT_EXPRESSION } from "@/app/playground/_variants/playgroundHelpers";
 import { saveComposer, setRemixParent } from "@/lib/composerStore";
 import type { SharedTake } from "@/lib/takes";
 

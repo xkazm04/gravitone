@@ -4,7 +4,7 @@
 // why there is no emotion slider among them.
 
 import { Slider } from "./PlaygroundPrimitives";
-import { DEFAULT_EXPRESSION, type Expression } from "./shared";
+import { DEFAULT_EXPRESSION, type Expression } from "./playgroundHelpers";
 
 export function PlaygroundExpression({ expr, setExpr }: {
   expr: Expression;

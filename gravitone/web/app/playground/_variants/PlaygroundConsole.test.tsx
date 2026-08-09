@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import type { Character } from "@/app/voices/_data/characters";
-import { DEFAULT_EXPRESSION, TAKE_TIMING_VERSION, type Segment, type Take } from "./shared";
-import type { SpeakResult } from "./engine";
+import { DEFAULT_EXPRESSION, TAKE_TIMING_VERSION, type Segment, type Take } from "./playgroundHelpers";
+import type { SpeakResult } from "./playgroundEngine";
 
 // ── the harness ───────────────────────────────────────────────────────────────
 // PlaygroundConsole is the studio's largest surface and had no render test at
@@ -42,8 +42,8 @@ const storeMocks = vi.hoisted(() => ({
 vi.mock("@/lib/useAuth", () => ({ useAuth: () => ({ user: null }) }));
 vi.mock("@/lib/voiceVault", () => ({ recordVoiceOwnership: async () => ({ saved: 0, failed: 0 }) }));
 
-vi.mock("./engine", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("./engine")>()),
+vi.mock("./playgroundEngine", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./playgroundEngine")>()),
   ...engineMocks,
 }));
 vi.mock("@/lib/takeStore", () => storeMocks);

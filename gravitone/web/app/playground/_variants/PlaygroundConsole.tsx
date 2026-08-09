@@ -28,7 +28,7 @@ import { Eyebrow } from "@/components/ui/Primitives";
 import { EMOTION_IDS } from "@/lib/emotions";
 import {
   composerLimit, composerWarnings, isTimingBasis, stripTags,
-} from "./shared";
+} from "./playgroundHelpers";
 import { DEFAULT_OUTPUT_FORMAT, type OutputFormat } from "@/lib/audioFormats";
 import { useAudioPlayer } from "./useAudioPlayer";
 import EmotionPicker from "./EmotionPicker";

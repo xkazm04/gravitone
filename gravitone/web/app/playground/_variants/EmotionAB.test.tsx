@@ -6,10 +6,10 @@ import { act, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { EngineBusyError } from "@/lib/engineSeam";
-import type { Segment, Take } from "./shared";
+import type { Segment, Take } from "./playgroundHelpers";
 
 const speak = vi.fn();
-vi.mock("./engine", async () => {
+vi.mock("./playgroundEngine", async () => {
   const seam = await import("@/lib/engineSeam");
   return {
     speak: (...args: unknown[]) => speak(...args),

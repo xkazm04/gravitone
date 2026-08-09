@@ -2,7 +2,7 @@
 // sentences the hand-off owes the user about what it left out.
 
 import { describe, expect, it } from "vitest";
-import { DEFAULT_EXPRESSION, DEFAULT_TEXT, MAX_SCRIPT_LINES } from "@/app/playground/_variants/shared";
+import { DEFAULT_EXPRESSION, DEFAULT_TEXT, MAX_SCRIPT_LINES } from "@/app/playground/_variants/playgroundHelpers";
 import { sanitizeComposer } from "@/lib/composerStore";
 import { sceneCastSummary, sceneComposer, sceneNotes, type Scene } from "./scene";
 

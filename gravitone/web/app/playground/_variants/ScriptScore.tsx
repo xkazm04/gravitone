@@ -34,7 +34,7 @@ import ScriptLane from "./ScriptLane";
 import {
   characterHue, parseTags, regionProblem, scoreRegion, toTags,
   type ScoreRegion, type ScriptLine,
-} from "./shared";
+} from "./playgroundHelpers";
 
 /** Offered when neither the scale nor the line carries anything, so the
  *  placement control is never an empty dropdown beside an enabled button. */

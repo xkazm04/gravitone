@@ -2,8 +2,8 @@ import { describe, expect, it, vi, afterEach } from "vitest";
 import {
   createStreamPlayer, EngineBusyError, isAbort, perform, refinePeaks, speak, speakStreaming,
   spliceRegion, transcribeWords, uploadTake,
-} from "./engine";
-import { DEFAULT_EXPRESSION, type Segment, type Take } from "./shared";
+} from "./playgroundEngine";
+import { DEFAULT_EXPRESSION, type Segment, type Take } from "./playgroundHelpers";
 import { REMIX_PARENT_KEY } from "@/lib/composerStore";
 
 const EXPR = DEFAULT_EXPRESSION;

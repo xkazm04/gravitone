@@ -26,7 +26,7 @@ import { useEffect, useMemo, useState } from "react";
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { EqBars } from "@/components/ui/Equalizer";
 import type { Character } from "@/app/voices/_data/characters";
-import { type ScriptLine, type Take } from "../_variants/shared";
+import { type ScriptLine, type Take } from "../_variants/playgroundHelpers";
 import LiveControls from "./LiveControls";
 import LiveTranscript from "./LiveTranscript";
 import { hueFor, toScriptLines } from "./liveTurns";

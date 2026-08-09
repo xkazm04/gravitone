@@ -12,7 +12,7 @@
 // quietly made the console's "this take could not be saved" banner unreachable
 // — the log promises durability, so a broken promise has to be sayable.
 
-import type { Take } from "@/app/playground/_variants/shared";
+import type { Take } from "@/app/playground/_variants/playgroundHelpers";
 import { openDb, runTx, TAKES_STORE } from "@/lib/playgroundDb";
 
 // Keep the store bounded across many sessions — restore reads the most recent

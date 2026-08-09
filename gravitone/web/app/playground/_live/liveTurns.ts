@@ -1,7 +1,7 @@
 // What a turn becomes once the stage has it: the conversation's own turn, plus
 // the audio it produced after it was banked as a take.
 
-import type { ScriptLine } from "../_variants/shared";
+import type { ScriptLine } from "../_variants/playgroundHelpers";
 import type { LiveTurn } from "./conversation";
 
 export type Row = LiveTurn & { url?: string; seconds?: number };

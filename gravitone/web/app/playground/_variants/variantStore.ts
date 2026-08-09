@@ -13,7 +13,7 @@
 // storage banner and "your lanes are not being kept" belongs in it.
 
 import { openDb, runTx, VARIANTS_STORE } from "@/lib/playgroundDb";
-import type { Segment } from "./shared";
+import type { Segment } from "./playgroundHelpers";
 
 /** Lane labels, in the order they are handed out. Matches the X/Y vocabulary the
  *  rest of the studio uses for an A/B comparison (TakePlayer label). */

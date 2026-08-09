@@ -10,7 +10,7 @@ import type { OutputFormat } from "@/lib/audioFormats";
 import {
   stripTags, TAKE_TIMING_VERSION,
   type Expression, type PerfLine, type ScriptLine, type Segment, type Take,
-} from "./shared";
+} from "./playgroundHelpers";
 // `speakStreaming` rather than `speak`: it IS the solo path now, and its own
 // policy is to take the buffered call for every request that may not honestly
 // be streamed. PunchIn still imports `speak` directly — a fragment re-render
@@ -18,7 +18,7 @@ import {
 import {
   speakStreaming, createStreamPlayer, perform,
   EngineBusyError, isAbort, type FallbackReason, type StreamPlayer,
-} from "./engine";
+} from "./playgroundEngine";
 import type { Character } from "@/app/voices/_data/characters";
 
 // What to tell the user when a take came from the browser voice. Each string

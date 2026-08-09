@@ -9,7 +9,7 @@
 // better without sixty lines of form in the middle of it.
 
 import { emotionMeta } from "@/lib/emotions";
-import type { ScoreRegion } from "./shared";
+import type { ScoreRegion } from "./playgroundHelpers";
 
 export default function ScoreInspector({
   region,

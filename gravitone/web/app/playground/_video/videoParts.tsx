@@ -4,7 +4,7 @@
 // day one so the two directions differ in WHERE the picture lives, never in
 // how a measured fact is rendered.
 
-import { fitVerdict, type RevoiceFit, type StudioJob, type VoiceoverFit } from "./data";
+import { fitVerdict, type RevoiceFit, type StudioJob, type VoiceoverFit } from "./videoData";
 
 /** One fit meter, drawn TO SCALE: the hairline track is the slot's budget, the
  *  bar is what was actually spoken, and an overrun paints amber PAST the

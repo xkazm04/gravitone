@@ -16,7 +16,7 @@
 
 import { useState } from "react";
 import { accept, proposalSummary, reviewText, type Suggestion } from "./suggest";
-import type { ScoreRegion } from "./shared";
+import type { ScoreRegion } from "./playgroundHelpers";
 
 export function useScoreDirector({
   value,

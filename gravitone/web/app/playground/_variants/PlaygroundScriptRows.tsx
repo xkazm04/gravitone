@@ -5,7 +5,7 @@
 // the last dub did to it. Extracted whole from the console; it is one loop and
 // one add-line button, and nothing outside the loop reads any of its markup.
 
-import { MAX_SCRIPT_LINES, MAX_TEXT_CHARS, type ScoreRegion, type ScriptLine } from "./shared";
+import { MAX_SCRIPT_LINES, MAX_TEXT_CHARS, type ScoreRegion, type ScriptLine } from "./playgroundHelpers";
 import ScoreText from "./ScoreText";
 import type { Character } from "@/app/voices/_data/characters";
 import type { Dub } from "../_video/useDub";

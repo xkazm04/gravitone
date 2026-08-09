@@ -8,7 +8,7 @@
 import { reconcileCharacters, type ComposerState } from "@/lib/composerStore";
 import { DEFAULT_OUTPUT_FORMAT } from "@/lib/audioFormats";
 import { deleteTake } from "@/lib/takeStore";
-import { appendEdit, type Take } from "./shared";
+import { appendEdit, type Take } from "./playgroundHelpers";
 import { dropVariants } from "./variantStore";
 import type { CommitPayload } from "./PunchIn";
 import type { usePlaygroundComposer } from "./usePlaygroundComposer";

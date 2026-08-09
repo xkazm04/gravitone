@@ -58,7 +58,7 @@ import {
 import {
   applyEmotion, DEFAULT_EXPRESSION, editPlainText, parseTags, toTags,
   wrappedAnnouncement, type Expression, type ScoreRegion,
-} from "./shared";
+} from "./playgroundHelpers";
 import { useScoreDirector } from "./useScoreDirector";
 import { useScorePreview } from "./useScorePreview";
 

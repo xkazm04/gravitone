@@ -8,7 +8,7 @@
 // one hook keeps their cleanup in one place.
 
 import { useEffect, useRef, useState } from "react";
-import type { Expression, ScoreRegion } from "./shared";
+import type { Expression, ScoreRegion } from "./playgroundHelpers";
 
 type PreviewState = { index: number; url: string } | null;
 

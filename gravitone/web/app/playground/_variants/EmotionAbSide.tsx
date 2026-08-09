@@ -6,7 +6,7 @@
 
 import EmotionIcon from "@/components/ui/EmotionIcon";
 import { emotionMeta } from "@/lib/emotions";
-import type { Take } from "./shared";
+import type { Take } from "./playgroundHelpers";
 import { spokenVoice, type AbSide, type Side } from "./emotionCompare";
 
 export default function EmotionAbSide({

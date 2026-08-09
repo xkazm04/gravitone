@@ -4,8 +4,8 @@
 
 import { useState } from "react";
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
-import { mediaUrl } from "./data";
-import { StepsRail } from "./parts";
+import { mediaUrl } from "./videoData";
+import { StepsRail } from "./videoParts";
 import { SlotRibbon } from "./dubParts";
 import type { Dub, DubLine } from "./useDub";
 

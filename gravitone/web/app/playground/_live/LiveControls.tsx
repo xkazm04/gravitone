@@ -5,7 +5,7 @@
 // stage's already-derived sentence, and it is both the reason and the title.
 
 import { Button } from "@/components/ui/Primitives";
-import type { ScriptLine } from "../_variants/shared";
+import type { ScriptLine } from "../_variants/playgroundHelpers";
 import type { AgentsInfo } from "./useLiveAgents";
 
 export default function LiveControls({

@@ -1,4 +1,4 @@
-import type { EditRegion, Segment } from "./shared";
+import type { EditRegion, Segment } from "./playgroundHelpers";
 
 /** What a committed lane hands back to the console, which owns take ids, the
  *  take log and persistence. */

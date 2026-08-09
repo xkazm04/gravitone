@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useState } from "react";
 import ScoreEditor from "./ScoreEditor";
-import { DEFAULT_TEXT, parseTags } from "./shared";
+import { DEFAULT_TEXT, parseTags } from "./playgroundHelpers";
 
 // The score is a VIEW of a string the engine already understands, so every test
 // here asserts on the string that comes back out. If the editor's picture and
