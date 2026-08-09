@@ -320,6 +320,18 @@
           "apiRoutes": [
             "/v1/narrate/{narration_id}"
           ]
+        },
+        {
+          "name": "Media Job Registry",
+          "description": "The job bookkeeping the voiceover and re-voice pipelines share: the JOBS dict, its lock, held admission permits released in a finally, first-writer-wins terminal state, the deferred work-dir reap and the public projection. Extracted once both pipelines had grown the same ~120 lines and the same defect had to be fixed in each by hand.",
+          "businessFeature": "Media Job Registry",
+          "category": "lib",
+          "filePaths": [
+            "gravitone/service/jobs.py",
+            "gravitone/service/tests/test_jobs.py"
+          ],
+          "target": null,
+          "apiRoutes": []
         }
       ]
     },
@@ -1897,6 +1909,7 @@
     "Video Studio › Silent-Video Voiceover [api] — 3 files",
     "Video Studio › Video Re-voice [api] — 3 files",
     "Video Studio › Audible Docs Narration [lib] — 2 files",
+    "Video Studio › Media Job Registry [lib] — 2 files",
     "Conversation Gym › Conversational Agent Socket [api] — 7 files",
     "Conversation Gym › Gym Replay & Grading [api] — 7 files",
     "Takes, Builds & Direction › Takes, Reviews & Lineage [lib] — 2 files",
@@ -1963,11 +1976,11 @@
   ],
   "summary": {
     "totalGroups": 15,
-    "totalContexts": 77,
-    "totalFiles": 740,
+    "totalContexts": 78,
+    "totalFiles": 742,
     "categories": {
       "api": 17,
-      "lib": 22,
+      "lib": 23,
       "test": 2,
       "config": 8,
       "ui": 28
@@ -1986,5 +1999,5 @@
   },
   "instructions": "Context map for Gravitone. Each group is a business domain (domain field); each context is a feature with its files (filePaths) + a technical category. Read this to learn which files belong to which feature BEFORE editing. When you change a context's files, update them here (or run Vibeman's refresh) to keep this fresh.",
   "generatedAt": "2026-08-09T00:00:00.000Z",
-  "revision": "rescan-2026-08-09"
+  "revision": "rescan-2026-08-09+jobs"
 }
