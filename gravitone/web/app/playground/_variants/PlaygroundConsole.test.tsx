@@ -120,6 +120,20 @@ async function mountConsole(o: Options = {}) {
   return view;
 }
 
+/** The COMPOSER's text areas, in document order.
+ *
+ *  Not "every textbox on the page". The marquee (../_video) stands above the
+ *  composer and contributes two inputs of its own — the footage link and the
+ *  style brief — which carry the textbox role too, so `getAllByRole("textbox")[0]`
+ *  stopped being the composer the moment a stage was added above it. The
+ *  composer's own surfaces are textareas; that is the discriminator, and it
+ *  says what these tests actually mean instead of relying on page order. */
+function composerLines(): HTMLTextAreaElement[] {
+  return screen
+    .getAllByRole("textbox")
+    .filter((t): t is HTMLTextAreaElement => t.tagName === "TEXTAREA");
+}
+
 /** Press Generate with a synthesis call that never settles, so the console
  *  stays in its rendering state and the status row can be read. */
 async function startRender() {
@@ -398,7 +412,7 @@ describe("PlaygroundConsole — reuse loads a take back into the composer", () =
     await mountConsole({ restored: [take({ text: "Reused solo line.", url: "blob:r" })] });
     fireEvent.click(screen.getByRole("button", { name: /reuse/ }));
     expect(screen.getByRole("button", { name: "solo" })).toHaveAttribute("aria-pressed", "true");
-    expect((screen.getAllByRole("textbox")[0] as HTMLTextAreaElement).value).toBe("Reused solo line.");
+    expect(composerLines()[0].value).toBe("Reused solo line.");
   });
 
   it("restores a performance take as a script, line by line", async () => {
@@ -411,7 +425,7 @@ describe("PlaygroundConsole — reuse loads a take back into the composer", () =
     });
     fireEvent.click(screen.getByRole("button", { name: /reuse/ }));
     expect(screen.getByRole("button", { name: "script" })).toHaveAttribute("aria-pressed", "true");
-    const values = screen.getAllByRole("textbox").map((t) => (t as HTMLTextAreaElement).value);
+    const values = composerLines().map((t) => t.value);
     expect(values).toContain("One.");
     expect(values).toContain("Two.");
     // Each line keeps the Character that spoke it.
@@ -604,7 +618,7 @@ describe("PlaygroundConsole — emotions are placed as regions, never typed as t
     // An empty solo composer switches to the canned two-line demo.
     fireEvent.change(scoreArea(), { target: { value: "" } });
     fireEvent.click(screen.getByRole("button", { name: "script" }));
-    const lines = screen.getAllByRole("textbox") as HTMLTextAreaElement[];
+    const lines = composerLines();
     // The demo's second line ships tagged; the composer shows only its words.
     expect(lines[1].value).toBe("Great to finally meet you!");
 

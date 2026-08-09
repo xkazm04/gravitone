@@ -58,26 +58,14 @@ import PunchIn, { type CommitPayload } from "./PunchIn";
 import { dropVariants } from "./variantStore";
 // The playground's Signal accents — the restrained tier of web/DESIGN.md.
 import { EmptyTakes, RenderRail, TakeArrival } from "./signal";
-// The video extension (../_video). Everything below is INERT unless the page
-// asks for a direction — the console with no `video` prop is byte-for-byte the
-// console that shipped, which is what makes the two directions comparable.
+// The video extension (../_video) — the MARQUEE, which won the video round
+// against a contained "reel bay" mode. The thesis it won on: the picture is not
+// a mode you enter, it is a stage above the console that stays put, and it owns
+// no words. A scene click loads that line into this console's own composer, so
+// the score, the emotion wheel, the A/B, the expression knobs and the take log
+// remain the only way words are written and rendered here.
 import { useReel } from "../_video/useReel";
-import ReelBay from "../_video/ReelBay";
 import Marquee from "../_video/Marquee";
-
-/**
- * Where the picture lives when this console is extended for video. The
- * prototype round is exactly this choice:
- *
- *   "bay"      — CONTAINMENT. A fourth thing the compose bay can hold, beside
- *                solo/script/live. The reel owns its words (a row per scene,
- *                edited in place); the console's shape never changes.
- *   "marquee"  — PERVASION. A stage above the whole console, present in every
- *                mode once loaded. It owns no words: a scene click loads that
- *                line into the real solo composer and the existing score,
- *                wheel, A/B and expression knobs do the work.
- */
-export type VideoDirection = "bay" | "marquee";
 
 function Bars({ peaks, progress = 0, active = false, className = "" }: { peaks: number[]; progress?: number; active?: boolean; className?: string }) {
   return (
@@ -256,7 +244,7 @@ function RenderStatus({ startedAt, etaSec, estAudioSec, etaBasisLabel, noEtaLabe
   );
 }
 
-export default function PlaygroundConsole({ video }: { video?: VideoDirection } = {}) {
+export default function PlaygroundConsole() {
   // Resolved once, here, and passed down: framer's own hook cannot be trusted
   // by anything server-rendered, and one reading keeps every accent in step.
   const still = useStillMotion();
@@ -277,10 +265,6 @@ export default function PlaygroundConsole({ video }: { video?: VideoDirection } 
   // multi-character performance rendered as one take via /v1/performance.
   const [mode, setMode] = useState<"solo" | "script">("solo");
   const [liveOn, setLiveOn] = useState(false);
-  // The reel pill, for the "bay" direction only — a boolean beside the mode
-  // union exactly like `liveOn`, so nothing about the persisted composer state
-  // (lib/composerStore, whose `mode` is solo|script) has to learn a new word.
-  const [reelOn, setReelOn] = useState(false);
   const [liveActive, setLiveActive] = useState(false);
   // What the next take is rendered as. It sits beside Generate rather than in
   // the expression panel because it is a decision about the FILE you keep, not
@@ -641,7 +625,6 @@ export default function PlaygroundConsole({ video }: { video?: VideoDirection } 
    *  synthesis path — a second one would be a second set of bugs. Stable
    *  identity: the bay mirrors the focused row through it on every edit. */
   const stageLine = useCallback((t: string) => setText(t), []);
-  const reelBay = video === "bay" && reelOn;
   // The active Character's palette: base scale + its custom slots.
   const scale = useMemo(
     () => (character?.scale?.length ? character.scale : EMOTION_IDS),
@@ -1405,14 +1388,13 @@ export default function PlaygroundConsole({ video }: { video?: VideoDirection } 
         </ErrorBanner>
       )}
 
-      {/* MARQUEE (pervasion direction) — the stage sits above everything and
-          stays there in every mode. It contributes the picture and each line's
-          length; the composer below stays the one place words are written. */}
-      {video === "marquee" && (
-        <div className="mt-8">
-          <Marquee reel={reel} characterName={character?.name ?? null} onStage={stageLine} />
-        </div>
-      )}
+      {/* THE MARQUEE — the stage sits above everything and stays there in
+          every mode. It contributes the two things the composer cannot know on
+          its own (the picture, and how long each line has to be); the composer
+          below stays the one place words are written. */}
+      <div className="mt-8">
+        <Marquee reel={reel} characterName={character?.name ?? null} onStage={stageLine} />
+      </div>
 
       {/* character rail */}
       <div className="mt-8">
@@ -1501,15 +1483,6 @@ export default function PlaygroundConsole({ video }: { video?: VideoDirection } 
                 className={`rounded-full border px-2.5 py-0.5 transition ${liveOn ? "border-cyan-400/30 bg-cyan-400/10 text-cyan-200" : "border-transparent text-white/50 hover:text-white/80"}`}>
                 live
               </button>
-              {video === "bay" && (
-                <button
-                  onClick={() => { if (!reelOn) switchMode("solo"); setReelOn((v) => !v); }}
-                  aria-pressed={reelOn}
-                  title="Narrate a video — one row per scene, rendered with this Character"
-                  className={`rounded-full border px-2.5 py-0.5 transition ${reelOn ? "border-cyan-400/30 bg-cyan-400/10 text-cyan-200" : "border-transparent text-white/50 hover:text-white/80"}`}>
-                  reel
-                </button>
-              )}
             </div>
             {/* The counter states the REAL ceiling, and turns as the text
                 approaches it — the limit used to be discovered by a rejected
@@ -1525,18 +1498,7 @@ export default function PlaygroundConsole({ video }: { video?: VideoDirection } 
               keeps the direction beside them as regions; the `[tags]` are
               derived on the way to the engine, so there is no markup here for a
               stray keystroke to break. */}
-          {/* REEL (bay direction) — the picture takes over the bay body, and
-              nothing else about the console moves. The focused row is mirrored
-              into `text`, so the footer's Generate renders it through the same
-              path a hand-typed line takes. */}
-          {reelBay ? (
-            <ReelBay
-              reel={reel}
-              characterName={character?.name ?? null}
-              emotions={character?.emotions ?? ["baseline"]}
-              onStage={stageLine}
-            />
-          ) : mode === "solo" ? (
+          {mode === "solo" ? (
             <div className="px-5 py-4">
               {/* The chips are handed IN rather than drawn below: they act on
                   the score's selection, so they belong in the score's own

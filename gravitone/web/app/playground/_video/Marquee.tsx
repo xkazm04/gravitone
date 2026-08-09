@@ -26,10 +26,16 @@ export default function Marquee({ reel, characterName, onStage }: {
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
 
+  // Before a reel lands the stage IS the door — same strip, same panel, so the
+  // console does not jump when the picture arrives.
   if (!reel.ready || !reel.jobId) {
-    return reel.jobId && reel.job
-      ? <div className="glass-panel rounded-2xl px-4 py-3"><ReelDoor reel={reel} characterName={characterName} layout="bar" /></div>
-      : <ReelDoor reel={reel} characterName={characterName} layout="bar" />;
+    return reel.jobId && reel.job ? (
+      <div className="glass-panel rounded-2xl px-4 py-3">
+        <ReelDoor reel={reel} characterName={characterName} />
+      </div>
+    ) : (
+      <ReelDoor reel={reel} characterName={characterName} />
+    );
   }
 
   const total = reel.scenes.reduce((a, s) => a + s.budget, 0) || 1;

@@ -1,12 +1,17 @@
 "use client";
 
-// The studio's one data layer: both prototype variants read jobs, submit
-// work and poll through THESE functions, so they can disagree about layout
-// and never about the wire. Shapes mirror service/voiceover_api.py and
-// service/revoice_api.py's _PUBLIC_KEYS.
+// The video data layer: every surface that reads a job, submits work or polls
+// goes through THESE functions, so no two can disagree about the wire. Shapes
+// mirror service/voiceover_api.py and service/revoice_api.py's _PUBLIC_KEYS.
+//
+// SCOPE, stated: the marquee renders the VOICEOVER half (a silent video gets a
+// narration). The re-voice half — `submitRevoice`, `SceneLine`, `RevoiceFit` —
+// is the client for /v1/revoice, which the service ships and the studio has no
+// surface for yet. It is kept here rather than deleted because the proxy routes
+// under app/api/revoice are its other half; nothing renders it today.
 
 import { useEffect, useRef, useState } from "react";
-import { apiJson, throwDetail } from "@/lib/apiFetch";
+import { apiJson } from "@/lib/apiFetch";
 
 export type StudioKind = "voiceover" | "revoice";
 
@@ -199,43 +204,19 @@ export async function loadScript(jobId: string): Promise<ScriptLine[]> {
   );
 }
 
-/** Re-perform one line through the SAME /api/speak the console uses — the
- *  playground's own preview machinery, pointed at a scene. Emotion travels in
- *  the metatag grammar; voice settings are the console's expression knobs. */
-export async function retakeLine(input: {
-  character_id: string;
-  emotion: string;
-  text: string;
-  voice_settings?: { temperature?: number; stability?: number; quality?: number };
-}): Promise<Blob> {
-  const body = {
-    character_id: input.character_id,
-    text: input.emotion && input.emotion !== "baseline"
-      ? `[${input.emotion}]${input.text}[/${input.emotion}]`
-      : input.text,
-    ...(input.voice_settings ? { voice_settings: input.voice_settings } : {}),
-  };
-  const r = await fetch("/api/speak?output_format=wav_24000", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!r.ok) {
-    await throwDetail(r, r.status === 429
-      ? "the render queue is full — try again shortly"
-      : "the retake could not be rendered");
-  }
-  return r.blob();
-}
+// (A per-scene `retakeLine` used to live here — a second synthesis path that
+// spoke one scene straight to /api/speak. The marquee retired it: a scene is
+// loaded into the console's own composer instead, so there is exactly ONE way
+// words become audio on this page, with one set of knobs and one take log.)
 
-// ── fit helpers both variants render from ────────────────────────────────────
+// ── fit helpers ──────────────────────────────────────────────────────────────
 
 export function isRevoiceFit(f: VoiceoverFit | RevoiceFit): f is RevoiceFit {
   return "method" in f;
 }
 
-/** The label a fit meter carries. Authored once so the two variants cannot
- *  drift into different words for the same measured fact. */
+/** The label a fit meter carries. Authored once so no two surfaces can drift
+ *  into different words for the same measured fact. */
 export function fitVerdict(f: VoiceoverFit | RevoiceFit): {
   tone: "ok" | "warn" | "muted" | "error";
   label: string;
