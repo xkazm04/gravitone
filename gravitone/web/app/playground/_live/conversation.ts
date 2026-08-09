@@ -89,6 +89,9 @@ export type ConversationHooks = {
   onTurn?: (turn: LiveTurn) => void;
   /** The agent's reply text, the moment it arrives — before its audio. */
   onAgentText?: (text: string) => void;
+  /** The agent has audio scheduled, or has just run out of it. Edge-triggered
+   *  off the `speaking` getter — the surface says who has the floor. */
+  onSpeaking?: (speaking: boolean) => void;
   onInterruption?: () => void;
   onMeta?: (meta: { conversationId: string; rate: number }) => void;
 };
@@ -133,6 +136,8 @@ export class LiveConversation {
    *  because the next thing the user says is a different utterance. */
   private userTurn: { id: string; text: string; final: boolean } | null = null;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The last `speaking` value the hook was told about. */
+  private spoke = false;
   private muted = false;
   private stopped = false;
   private state: LiveStatus = "idle";
@@ -149,6 +154,16 @@ export class LiveConversation {
   /** Whether the agent has audio scheduled right now (for a "speaking" chip). */
   get speaking(): boolean {
     return this.sources.size > 0;
+  }
+
+  /** Announce a CHANGE in `speaking`, and nothing else. The getter above is the
+   *  one definition of the state; this only decides when to say it out loud, so
+   *  the chip can never disagree with the audio graph. */
+  private syncSpeaking(): void {
+    const now = this.speaking;
+    if (now === this.spoke) return;
+    this.spoke = now;
+    this.hooks.onSpeaking?.(now);
   }
 
   /**
@@ -429,7 +444,11 @@ export class LiveConversation {
       const at = this.nextAt;
       this.nextAt += buffer.duration;
       this.sources.add(src);
-      src.onended = () => this.sources.delete(src);
+      this.syncSpeaking();
+      src.onended = () => {
+        this.sources.delete(src);
+        this.syncSpeaking();
+      };
       src.start(at);
     } catch {
       /* one undecodable frame is a gap, not a dead call */
@@ -453,6 +472,9 @@ export class LiveConversation {
     }
     this.sources.clear();
     this.nextAt = 0;
+    // Barge-in and teardown both land here: the floor is free the instant the
+    // audio stops, and the chip must not outlive the sound it describes.
+    this.syncSpeaking();
   }
 
   // ── protocol ───────────────────────────────────────────────────────────────

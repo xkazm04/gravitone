@@ -25,11 +25,12 @@
 import { useEffect, useMemo, useState } from "react";
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { EqBars } from "@/components/ui/Equalizer";
+import { useStillMotion } from "@/lib/useStillMotion";
 import type { Character } from "@/app/voices/_data/characters";
 import { type ScriptLine, type Take } from "../_variants/playgroundHelpers";
 import LiveControls from "./LiveControls";
 import LiveTranscript from "./LiveTranscript";
-import { hueFor, toScriptLines } from "./liveTurns";
+import { floorLabel, hueFor, toScriptLines } from "./liveTurns";
 import { useLiveAgents } from "./useLiveAgents";
 import { useLiveCall } from "./useLiveCall";
 
@@ -49,10 +50,14 @@ export type LiveStageProps = {
   scriptLines?: ScriptLine[];
   /** True while a call is up, so the console can gate Generate. */
   onActiveChange?: (active: boolean) => void;
+  /** `prefers-reduced-motion`, when the console has already resolved it. Absent,
+   *  this stage reads it itself — it is never guessed. */
+  still?: boolean;
 };
 
 export default function LiveStage({
   characters, charId, generateBusy, onTake, onScript, scriptLines = [], onActiveChange,
+  still: stillProp,
 }: LiveStageProps) {
   const [scene, setScene] = useState("");
 
@@ -78,9 +83,16 @@ export default function LiveStage({
   }, [character]);
 
   const {
-    status, live, refusal, setRefusal, rows, setRows, muted, announcement,
+    status, live, refusal, setRefusal, rows, setRows, muted, speaking, announcement,
     rehearsing, setRehearsing, dial, hangUp, toggleMute,
   } = useLiveCall({ charId, character, agentId, onTake });
+
+  // Reduced motion, read ONCE for this surface and passed down (DESIGN.md
+  // "gate the animation, never drop the element"). The console resolves its own
+  // and may hand it in; LiveStage is mounted as one element with its own props
+  // (batch-2 §3), so it answers for itself when it is not told.
+  const stillPref = useStillMotion();
+  const still = stillProp ?? stillPref;
 
   useEffect(() => { onActiveChange?.(live); }, [live, onActiveChange]);
 
@@ -200,10 +212,16 @@ export default function LiveStage({
           <div className="flex h-6 min-w-24 flex-1 items-end gap-[3px]" aria-hidden>
             <EqBars bars={20} height="100%" />
           </div>
-          <span className="font-jetbrains shrink-0 text-[11px] text-white/55">
-            {status === "connecting" ? "connecting…"
-              : status === "live" ? (muted ? "muted" : "listening")
-              : rows.length > 0 ? "call ended" : ""}
+          {/* Who has the floor — see `floorLabel`. The accent is the restrained
+              tier's whole budget here: the word turns cyan (the agent's colour
+              in the transcript) for exactly as long as it is speaking. */}
+          <span
+            className={`font-jetbrains shrink-0 text-[11px] transition-colors ${
+              status === "live" && speaking ? "text-cyan-300" : "text-white/55"
+            }`}
+            data-testid="live-floor"
+          >
+            {floorLabel({ status, speaking, muted, hasRows: rows.length > 0 })}
           </span>
         </div>
 
@@ -226,6 +244,7 @@ export default function LiveStage({
             charId={charId}
             characterName={character?.name}
             live={live}
+            still={still}
             onHandOff={handOff}
             onClear={() => setRows([])}
           />

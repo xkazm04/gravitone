@@ -2,13 +2,34 @@
 // the audio it produced after it was banked as a take.
 
 import type { ScriptLine } from "../_variants/playgroundHelpers";
-import type { LiveTurn } from "./conversation";
+import type { LiveStatus, LiveTurn } from "./conversation";
 
 export type Row = LiveTurn & { url?: string; seconds?: number };
 
 /** The Character's colour on this stage — its avatar and its turn players. One
  *  derivation, so the dot and the waveform can never disagree. */
 export const hueFor = (id: string) => (id.length * 47) % 360;
+
+/**
+ * Who has the floor, in the words the stage says out loud.
+ *
+ * `speaking` is the conversation's own getter — audio actually SCHEDULED — so
+ * this can never claim the agent is talking after it stopped. While it talks,
+ * "listening" is the one thing the call is not doing, which is what this fixes.
+ * Muted is still said over the top of it: the agent holding the floor does not
+ * make the microphone live again, and dropping that would be the worse silence.
+ */
+export function floorLabel(
+  { status, speaking, muted, hasRows }:
+  { status: LiveStatus; speaking: boolean; muted: boolean; hasRows: boolean },
+): string {
+  if (status === "connecting") return "connecting…";
+  if (status === "live") {
+    if (speaking) return muted ? "muted · agent speaking" : "agent speaking";
+    return muted ? "muted" : "listening";
+  }
+  return hasRows ? "call ended" : "";
+}
 
 /**
  * Put a turn into the transcript BY ID.

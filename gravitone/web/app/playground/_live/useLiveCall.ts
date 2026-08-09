@@ -28,6 +28,8 @@ export function useLiveCall({ charId, character, agentId, onTake }: {
   const [refusal, setRefusal] = useState<LiveRefusal | null>(null);
   const [rows, setRows] = useState<Row[]>([]);
   const [muted, setMuted] = useState(false);
+  /** The agent has audio scheduled — it, not you, has the floor. */
+  const [speaking, setSpeaking] = useState(false);
   const [announcement, setAnnouncement] = useState("");
   const [rehearsing, setRehearsing] = useState(false);
 
@@ -119,6 +121,7 @@ export function useLiveCall({ charId, character, agentId, onTake }: {
         onStatus: (s) => { if (mounted.current) setStatus(s); },
         onRefusal: (r) => { if (mounted.current) setRefusal(r); },
         onTurn,
+        onSpeaking: (s) => { if (mounted.current) setSpeaking(s); },
         onInterruption: () => {
           if (mounted.current) setAnnouncement("You interrupted — the agent stopped.");
         },
@@ -148,6 +151,7 @@ export function useLiveCall({ charId, character, agentId, onTake }: {
     callRef.current = null;
     setStatus("idle");
     setMuted(false);
+    setSpeaking(false);
     setRehearsing(false);
   }
 
@@ -160,7 +164,7 @@ export function useLiveCall({ charId, character, agentId, onTake }: {
   }
 
   return {
-    status, live, refusal, setRefusal, rows, setRows, muted, announcement,
+    status, live, refusal, setRefusal, rows, setRows, muted, speaking, announcement,
     rehearsing, setRehearsing,
     dial, hangUp, toggleMute,
   };

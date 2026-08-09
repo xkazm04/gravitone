@@ -357,6 +357,57 @@ describe("protocol", () => {
     expect(h.turns[0].text).toBe("I was saying something long.");
   });
 
+  it("says when the agent has the floor, and when it gives it back", async () => {
+    const speaking: boolean[] = [];
+    const mic = fakeMic();
+    const call = new LiveConversation(
+      { onSpeaking: (s) => speaking.push(s) },
+      {
+        WebSocketImpl: FakeWS as unknown as typeof WebSocket,
+        getUserMedia: async () => mic.stream as unknown as MediaStream,
+        createAudioContext: () => new FakeCtx() as unknown as AudioContext,
+      },
+    );
+    await call.start("ws://x");
+    const ws = FakeWS.last!;
+    const ctx = FakeCtx.last!;
+    ws.open();
+    expect(call.speaking).toBe(false);
+
+    speak(ws, "I have something to say.", 1600);
+    expect(call.speaking).toBe(true);
+    speak(ws, "", 1600);            // a second burst is not a second announcement
+    expect(speaking).toEqual([true]);
+
+    // The floor goes back when the audio actually runs out — the getter is the
+    // one definition, so the chip cannot outlive the sound.
+    for (const s of ctx.sources) s.onended?.();
+    expect(call.speaking).toBe(false);
+    expect(speaking).toEqual([true, false]);
+    call.stop();
+  });
+
+  it("gives the floor back the instant a barge-in cuts the audio", async () => {
+    const speaking: boolean[] = [];
+    const mic = fakeMic();
+    const call = new LiveConversation(
+      { onSpeaking: (s) => speaking.push(s) },
+      {
+        WebSocketImpl: FakeWS as unknown as typeof WebSocket,
+        getUserMedia: async () => mic.stream as unknown as MediaStream,
+        createAudioContext: () => new FakeCtx() as unknown as AudioContext,
+      },
+    );
+    await call.start("ws://x");
+    FakeWS.last!.open();
+    speak(FakeWS.last!, "I was saying something long.", 1600);
+    expect(speaking).toEqual([true]);
+    FakeWS.last!.emit({ type: "interruption", interruption_event: { reason: "user_speech" } });
+    expect(speaking).toEqual([true, false]);
+    expect(call.speaking).toBe(false);
+    call.stop();
+  });
+
   it("survives a malformed frame and an unknown message type", async () => {
     const h = await dial();
     h.ws.open();

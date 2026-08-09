@@ -6,10 +6,38 @@
 
 import { describe, expect, it } from "vitest";
 import type { LiveTurn } from "./conversation";
-import { toScriptLines, upsertRow, type Row } from "./liveTurns";
+import { floorLabel, toScriptLines, upsertRow, type Row } from "./liveTurns";
 
 const turn = (over: Partial<LiveTurn> = {}): LiveTurn => ({
   id: "u1", role: "user", text: "hello", rate: 16_000, interrupted: false, at: 1, ...over,
+});
+
+describe("floorLabel", () => {
+  const at = (over: Parameters<typeof floorLabel>[0]) => floorLabel(over);
+
+  it("says the agent is SPEAKING rather than that we are listening", () => {
+    // The bug this fixes: for the several seconds the agent is talking, the
+    // stage said "listening" — the one thing the call is not doing.
+    expect(at({ status: "live", speaking: true, muted: false, hasRows: true }))
+      .toBe("agent speaking");
+    expect(at({ status: "live", speaking: false, muted: false, hasRows: true }))
+      .toBe("listening");
+  });
+
+  it("never drops MUTED just because the agent has the floor", () => {
+    expect(at({ status: "live", speaking: true, muted: true, hasRows: true }))
+      .toBe("muted · agent speaking");
+    expect(at({ status: "live", speaking: false, muted: true, hasRows: false }))
+      .toBe("muted");
+  });
+
+  it("keeps connecting, ended, and the empty stage as they were", () => {
+    expect(at({ status: "connecting", speaking: false, muted: false, hasRows: false }))
+      .toBe("connecting…");
+    expect(at({ status: "ended", speaking: false, muted: false, hasRows: true }))
+      .toBe("call ended");
+    expect(at({ status: "idle", speaking: false, muted: false, hasRows: false })).toBe("");
+  });
 });
 
 describe("upsertRow", () => {

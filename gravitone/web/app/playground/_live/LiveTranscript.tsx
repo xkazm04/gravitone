@@ -10,7 +10,7 @@ import { EASE } from "@/components/ui/tokens";
 import { hueFor, type Row } from "./liveTurns";
 
 export default function LiveTranscript({
-  rows, charId, characterName, live, onHandOff, onClear,
+  rows, charId, characterName, live, still = false, onHandOff, onClear,
 }: {
   rows: Row[];
   charId: string;
@@ -18,15 +18,26 @@ export default function LiveTranscript({
   characterName?: string;
   /** A call is up, so the transcript cannot be cleared out from under it. */
   live: boolean;
+  /** The visitor asked for reduced motion. The rows still arrive — they are the
+   *  conversation — they simply arrive already in place (DESIGN.md: gate the
+   *  animation, never drop the element). */
+  still?: boolean;
   onHandOff: () => void;
   onClear: () => void;
 }) {
   return (
-    <div className="space-y-2">
+    // `data-motion` states which mode this list is in, so the reduced-motion
+    // path is a property a test can read rather than a prop nobody can see.
+    <div className="space-y-2" data-motion={still ? "still" : "entrance"}>
       <AnimatePresence initial={false}>
         {rows.map((r) => (
-          <motion.div key={r.id} layout initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.3, ease: EASE }}
+          // The entrance is functional, not decorative: a turn sliding in is how
+          // you see the floor change while you are listening rather than
+          // reading. Under `still` the same row is simply already there.
+          <motion.div key={r.id} layout={!still}
+            initial={still ? false : { opacity: 0, y: -8 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={still ? { duration: 0 } : { duration: 0.3, ease: EASE }}
             className="rounded-xl border border-white/10 bg-white/[0.02] px-4 py-3">
             <div className="font-jetbrains flex flex-wrap items-center gap-3 text-[11px] text-white/60">
               <span className={r.role === "agent" ? "text-cyan-300" : "text-white/80"}>
