@@ -122,6 +122,7 @@
             "gravitone/service/demand.py",
             "gravitone/service/emotion_basis.py",
             "gravitone/service/prosody.py",
+            "gravitone/service/tests/test_demand.py",
             "gravitone/service/tests/test_derive_ab.py",
             "gravitone/service/tests/test_derive_autofill.py",
             "gravitone/service/tests/test_emotion_basis.py",
@@ -129,7 +130,10 @@
             "gravitone/service/tests/test_emotion_fallback.py",
             "gravitone/service/tests/test_emotion_residuals.py",
             "gravitone/service/tests/test_prosody.py",
+            "gravitone/service/tests/test_tools_cli.py",
             "gravitone/service/tools/__init__.py",
+            "gravitone/service/tools/__main__.py",
+            "gravitone/service/tools/cli.py",
             "gravitone/service/tools/derive_ab.py",
             "gravitone/service/tools/derive_autofill.py",
             "gravitone/service/tools/emotion_residuals.py",
@@ -1899,7 +1903,7 @@
     "Speech Synthesis Core › Concurrency Engine & Admission [lib] — 14 files",
     "Speech Synthesis Core › Engine Plane & Alternate Mouths [lib] — 8 files",
     "Speech Synthesis Core › Voice & Character Registry [lib] — 13 files",
-    "Speech Synthesis Core › Emotion Algebra & Prosody [lib] — 15 files",
+    "Speech Synthesis Core › Emotion Algebra & Prosody [lib] — 19 files",
     "Voice Cloning & Ingest › Ingest Pipeline [api] — 17 files",
     "Voice Cloning & Ingest › Link Ingest [api] — 4 files",
     "Voice Cloning & Ingest › Diarization, Casting & Voiceprints [lib] — 9 files",
@@ -1977,7 +1981,7 @@
   "summary": {
     "totalGroups": 15,
     "totalContexts": 78,
-    "totalFiles": 742,
+    "totalFiles": 746,
     "categories": {
       "api": 17,
       "lib": 23,
@@ -1999,5 +2003,5 @@
   },
   "instructions": "Context map for Gravitone. Each group is a business domain (domain field); each context is a feature with its files (filePaths) + a technical category. Read this to learn which files belong to which feature BEFORE editing. When you change a context's files, update them here (or run Vibeman's refresh) to keep this fresh.",
   "generatedAt": "2026-08-09T00:00:00.000Z",
-  "revision": "rescan-2026-08-09+jobs+compare"
+  "revision": "rescan-2026-08-09+jobs+compare+tools"
 }

@@ -363,9 +363,16 @@ class TransferQualityGateTests(_DeriveCase):
         # A quality of 0.0 from a version we cannot interpret must neither
         # refuse the derive nor be reported as this voice's quality.
         self.assertEqual(r.status_code, 201, r.text)
-        self.assertEqual(
-            r.json()["derived_from"]["transfer"], {"quality": None,
-                                                   "state": "unmeasured"})
+        # Asserted by MEANING rather than by exact dict: the transfer row is now
+        # emotion_basis.transfer_payload(), which deliberately emits the same key
+        # set in all three states so no consumer infers anything from a missing
+        # key. The two keys this test has always cared about carry the same
+        # values they always did; what changed is that the row is no longer a
+        # different SHAPE depending on whether anything was measured.
+        transfer = r.json()["derived_from"]["transfer"]
+        self.assertEqual(transfer["state"], eb.TRANSFER_UNMEASURED)
+        self.assertIsNone(transfer["quality"])
+        self.assertIsNone(transfer["measured"])
 
     def test_a_donor_transplant_is_not_gated_by_a_number_about_the_basis(self) -> None:
         # The harness measures BASIS directions. A named donor is a different,

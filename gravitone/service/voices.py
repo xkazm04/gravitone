@@ -68,12 +68,13 @@ BUILTIN_IDS = frozenset(vid for vid, _ in BUILTIN)
 RECORDED = "recorded"
 DERIVED = "derived"
 
-# What a derived Voice says about its measured quality when nothing measured it
-# (no A/B harness run, or a donor transplant, which the harness does not test).
-# `quality: None` — never a fabricated 0 — plus a word for WHY it is null, so a
-# reader can tell "not tested" apart from "tested and bad", which is the whole
-# difference the transfer gate exists to keep.
-UNMEASURED_TRANSFER = {"quality": None, "state": "unmeasured"}
+# What a derived Voice says about its measured quality now lives in ONE place:
+# emotion_basis.transfer_payload(), which emits the same key set whether the
+# quality was measured, measured-and-bad, or never measured. This module used to
+# carry half of that shape — an UNMEASURED_TRANSFER constant here and a measured
+# dict built inline below — and the halves had drifted: the unmeasured row said
+# `state: "unmeasured"` while the MEASURED row had no `state` key at all, so a
+# client reading transfer.state got undefined exactly when a measurement existed.
 
 
 class Voice(BaseModel):
@@ -1519,7 +1520,7 @@ def derive_emotion(character_id: str, emotion: str,
         # The A/B harness measures BASIS directions; a donor transplant is a
         # different mechanism nobody measured, so it records "unmeasured" rather
         # than borrowing a number that was not about it.
-        transfer = UNMEASURED_TRANSFER
+        transfer = emotion_basis.transfer_payload(None)
     else:
         basis, reason = emotion_basis.load(VOICES_DIR)
         if basis is None:
@@ -1534,13 +1535,9 @@ def derive_emotion(character_id: str, emotion: str,
         # refused here — the whole point of measuring it. An emotion nobody has
         # measured is allowed and says so on the row: absence of a measurement
         # is not evidence of a bad voice.
-        measured, refusal = emotion_basis.transfer_gate(basis, emotion)
+        transfer, refusal = emotion_basis.transfer_check(basis, emotion)
         if refusal is not None:
             raise HTTPException(422, refusal)
-        transfer = UNMEASURED_TRANSFER if measured is None else {
-            "quality": measured.quality, "speakers": measured.speakers,
-            "in_sample": measured.in_sample,
-            "version": emotion_basis.TRANSFER_VERSION}
         vector, alpha = entry.vector, entry.alpha
         basis_version, confidence = basis.version, entry.coherence
         source = {"source": "basis", "donor": None,
