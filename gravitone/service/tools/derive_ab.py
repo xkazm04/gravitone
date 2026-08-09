@@ -38,10 +38,11 @@ Two honesty rules:
     whichever speakers had the emotion -- often the same ones tested here. That
     flatters the result, so `in_sample` travels with every published number.
 
-Run:
+Run (``python -m service.tools`` lists the whole pipeline and what each part
+needs; this one needs the engine):
 
-    python -m service.tools.derive_ab --dry-run
-    python -m service.tools.derive_ab --emotion angry
+    python -m service.tools ab --dry-run
+    python -m service.tools ab --emotion angry
 """
 from __future__ import annotations
 

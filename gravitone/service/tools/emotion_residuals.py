@@ -39,10 +39,11 @@ Two honesty rules, both asserted in `test_emotion_residuals`:
 pure numpy and is exercised on synthetic tensors with KNOWN geometry, so the
 math is proven here and only the corpus needs the Arm box.
 
-Run:
+Run (``python -m service.tools`` lists the whole pipeline and what each part
+needs; this is the FIRST step -- nothing else should be run until it says go):
 
-    python -m service.tools.emotion_residuals
-    python -m service.tools.emotion_residuals --json
+    python -m service.tools residuals
+    python -m service.tools residuals --json
     python -m service.tools.emotion_residuals --emotion angry
 """
 from __future__ import annotations

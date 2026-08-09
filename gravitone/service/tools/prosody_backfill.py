@@ -11,10 +11,11 @@ every slot, on purpose — the comparison in ``emotions.nearest_measured`` is
 between slots of one Character, so any content difference between them would be
 measured as an emotion difference.
 
-Run:
+Run (``python -m service.tools`` lists the whole pipeline and what each part
+needs; this one needs the engine):
 
-    python -m service.tools.prosody_backfill --dry-run
-    python -m service.tools.prosody_backfill --limit 20
+    python -m service.tools prosody --dry-run
+    python -m service.tools prosody --limit 20
 
 **This box cannot do the real thing.** ``service/engine.py`` imports torch and
 pocket_tts, neither of which is installed outside the container, so the tool
