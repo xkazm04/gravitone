@@ -5,7 +5,7 @@
 // how a verdict, a slot or a clock is rendered.
 
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
-import { fitVerdict, type RevoiceFit } from "./videoData";
+import { fitVerdict, substitution, type RevoiceFit } from "./videoData";
 import { tc } from "./videoParts";
 import type { Dub, DubLine } from "./useDub";
 
@@ -32,9 +32,20 @@ export function FitBadge({ fit }: { fit: RevoiceFit | null }) {
     : v.tone === "warn" ? "border-amber-400/30 bg-amber-400/10 text-amber-200"
     : v.tone === "muted" ? "border-white/12 text-white/50"
     : "border-cyan-400/30 bg-cyan-400/10 text-cyan-200";
+  // What the brain SWAPPED, beside what the ladder did — the two are different
+  // liberties (a substituted emotion vs a reshaped duration) and neither may
+  // be inferred from the other. Restrained: a stated fact, no colour of its own.
+  const swap = substitution({
+    requested: fit.emotion_requested,
+    delivered: fit.emotion,
+    stemFallback: fit.stem_fallback,
+  });
   return (
-    <span className={`font-jetbrains rounded-full border px-2 py-0.5 text-[11px] ${skin}`}>
-      {v.label}
+    <span className="inline-flex flex-wrap items-baseline gap-x-2">
+      <span className={`font-jetbrains rounded-full border px-2 py-0.5 text-[11px] ${skin}`}>
+        {v.label}
+      </span>
+      {swap && <span className="font-jetbrains text-[11px] text-white/50">{swap}</span>}
     </span>
   );
 }

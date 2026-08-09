@@ -77,7 +77,9 @@ export default function RevoiceStage({ dub, draft, onStage }: {
               <p className="font-jetbrains mt-1 text-[11px] text-white/55">
                 {summary.lines} lines · {summary.verbatim} verbatim · {summary.atempo} time-stretched ·{" "}
                 {summary.rewritten} rewritten
-                {j.brain ? ` · directed by ${j.brain.backend}` : ""}
+                {j.brain
+                  ? ` · directed by ${j.brain.backend}${j.brain.model ? ` (${j.brain.model})` : ""}`
+                  : ""}
               </p>
             )}
             {/* spilling = the dub rendered, with a caveat (warning · amber);

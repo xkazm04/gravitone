@@ -3,11 +3,21 @@
 // ── narrate ──────────────────────────────────────────────────────────────────
 
 import { useRef } from "react";
-import { frameUrl, mediaUrl } from "./videoData";
+import { frameUrl, mediaUrl, substitution } from "./videoData";
 import { FitMeter, tc } from "./videoParts";
 import MarqueePlayhead from "./MarqueePlayhead";
 import ReelDoor from "./ReelDoor";
 import type { Reel, Scene } from "./useReel";
+
+/** What was substituted for this scene's emotion, if anything — the writer's
+ *  request against what the Character could actually speak. */
+function sceneSwap(s: Scene): string | null {
+  return substitution({
+    requested: s.emotionRequested,
+    delivered: s.fit?.emotion ?? s.emotion,
+    stemFallback: s.fit?.stem_fallback,
+  });
+}
 
 export default function NarrateStage({ reel, characterName, onStage }: {
   reel: Reel; characterName: string | null; onStage: (t: string) => void;
@@ -29,7 +39,9 @@ export default function NarrateStage({ reel, characterName, onStage }: {
     const v = videoRef.current;
     if (v) {
       v.currentTime = s.start + 0.05; // land inside the block, never on its seam
-      void v.play().catch(() => { /* autoplay refused — the seek still landed */ });
+      // play() is only a promise where the media stack implements one; the
+      // seek above is the part that must land either way.
+      void v.play()?.catch(() => { /* autoplay refused — the seek still landed */ });
     }
   };
 
@@ -49,15 +61,28 @@ export default function NarrateStage({ reel, characterName, onStage }: {
               <p className="mt-1 truncate text-base text-white">{reel.job?.source.title}</p>
               <p className="font-jetbrains mt-1 text-[11px] text-white/55">
                 {tc(total)} · {reel.scenes.length} scenes · narrated by {characterName}
-                {reel.job?.brain ? ` · written by ${reel.job.brain.backend}` : ""}
+                {reel.job?.brain
+                  ? ` · written by ${reel.job.brain.backend}${
+                      reel.job.brain.model ? ` (${reel.job.brain.model})` : ""}`
+                  : ""}
               </p>
             </div>
-            <button
-              onClick={() => void reel.reset()}
-              className="font-jetbrains shrink-0 cursor-pointer rounded-lg border border-white/15 px-3 py-1.5 text-[11px] text-white/70 transition hover:border-rose-400/40 hover:text-rose-200"
-            >
-              new reel
-            </button>
+            <div className="flex shrink-0 items-center gap-2">
+              {/* the narrated reel leaves the same way the dub does — the only
+                  exit used to be the browser's own context menu, unstated */}
+              <a
+                href={mediaUrl("voiceover", reel.jobId, "video")} download
+                className="font-jetbrains cursor-pointer rounded-lg border border-white/15 px-3 py-1.5 text-[11px] text-white/70 transition hover:border-cyan-400/40 hover:text-cyan-200"
+              >
+                download the reel
+              </a>
+              <button
+                onClick={() => void reel.reset()}
+                className="font-jetbrains cursor-pointer rounded-lg border border-white/15 px-3 py-1.5 text-[11px] text-white/70 transition hover:border-rose-400/40 hover:text-rose-200"
+              >
+                new reel
+              </button>
+            </div>
           </div>
 
           {focused && (
@@ -68,6 +93,13 @@ export default function NarrateStage({ reel, characterName, onStage }: {
               <p className="mt-1 line-clamp-2 text-sm text-white/80">
                 {focused.text || "(the writer left this scene silent)"}
               </p>
+              {/* A stated fact, not an alarm: the writer asked for an emotion
+                  this Character has never recorded, so something else spoke the
+                  line. It used to be computed (useReel: emotionRequested,
+                  fit.stem_fallback) and shown nowhere. */}
+              {sceneSwap(focused) && (
+                <p className="font-jetbrains mt-1 text-[11px] text-white/50">{sceneSwap(focused)}</p>
+              )}
               {focused.fit && <div className="mt-2"><FitMeter fit={focused.fit} /></div>}
             </div>
           )}
@@ -84,7 +116,8 @@ export default function NarrateStage({ reel, characterName, onStage }: {
                 key={s.i}
                 onClick={() => go(s)}
                 aria-pressed={on}
-                title={`Scene ${s.i + 1} · ${tc(s.start)} · ${s.budget.toFixed(1)}s`}
+                title={[`Scene ${s.i + 1}`, tc(s.start), `${s.budget.toFixed(1)}s`, sceneSwap(s)]
+                  .filter(Boolean).join(" · ")}
                 style={{ width: `${(s.budget / total) * 100}%` }}
                 className={`group relative min-w-[10px] cursor-pointer overflow-hidden rounded-md border transition ${
                   on ? "border-cyan-400/60" : "border-white/10 hover:border-white/35"

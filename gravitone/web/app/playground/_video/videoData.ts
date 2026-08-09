@@ -229,6 +229,28 @@ export function isRevoiceFit(f: VoiceoverFit | RevoiceFit): f is RevoiceFit {
   return "method" in f;
 }
 
+/** What the box put in place of what was asked for, in one phrase — or null
+ *  when nothing was substituted. Authored ONCE so a swapped emotion cannot be
+ *  described two ways on two surfaces.
+ *
+ *  `stemFallback` is the backend's own flag (service/emotions.py::resolve): the
+ *  voice that spoke this line came from a slot this Character has not actually
+ *  recorded — a nearest-measured or derived stand-in — which is true even when
+ *  the emotion's NAME is the one that was asked for. Silence about it would be
+ *  the console presenting a computed stand-in as a performance. */
+export function substitution(input: {
+  requested?: string | null;
+  delivered?: string | null;
+  stemFallback?: boolean;
+}): string | null {
+  const { requested, delivered, stemFallback } = input;
+  if (requested && requested !== delivered) {
+    return `asked for ${requested} · spoken ${delivered || "baseline"}`;
+  }
+  if (stemFallback) return `no recorded ${delivered || "emotion"} — a stand-in was used`;
+  return null;
+}
+
 /** The label a fit meter carries. Authored once so no two surfaces can drift
  *  into different words for the same measured fact. */
 export function fitVerdict(f: VoiceoverFit | RevoiceFit): {

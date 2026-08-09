@@ -91,7 +91,19 @@ export function StepsRail({ job, stalled }: { job: StudioJob; stalled: boolean }
 function ProgressNote({ job, step }: { job: StudioJob; step: string }) {
   const p = job.partial;
   let note: string | null = null;
-  if (step === "scenes" && p.scenes) note = `${p.scenes} scenes`;
+  // The source's own facts, KEPT rather than dropped: during fetch there is
+  // nothing else on screen, and "3:20 · 1920×1080" is how a user tells at a
+  // glance that the box got the video they meant — and how long they are in
+  // for. `frames` earns its place next to `scenes` because a scene whose frame
+  // was never captured is narrated blind, and the shortfall shows here first.
+  if (step === "fetch" && p.video) {
+    note = `${tc(p.video.seconds)} · ${p.video.width}×${p.video.height}`;
+  }
+  if (step === "scenes" && p.scenes) {
+    note = p.frames != null && p.frames !== p.scenes
+      ? `${p.scenes} scenes · ${p.frames} frames`
+      : `${p.scenes} scenes`;
+  }
   if (step === "look" && p.described != null) note = `${p.described}/${p.scenes ?? "?"} described`;
   if (step === "write" && p.words) note = `${p.lines ?? 0} lines · ${p.words} words`;
   if (step === "speak" && p.spoken_total) {
