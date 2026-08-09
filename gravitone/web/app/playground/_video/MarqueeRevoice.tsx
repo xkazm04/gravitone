@@ -56,6 +56,14 @@ export default function RevoiceStage({ dub, draft, onStage }: {
       {j?.status === "running" && <div className="mt-4"><StepsRail job={j} stalled={dub.stalled} /></div>}
       {j?.status === "error" && <ErrorBanner>{j.error}</ErrorBanner>}
       {j?.status === "expired" && <ErrorBanner>this dub aged out on the box — run it again</ErrorBanner>}
+      {/* cancelled is a real backend state (service/revoice_api.py::cancel) and
+          it used to paint nothing at all. Amber: an abandoned run is not a
+          failure, but the panel must not look like a dub that never happened. */}
+      {j?.status === "cancelled" && (
+        <ErrorBanner severity="warning">
+          this dub was cancelled — nothing further will be rendered for it
+        </ErrorBanner>
+      )}
 
       {j?.status === "done" && dub.jobId && (
         <div className="mt-4 flex flex-col gap-4 lg:flex-row">
@@ -72,16 +80,19 @@ export default function RevoiceStage({ dub, draft, onStage }: {
                 {j.brain ? ` · directed by ${j.brain.backend}` : ""}
               </p>
             )}
+            {/* spilling = the dub rendered, with a caveat (warning · amber);
+                failed = lines that are NOT in the file (error · rose). One
+                banner component decides both, so the two can never swap hues. */}
             {!!summary?.spilling && (
-              <p className="font-jetbrains mt-1 text-[11px] text-amber-200">
+              <ErrorBanner severity="warning" className="mt-1">
                 {summary.spilling} line{summary.spilling > 1 ? "s" : ""} still run past their slot — the
                 picture keeps playing under them
-              </p>
+              </ErrorBanner>
             )}
             {!!summary?.failed && (
-              <p className="font-jetbrains mt-1 text-[11px] text-rose-300">
+              <ErrorBanner className="mt-1">
                 {summary.failed} line{summary.failed > 1 ? "s" : ""} could not be re-performed
-              </p>
+              </ErrorBanner>
             )}
             <a href={mediaUrl("revoice", dub.jobId, "video")} download
                className="font-jetbrains mt-3 inline-block cursor-pointer rounded-lg border border-white/15 px-3 py-1.5 text-[11px] text-white/70 transition hover:border-cyan-400/40 hover:text-cyan-200">

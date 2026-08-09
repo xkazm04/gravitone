@@ -4,6 +4,7 @@
 // day one so the two directions differ in WHERE the picture lives, never in
 // how a measured fact is rendered.
 
+import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { fitVerdict, type RevoiceFit, type StudioJob, type VoiceoverFit } from "./videoData";
 
 /** One fit meter, drawn TO SCALE: the hairline track is the slot's budget, the
@@ -76,10 +77,12 @@ export function StepsRail({ job, stalled }: { job: StudioJob; stalled: boolean }
           </li>
         ))}
       </ol>
+      {/* a degraded CONNECTION is a warning, not a failure: the job itself is
+          fine, only our view of it is behind. Severity is the banner's job. */}
       {stalled && (
-        <p className="font-jetbrains mt-3 text-[11px] text-amber-200">
+        <ErrorBanner severity="warning" className="mt-3">
           connection degraded — the job keeps running on the box; this page will catch up
-        </p>
+        </ErrorBanner>
       )}
     </div>
   );

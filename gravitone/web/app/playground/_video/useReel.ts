@@ -8,8 +8,9 @@
 // building a second page is that one roster, one selection, one set of
 // expression knobs serve both the composer and the picture.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { ApiError } from "@/lib/apiFetch";
+import { useMounted } from "@/lib/useMounted";
 import {
   cancelJob, loadScript, submitVoiceover, useStudioJob,
   type ScriptLine, type VoiceoverFit,
@@ -47,13 +48,9 @@ export function useReel({ characterId }: { characterId: string }) {
   const [script, setScript] = useState<ScriptLine[] | null>(null);
   const [edits, setEdits] = useState<Record<number, { text?: string; emotion?: string }>>({});
   const [focus, setFocus] = useState(0);
+  const [cancelling, setCancelling] = useState(false);
   const { job, stalled } = useStudioJob("voiceover", jobId);
-  const mounted = useRef(true);
-
-  useEffect(() => {
-    mounted.current = true;
-    return () => { mounted.current = false; };
-  }, []);
+  const mounted = useMounted();
 
   // The written script arrives with the finished job. A script that cannot be
   // read is NOT fatal — the reel still plays and the fit report still renders;
@@ -117,19 +114,41 @@ export function useReel({ characterId }: { characterId: string }) {
     }
   }, [url, characterId, style, submitting]);
 
+  /** Abandon this reel. The box is asked FIRST and the view is cleared only if
+   *  it agreed: painting "new reel" over a render that is still going would be
+   *  the console claiming something it never verified. A refused cancel leaves
+   *  the reel exactly where it is and says so. */
   const reset = useCallback(async () => {
     const id = jobId;
     const running = job?.status === "running";
+    if (id && running) {
+      if (cancelling) return;           // one cancel per click, not per press
+      setCancelling(true);
+      try {
+        await cancelJob("voiceover", id);
+      } catch (e) {
+        if (mounted.current) {
+          // an ApiError with an EMPTY detail (a proxy that answered `{}`) must
+          // not leave a dangling dash where the reason should be
+          const why = e instanceof ApiError && e.message
+            ? e.message : "the cancel request failed";
+          setError(`${why} — this reel is still rendering on the box`);
+        }
+        return;
+      } finally {
+        if (mounted.current) setCancelling(false);
+      }
+      if (!mounted.current) return;
+    }
     setJobId(null);
     setScript(null);
     setEdits({});
     setError(null);
-    if (id && running) await cancelJob("voiceover", id);
-  }, [jobId, job?.status]);
+  }, [jobId, job?.status, cancelling, mounted]);
 
   return {
     url, setUrl, style, setStyle,
-    jobId, job, stalled, submitting, error,
+    jobId, job, stalled, submitting, cancelling, error,
     scenes, focus, setFocus, patch,
     submit, reset,
     /** the reel is loaded and has scenes to work with */

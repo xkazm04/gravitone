@@ -39,9 +39,10 @@ export default function ReelDoor({ reel, characterName }: {
           </div>
           <button
             onClick={() => void reel.reset()}
-            className="font-jetbrains shrink-0 cursor-pointer rounded-lg border border-white/15 px-3 py-1.5 text-[11px] text-white/70 transition hover:border-rose-400/40 hover:text-rose-200"
+            disabled={reel.cancelling}
+            className="font-jetbrains shrink-0 cursor-pointer rounded-lg border border-white/15 px-3 py-1.5 text-[11px] text-white/70 transition hover:border-rose-400/40 hover:text-rose-200 disabled:opacity-40"
           >
-            {j.status === "running" ? "cancel" : "new reel"}
+            {reel.cancelling ? "cancelling…" : j.status === "running" ? "cancel" : "new reel"}
           </button>
         </div>
         {j.status === "running" && <div className="mt-4"><StepsRail job={j} stalled={reel.stalled} /></div>}
@@ -49,9 +50,20 @@ export default function ReelDoor({ reel, characterName }: {
         {j.status === "expired" && (
           <ErrorBanner>this reel aged out on the box — load it again</ErrorBanner>
         )}
+        {/* A job the box marked cancelled — ours, or one abandoned from another
+            tab. It is not a failure, so it is amber: nothing further will be
+            rendered, and the state is stated instead of painting an empty panel. */}
+        {j.status === "cancelled" && (
+          <ErrorBanner severity="warning">
+            this reel was cancelled — nothing further will be rendered for it
+          </ErrorBanner>
+        )}
         {j.limits.length > 0 && j.status === "done" && (
           <ErrorBanner severity="warning">{j.limits.join(" · ")}</ErrorBanner>
         )}
+        {/* the cancel above lives HERE, so its refusal has to be readable here
+            too — the pre-job door's banner is a different screen. */}
+        {reel.error && <ErrorBanner>{reel.error}</ErrorBanner>}
       </div>
     );
   }

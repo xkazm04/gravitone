@@ -91,7 +91,7 @@ export function DubControls({ dub, lines, label = "Dub ▶" }: {
           hint="a line that cannot fit its slot may be reworded — the new words are shown, never swapped in silently" />
         <button
           onClick={() => void (running ? dub.reset() : dub.run(lines))}
-          disabled={!running && (!!blocked || dub.submitting)}
+          disabled={dub.cancelling || (!running && (!!blocked || dub.submitting))}
           title={running ? "Abandon this dub" : (blocked ?? "Replace the dialogue and render the video")}
           className={`font-jetbrains cursor-pointer rounded-lg border px-3 py-1.5 text-[11px] transition disabled:opacity-40 ${
             running
@@ -99,7 +99,9 @@ export function DubControls({ dub, lines, label = "Dub ▶" }: {
               : "border-cyan-400/30 bg-cyan-400/10 text-cyan-200 enabled:hover:bg-cyan-400/20"
           }`}
         >
-          {running ? "cancel dub" : dub.submitting ? "sending…" : label}
+          {dub.cancelling ? "cancelling…"
+            : running ? "cancel dub"
+            : dub.submitting ? "sending…" : label}
         </button>
       </div>
       {blocked && !running && (

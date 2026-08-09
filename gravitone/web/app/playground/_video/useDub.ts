@@ -9,8 +9,9 @@
 // lines by whoever owns them, which is exactly the thing the round is choosing
 // between.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { ApiError } from "@/lib/apiFetch";
+import { useMounted } from "@/lib/useMounted";
 import { cancelJob, submitRevoice, useStudioJob, type RevoiceFit } from "./videoData";
 
 export type DubLine = {
@@ -44,14 +45,11 @@ export function useDub() {
   // position in what was sent, so pairing it to whatever is on screen now
   // would mis-attribute every verdict the moment a line is added or moved.
   const [submitted, setSubmitted] = useState<DubLine[]>([]);
+  const [cancelling, setCancelling] = useState(false);
   const { job, stalled } = useStudioJob("revoice", jobId);
   // Every `await` below is followed by a setState; the guard is what keeps a
   // dub submitted just before a tab switch from writing into a dead tree.
-  const mounted = useRef(true);
-  useEffect(() => {
-    mounted.current = true;
-    return () => { mounted.current = false; };
-  }, []);
+  const mounted = useMounted();
 
   /** Fill in the slots nothing has set yet: each line follows the one before
    *  it. Deterministic, so a sheet does not reshuffle itself as it is edited. */
@@ -117,14 +115,33 @@ export function useDub() {
     }
   }, [submitting, blockedFor, url, direct, rewrite]);
 
+  /** Abandon this dub. The box is asked FIRST and the sheet is only released
+   *  if it agreed — a refused cancel leaves the dub running and says so, rather
+   *  than drawing a fresh sheet over a render nobody stopped. */
   const reset = useCallback(async () => {
     const id = jobId;
     const running = job?.status === "running";
+    if (id && running) {
+      if (cancelling) return;           // one cancel per click, not per press
+      setCancelling(true);
+      try {
+        await cancelJob("revoice", id);
+      } catch (e) {
+        if (mounted.current) {
+          const why = e instanceof ApiError && e.message
+            ? e.message : "the cancel request failed";
+          setError(`${why} — this dub is still rendering on the box`);
+        }
+        return;
+      } finally {
+        if (mounted.current) setCancelling(false);
+      }
+      if (!mounted.current) return;
+    }
     setJobId(null);
     setSubmitted([]);
     setError(null);
-    if (id && running) await cancelJob("revoice", id);
-  }, [jobId, job?.status]);
+  }, [jobId, job?.status, cancelling, mounted]);
 
   const fits = useMemo(
     () => (job?.result?.fit ?? []) as RevoiceFit[],
@@ -150,7 +167,7 @@ export function useDub() {
     url, setUrl,
     direct, setDirect, rewrite, setRewrite,
     timing, slotsFor, patchTiming,
-    jobId, job, stalled, submitting, error,
+    jobId, job, stalled, submitting, cancelling, error,
     run, reset, blockedFor, fitFor, slots,
     ready: job?.status === "done",
   };

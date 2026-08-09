@@ -11,7 +11,7 @@
 // under app/api/revoice are its other half; nothing renders it today.
 
 import { useEffect, useRef, useState } from "react";
-import { apiJson } from "@/lib/apiFetch";
+import { apiJson, throwDetail } from "@/lib/apiFetch";
 
 export type StudioKind = "voiceover" | "revoice";
 
@@ -112,8 +112,17 @@ export async function submitRevoice(input: {
   );
 }
 
+/** Abandon a running job. THROWS when the box did not agree — the caller must
+ *  not clear its view on a cancel that never happened; the render is still
+ *  burning on the box and the user has to be told so.
+ *
+ *  A 404 is the one non-OK answer that is NOT a failure: the job already aged
+ *  out of the registry (`errors.job_expired`), so there is nothing left running
+ *  and clearing the view is the truthful outcome. */
 export async function cancelJob(kind: StudioKind, jobId: string): Promise<void> {
-  await fetch(`/api/${kind}/${jobId}`, { method: "DELETE" });
+  const r = await fetch(`/api/${kind}/${jobId}`, { method: "DELETE" });
+  if (r.ok || r.status === 404) return;
+  await throwDetail(r, "the cancel request was refused");
 }
 
 /** Poll one studio job until it lands. The compact sibling of ingest's
@@ -135,6 +144,11 @@ export function useStudioJob(kind: StudioKind, jobId: string | null) {
     }
     let live = true;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    // Per-JOB counters. Kept in refs so a re-render cannot reset them, but
+    // re-armed here: a previous job that ended stalled must not make the next
+    // job's first hiccup report a degraded connection.
+    failures.current = 0;
+    stepSince.current = { step: "", at: 0 };
 
     const delay = (step: string) => {
       if (document.visibilityState === "hidden") return 30_000;
