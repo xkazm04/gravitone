@@ -52,9 +52,24 @@ MAX_SECONDS = float(_str("REVOICE_MAX_SECONDS", "") or 900)
 
 _TTL_S = 30 * 60
 _RUNNING_TTL_S = 120 * 60
+#: A work dir is NEVER deleted the instant its job dies: a `FileResponse` for
+#: revoiced.mp4 / track.wav may still be streaming out of it. Every deletion is
+#: deferred by this grace and performed by `_gc` — one reclamation path, so no
+#: door has to reason about who might be reading.
+_REAP_GRACE_S = 60
 
 JOBS: dict[str, dict] = {}
 _LOCK = threading.Lock()
+#: (deadline, work_dir) — the ONLY place a work dir is removed from disk.
+_REAP: list[tuple[float, str]] = []
+
+#: Admission is a HELD PERMIT, not a count derived from job status — the same
+#: discipline `engine.py` runs on. A count says "the door is free" the moment a
+#: worker stops writing `running`, which a worker killed by process exit or a
+#: BaseException never gets to do: the old `_active()` left MAX_ACTIVE=1 shut
+#: for the whole _RUNNING_TTL_S window. `_run_job` releases in a `finally`, so
+#: every exit path — return, exception, BaseException, cancel — frees it.
+_ADMIT = threading.BoundedSemaphore(max(MAX_ACTIVE, 0))
 
 STEPS = (("fetch", "fetching the video"),
          ("direct", "composing the emotional read"),
@@ -73,7 +88,8 @@ _LIMIT_BED = ("the original background (music, ambience) is not carried over "
 # ── registry plumbing (mirrors voiceover_api; small enough that sharing a
 #    base would couple two lifecycles for ~60 lines of dict bookkeeping) ─────
 
-def _new_job(source: dict, lines: list[dict], options: dict) -> dict:
+def _new_job(source: dict, lines: list[dict], options: dict,
+             *, permit: bool = False) -> dict:
     job_id = uuid.uuid4().hex[:12]
     wd = WORK_DIR / job_id
     wd.mkdir(parents=True, exist_ok=True)
@@ -83,7 +99,7 @@ def _new_job(source: dict, lines: list[dict], options: dict) -> dict:
            "partial": {}, "error": None, "source": source, "lines": lines,
            "options": options, "brain": None, "result": None,
            "limits": [_LIMIT_BED],
-           "work_dir": str(wd), "cancel": False,
+           "work_dir": str(wd), "cancel": False, "permit": bool(permit),
            "created": time.time(), "touched": time.time()}
     with _LOCK:
         JOBS[job_id] = job
@@ -119,23 +135,57 @@ def _partial(job: dict, d: dict) -> None:
         job["partial"].update(d)
 
 
+def _finish(job: dict, status: str, **fields) -> None:
+    """Write a job's ONE terminal state — first writer wins.
+
+    `cancel()` may flip a running job to `cancelled` while the phase thread is
+    mid-step; that thread then finishes its step and used to stamp `done` over
+    the top, so a job could report two terminal states depending on who read it
+    when. A job leaves `running` exactly once.
+    """
+    with _LOCK:
+        if job["status"] != "running":
+            return
+        job.update(fields)
+        job["status"] = status
+        job["touched"] = time.time()
+
+
+def _schedule_reap(work_dir: str) -> None:
+    """Hand a work dir to `_gc`, `_REAP_GRACE_S` from now. Callers hold _LOCK."""
+    _REAP.append((time.time() + _REAP_GRACE_S, work_dir))
+
+
 def _gc() -> None:
     now = time.time()
-    doomed: list[dict] = []
     with _LOCK:
         for job in list(JOBS.values()):
             idle = now - job["touched"]
             age = now - job["created"]
             done = job["status"] in ("done", "error", "cancelled")
             if (done and idle > _TTL_S) or age > _RUNNING_TTL_S:
-                doomed.append(JOBS.pop(job["id"]))
-    for job in doomed:
-        shutil.rmtree(job["work_dir"], ignore_errors=True)
+                _schedule_reap(JOBS.pop(job["id"])["work_dir"])
+        due = [w for deadline, w in _REAP if deadline <= now]
+        _REAP[:] = [(d, w) for d, w in _REAP if d > now]
+    for work_dir in due:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
-def _active() -> int:
+def _acquire_admission() -> bool:
+    return _ADMIT.acquire(blocking=False)
+
+
+def _release_admission(job: dict) -> None:
+    """Hand back this job's permit, at most once.
+
+    Idempotent by construction: the flag is popped under the lock, so two
+    callers racing (a door that failed to start its thread, the worker's
+    `finally`) cannot double-release a BoundedSemaphore.
+    """
     with _LOCK:
-        return sum(1 for j in JOBS.values() if j["status"] == "running")
+        held = bool(job.pop("permit", False))
+    if held:
+        _ADMIT.release()
 
 
 # ── the phase thread ──────────────────────────────────────────────────────────
@@ -241,7 +291,7 @@ def _run_job(job: dict) -> None:
         voiceover.mux(video, wd / "track.wav", wd / "revoiced.mp4")
         _step(job, "mux", "done")
         methods = [f.get("method") for f in fit_report]
-        _update(job, status="done", result={
+        _finish(job, "done", result={
             "fit": fit_report,
             "summary": {
                 "lines": len(fit_report),
@@ -255,12 +305,18 @@ def _run_job(job: dict) -> None:
             }})
     except _Cancelled:
         logger.info("revoice job %s: abandoned (cancelled)", job["id"])
+        _finish(job, "cancelled")
     except _AUTHORED as exc:
-        _update(job, status="error", error=str(exc))
+        _finish(job, "error", error=str(exc))
     except Exception as exc:  # noqa: BLE001 - the boundary; sanitize and log
         logger.exception("revoice job %s failed", job["id"])
-        _update(job, status="error",
+        _finish(job, "error",
                 error=errors.sanitize_detail("re-voicing this video", exc))
+    finally:
+        # The permit is released HERE and only here for a started job: a
+        # BaseException (or a worker torn down mid-flight) skips every `except`
+        # above but never this.
+        _release_admission(job)
 
 
 class _Cancelled(Exception):
@@ -318,7 +374,7 @@ def start(req: RevoiceReq):
             return JSONResponse(status_code=422, content={"detail": (
                 f"lines reach {last:.0f}s but this box re-voices at most "
                 f"the first {MAX_SECONDS:.0f} seconds of a video")})
-    if _active() >= MAX_ACTIVE:
+    if not _acquire_admission():
         return JSONResponse(status_code=429, headers={"Retry-After": "60"},
                             content={"detail": (
                                 "this box is already re-voicing a video — "
@@ -327,10 +383,24 @@ def start(req: RevoiceReq):
               "start": l.start, "end": l.end,
               "emotion": (l.emotion or "baseline")}
              for i, l in enumerate(req.lines)]
-    job = _new_job({"kind": "url", "url": url, "title": info.title},
-                   lines, {"direct": req.direct, "rewrite": req.rewrite})
-    threading.Thread(target=_run_job, args=(job,),
-                     name=f"revoice-{job['id']}", daemon=True).start()
+    job = None
+    try:
+        job = _new_job({"kind": "url", "url": url, "title": info.title},
+                       lines, {"direct": req.direct, "rewrite": req.rewrite},
+                       permit=True)
+        threading.Thread(target=_run_job, args=(job,),
+                         name=f"revoice-{job['id']}", daemon=True).start()
+    except BaseException:
+        # No `_run_job` will ever run its `finally` for this job — the door is
+        # the only one left who can hand the permit back.
+        if job is None:
+            _ADMIT.release()
+        else:
+            with _LOCK:
+                JOBS.pop(job["id"], None)
+            _release_admission(job)
+            shutil.rmtree(job["work_dir"], ignore_errors=True)
+        raise
     return {"job_id": job["id"], "source": job["source"],
             "lines": len(lines)}
 
@@ -378,11 +448,17 @@ def cancel(job_id: str):
         return errors.job_expired()
     with _LOCK:
         job["cancel"] = True
-        running = job["status"] == "running"
-        if running:
+        job["touched"] = time.time()
+        if job["status"] == "running":
+            # The phase thread sees the flag at its next boundary and stops. It
+            # keeps its admission permit until it actually does — the box IS
+            # still busy until then — and its work dir is reclaimed by `_gc`,
+            # never yanked from under it.
             job["status"] = "cancelled"
         else:
+            # Terminal already: the artifacts may be mid-download. Drop the job
+            # from the registry (so the next poll is an honest 404) but let the
+            # reap grace expire before the bytes go.
             JOBS.pop(job_id, None)
-    if not running:
-        shutil.rmtree(job["work_dir"], ignore_errors=True)
+            _schedule_reap(job["work_dir"])
     return {"status": "cancelled"}
