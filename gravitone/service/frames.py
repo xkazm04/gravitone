@@ -24,6 +24,8 @@ import logging
 import os
 import re
 import subprocess
+import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -45,9 +47,20 @@ SCENE_THRESHOLD = float(os.environ.get("FRAMES_SCENE_THRESHOLD", "") or 0.3)
 FRAME_HEIGHT = int(os.environ.get("FRAMES_HEIGHT", "") or 360)
 FRAME_QUALITY = int(os.environ.get("FRAMES_JPEG_Q", "") or 3)
 
-#: Wall-clock ceilings. Detection decodes the whole video once (roughly
-#: realtime at 480p on CPU); capture seeks by keyframe and is near-instant.
+#: Wall-clock ceilings. Detection decodes what it is asked to analyse once
+#: (roughly realtime at 480p on CPU); capture seeks by keyframe and is
+#: near-instant. A single constant ceiling made a long video RACE the clock
+#: instead of failing predictably, so detection's budget is now derived from
+#: the length it was asked to analyse: SPEED_FACTOR wall-clock seconds per
+#: video second, floored so a short video still gets room to start ffmpeg, and
+#: capped by DETECT_TIMEOUT_S so nothing ever waits longer than it used to.
 DETECT_TIMEOUT_S = float(os.environ.get("FRAMES_DETECT_TIMEOUT", "") or 600)
+DETECT_MIN_TIMEOUT_S = float(os.environ.get("FRAMES_DETECT_MIN_TIMEOUT", "")
+                             or 120)
+DETECT_SPEED_FACTOR = float(os.environ.get("FRAMES_DETECT_SPEED_FACTOR", "")
+                            or 4.0)
+#: How often the detect pass looks up to ask "still wanted?".
+DETECT_POLL_S = float(os.environ.get("FRAMES_DETECT_POLL", "") or 0.5)
 CAPTURE_TIMEOUT_S = float(os.environ.get("FRAMES_CAPTURE_TIMEOUT", "") or 30)
 
 #: Visual signature: the same captured frame, also written out as a tiny
@@ -69,6 +82,10 @@ SIG_CELL_DELTA = int(os.environ.get("FRAMES_SIG_CELL_DELTA", "") or 24)
 SIG_CELL_MAX = int(os.environ.get("FRAMES_SIG_CELL_MAX", "") or 4)
 
 _run = subprocess.run  # the test seam, same convention as ingest_url
+#: detection's own seam. It cannot use `_run`: a blocking `subprocess.run`
+#: cannot be interrupted, and a cancelled job must not wait out a pass nobody
+#: wants any more.
+_popen = subprocess.Popen
 
 _PTS_RE = re.compile(r"pts_time:\s*([0-9]+(?:\.[0-9]+)?)")
 
@@ -144,32 +161,113 @@ def detect_scenes(video: Path, *, duration: float | None = None,
 
     A video with no detected cuts is ONE scene (split to max_s) — a static
     talking-head video is a perfectly good subject that simply has no cuts.
+
+    `duration` is a BUDGET, not a hint: detection analyses only that many
+    seconds of the file. The caller's ceiling (voiceover's MAX_SECONDS) is
+    already folded into it, and every scene past it would be discarded by
+    `_coalesce` anyway — so decoding a three-hour upload to find cuts in
+    footage nobody will narrate is pure waste, and it is that waste that made
+    a long video race a constant timeout.
+
+    Cancelling kills the pass: `should_cancel` is polled while ffmpeg runs,
+    not only after it returns, and a cancelled detection returns no scenes.
     """
     if duration is None:
         duration = probe_video(video)["duration"]
-    cuts = _detect_cuts(video, threshold=threshold)
-    if should_cancel and should_cancel():
+    cuts = _detect_cuts(video, threshold=threshold, limit_s=float(duration),
+                        should_cancel=should_cancel)
+    if cuts is None or (should_cancel and should_cancel()):
         return []
     bounds = _coalesce([0.0, *cuts, float(duration)], min_s=min_s, max_s=max_s)
     return [Scene(i=i, start=round(a, 3), end=round(b, 3))
             for i, (a, b) in enumerate(zip(bounds, bounds[1:]))]
 
 
-def _detect_cuts(video: Path, *, threshold: float) -> list[float]:
-    cmd = ["ffmpeg", "-hide_banner", "-nostats", "-i", str(video),
-           "-vf", f"select='gt(scene,{threshold})',showinfo",
-           "-f", "null", "-"]
+def detect_budget_s(analysed_s: float | None) -> float:
+    """Wall-clock a detect pass over `analysed_s` seconds of video may take."""
+    if not analysed_s or analysed_s <= 0:
+        return DETECT_TIMEOUT_S
+    return max(DETECT_MIN_TIMEOUT_S,
+               min(DETECT_TIMEOUT_S, analysed_s * DETECT_SPEED_FACTOR))
+
+
+class _DetectTimeout(Exception):
+    """Internal: the pass outlived its budget and was killed."""
+
+
+def _detect_cuts(video: Path, *, threshold: float,
+                 limit_s: float | None = None,
+                 should_cancel: Callable[[], bool] | None = None
+                 ) -> list[float] | None:
+    """Cut timestamps, or None when the caller cancelled mid-pass."""
+    cmd = ["ffmpeg", "-hide_banner", "-nostats", "-i", str(video)]
+    if limit_s and limit_s > 0:
+        cmd += ["-t", f"{limit_s:.3f}"]
+    cmd += ["-vf", f"select='gt(scene,{threshold})',showinfo",
+            "-f", "null", "-"]
+    budget = detect_budget_s(limit_s)
     try:
-        r = _run(cmd, capture_output=True, timeout=DETECT_TIMEOUT_S)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        logger.error("scene detection failed for %s: %s", video.name, exc)
-        raise FramesError("scene detection took too long or could not run")
-    if r.returncode != 0:
+        got = _watch(cmd, budget_s=budget, should_cancel=should_cancel)
+    except _DetectTimeout:
+        logger.error("scene detection outlived %.0fs on %.0fs of %s",
+                     budget, limit_s or 0.0, video.name)
+        raise FramesError(
+            f"scene detection did not finish within {budget:.0f} seconds on "
+            f"the first {limit_s or 0.0:.0f} seconds of this video — it is "
+            "too heavy to scan on this box")
+    except OSError as exc:
+        logger.error("scene detection could not run for %s: %s",
+                     video.name, exc)
+        raise FramesError("scene detection could not be started")
+    if got is None:
+        logger.info("scene detection abandoned for %s (cancelled)", video.name)
+        return None
+    rc, err = got
+    if rc != 0:
         logger.warning("scene detection refused %s: %s", video.name,
-                       (r.stderr or b"")[-400:])
+                       err[-400:])
         raise FramesError("this video could not be scanned for scene changes")
-    err = (r.stderr or b"").decode("utf-8", "replace")
-    return sorted({float(m) for m in _PTS_RE.findall(err)})
+    text = err.decode("utf-8", "replace")
+    return sorted({float(m) for m in _PTS_RE.findall(text)})
+
+
+def _watch(cmd: list[str], *, budget_s: float,
+           should_cancel: Callable[[], bool] | None
+           ) -> tuple[int, bytes] | None:
+    """Run `cmd`, polling for cancellation, and KILL it when it is not wanted
+    or has outlived `budget_s`. Returns (returncode, stderr) or None when the
+    caller cancelled. Raises `_DetectTimeout` on the budget.
+
+    stderr goes to a temp file rather than a pipe on purpose: showinfo writes
+    one line per cut, and a pipe nobody drains while polling is a deadlock.
+    """
+    with tempfile.TemporaryFile() as err:
+        proc = _popen(cmd, stdin=subprocess.DEVNULL,
+                      stdout=subprocess.DEVNULL, stderr=err)
+        deadline = time.monotonic() + budget_s
+        while True:
+            try:
+                proc.wait(timeout=DETECT_POLL_S)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            if should_cancel and should_cancel():
+                _kill(proc)
+                return None
+            if time.monotonic() >= deadline:
+                _kill(proc)
+                raise _DetectTimeout()
+        err.seek(0)
+        return proc.returncode, err.read()
+
+
+def _kill(proc) -> None:
+    """Stop a pass we no longer want, and do not leave a zombie behind."""
+    try:
+        proc.kill()
+        proc.wait(timeout=10)
+    except Exception:  # noqa: BLE001 - a dead process is the goal, not a crash
+        logger.warning("could not reap the scene detection process")
 
 
 def _coalesce(bounds: list[float], *, min_s: float, max_s: float) -> list[float]:
