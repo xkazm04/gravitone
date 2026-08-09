@@ -218,6 +218,44 @@ class JobRunTests(unittest.TestCase):
         self.assertEqual(job["status"], "cancelled")
         self.assertIsNone(job["result"])
 
+    # ── the post-mux truth (what is actually in the mp4) ──────────────────
+    def test_a_line_clipped_at_the_video_end_says_so(self) -> None:
+        # slot 8-12s in a 10s video, spoken for 4s: 2s of it fall off the end.
+        with TemporaryDirectory() as td:
+            job = self._run(
+                self._job(td, lines=[(0.0, 4.0), (8.0, 12.0)]),
+                self._stubs(speak=lambda v, t: (_wav(4.0), 4.0), duration=10.0))
+        self.assertEqual(job["status"], "done")
+        first, last = job["result"]["fit"]
+        self.assertEqual(first["track_clipped_seconds"], 0.0)
+        self.assertAlmostEqual(last["track_clipped_seconds"], 2.0, places=1)
+        self.assertTrue(last["in_track"])
+        self.assertEqual(job["result"]["summary"]["clipped"], 1)
+
+    def test_the_estimate_and_the_track_truth_are_both_kept(self) -> None:
+        with TemporaryDirectory() as td:
+            job = self._run(
+                self._job(td, lines=[(0.0, 4.0), (8.0, 12.0)]),
+                self._stubs(speak=lambda v, t: (_wav(4.0), 4.0), duration=10.0))
+        last = job["result"]["fit"][1]
+        # the ladder saw a line that fits its 4s slot; the TRACK lost 2s of it
+        self.assertEqual(last["spill_seconds"], 0.0)
+        self.assertGreater(last["track_clipped_seconds"], 0.0)
+        self.assertIn("track_spill_seconds", last)
+
+    def test_a_failed_line_is_not_counted_as_audible(self) -> None:
+        def refuse_first(voice_id, text):
+            if text.endswith("0"):
+                raise RuntimeError("engine sad")
+            return _wav(2.0), 2.0
+
+        with TemporaryDirectory() as td:
+            job = self._run(self._job(td), self._stubs(speak=refuse_first))
+        fit = job["result"]["fit"]
+        self.assertFalse(fit[0]["in_track"])
+        self.assertTrue(fit[1]["in_track"])
+        self.assertEqual(job["result"]["summary"]["silent_in_track"], 1)
+
 
 class AdmissionTests(unittest.TestCase):
     """The door is a HELD permit. A worker that dies without reaching an

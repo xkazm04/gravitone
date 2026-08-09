@@ -290,8 +290,9 @@ def _run_job(job: dict) -> None:
                         "emotion": l.get("emotion", "baseline"),
                         "wav": l.get("wav"), "seconds": l.get("seconds")}
                        for l in lines]
-        track, _ = voiceover.build_track(track_lines, placements,
-                                         video_seconds=video_seconds)
+        track, placed = voiceover.build_track(track_lines, placements,
+                                              video_seconds=video_seconds)
+        _merge_track_truth(fit_report, placed)
         (wd / "track.wav").write_bytes(track)
         (wd / "fit.json").write_text(json.dumps(fit_report), "utf-8")
         voiceover.mux(video, wd / "track.wav", wd / "revoiced.mp4")
@@ -305,8 +306,16 @@ def _run_job(job: dict) -> None:
                 "atempo": methods.count("atempo"),
                 "rewritten": (methods.count("rewrite")
                               + methods.count("rewrite+atempo")),
+                # `spilling` stays the ladder's ESTIMATE (unchanged meaning);
+                # the two below are measured against what is in the file.
                 "spilling": sum(1 for f in fit_report
                                 if f.get("spill_seconds")),
+                "spilling_in_track": sum(1 for f in fit_report
+                                         if f.get("track_spill_seconds")),
+                "clipped": sum(1 for f in fit_report
+                               if f.get("track_clipped_seconds")),
+                "silent_in_track": sum(1 for f in fit_report
+                                       if not f.get("in_track")),
                 "failed": sum(1 for f in fit_report if f.get("error")),
             }})
     except _Cancelled:
@@ -323,6 +332,28 @@ def _run_job(job: dict) -> None:
         # BaseException (or a worker torn down mid-flight) skips every `except`
         # above but never this.
         _release_admission(job)
+
+
+def _merge_track_truth(fit_report: list[dict], placed: list[dict]) -> None:
+    """Fold `build_track`'s accounting into the per-line fit report.
+
+    `fit_line`'s `spill_seconds` is an ESTIMATE: spoken seconds minus the slot,
+    computed for one line in isolation before anything is placed. `build_track`
+    measures what actually landed in track.wav — against the real video length
+    and the neighbouring slots — so a line truncated at the end of the video
+    spills less than the estimate claimed and loses seconds the estimate never
+    mentioned. Both numbers survive, named apart: `spill_seconds` is what the
+    ladder decided, `track_*` is what is in the mp4 the user downloads.
+    """
+    by_i = {p.get("scene"): p for p in placed}
+    for f in fit_report:
+        p = by_i.get(f["i"]) or {}
+        f["track_spill_seconds"] = round(float(p.get("spill_seconds") or 0.0), 2)
+        f["track_clipped_seconds"] = round(
+            float(p.get("clipped_seconds") or 0.0), 2)
+        # Some audio for this line is actually audible in the track.
+        f["in_track"] = bool(
+            (p.get("seconds") or 0.0) > (p.get("clipped_seconds") or 0.0))
 
 
 class _Cancelled(Exception):
