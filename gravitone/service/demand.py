@@ -42,17 +42,31 @@ _EMOTION_RE = re.compile(r"^[a-z_]{1,32}$")
 
 
 def _load() -> dict:
+    """The store, or `{}` with the reason logged. NEVER raises.
+
+    Three readers depend on that promise and none of them can afford an
+    exception: `record_fallback` runs inside a synthesis request,
+    `voices._demand()` decorates the studio roster, and `derive_autofill`
+    plans from it. So every way a file can refuse to become a dict is caught
+    here, not just malformed JSON — `read_text` raises `OSError` when the file
+    is unreadable and `UnicodeDecodeError` (a `ValueError`, NOT an `OSError`)
+    on bytes that are not UTF-8, and both used to escape this function: past
+    `record_fallback`'s `except OSError`, out of `all_demand()`, and into the
+    roster. Same posture as `direction._load`: report it, treat it as empty,
+    and let the next write re-establish the file.
+    """
     if not DEMAND_PATH.is_file():
         return {}
     try:
         data = json.loads(DEMAND_PATH.read_text("utf-8"))
-        return data if isinstance(data, dict) else {}
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError):
         # With atomic writes below, a torn file no longer happens from our own
         # (even multi-replica) writes; if it's still corrupt, don't silently
         # zero the whole demand history — surface it.
-        logger.warning("emotion_demand.json is corrupt; treating as empty (%s)", DEMAND_PATH)
+        logger.warning("emotion_demand.json is unreadable; treating as empty (%s)",
+                       DEMAND_PATH)
         return {}
+    return data if isinstance(data, dict) else {}
 
 
 def record_fallback(character_id: str, requested_emotion: str) -> None:
@@ -69,18 +83,49 @@ def record_fallback(character_id: str, requested_emotion: str) -> None:
         # handler below — telemetry never costs a caller their synthesis.
         with _LOCK, file_lock(_lock_path()):
             data = _load()
-            char = data.setdefault(character_id, {})
-            char[emotion] = int(char.get(emotion, 0)) + 1
+            char = data.get(character_id)
+            if not isinstance(char, dict):
+                # A well-formed JSON file whose shape is wrong (hand-edited, or
+                # written by something else) must not become an AttributeError
+                # in the middle of a synthesis request. The bad branch is
+                # replaced, not the whole file.
+                char = {}
+                data[character_id] = char
+            char[emotion] = _count(char.get(emotion)) + 1
             atomic_write_text(DEMAND_PATH, json.dumps(data, indent=2))
-    except OSError:
-        pass
+    except (OSError, ValueError) as exc:
+        # OSError covers a wedged lock (TimeoutError) and an unwritable disk;
+        # ValueError covers anything the store's own contents can still throw.
+        # Losing a count is acceptable — losing the caller's audio is not — but
+        # it is LOGGED, because a telemetry file that silently stops counting
+        # is a recording queue that silently stops being evidence.
+        logger.warning("emotion demand not recorded for %s/%s (%s)",
+                       character_id, emotion, exc)
+
+
+def _count(value: object) -> int:
+    """A stored count as an int, treating anything that is not one as zero.
+
+    `True` is an `int` in Python and would count as 1; a string count from a
+    hand-edited file would raise inside the lock. Neither may happen here.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    return int(value)
 
 
 def demand_for(character_id: str, data: dict | None = None) -> dict[str, int]:
-    """emotion -> unmet request count for one Character."""
+    """emotion -> unmet request count for one Character. NEVER raises.
+
+    A Character whose branch is not a dict (corrupt, or hand-edited) reads as
+    no demand rather than as an `AttributeError` on the roster: this decorates
+    a list of voices, and it may not be able to take that list down.
+    """
     src = data if data is not None else _load()
-    raw = src.get(character_id, {})
-    return {e: int(n) for e, n in raw.items() if isinstance(n, (int, float))}
+    raw = src.get(character_id) if isinstance(src, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    return {str(e): _count(n) for e, n in raw.items() if _count(n)}
 
 
 def all_demand() -> dict:
