@@ -30,6 +30,7 @@ from typing import Callable
 
 import numpy as np
 
+from service import errors
 from service.emotions import BASELINE, normalize_emotion
 
 logger = logging.getLogger("gravitone.voiceover")
@@ -44,11 +45,43 @@ RATE = 24000
 
 MUX_TIMEOUT_S = 300
 
+#: How many per-line engine TIMEOUTS in a row mean "the engine is wedged" rather
+#: than "that line was unlucky".
+#:
+#: Why 3, and why CONSECUTIVE. A timeout costs the whole per-line deadline
+#: (`voiceover_api.LINE_TIMEOUT_S`, 120 s by default) and produces nothing, so
+#: the price of guessing is measured in minutes, not milliseconds:
+#:
+#:   * 1 would misread the honest slow case — the first line on a cold engine
+#:     waits behind a model load it did not cause — as a dead box.
+#:   * 2 still cannot separate a stall pair from a wedge; a queue that drained
+#:     slowly twice is a bad afternoon, not a broken engine.
+#:   * 3 costs ~6 minutes before the job gives up, against ~1 hour for a
+#:     30-scene script run out to the end. Six minutes is longer than any
+#:     transient the engine recovers from on its own, and short enough that the
+#:     user is still watching the steps rail when it says so.
+#:
+#: A TOTAL count would fail a long, mostly-healthy script; consecutive is the
+#: shape of the claim being made ("the engine is not answering AT ALL, now").
+#: Only a SUCCESSFUL line resets the streak: a refusal that comes back fast is
+#: not evidence the engine is alive, it is only evidence it is cheap.
+MAX_CONSECUTIVE_TIMEOUTS = 3
+
 _run = subprocess.run  # test seam, house convention
 
 
 class VoiceoverError(RuntimeError):
     """Named, user-safe."""
+
+
+class EngineTimeout(VoiceoverError):
+    """The engine took the whole per-line deadline and answered nothing.
+
+    Distinct from every other synthesis failure ON PURPOSE: a refusal is one
+    line's problem and costs one line's time, but a timeout is the shape a
+    SYSTEMICALLY wedged engine takes, and it costs the full deadline every time
+    it happens. `synthesize_lines` counts these and only these.
+    """
 
 
 # ── the writer ────────────────────────────────────────────────────────────────
@@ -139,7 +172,9 @@ def synthesize_lines(lines: list[dict], *,
                      speak: Callable[[str, str], tuple[bytes, float]],
                      resolve_voice: Callable[[str], tuple[str, str, bool]],
                      should_cancel: Callable[[], bool] | None = None,
-                     progress: Callable[[int, int], None] | None = None) -> list[dict]:
+                     progress: Callable[[int, int], None] | None = None,
+                     max_consecutive_timeouts: int = MAX_CONSECUTIVE_TIMEOUTS,
+                     ) -> list[dict]:
     """Speak every non-silent line. Serial on purpose: the engine pool is the
     process's real parallelism and a bulk job must not starve interactive
     requests by flooding the admission queue.
@@ -150,8 +185,17 @@ def synthesize_lines(lines: list[dict], *,
     `stem_fallback` (the Character lacked the stem), or `error` per line —
     one refused line degrades that scene to silence, named, and the job
     continues.
+
+    ISOLATED failure is survivable and always has been. SYSTEMIC failure is
+    not, and used to be indistinguishable: a wedged engine timed out on every
+    line for the full per-line deadline, so a 30-scene script spent an hour of
+    a single-job box producing nothing while the steps rail said "speaking it".
+    `speak` raising :class:`EngineTimeout` is the signal that the deadline —
+    not the engine's judgement — ended the call; `max_consecutive_timeouts` of
+    them in a row raises :class:`errors.UserFacing` and abandons the script.
     """
     todo = [l for l in lines if l["text"]]
+    timeouts = 0  # CONSECUTIVE, reset only by a line that actually spoke
     for n, line in enumerate(todo):
         if should_cancel and should_cancel():
             break
@@ -163,11 +207,28 @@ def synthesize_lines(lines: list[dict], *,
         line["stem_fallback"] = bool(fell_back)
         try:
             wav, seconds = speak(voice_id, line["text"])
+        except EngineTimeout as exc:
+            timeouts += 1
+            logger.warning("voiceover line for scene %s timed out "
+                           "(%d in a row): %r", line["scene"], timeouts, exc)
+            line["error"] = "the engine did not answer in time for this line"
+            line["timed_out"] = True
+            if timeouts >= max_consecutive_timeouts:
+                # Not this line's problem — the engine's. Stop before the
+                # remaining lines each buy another full deadline of silence.
+                raise errors.UserFacing(
+                    f"the synthesis engine stopped answering — "
+                    f"{timeouts} narration lines in a row ran out their time "
+                    "limit with nothing back, so the rest of the script was "
+                    "abandoned rather than waiting the same again on every "
+                    "line left") from None
+            continue
         except Exception as exc:  # noqa: BLE001 - one line must not cost the video
             logger.warning("voiceover line for scene %s failed: %r",
                            line["scene"], exc)
             line["error"] = "this line could not be synthesized"
             continue
+        timeouts = 0
         line["wav"] = wav
         line["seconds"] = round(seconds, 3)
     return lines

@@ -29,6 +29,7 @@ import sys
 import threading
 import time
 import uuid
+from concurrent.futures import TimeoutError as FuturesTimeout
 from pathlib import Path
 
 from fastapi import APIRouter, File, Form, UploadFile
@@ -236,7 +237,21 @@ def _engine_speak(voice_id: str, text: str) -> tuple[bytes, float]:
         raise voiceover.VoiceoverError(
             "no synthesis engine is running in this process")
     j = engine.submit(voice_id, text)
-    r = j.future.result(timeout=LINE_TIMEOUT_S)
+    try:
+        r = j.future.result(timeout=LINE_TIMEOUT_S)
+    except FuturesTimeout as exc:
+        # The DEADLINE ended this call, not the engine's judgement — a caller
+        # that cannot tell those apart cannot tell one bad line from a wedged
+        # box (see voiceover.MAX_CONSECUTIVE_TIMEOUTS). Signal the abandon
+        # contract on the way out: a job still queued is skipped un-run and its
+        # engine permit comes back now, instead of burning a generation whose
+        # bytes this job will never read.
+        abandoned = getattr(j, "abandoned", None)
+        if abandoned is not None:
+            abandoned.set()
+        raise voiceover.EngineTimeout(
+            "the synthesis engine did not answer within this box's per-line "
+            "time limit") from exc
     return r.wav_bytes, r.audio_seconds
 
 
