@@ -44,6 +44,19 @@ describe("LiveTranscript", () => {
     expect(screen.getByText("hearing…")).toBeInTheDocument();
   });
 
+  it("draws the seam where a call ended and a new one began", () => {
+    // Redialling does not resume anything — the service starts a fresh
+    // conversation per socket — so the rows below the seam were heard by an
+    // agent that remembers none of the rows above it.
+    mount({ breaks: ["u1"], still: true });
+    expect(screen.getByText(/what follows is a new conversation/)).toBeInTheDocument();
+  });
+
+  it("draws no seam in a conversation that never broke", () => {
+    mount({ still: true });
+    expect(screen.queryByText(/new conversation/)).toBeNull();
+  });
+
   it("refuses to clear a transcript while the call is still up", () => {
     mount({ live: true });
     expect(screen.getByRole("button", { name: /clear/i })).toBeDisabled();

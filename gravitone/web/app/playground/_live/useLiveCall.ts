@@ -33,10 +33,25 @@ export function useLiveCall({ charId, character, agentId, onTake }: {
   const [announcement, setAnnouncement] = useState("");
   const [rehearsing, setRehearsing] = useState(false);
 
+  /** Row ids after which a call ENDED. What follows them is a different
+   *  conversation — the service keeps no history across sockets — so the
+   *  transcript draws the break rather than reading as one continuous call. */
+  const [breaks, setBreaks] = useState<string[]>([]);
+
   const callRef = useRef<LiveConversation | null>(null);
   const urlsRef = useRef<string[]>([]);
+  const rowsRef = useRef<Row[]>([]);
+  /** The agent config of the last call, so "redial" repeats THIS call rather
+   *  than a default one the user never asked for. */
+  const overrideRef = useRef<Record<string, unknown>>({});
+  /** A dial is in flight. `live` cannot cover the window between the click and
+   *  the signed-URL response, and a double-click there opens two calls — two
+   *  microphones, two of the service's limited session slots. */
+  const dialingRef = useRef(false);
 
   const live = status === "connecting" || status === "live";
+
+  useEffect(() => { rowsRef.current = rows; }, [rows]);
 
   // Teardown: a live conversation must not survive this component. Object URLs
   // minted for the in-stage players are revoked here; the TAKE's own url belongs
@@ -114,8 +129,14 @@ export function useLiveCall({ charId, character, agentId, onTake }: {
 
   /** Open a call. `override` is the agent config for THIS conversation only. */
   const dial = useCallback(async (override: Record<string, unknown>) => {
-    if (live || !agentId) return;
+    if (live || dialingRef.current || !agentId) return;
+    dialingRef.current = true;
+    overrideRef.current = override;
     setRefusal(null);
+    // Everything already said belongs to a conversation that is over: mark the
+    // seam so the new call's turns cannot be read as a continuation of it.
+    const lastRow = rowsRef.current.at(-1);
+    if (lastRow) setBreaks((b) => (b.includes(lastRow.id) ? b : [...b, lastRow.id]));
     const call = new LiveConversation(
       {
         onStatus: (s) => { if (mounted.current) setStatus(s); },
@@ -143,8 +164,15 @@ export function useLiveCall({ charId, character, agentId, onTake }: {
         kind: "policy",
         message: e instanceof Error ? e.message : "the conversation could not be authorized",
       });
+    } finally {
+      dialingRef.current = false;
     }
   }, [agentId, bus, live, mounted, onTurn]);
+
+  /** Dial again after a call died: the same agent config, a NEW conversation.
+   *  A fresh signed URL is fetched by `dial` — a ticket lives 120 s
+   *  (CONVAI_TICKET_TTL_S) and the old one may well be spent. */
+  const redial = useCallback(() => { void dial(overrideRef.current); }, [dial]);
 
   function hangUp() {
     callRef.current?.stop();
@@ -164,8 +192,8 @@ export function useLiveCall({ charId, character, agentId, onTake }: {
   }
 
   return {
-    status, live, refusal, setRefusal, rows, setRows, muted, speaking, announcement,
-    rehearsing, setRehearsing,
-    dial, hangUp, toggleMute,
+    status, live, refusal, setRefusal, rows, setRows, breaks, setBreaks,
+    muted, speaking, announcement, rehearsing, setRehearsing,
+    dial, redial, hangUp, toggleMute,
   };
 }

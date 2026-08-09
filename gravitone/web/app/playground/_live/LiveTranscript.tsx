@@ -4,16 +4,20 @@
 // can do with a finished rehearsal: send it to the Script composer, or clear it
 // (which never touches the takes it already banked).
 
+import { Fragment } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import TakePlayer from "@/components/ui/TakePlayer";
 import { EASE } from "@/components/ui/tokens";
 import { hueFor, type Row } from "./liveTurns";
 
 export default function LiveTranscript({
-  rows, charId, characterName, live, still = false, onHandOff, onClear,
+  rows, charId, characterName, live, still = false, breaks = [], onHandOff, onClear,
 }: {
   rows: Row[];
   charId: string;
+  /** Row ids a call ENDED after. Everything below such a row was said in a
+   *  different conversation, to an agent that remembers none of the above. */
+  breaks?: string[];
   /** The dialled Character's name, or undefined when the rail has none. */
   characterName?: string;
   /** A call is up, so the transcript cannot be cleared out from under it. */
@@ -31,10 +35,11 @@ export default function LiveTranscript({
     <div className="space-y-2" data-motion={still ? "still" : "entrance"}>
       <AnimatePresence initial={false}>
         {rows.map((r) => (
-          // The entrance is functional, not decorative: a turn sliding in is how
-          // you see the floor change while you are listening rather than
-          // reading. Under `still` the same row is simply already there.
-          <motion.div key={r.id} layout={!still}
+          <Fragment key={r.id}>
+          {/* The entrance is functional, not decorative: a turn sliding in is how
+              you see the floor change while you are listening rather than
+              reading. Under `still` the same row is simply already there. */}
+          <motion.div layout={!still}
             initial={still ? false : { opacity: 0, y: -8 }}
             animate={{ opacity: 1, y: 0 }}
             transition={still ? { duration: 0 } : { duration: 0.3, ease: EASE }}
@@ -64,6 +69,19 @@ export default function LiveTranscript({
                 label={`${characterName ?? "agent"} turn`} />
             )}
           </motion.div>
+          {breaks.includes(r.id) && (
+            // The seam between two calls, said in words. The service starts a
+            // new conversation on every connection (convai.py::_Session), so
+            // what follows was heard by an agent with no memory of what is
+            // above it — and a transcript that ran straight on would be
+            // claiming a continuity that never existed.
+            <p className="font-jetbrains flex items-center gap-3 py-1 text-[11px] text-white/45">
+              <span className="h-px flex-1 bg-white/12" aria-hidden />
+              that call ended — what follows is a new conversation
+              <span className="h-px flex-1 bg-white/12" aria-hidden />
+            </p>
+          )}
+          </Fragment>
         ))}
       </AnimatePresence>
 

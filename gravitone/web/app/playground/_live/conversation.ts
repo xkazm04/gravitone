@@ -55,9 +55,29 @@ export type LiveStatus = "idle" | "connecting" | "live" | "ended";
 /** Every way a live call can be refused, NAMED. "line busy" is a real answer
  *  (the service caps concurrent sessions) and must never look like a crash. */
 export type LiveRefusal = {
-  kind: "busy" | "policy" | "mic" | "transport" | "unsupported";
+  kind: "busy" | "policy" | "mic" | "transport" | "unsupported" | "dropped";
   message: string;
 };
+
+/**
+ * What the user is told when a live call dies on the wire.
+ *
+ * There is deliberately NO automatic reconnect here, and the reason is in the
+ * service: `/v1/convai/conversation` takes an agent id and a ticket and nothing
+ * else (convai.py::conversation), and `_Session.__init__` mints a fresh
+ * `conversation_id`, an EMPTY `history` and its own `Recorder` for every socket
+ * that arrives. A second socket is therefore a different conversation — the
+ * agent remembers none of what was just said, and the recording is split in two
+ * under a new id. Silently redialling under a transcript that keeps scrolling
+ * would be the studio claiming a continuity the service cannot provide.
+ *
+ * So the call ends, honestly, and redialling is the user's decision — with the
+ * transcript kept and the break drawn where it happened.
+ */
+export const DROPPED_NOTE =
+  "It cannot be resumed: this service starts a new conversation on every connection, " +
+  "so the agent would not remember any of this. Your transcript is kept — redial to " +
+  "start a fresh call.";
 
 export type LiveTurn = {
   id: string;
@@ -610,6 +630,19 @@ export class LiveConversation {
       return;
     }
     if (code !== 1000 && code !== 1005) {
+      // A socket that DIED (it was live, there was a conversation) is a
+      // different event from one that was never accepted, and the difference is
+      // the only thing the user can act on: one is "the line dropped, redial",
+      // the other is "this service would not take the call".
+      if (this.state === "live") {
+        this.refuse({
+          kind: "dropped",
+          message: `${reason
+            ? `The connection to the conversation dropped: ${reason}.`
+            : "The connection to the conversation dropped."} ${DROPPED_NOTE}`,
+        });
+        return;
+      }
       this.refuse({
         kind: "transport",
         message: reason

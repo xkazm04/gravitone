@@ -83,8 +83,9 @@ export default function LiveStage({
   }, [character]);
 
   const {
-    status, live, refusal, setRefusal, rows, setRows, muted, speaking, announcement,
-    rehearsing, setRehearsing, dial, hangUp, toggleMute,
+    status, live, refusal, setRefusal, rows, setRows, breaks, setBreaks,
+    muted, speaking, announcement, rehearsing, setRehearsing,
+    dial, redial, hangUp, toggleMute,
   } = useLiveCall({ charId, character, agentId, onTake });
 
   // Reduced motion, read ONCE for this surface and passed down (DESIGN.md
@@ -171,8 +172,24 @@ export default function LiveStage({
         <ErrorBanner className="mx-5 mt-4" severity={refusal.kind === "busy" ? "warning" : "error"}>
           <span className="flex items-center justify-between gap-3">
             <span>{refusal.message}</span>
-            <button onClick={() => setRefusal(null)} aria-label="Dismiss"
-              className="shrink-0 text-white/60 transition hover:text-white">✕</button>
+            <span className="flex shrink-0 items-center gap-3">
+              {/* A dropped line is the one refusal with an action attached: the
+                  call cannot be resumed, so the honest offer is a NEW one, and
+                  it is the user who decides to make it. Blocked for the same
+                  reasons Talk is blocked — the service may be capped now. */}
+              {refusal.kind === "dropped" && (
+                <button
+                  onClick={redial}
+                  disabled={!!dialBlocked}
+                  title={dialBlocked ?? "Dial this agent again — a new conversation, with your transcript kept"}
+                  className="font-jetbrains cursor-pointer rounded-lg border border-white/20 px-2.5 py-1 text-[11px] text-white/80 transition enabled:hover:border-cyan-400/40 enabled:hover:text-cyan-200 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  redial ▶
+                </button>
+              )}
+              <button onClick={() => setRefusal(null)} aria-label="Dismiss"
+                className="text-white/60 transition hover:text-white">✕</button>
+            </span>
           </span>
         </ErrorBanner>
       )}
@@ -245,8 +262,9 @@ export default function LiveStage({
             characterName={character?.name}
             live={live}
             still={still}
+            breaks={breaks}
             onHandOff={handOff}
-            onClear={() => setRows([])}
+            onClear={() => { setRows([]); setBreaks([]); }}
           />
         )}
       </div>

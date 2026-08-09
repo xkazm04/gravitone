@@ -431,20 +431,64 @@ describe("refusals", () => {
     expect(h.mic.track.stop).toHaveBeenCalled();
   });
 
-  it("says something, and releases the mic, when the socket dies mid-call", async () => {
+  it("calls a mid-call death a DROPPED line, and says it cannot be resumed", async () => {
     // 1006 is the abnormal close a dropped network gives: no code was ever sent.
-    // Silence here is the failure mode that matters — a call that is over while
-    // the stage still looks live.
+    // There is no reconnect here on purpose — the service mints a new
+    // conversation_id, an empty history and a new recording for every socket
+    // (convai.py::_Session), so a silent redial would fake a continuity that
+    // does not exist. The honest answer is: the line dropped, here is why you
+    // cannot just resume, redial when you want to.
     const h = await dial();
     h.ws.open();
     speak(h.ws, "Mid sentence when the wire went");
     h.ws.serverClose(1006, "");
+
     expect(h.refusals).toHaveLength(1);
-    expect(h.refusals[0].message).not.toBe("");
+    expect(h.refusals[0].kind).toBe("dropped");
+    expect(h.refusals[0].message).toContain("dropped");
+    expect(h.refusals[0].message).toContain("would not remember");
+    // Nothing was reconnected behind the user's back.
+    expect(FakeWS.last).toBe(h.ws);
+    // And nothing was leaked: the recording light goes out, the worklet stops,
+    // the streams leave the bus, the context closes.
     expect(h.mic.track.stop).toHaveBeenCalled();
+    expect(h.worklet.port.postMessage).toHaveBeenCalledWith("stop");
+    expect(h.worklet.disconnected).toBe(true);
+    expect(h.bus.unregisterStream).toHaveBeenCalledWith(h.mic.stream);
+    expect(h.ctx.close).toHaveBeenCalled();
     expect(h.call.status).toBe("ended");
     // The turn in flight is still banked: the user had that exchange.
     expect(h.turns.filter((t) => t.role === "agent")).toHaveLength(1);
+  });
+
+  it("keeps the server's own reason when the line drops with one", async () => {
+    const h = await dial();
+    h.ws.open();
+    h.ws.serverClose(1011, "the engine died");
+    expect(h.refusals[0].kind).toBe("dropped");
+    expect(h.refusals[0].message).toContain("the engine died");
+  });
+
+  it("a socket that never opened is a REFUSAL, not a dropped line", async () => {
+    // The distinction is the only thing the user can act on: "the line dropped,
+    // redial" versus "this service would not take the call at all".
+    const h = await dial();
+    h.ws.serverClose(1006, "");
+    expect(h.refusals[0].kind).toBe("transport");
+    expect(h.refusals[0].message).toContain("closed unexpectedly");
+    expect(h.mic.track.stop).toHaveBeenCalled();
+  });
+
+  it("cannot be restarted after it dropped — a redial is a NEW conversation", async () => {
+    // The dead client stays dead: whoever redials builds a fresh
+    // LiveConversation (useLiveCall::dial), which is the only shape that
+    // matches what the service does with a second socket.
+    const h = await dial();
+    h.ws.open();
+    h.ws.serverClose(1006, "");
+    await h.call.start("ws://service.local/again");
+    expect(FakeWS.last).toBe(h.ws);
+    expect(h.call.status).toBe("ended");
   });
 
   it("passes a policy close (1008) through in the service's own words", async () => {
