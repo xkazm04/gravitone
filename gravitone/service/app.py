@@ -59,6 +59,7 @@ from service.cache import CachedAudio, SynthCache
 from service.config import SETTINGS
 from service.demand import record_fallback
 from service.emotions import parse_segments, resolve
+from service import engine as engine_module
 from service.engine import (
     AdmissionRejected, ShuttingDown, TtsEngine, concat_wavs,
     resample_pcm16, resample_wav_bytes, wav_bytes_to_mp3,
@@ -1360,6 +1361,40 @@ async def _render_tts(voice_id: str, req: TTSRequest, emotion: str | None,
 # process segments text. Both are folded into the digest, so a replica
 # configured differently cannot hand out the same NAME for different bytes.
 
+def _quantized_backend() -> str:
+    """The int8 kernel backend this process ACTUALLY renders under.
+
+    Only meaningful when ``SETTINGS.quantize`` is on. The setting itself
+    (``TTS_QUANTIZED_ENGINE``) defaults to ``"auto"``, which deliberately means
+    a DIFFERENT backend on different boxes — so the request is not an identity,
+    only the resolution is. Three sources, most-truthful first:
+
+      1. ``ENGINE.tuning["quantized_engine"]`` — what ``_apply_cpu_tuning``
+         observed on ``torch.backends.quantized.engine`` after selecting. This
+         is the running truth and is what /metrics already reports.
+      2. ``engine._select_quantized_engine()`` — the same resolution, recomputed,
+         for the window before the engine exists (and for tests that rebind
+         SETTINGS without restarting it).
+      3. ``torch.backends.quantized.engine`` — when nothing was selected, torch's
+         build-time default is still a real, box-specific backend, so it is the
+         answer rather than "none in particular".
+
+    ``"unknown"`` if torch cannot be asked at all: a distinct name is honest,
+    while silently reusing another box's name would not be.
+    """
+    applied = getattr(ENGINE, "tuning", None)
+    if isinstance(applied, dict) and applied.get("quantized_engine"):
+        return str(applied["quantized_engine"]).strip().lower()
+    try:
+        chosen = engine_module._select_quantized_engine()
+        if chosen:
+            return str(chosen).strip().lower()
+        current = getattr(engine_module.torch.backends.quantized, "engine", None)
+    except (AttributeError, RuntimeError, TypeError):  # pragma: no cover
+        return "unknown"
+    return str(current).strip().lower() if current else "default"
+
+
 def _engine_version() -> str:
     """Model/engine identity plus the process-wide generation config.
 
@@ -1367,9 +1402,22 @@ def _engine_version() -> str:
     LAW); the rest are the ``SETTINGS`` values that reach every generation and
     genuinely change the audio, exactly the ones ``_cache_key`` already folds in.
     Read from SETTINGS at call time so a test that rebinds them is honoured.
+
+    ``quant=`` carries the RESOLVED int8 backend when quantization is on
+    (``quant=1:qnnpack``), because the backend that serves the int8 kernels
+    changes the numbers — fbgemm requantizes with reduced-range activations to
+    stay overflow-safe on x86 VNNI/AVX2 while qnnpack uses the full 8-bit range
+    on Arm, so the two do not merely take different code paths to one answer.
+    With quantization OFF the axis cannot reach a single weight, so the string
+    stays exactly ``quant=0`` — every digest ever minted on a default (fp32)
+    box keeps its name. See the DIGEST LAW note in ``buildstore``.
     """
+    if SETTINGS.quantize:
+        quant = f"1:{_quantized_backend()}"
+    else:
+        quant = "0"
     return (f"{buildstore.MODEL_VERSION}"
-            f"/lang={SETTINGS.language}/quant={int(bool(SETTINGS.quantize))}"
+            f"/lang={SETTINGS.language}/quant={quant}"
             f"/max_tokens={SETTINGS.max_tokens}")
 
 

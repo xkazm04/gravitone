@@ -30,6 +30,30 @@ mode a build system cannot survive. ``service/tests/test_buildstore.py`` pins a
 golden fixture manifest to exact digest strings, so a silent identity change
 fails loudly there rather than quietly in someone's repository.
 
+"How the weights are executed" includes WHICH KERNELS execute them. The
+``engine_version`` component (built by ``service.app._engine_version``) therefore
+carries the RESOLVED int8 backend whenever quantization is on —
+``quant=1:qnnpack`` — not the configured request, because ``TTS_QUANTIZED_ENGINE``
+defaults to ``"auto"`` and ``"auto"`` names a different backend on every box.
+fbgemm and qnnpack are not two spellings of one computation: fbgemm requantizes
+with reduced-range activations to stay overflow-safe on x86, qnnpack uses the
+full 8-bit range on Arm, so the same weights and the same text produce different
+samples under the two. A digest that ignored the backend would name both.
+
+This did NOT bump ``IDENTITY_VERSION``: the payload's SHAPE is unchanged (no
+component added, removed or re-ordered) — one component's VALUE gained an axis,
+exactly as ``lang=`` and ``max_tokens=`` already encode config inside it. The
+blast radius is bounded on purpose: with ``TTS_QUANTIZE`` off (the shipped
+default) the string is still ``quant=0``, so every digest ever minted on an fp32
+box keeps its name and every stored artifact stays reachable. On a
+``quantize=True`` box the names DO move, which is the point — those digests were
+answering the wrong question. Nothing is deleted: the old artifacts remain
+served under ``GET /v1/audio/{digest}`` (they were correct for the identity that
+minted them), the next build re-mints under the backend-qualified name, and the
+now-unreferenced bytes age out through the store's ordinary LRU budget. Bumping
+``IDENTITY_VERSION`` instead would have invalidated the overwhelming majority of
+digests — the fp32 ones, which were never wrong — to fix the minority.
+
 Two more things joined them once the build plane grew teeth, and they are the
 same idea one level up:
 

@@ -131,6 +131,99 @@ class GoldenDigestTests(unittest.TestCase):
         self.assertEqual(_digest(line, overrides=reordered), _digest(line))
 
 
+class QuantizedBackendIdentityTests(unittest.TestCase):
+    """The int8 backend is part of the name — the DIGEST LAW's kernel clause.
+
+    ``TTS_QUANTIZED_ENGINE`` defaults to ``"auto"``, which resolves to qnnpack on
+    aarch64 and to torch's build default elsewhere. fbgemm and qnnpack do not
+    compute the same int8 answer (fbgemm requantizes reduced-range to stay
+    overflow-safe on x86), so two boxes running the same weights on the same
+    text produce different bytes. Colliding names for those bytes is exactly the
+    failure a lockfile cannot survive.
+
+    The blast radius is pinned here too: with quantization OFF the string is
+    still ``quant=0``, which is why this change did NOT bump IDENTITY_VERSION
+    and why every fp32 digest ever handed out keeps its name.
+    """
+
+    def setUp(self) -> None:
+        import dataclasses
+        self._orig = appmod.SETTINGS
+        self._replace = dataclasses.replace
+        self.addCleanup(lambda: setattr(appmod, "SETTINGS", self._orig))
+
+    def _settings(self, **kw) -> None:
+        appmod.SETTINGS = self._replace(self._orig, **kw)
+
+    def _under(self, backend: str) -> str:
+        """``_engine_version()`` as resolved on a box whose backend is ``backend``."""
+        orig = appmod._quantized_backend
+        appmod._quantized_backend = lambda: backend
+        try:
+            return appmod._engine_version()
+        finally:
+            appmod._quantized_backend = orig
+
+    def test_fp32_boxes_keep_the_pinned_engine_string(self) -> None:
+        # The golden fixture's engine string, byte for byte: no existing digest
+        # moved, so no stored artifact became unreachable under its old name.
+        self._settings(quantize=False, language="english", max_tokens=50)
+        self.assertEqual(appmod._engine_version(), GOLDEN_ENGINE)
+        # ...and the backend cannot leak in even if the box resolves one.
+        self.assertEqual(self._under("qnnpack"), GOLDEN_ENGINE)
+
+    def test_two_backends_do_not_collide(self) -> None:
+        self._settings(quantize=True)
+        qnn = self._under("qnnpack")
+        fbg = self._under("fbgemm")
+        self.assertNotEqual(qnn, fbg)
+        line = GOLDEN_MANIFEST["plain-wav"]
+        # Same voice, same text, same knobs, same format — different kernels.
+        self.assertNotEqual(_digest(line, engine_version=qnn),
+                            _digest(line, engine_version=fbg))
+
+    def test_quantized_names_differ_from_the_fp32_name(self) -> None:
+        self._settings(quantize=False)
+        fp32 = appmod._engine_version()
+        self._settings(quantize=True)
+        self.assertNotEqual(self._under("qnnpack"), fp32)
+        self.assertIn("quant=1:qnnpack", self._under("qnnpack"))
+
+    def test_backend_is_the_resolved_value_not_the_auto_request(self) -> None:
+        # "auto" must never reach the identity: it means qnnpack on one box and
+        # torch's build default on the next, so it names two different sounds.
+        self._settings(quantize=True, quantized_engine="auto")
+        self.assertNotIn("auto", appmod._engine_version())
+
+    def test_running_engines_applied_tuning_wins(self) -> None:
+        # The truth, not the intent: what _apply_cpu_tuning OBSERVED after
+        # selecting is what the render actually used.
+        self._settings(quantize=True, quantized_engine="auto")
+        orig_engine = appmod.ENGINE
+
+        class _Stub:
+            tuning = {"quantized_engine": "fbgemm"}
+
+        appmod.ENGINE = _Stub()
+        try:
+            self.assertEqual(appmod._quantized_backend(), "fbgemm")
+        finally:
+            appmod.ENGINE = orig_engine
+
+    def test_backend_resolves_without_a_started_engine(self) -> None:
+        # Before startup (and in tests that rebind SETTINGS) there is no tuning
+        # dict; the answer must still be a concrete backend name, never blank.
+        self._settings(quantize=True, quantized_engine="auto")
+        orig_engine = appmod.ENGINE
+        appmod.ENGINE = None
+        try:
+            name = appmod._quantized_backend()
+        finally:
+            appmod.ENGINE = orig_engine
+        self.assertTrue(name)
+        self.assertNotIn(" ", name)
+
+
 class DigestParsingTests(unittest.TestCase):
     def test_accepts_both_spellings(self) -> None:
         bare = "a" * 64
