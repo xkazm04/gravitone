@@ -24,13 +24,53 @@ WHAT IT ACTUALLY DOES, MEASURED
 sherpa-onnx's own labelled fixtures (real recorded humans) and against synthetic
 speech from this service's own voices, and the two disagree sharply:
 
-======================  ==================  ====================================
-input                   truth -> found      verdict
-======================  ==================  ====================================
-two-speakers-en (real)  2 -> 2              correct
-four-speakers-zh (real) 4 -> 4              correct (at threshold 0.6)
-two TTS voices mixed    2 -> 3              WRONG: it split one voice in two
-======================  ==================  ====================================
+=============================  ==============  ==============================
+input                          truth -> found  verdict
+=============================  ==============  ==============================
+two-speakers-en (real)         2 -> 2          correct
+four-speakers-zh (real)        4 -> 4          correct (at threshold 0.6)
+six real speakers (4zh + 2en)  6 -> 6          correct — the table's old top
+                                               was four, and four was not a
+                                               ceiling
+two TTS voices mixed           2 -> 3          WRONG: it split one voice in two
+hiss bed, 25 dB SNR            2 -> 2          correct, but this is the knee —
+                                               one noise draw of four collapsed
+                                               here
+hiss bed, 20 dB SNR            2 -> 1          WRONG: hiss collapses two people
+                                               into one (3/3 draws)
+tonal music bed, 10 and 0 dB   2 -> 2          correct — a HARMONIC bed is
+                                               survivable at a level broadband
+                                               hiss is not
+crosstalk, 2 voices overlaid   2 -> 3          WRONG (over-counts)
+crosstalk, 6 voices overlaid   6 -> 3          WRONG (collapses)
+hiss / flat tone / digital     0 -> 0          correct: no phantom speaker
+silence, no speech at all
+tremolo'd tonal bed, no        0 -> 1          WRONG: 11 s of "speech" from
+speech at all                                  music nobody spoke over
+=============================  ==============  ==============================
+
+Read the bottom half as one finding: **level and modulation, not the number of
+people, are what break it.** Adding speakers does not (six were counted); a
+sustained overlap or a broadband bed destroys the identity decision in opposite
+directions; and a slow amplitude modulation over a tonal drone is enough to
+manufacture a speaker out of a recording that contains no voice at all. Two
+consequences a caller must carry: a hissy recording of two people comes back as
+one person talking — the same wrong answer this module exists to stop returning,
+arriving by a different road — and "1 speaker" is not evidence that anybody
+spoke.
+
+Provenance, because it decides how much these rows are worth: rows 1, 2 and the
+TTS row are recordings. The six-speaker row is two real recordings back to back
+(six genuinely different people, no overlap). The bed and crosstalk rows are
+CONSTRUCTED — a bed summed under a real recording, or two real recordings summed
+on top of each other. Summing is exactly what a noise bed does, so those rows
+are worth what they say; summed crosstalk is NOT the same as a real co-located
+recording of people talking over each other (no room, no shared microphone, and
+nobody raising their voice to be heard), so treat those two rows as evidence
+that overlap breaks the count and not as a measurement of how badly. Building
+that fixture needs a recording this repo does not have; saying so is better than
+publishing a number from a fixture that cannot support it. Every row above is
+reproduced by ``test_diarize.RealAudioTests`` (``GRAVITONE_DIARIZE_E2E=1``).
 
 So: **good on recorded humans, unreliable on synthetic speech.** Independently
 expressive TTS output moves the speaker embedding more than one real person's
