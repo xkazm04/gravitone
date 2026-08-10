@@ -33,11 +33,20 @@ from fastapi.testclient import TestClient
 
 @dataclass
 class ScoredWord:
-    """An ASR word that DOES carry a probability (stt.Word does not yet)."""
+    """An ASR word carrying a probability, whatever the backend calls it."""
     text: str
     start: float
     end: float
     probability: float
+
+
+def scored(text: str, *probs, duration: float = 2.0) -> list:
+    """``evenly``, but every word carries the confidence you hand it."""
+    parts = text.split()
+    step = duration / max(1, len(parts))
+    return [stt.Word(text=p, start=round(i * step, 3),
+                     end=round((i + 1) * step, 3), confidence=probs[i])
+            for i, p in enumerate(parts)]
 
 
 def words(*specs) -> list:
@@ -237,6 +246,41 @@ class AlignmentTests(unittest.TestCase):
         self.assertNotIn(".", norm["characters"])
         self.assertEqual("".join(norm["characters"]), "Hello brave world")
 
+    def test_a_span_carries_the_confidence_it_was_anchored_on(self) -> None:
+        al = verify.align(self.TEXT, scored("hello brave world", 0.99, 0.42,
+                                            0.97, duration=3.0), duration_s=3.0)
+        self.assertEqual([w.confidence for w in al.words], [0.99, 0.42, 0.97])
+        self.assertEqual(al.words[1].to_dict()["confidence"], 0.42)
+        # And it survives the normalized timeline, which rebuilds the spans.
+        self.assertEqual([w.confidence for w in
+                          verify.align(self.TEXT,
+                                       scored("hello brave world", 0.99, 0.42,
+                                              0.97, duration=3.0),
+                                       duration_s=3.0).words],
+                         [0.99, 0.42, 0.97])
+
+    def test_an_ungraded_word_is_none_and_never_zero(self) -> None:
+        """Three different silences, one honest answer: null.
+
+        A word the ear never rated, a word the ear never heard, and a transcript
+        with no word data at all are all UNGRADED — and an editor that dims by
+        confidence must not dim them as if the model had rejected them.
+        """
+        al = verify.align(self.TEXT, evenly("hello brave world", 3.0),
+                          duration_s=3.0)
+        self.assertTrue(all(w.confidence is None for w in al.words))
+        partial = verify.align(self.TEXT, scored("hello world", 0.9, 0.9,
+                                                 duration=3.0), duration_s=3.0)
+        self.assertIsNone(partial.words[1].confidence)  # interpolated: unheard
+        self.assertFalse(partial.words[1].matched)
+
+    def test_a_numeral_takes_the_weakest_rated_word_that_read_it(self) -> None:
+        """"42" is two heard words; the number is only as certain as the shakier
+        half. Unrated halves contribute nothing rather than a zero."""
+        al = verify.align("Room 42.", scored("room forty two", 0.99, 0.95, 0.31,
+                                             duration=3.0), duration_s=3.0)
+        self.assertEqual(al.words[1].confidence, 0.31)
+
     def test_a_numeral_anchors_every_word_it_expands_to(self) -> None:
         al = verify.align("Room 42.", evenly("room forty two", 3.0),
                           duration_s=3.0)
@@ -405,6 +449,19 @@ class StrictRetryTests(_RouteBase):
         self.assertLessEqual(len(appmod.ENGINE.executed), 2)
 
 
+class RatedTimelineTests(_RouteBase):
+    """An ear that DOES rate its words: the numbers must reach the caller."""
+
+    def _transcribe(self, pcm, **kwargs):
+        self.transcriptions += 1
+        return transcript(self.HEARD, scored(self.HEARD, 0.99, 0.38))
+
+    def test_the_timeline_reports_per_word_confidence(self) -> None:
+        body = self._post("/with-timestamps").json()
+        self.assertEqual([w["confidence"] for w in body["words"]], [0.99, 0.38])
+        self.assertEqual(body["fidelity"]["confidence_source"], "asr")
+
+
 class WithTimestampsTests(_RouteBase):
     def test_elevenlabs_shape(self) -> None:
         r = self._post("/with-timestamps")
@@ -428,6 +485,16 @@ class WithTimestampsTests(_RouteBase):
         self.assertEqual(body["fidelity"]["score"], 1.0)
         self.assertEqual(body["anchored_words"], 2)
         self.assertEqual(body["interpolated_words"], 0)
+
+    def test_word_spans_grew_confidence_and_nothing_else(self) -> None:
+        first = self._post("/with-timestamps").json()["words"][0]
+        established = {"text", "start", "end", "start_time_seconds",
+                       "end_time_seconds", "matched"}
+        self.assertLessEqual(established, set(first))
+        self.assertEqual(set(first) - established, {"confidence"})
+        # This stand-in ear rates nothing, so every span says so — in null, not
+        # in a number that would read as "the model thought this was wrong".
+        self.assertIsNone(first["confidence"])
 
     def test_the_synthesis_headers_are_the_drop_in_route_s(self) -> None:
         r = self._post("/with-timestamps")

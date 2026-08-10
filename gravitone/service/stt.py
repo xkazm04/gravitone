@@ -255,9 +255,10 @@ def _assemble(collected, detected, elapsed: float) -> Transcript:
     for seg in collected:
         parts.append(seg.text)
         for w in (getattr(seg, "words", None) or []):
+            prob = getattr(w, "probability", None)
             words.append(Word(text=w.word.strip(), start=round(w.start, 3),
                               end=round(w.end, 3),
-                              confidence=getattr(w, "probability", None)))
+                              confidence=None if prob is None else round(float(prob), 3)))
     duration = float(getattr(detected, "duration", 0.0) or 0.0)
     return Transcript(
         text=" ".join(p.strip() for p in parts).strip(),
@@ -386,6 +387,13 @@ def speech_to_text(
         ``speaker_threshold`` tunes it; there is deliberately no "number of
         speakers" parameter, because the underlying one does not honour it.
 
+    Each word additionally carries ``confidence`` — the model's own probability
+    for that word, which Scribe does not return and this service refuses to
+    throw away (see ``Word.confidence``). It is ``null``, never 0.0, when the
+    backend rated no words: absent is not zero, and an editor that dims
+    uncertain words must be able to tell "the model was unsure" from "nothing
+    rated it" (the house rule, from service/verify.py).
+
     ``model_id`` is accepted for drop-in compatibility and ignored; which model
     runs is this replica's configuration (STT_MODEL), not the caller's choice.
     """
@@ -431,7 +439,10 @@ def speech_to_text(
         "language_probability": result.language_probability,
         "text": result.text,
         "words": [{"text": w.text, "start": w.start, "end": w.end,
-                   "type": "word", "speaker_id": w.speaker_id} for w in result.words],
+                   "type": "word", "speaker_id": w.speaker_id,
+                   # Additive to the Scribe shape. None (JSON null) means the
+                   # backend rated no words — NOT that it rated this one badly.
+                   "confidence": w.confidence} for w in result.words],
         # Ours, not Scribe's: what it cost and how much to trust the speakers.
         "duration_s": result.duration_s,
         "transcribe_s": result.transcribe_s,

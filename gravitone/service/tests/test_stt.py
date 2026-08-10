@@ -29,8 +29,13 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 
 class _Word:
-    def __init__(self, word: str, start: float, end: float):
+    def __init__(self, word: str, start: float, end: float, probability=None):
         self.word, self.start, self.end = word, start, end
+        # Set only when given: a backend that rates no words has no attribute
+        # at all, which is the case that must stay distinguishable from a LOW
+        # rating all the way out to the JSON.
+        if probability is not None:
+            self.probability = probability
 
 
 class _Segment:
@@ -52,6 +57,9 @@ class _FakeModel:
     calls: list[dict] = []
     text = "React and PostgreSQL."
     words = True
+    # Per-word probabilities, when this stand-in is standing in for a backend
+    # that rates words. None => the words carry no probability at all.
+    probabilities: list | None = None
 
     def __init__(self, name, **kwargs):
         type(self).built.append((name, kwargs))
@@ -59,9 +67,11 @@ class _FakeModel:
 
     def transcribe(self, audio, **kwargs):
         type(self).calls.append(dict(kwargs, audio=audio))
-        words = ([_Word("React", 0.0, 0.4), _Word("and", 0.4, 0.6),
-                  _Word("PostgreSQL.", 0.6, 1.2)] if kwargs.get("word_timestamps")
-                 else [])
+        probs = type(self).probabilities or [None, None, None]
+        words = ([_Word("React", 0.0, 0.4, probs[0]),
+                  _Word("and", 0.4, 0.6, probs[1]),
+                  _Word("PostgreSQL.", 0.6, 1.2, probs[2])]
+                 if kwargs.get("word_timestamps") else [])
         # A generator, like the real one: the work happens on iteration, which
         # is why service.stt materializes it inside its lock.
         return (s for s in [_Segment(type(self).text, words)]), _Info()
@@ -87,6 +97,7 @@ class _FakeWhisperCase(unittest.TestCase):
         _FakeModel.built.clear()
         _FakeModel.calls.clear()
         _FakeModel.text = "React and PostgreSQL."
+        _FakeModel.probabilities = None
         self._orig_settings = stt.SETTINGS
         stt._MODEL = None
         stt._MODEL_KEY = None
@@ -201,6 +212,22 @@ class TranscribeTests(_FakeWhisperCase):
     def test_off_rate_audio_is_resampled_rather_than_refused(self) -> None:
         result = stt.transcribe_pcm(b"\x00\x00" * 8000, rate=8000)
         self.assertEqual(result.text, "React and PostgreSQL.")
+
+    def test_a_word_keeps_the_probability_the_model_gave_it(self) -> None:
+        _FakeModel.probabilities = [0.982, 0.41, 0.77]
+        result = stt.transcribe(np.zeros(16000, dtype=np.float32),
+                                word_timestamps=True)
+        self.assertEqual([w.confidence for w in result.words], [0.982, 0.41, 0.77])
+
+    def test_a_word_the_model_did_not_rate_is_none_not_zero(self) -> None:
+        """Absent is not zero (service/verify.py's rule, kept end to end).
+
+        0.0 would say "the model was certain this is wrong"; None says "nobody
+        graded it", and only one of those is true.
+        """
+        result = stt.transcribe(np.zeros(16000, dtype=np.float32),
+                                word_timestamps=True)
+        self.assertEqual([w.confidence for w in result.words], [None, None, None])
 
     def test_an_empty_room_transcribes_to_nothing(self) -> None:
         _FakeModel.text = "   "
@@ -344,6 +371,27 @@ class HttpSurfaceTests(_FakeWhisperCase):
         first = body["words"][0]
         self.assertEqual((first["text"], first["type"], first["speaker_id"]),
                          ("React", "word", "speaker_0"))
+
+    def test_the_word_shape_is_additive_only(self) -> None:
+        """An ElevenLabs-shaped API: existing clients read these five keys and
+        must keep finding exactly them, plus whatever we add."""
+        first = self._post().json()["words"][0]
+        self.assertLessEqual({"text", "start", "end", "type", "speaker_id"},
+                             set(first))
+        self.assertEqual(set(first) - {"text", "start", "end", "type",
+                                       "speaker_id"}, {"confidence"})
+
+    def test_every_word_carries_the_models_confidence(self) -> None:
+        _FakeModel.probabilities = [0.99, 0.4, 0.88]
+        body = self._post().json()
+        self.assertEqual([w["confidence"] for w in body["words"]],
+                         [0.99, 0.4, 0.88])
+
+    def test_an_unrated_word_is_null_and_not_a_low_score(self) -> None:
+        """The distinction the punch-in editor needs: a word nobody graded must
+        not render like a word graded 0.4."""
+        body = self._post().json()
+        self.assertTrue(all(w["confidence"] is None for w in body["words"]))
 
     def test_a_whole_recording_spends_the_beam(self) -> None:
         """Nothing is waiting on a file the way a turn waits on a sentence."""

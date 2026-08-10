@@ -240,10 +240,10 @@ class Heard:
 def word_confidence(word) -> float | None:
     """The transcriber's confidence for one word, whatever it calls it.
 
-    ``service.stt.Word`` carries no probability today (faster-whisper has one
-    per word and ``stt._assemble`` drops it), so this returns None there and
-    the report says ``confidence_source: "unrated"`` rather than pretending to
-    a floor it never applied.
+    ``service.stt.Word`` carries faster-whisper's per-word probability, but only
+    on a decode that asked for word timestamps — without them the model emits no
+    words at all. When there is no number this returns None and the report says
+    ``confidence_source`` rather than pretending to a floor it never applied.
     """
     for attr in ("confidence", "probability", "prob"):
         value = getattr(word, attr, None)
@@ -535,11 +535,19 @@ class WordSpan:
     start_s: float
     end_s: float
     matched: bool        # True: anchored on a heard word; False: interpolated
+    # The transcriber's confidence in the heard word(s) this span was anchored
+    # on — the weakest RATED one, because a word is only as certain as its
+    # least certain piece. None means nothing rated it: the ear reported no
+    # probability, or the word was never heard at all (``matched: false``).
+    # Absent is not zero; a caller dimming uncertain words must not dim a word
+    # merely because nobody graded it.
+    confidence: float | None = None
 
     def to_dict(self) -> dict:
         return {"text": self.text, "start": self.start, "end": self.end,
                 "start_time_seconds": self.start_s,
-                "end_time_seconds": self.end_s, "matched": self.matched}
+                "end_time_seconds": self.end_s, "matched": self.matched,
+                "confidence": self.confidence}
 
 
 @dataclass
@@ -598,7 +606,8 @@ class Alignment:
         cursor = 0
         for span in self.words:
             spans.append(WordSpan(span.text, cursor, cursor + len(span.text),
-                                  span.start_s, span.end_s, span.matched))
+                                  span.start_s, span.end_s, span.matched,
+                                  span.confidence))
             cursor += len(span.text) + 1
         return Alignment(spans, self.duration_s).characters(text)
 
@@ -618,17 +627,30 @@ def align(reference_text: str, heard, *, duration_s: float,
     a word with no counterpart at all is interpolated between its neighbours.
     Low-confidence heard words are usable as timing anchors even though they
     are not usable as evidence — where a word lands and whether it was right
-    are two different questions.
+    are two different questions. Each span reports that confidence
+    (``WordSpan.confidence``) so a punch-in editor can draw the difference
+    between a word the ear was sure of and one it guessed at, instead of
+    rendering every word with the same unstated certainty.
     """
     ref = normalize(reference_text)
     hyp = heard_tokens(heard)
     groups = source_words(reference_text)
     timings: dict[int, tuple[float, float, bool]] = {}
+    # group -> the RATED confidences of every heard word that fed this source
+    # word. Unrated heard words contribute nothing rather than a zero, exactly
+    # as they contribute nothing to `compare`'s numerator or denominator.
+    confs: dict[int, list[float]] = {}
+
+    def _rate(group: int, block: list[Heard]) -> None:
+        for h in block:
+            if h.confidence is not None:
+                confs.setdefault(group, []).append(float(h.confidence))
 
     for op, i1, i2, j1, j2 in _blocks(ref, hyp, reference_text):
         if op in ("delete", "insert"):
             continue
         if op == "numeral":
+            _rate(ref[i1].group, hyp[j1:j2])
             # The whole numeral is ONE source word: it spans every heard word
             # that read it, and it really was matched.
             spans = [(float(h.start_s), float(h.end_s)) for h in hyp[j1:j2]
@@ -638,6 +660,7 @@ def align(reference_text: str, heard, *, duration_s: float,
                                           max(e for _, e in spans), True)
             continue
         for token, word in zip(ref[i1:i2], hyp[j1:j2]):
+            _rate(token.group, [word])
             if word.start_s is None or word.end_s is None:
                 continue
             start, end, was = timings.get(
@@ -650,11 +673,13 @@ def align(reference_text: str, heard, *, duration_s: float,
     for group, start, end in groups:
         timed = timings.get(group)
         text = reference_text[start:end]
+        rated = confs.get(group)
+        conf = round(min(rated), 3) if rated else None
         if timed is None:
-            spans.append(WordSpan(text, start, end, -1.0, -1.0, False))
+            spans.append(WordSpan(text, start, end, -1.0, -1.0, False, conf))
         else:
             spans.append(WordSpan(text, start, end, round(timed[0], 3),
-                                  round(timed[1], 3), timed[2]))
+                                  round(timed[1], 3), timed[2], conf))
 
     _interpolate(spans, duration_s)
     anchored = sum(1 for s in spans if s.matched)
