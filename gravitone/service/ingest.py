@@ -67,7 +67,7 @@ from typing import Callable, NamedTuple
 
 import numpy as np
 
-from service import voiceprint
+from service import vad, voiceprint
 from service.atomicio import atomic_write_text, file_lock
 from service.config import SETTINGS
 from service.emotions import BASELINE, EMOTION_SCALE
@@ -784,15 +784,22 @@ def clean_local(src: Path, dst: Path) -> None:
 _FRAME_SECONDS = 0.02
 _FLOOR_PCT = 10.0          # the quiet tenth of the clip ≈ its background
 _SPEECH_PCT = 95.0         # the loud twentieth ≈ its speech, robust to clicks
-_NOISE_MARGIN_DB = 8.0     # threshold sits this far ABOVE the measured floor…
 _SPEECH_HEADROOM_DB = 6.0  # …and never closer than this to the speech level
 _MIN_RANGE_DB = 8.0        # floor and speech this close = nothing to gate on
 _SILENT_DBFS = -55.0       # louder than this is audio; quieter is silence
-_DB_FLOOR = -90.0          # log floor for digital silence
+# The three below have no literal here on purpose. `service/vad.py` — the
+# streaming gate whose docstring has always claimed it uses "the same values" as
+# this detector — is the single definition, and these are that module's own
+# objects, so the two doors audio comes in through cannot end up disagreeing
+# about what "background" means. Writing a number here instead fails
+# test_vad.LevelConstantsAreSharedTests. vad.py imports nothing from the
+# service, so this direction cannot cycle.
+_NOISE_MARGIN_DB = vad.NOISE_MARGIN_DB    # threshold sits this far ABOVE the floor…
+_DB_FLOOR = vad.DB_FLOOR                  # log floor for digital silence
 # Sanity rails on the derived threshold. The low end still leaves ~15 dB above
 # 16-bit dither, so a genuinely quiet (far-mic) recording is gated on its own
 # floor rather than crushed back towards the old constant.
-_THRESHOLD_CLAMP = (-75.0, -12.0)
+_THRESHOLD_CLAMP = vad.THRESHOLD_CLAMP
 # Used only when the level distribution cannot be measured (a wav that is not
 # the 24 kHz mono 16-bit this pipeline produces): the old fixed constant, now
 # an explicit fallback rather than the policy.

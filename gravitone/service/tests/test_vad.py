@@ -7,10 +7,14 @@ not, and the boundaries between them are the only thing being measured.
 from __future__ import annotations
 
 import math
+import re
 import unittest
+from pathlib import Path
 
 import numpy as np
 
+from service import ingest as ingest_module
+from service import vad
 from service.vad import SPEECH_END, SPEECH_START, SpeechGate
 
 RATE = 16000
@@ -266,6 +270,54 @@ class EchoReferenceTests(unittest.TestCase):
         gate = self._ready()
         gate.expect_echo(self.ECHO_LEVEL_DB, 0.0, lag_ms=0)
         self.assertFalse(gate.echo_active)
+
+
+class LevelConstantsAreSharedTests(unittest.TestCase):
+    """The docstring's claim about ingest, enforced instead of asserted in prose.
+
+    ``vad``'s module docstring says the batch detector in ``ingest`` works from
+    the same idea of "background" as this gate. It used to say the values were
+    "the same" while each module held its own literals and nothing checked —
+    the exact shape (a contract described in prose that the code does not have)
+    the repo already has a rule about. ``vad`` now DECLARES them and ``ingest``
+    binds this module's objects; these tests fail the moment a second literal
+    appears on either side.
+    """
+
+    def test_ingest_binds_this_modules_objects_rather_than_copies(self) -> None:
+        from service import ingest
+
+        for mine, theirs in (("DB_FLOOR", "_DB_FLOOR"),
+                             ("NOISE_MARGIN_DB", "_NOISE_MARGIN_DB"),
+                             ("THRESHOLD_CLAMP", "_THRESHOLD_CLAMP")):
+            with self.subTest(constant=mine):
+                self.assertIs(getattr(vad, mine), getattr(ingest, theirs),
+                              f"ingest.{theirs} is no longer service.vad.{mine} "
+                              "— one of the two grew its own literal")
+
+    def test_the_source_of_truth_lives_here_and_only_here(self) -> None:
+        """A grep-level check, because `is` alone cannot see a re-assignment
+        that happens to use the same value: -90.0 is -90.0 by float interning in
+        CPython, and a copied literal that agrees TODAY is exactly the drift this
+        is meant to catch."""
+        source = Path(ingest_module.__file__).read_text("utf-8")
+        for name in ("_DB_FLOOR", "_NOISE_MARGIN_DB", "_THRESHOLD_CLAMP"):
+            with self.subTest(constant=name):
+                assignments = re.findall(rf"^{name}\s*=\s*(.+)$", source, re.M)
+                self.assertEqual(1, len(assignments), f"{name} in ingest.py")
+                self.assertTrue(assignments[0].startswith("vad."),
+                                f"ingest.py defines its own {name} = "
+                                f"{assignments[0]} instead of using vad's")
+
+    def test_the_gate_threshold_is_derived_from_them(self) -> None:
+        """Not decoration: the shared numbers are what the gate actually gates
+        on, so a change to either one moves this threshold."""
+        gate = SpeechGate(RATE)
+        self.assertEqual(gate.threshold_db,
+                         min(max(vad.DB_FLOOR + vad.NOISE_MARGIN_DB,
+                                 vad.THRESHOLD_CLAMP[0]), vad.THRESHOLD_CLAMP[1]))
+        gate.feed(noise(200))
+        self.assertGreater(gate.threshold_db, vad.DB_FLOOR)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,11 @@ percentile floor in one pass and hands the spans to ffmpeg. A conversation has
 measured, and the decision that matters — "the turn is over, answer now" — has
 to be made from silence alone, before anything else can happen.
 
+What the two genuinely share is the definition of "background": ``DB_FLOOR``,
+``NOISE_MARGIN_DB`` and ``THRESHOLD_CLAMP`` are declared HERE and imported by
+``ingest``, one object each. That used to be a claim in this docstring over two
+independent sets of literals — see the comment on those constants below.
+
 Why level and not a neural VAD: this is the sovereign half of the product. A
 level gate has no weights to download, no second inference competing with the
 TTS pool for the cores the launcher pinned, and no opinion about which language
@@ -69,16 +74,26 @@ import numpy as np
 FRAME_MS = 20
 SAMPLE_WIDTH = 2  # PCM16, the only format this service speaks on the wire
 
-# Log floor for digital silence. Both this and the two numbers below are the
-# same values ingest.py derives its batch threshold from — the gate should not
-# disagree with itself about what "background" means depending on which door
-# the audio came in through.
-_DB_FLOOR = -90.0
-_NOISE_MARGIN_DB = 8.0
+# ── what "background" means, for the whole service ──────────────────────────
+# These three are THE definition, not a copy of one: `ingest.detect_speech`
+# imports them from here (`ingest.DB_FLOOR` and friends are aliases of these
+# objects), so the streaming gate and the batch detector cannot drift apart by
+# one of them being edited. They live in this module because it is the leaf —
+# vad.py imports nothing from the service, so anybody may import it back.
+#
+# The claim used to be a sentence in this docstring saying the values were "the
+# same" as ingest's, while both modules held their own literals and nothing
+# checked. `test_vad.LevelConstantsAreSharedTests` now fails if a second
+# definition reappears on either side.
+#
+# Log floor for digital silence.
+DB_FLOOR = -90.0
+# How far above the background a frame must sit to count as speech.
+NOISE_MARGIN_DB = 8.0
 # Rails on the derived threshold. The low end matters most here: a client that
 # pads with TRUE digital silence drags the tracked floor to -90 dB, and without
 # a clamp the gate would then trigger on dither.
-_THRESHOLD_CLAMP = (-75.0, -12.0)
+THRESHOLD_CLAMP = (-75.0, -12.0)
 # How fast the tracked floor may rise, in dB per frame (1 dB/s at 20 ms).
 # Downward it moves instantly — a quieter frame IS new evidence about the
 # background — but upward it has to creep, or a long utterance would drag the
@@ -121,13 +136,13 @@ class GateEvent:
 
 
 def frame_db(frame: np.ndarray) -> float:
-    """RMS of one int16 frame in dBFS, floored at ``_DB_FLOOR``."""
+    """RMS of one int16 frame in dBFS, floored at ``DB_FLOOR``."""
     if frame.size == 0:
-        return _DB_FLOOR
+        return DB_FLOOR
     rms = float(np.sqrt(np.mean(np.square(frame.astype(np.float64)))))
     if rms <= 0.0:
-        return _DB_FLOOR
-    return max(_DB_FLOOR, 20.0 * math.log10(rms / 32768.0))
+        return DB_FLOOR
+    return max(DB_FLOOR, 20.0 * math.log10(rms / 32768.0))
 
 
 class SpeechGate:
@@ -155,13 +170,13 @@ class SpeechGate:
         self._loud_run = 0                    # consecutive frames over threshold
         self._quiet_run = 0                   # consecutive frames under it
         self._speaking = False
-        self._peak_db = _DB_FLOOR
+        self._peak_db = DB_FLOOR
         self._frames_seen = 0                 # every frame ever, = the clock
         self._utterance_start_frame = 0
         # Echo reference (see expect_echo). Zero frames = no window open, which
         # is the state a gate stays in forever unless a caller opts in.
         self._echo_frames = 0
-        self._echo_gate_db = _DB_FLOOR
+        self._echo_gate_db = DB_FLOOR
         self.suppressed_onsets = 0            # frames declined as our own output
 
     # -- state a caller can ask about ---------------------------------------
@@ -206,9 +221,9 @@ class SpeechGate:
     @property
     def threshold_db(self) -> float:
         """Level a frame must beat to count as speech, given what has been heard."""
-        floor = self._floor_db if self._floor_db is not None else _DB_FLOOR
-        return min(max(floor + _NOISE_MARGIN_DB, _THRESHOLD_CLAMP[0]),
-                   _THRESHOLD_CLAMP[1])
+        floor = self._floor_db if self._floor_db is not None else DB_FLOOR
+        return min(max(floor + NOISE_MARGIN_DB, THRESHOLD_CLAMP[0]),
+                   THRESHOLD_CLAMP[1])
 
     def _now_s(self) -> float:
         return self._frames_seen * FRAME_MS / 1000.0
@@ -250,7 +265,7 @@ class SpeechGate:
             # reference suppresses ONSETS, and nothing else.
             events = self._continue(frame, db, loud)
         if self._echo_frames == 0:
-            self._echo_gate_db = _DB_FLOOR
+            self._echo_gate_db = DB_FLOOR
         return events
 
     def _track_floor(self, db: float, loud: bool) -> None:
@@ -310,7 +325,7 @@ class SpeechGate:
         self._loud_run = 0
         self._quiet_run = 0
         peak = self._peak_db
-        self._peak_db = _DB_FLOOR
+        self._peak_db = DB_FLOOR
 
         # Trailing silence is the END SIGNAL, not part of what was said. Whisper
         # is happier without it and the duration we report stays honest.
