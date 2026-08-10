@@ -930,13 +930,25 @@ export function useCharacter(characterId: string) {
    *  ("no basis has been built", "angry does not transfer between speakers well
    *  enough"), and the rack shows each one against the row it belongs to. The
    *  hook's shared error banner would strip that placement away. */
+  // The emotion with a derive in flight. A REF, for the same reason
+  // `removingRef` is one: a double-click is two clicks before any re-render, so
+  // `busySlot` (state) has not repainted `disabled` yet when the second one
+  // lands. Unsuppressed, the second request reaches a server that mints under a
+  // lock and answers 409 — a raw collision surfaced against a slot the user
+  // only asked to fill once, and this mutation MINTS a Voice, so it deserves at
+  // least the discipline the delete path already has.
+  const derivingRef = useRef<string | null>(null);
+
   const deriveVoice = useCallback(async (emotion: string, donor?: string | null) => {
+    if (derivingRef.current) return undefined; // in-flight gate
+    derivingRef.current = emotion;
     setBusySlot(emotion);
     try {
       const v = await deriveVoiceReq(characterId, emotion, donor);
       await refresh();
       return v;
     } finally {
+      derivingRef.current = null;
       if (mounted.current) setBusySlot(null);
     }
   }, [characterId, mounted, refresh]);
