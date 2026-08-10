@@ -149,6 +149,69 @@ class FidelityTests(unittest.TestCase):
         self.assertEqual(report.score, 1.0)
         self.assertEqual(report.rated_deltas, [])
 
+    def test_a_homophone_slip_is_not_charged_to_the_synthesizer(self) -> None:
+        """"their"/"there" is ONE sound. An ASR cannot tell them apart because a
+        listener cannot either, so scoring it as `wrong` is a false FAIL — and
+        `verify=strict` can refuse a render on one."""
+        for asked, heard in (("Put it over there.", "put it over their"),
+                             ("It is their car.", "it is there car"),
+                             ("They're late.", "there late"),
+                             ("Send it to me too.", "send it to me to"),
+                             ("I know the way.", "i no the weigh"),
+                             ("Write it down.", "right it down")):
+            with self.subTest(asked=asked):
+                report = verify.compare(asked, evenly(heard))
+                self.assertEqual(report.score, 1.0, asked)
+                self.assertEqual(report.rated_deltas, [])
+
+    def test_a_genuinely_wrong_word_still_fails(self) -> None:
+        """The other direction, which is the one that must stay expensive."""
+        report = verify.compare("Deploy the react app.",
+                                evenly("deploy the rust app"))
+        self.assertLess(report.score, 1.0)
+        self.assertEqual([d.kind for d in report.rated_deltas], ["wrong"])
+        # Specifically: Soundex maps both "react" and "rust" to R230, which is
+        # why the mechanism is a curated table and not a phonetic hash.
+        self.assertNotIn("rust", verify.homophones("react"))
+
+    def test_a_homophone_next_to_a_real_error_forgives_only_the_homophone(self) -> None:
+        report = verify.compare("Sell their house.", evenly("cell there hose"))
+        # "sell"/"cell" and "their"/"there" are sounds; "house"/"hose" is not.
+        self.assertEqual([(d.expected, d.heard) for d in report.rated_deltas],
+                         [("house", "hose")])
+        self.assertEqual(report.matched, 2)
+        self.assertEqual(report.errors, 1)
+
+    def test_the_table_holds_no_heteronyms(self) -> None:
+        """A heteronym is the one case where a synthesizer really can say the
+        wrong word audibly ("read" as /riːd/), so forgiving it would hide a
+        defect rather than a spelling."""
+        for word in ("read", "reed", "lead", "led", "bow", "tear", "live",
+                     "wind", "row", "sow", "close", "desert"):
+            self.assertEqual(verify.homophones(word), frozenset(), word)
+
+    def test_homophone_equivalence_is_symmetric_and_not_transitive(self) -> None:
+        self.assertIn("there", verify.homophones("their"))
+        self.assertIn("their", verify.homophones("there"))
+        # "sight"/"site"/"cite" share a group; "see"/"sea" is a different one
+        # and must not leak into it.
+        self.assertNotIn("sea", verify.homophones("sight"))
+
+    def test_a_homophone_is_anchored_rather_than_interpolated(self) -> None:
+        al = verify.align("Over there.", evenly("over their", 2.0),
+                          duration_s=2.0)
+        self.assertTrue(all(w.matched for w in al.words))
+
+    def test_the_numeral_handling_does_not_regress(self) -> None:
+        self.assertEqual(verify.compare("Founded in 1990.",
+                                        evenly("founded in nineteen ninety")).score,
+                         1.0)
+        self.assertEqual(verify.compare("Room 42.",
+                                        evenly("room forty two")).score, 1.0)
+        # A number read as the WRONG number is still an error.
+        self.assertLess(verify.compare("Room 42.",
+                                       evenly("room forty three")).score, 1.0)
+
     def test_low_confidence_words_never_indict_the_synthesizer(self) -> None:
         heard = [ScoredWord("deploy", 0.0, 0.5, 0.99),
                  ScoredWord("the", 0.5, 0.7, 0.99),

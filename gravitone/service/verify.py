@@ -9,6 +9,9 @@ those word spans, and it deliberately contains no model, no I/O and no clock:
   * a **text normalizer** shared by BOTH sides of the comparison (the request
     text and the transcript), so "42" vs "forty two", "Dr." vs "doctor" and
     "don't" vs "dont" are the same words rather than three false failures;
+  * a **homophone carve-out** applied to what is left over after all of that
+    (``_split_homophones``): "their" for "there" is one sound, so it is not a
+    synthesis defect and must not be charged as one;
   * a **word-level alignment mapper** that carries ASR ``Word`` spans back onto
     the ORIGINAL request text (character offsets included — the caller asked
     for a timeline over the words it sent, not over what the ear heard);
@@ -84,6 +87,71 @@ ABBREVIATIONS: dict[str, tuple[str, ...]] = {
     "&": ("and",),
     "%": ("percent",),
 }
+
+
+# Words that are the SAME SOUND and a different spelling. Consulted only for
+# residual mismatches (see ``_split_homophones``), never during normalization.
+#
+# Why a curated table and not Soundex/Metaphone: a phonetic hash does not encode
+# "identical pronunciation", it encodes "similar consonant skeleton", and it is
+# far too coarse for a claim-checker. Soundex maps both "react" and "rust" to
+# R230 — this suite's own canonical example of a real synthesis defect
+# (test_verify: "Deploy the react app" heard as "rust") would become a PASS.
+# The table below cannot do that: every entry is a pair a listener could not
+# tell apart either, so forgiving it forgives nothing audible.
+#
+# Admission rules for an entry, and they are what keep the false-PASS class
+# small: (1) identical pronunciation in general American, not merely similar —
+# "marry"/"merry" and "caught"/"court" are accent-dependent and are OUT;
+# (2) no heteronyms — "read"/"reed" and "lead"/"led" are excluded because a
+# synthesizer really can read the wrong one of those aloud, and that IS a defect
+# an ear can hear. Groups are matched pairwise and NOT transitively, so a word
+# may sit in two groups without merging them.
+_HOMOPHONE_GROUPS: tuple[tuple[str, ...], ...] = (
+    ("their", "there", "theyre"), ("to", "too", "two"), ("your", "youre"),
+    ("whose", "whos"), ("hear", "here"), ("for", "four", "fore"),
+    ("by", "buy", "bye"), ("no", "know"), ("one", "won"),
+    ("right", "write", "rite", "wright"), ("new", "knew"), ("see", "sea"),
+    ("son", "sun"), ("weather", "whether"), ("wear", "where", "ware"),
+    ("knight", "night"), ("flour", "flower"), ("piece", "peace"),
+    ("ate", "eight"), ("mail", "male"), ("meat", "meet"),
+    ("pair", "pear", "pare"), ("plain", "plane"), ("rain", "reign", "rein"),
+    ("road", "rode"), ("sight", "site", "cite"), ("steal", "steel"),
+    ("tail", "tale"), ("threw", "through"), ("waist", "waste"),
+    ("wait", "weight"), ("way", "weigh"), ("week", "weak"), ("wood", "would"),
+    ("hour", "our"), ("allowed", "aloud"), ("bare", "bear"),
+    ("brake", "break"), ("cell", "sell"), ("cent", "scent", "sent"),
+    ("dear", "deer"), ("die", "dye"), ("fair", "fare"), ("flee", "flea"),
+    ("heal", "heel"), ("hi", "high"), ("hole", "whole"), ("made", "maid"),
+    ("main", "mane"), ("passed", "past"), ("peak", "peek"), ("sale", "sail"),
+    ("stair", "stare"), ("throne", "thrown"), ("toe", "tow"),
+    ("vain", "vein", "vane"), ("board", "bored"), ("cheap", "cheep"),
+    ("coarse", "course"), ("great", "grate"), ("groan", "grown"),
+    ("guessed", "guest"), ("him", "hymn"), ("in", "inn"), ("knot", "not"),
+    ("lessen", "lesson"), ("loan", "lone"), ("mind", "mined"),
+    ("morning", "mourning"), ("none", "nun"), ("or", "oar", "ore"),
+    ("pale", "pail"), ("pause", "paws"), ("poll", "pole"),
+    ("praise", "prays", "preys"), ("rap", "wrap"), ("ring", "wring"),
+    ("role", "roll"), ("scene", "seen"), ("sew", "so"), ("some", "sum"),
+    ("stake", "steak"), ("stationary", "stationery"), ("tide", "tied"),
+    ("toad", "towed"), ("which", "witch"), ("whine", "wine"),
+    ("berry", "bury"), ("blew", "blue"), ("ceiling", "sealing"),
+    ("chord", "cord"), ("complement", "compliment"), ("council", "counsel"),
+    ("creak", "creek"), ("crews", "cruise"), ("currant", "current"),
+    ("dew", "due", "do"),
+)
+
+HOMOPHONES: dict[str, frozenset[str]] = {}
+for _group in _HOMOPHONE_GROUPS:
+    for _word in _group:
+        HOMOPHONES[_word] = HOMOPHONES.get(_word, frozenset()) | (
+            frozenset(_group) - {_word})
+del _group, _word
+
+
+def homophones(word: str) -> frozenset[str]:
+    """Every word that is pronounced exactly like ``word`` (folded form)."""
+    return HOMOPHONES.get(word, frozenset())
 
 
 def fold(raw: str) -> str:
@@ -436,7 +504,57 @@ def _blocks(ref: list[Token], hyp: list[Heard], text: str) -> list[tuple]:
         else:
             blocks[i][0] = "replace"
         i += 1
-    return [tuple(b) for b in blocks]
+    return [tuple(b) for b in _split_homophones(blocks, ref, hyp)]
+
+
+def _split_homophones(blocks: list[list], ref: list[Token],
+                      hyp: list[Heard]) -> list[list]:
+    """Carve the same-sounding pairs out of the mismatches that are left.
+
+    A homophone slip is not a synthesis defect: "their" and "there" are one
+    sound, so an ASR cannot tell which one the mouth produced and neither could
+    a listener. Charging it to the synthesizer is a false FAIL — and ``verify``
+    can REFUSE a render (``?verify=strict``), which makes that the expensive
+    direction of wrong.
+
+    Deliberately narrow, because loosening a checker makes false PASSES cheaper:
+
+      * it runs LAST, over residual ``replace`` blocks only — words the diff has
+        already paired 1:1 and everything else has already failed to explain. A
+        phonetic pass over the whole transcript would be a different, much
+        broader tool;
+      * only equal-length blocks qualify (a substitution that changed the word
+        count is not a homophone slip);
+      * pairs are forgiven INDIVIDUALLY. "their house" heard as "there hose"
+        still reports one ``wrong`` — the homophone is carved out, the real
+        error is charged.
+
+    What this can now let through, stated plainly: a synthesizer that renders a
+    word as a different, identically-pronounced word. That failure is inaudible
+    by construction (that is what "identical pronunciation" means), so the class
+    of real defect being lost is the one nobody could hear — with one honest
+    exception, "2" read as "to", where the writing carried a distinction the
+    speech never could.
+    """
+    out: list[list] = []
+    for block in blocks:
+        op, i1, i2, j1, j2 = block
+        if op != "replace" or (i2 - i1) != (j2 - j1) or i2 == i1:
+            out.append(block)
+            continue
+        run_op: str | None = None
+        run_start = 0
+        span = i2 - i1
+        for k in range(span + 1):
+            kind = None if k == span else (
+                "homophone" if hyp[j1 + k].text in homophones(ref[i1 + k].text)
+                else "replace")
+            if kind != run_op:
+                if run_op is not None:
+                    out.append([run_op, i1 + run_start, i1 + k,
+                                j1 + run_start, j1 + k])
+                run_op, run_start = kind, k
+    return out
 
 
 def compare(reference_text: str, heard, *,
@@ -465,7 +583,10 @@ def compare(reference_text: str, heard, *,
 
     for op, i1, i2, j1, j2 in _blocks(ref, hyp, reference_text):
         ref_block, hyp_block = ref[i1:i2], hyp[j1:j2]
-        if op == "equal":
+        if op in ("equal", "homophone"):
+            # A homophone pair is one sound: the ear cannot have distinguished
+            # it and neither could a listener, so it is a match — but still
+            # subject to the confidence floor, exactly like an equal pair.
             for token, word in zip(ref_block, hyp_block):
                 if rated(word):
                     report.matched += 1
@@ -667,7 +788,7 @@ def align(reference_text: str, heard, *, duration_s: float,
                 token.group, (float(word.start_s), float(word.end_s), False))
             timings[token.group] = (
                 min(start, float(word.start_s)), max(end, float(word.end_s)),
-                was or op == "equal")
+                was or op in ("equal", "homophone"))
 
     spans: list[WordSpan] = []
     for group, start, end in groups:
