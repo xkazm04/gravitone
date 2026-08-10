@@ -39,13 +39,20 @@ export default function VoiceNewSpeakerStage({
           ? "This is what will be cloned."
           : multi ? "Who is in this recording?" : "Which voice is your character?"}
       </h2>
-      {/* "N speakers detected" is a diarization result. Sovereign mode
-          without the local diarizer has none — its single entry is an
-          assumption, not a finding. */}
+      {/* "N speakers detected" is a diarization result, and a HYPOTHESIS —
+          `DiarizationResult.count_is_certain` is False by construction and has
+          never been anything else. Measured on real recordings (see
+          service/diarize.py's table): a hiss bed at 20 dB collapses two real
+          speakers into one, and six speakers come back as six. So the count is
+          worth stating and not worth asserting, and the single-speaker line in
+          particular must not tell the user that everything audible IS one
+          person — on noisy audio that is the case the diarizer gets wrong.
+          Sovereign mode without the local diarizer has no result at all; its
+          single entry is an assumption rather than even a finding. */}
       <p className="mt-1 max-w-2xl text-sm text-white/60">
         {job.mode === "sovereign" && !multi
-          ? "Sovereign mode found one speaker here, so everything audible is treated as the same person. Play the sample to hear what that is, then continue."
-          : `${speakers.length} speaker${speakers.length === 1 ? "" : "s"} detected. Play a sample, then take one to the review ledger — or tick several and cast them all at once, from this one scan.`}
+          ? "Sovereign mode heard one speaker here, so everything audible will be treated as the same person. On a noisy recording that can be wrong — play the sample and check it is one voice before you continue."
+          : `${speakers.length} speaker${speakers.length === 1 ? "" : "s"} detected — a hypothesis, not a headcount. Play a sample, then take one to the review ledger — or tick several and cast them all at once, from this one scan.`}
       </p>
       <div className="mt-5 space-y-2">
         {speakers.map((s, i) => (
