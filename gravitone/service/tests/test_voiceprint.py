@@ -309,6 +309,16 @@ _CROWD = {"themA": _unit(0, 1), "themB": _unit(0, -1),
 
 
 def _vector(tag: str, i: int) -> "np.ndarray":
+    if tag.startswith("axis"):
+        # Orthonormal, so N of them are mutually as unlike as this space allows
+        # while still HAVING a centroid (the _CROWD four cancel to nothing, which
+        # is a different fixture for a different test).
+        return _unit(*([0.0] * int(tag[4:]) + [1.0]))
+    if tag == "away":
+        # Far enough round from "me" that the two of them alone average to a
+        # centroid BOTH sit below the foreign floor of — the shape a two-segment
+        # recording needs to test a drop budget of zero.
+        return _unit(-0.95, 0.31)
     if tag == "me":
         # Jittered: one real speaker's clips are near each other, not identical,
         # and a zero-spread fixture would make the MAD rule untestable.
@@ -416,6 +426,187 @@ class SegmentJudgementTests(unittest.TestCase):
                                places=2)
         self.assertIsNone(scan.payload["stems"]["happy"]["identity"])
         self.assertIn("no such stem", scan.payload["stems"]["happy"]["reason"])
+
+
+# ── the exact edges of the decision ─────────────────────────────────────────
+def _sims_of(spec: list[tuple[str, str]]) -> tuple[list[float], float, float]:
+    """The similarities `measure_segments` will compute for `spec`, exactly.
+
+    Computed through `voiceprint` itself rather than re-derived, so a boundary
+    test can name the precise float a segment lands on instead of a rounded one
+    read back out of the payload.
+    """
+    vectors = [_vector(tag, i) for i, (_, tag) in enumerate(spec)]
+    centre = voiceprint.centroid(vectors)
+    sims = [voiceprint.similarity(v, centre) for v in vectors]
+    median = float(np.median(sorted(sims)))
+    mad = float(np.median([abs(s - median) for s in sorted(sims)]))
+    return sims, median, mad
+
+
+class DecisionBoundaryTests(unittest.TestCase):
+    """Where the rule flips, to the last float.
+
+    `SegmentJudgementTests` proves the rule does the right thing in the middle
+    of each region. These pin the edges — the comparisons themselves — because
+    the difference between `<` and `<=` here is the difference between keeping
+    and deleting somebody's recording, and because the constants are now
+    calibrated (`test_fidelity_calibration.py`) against a distribution whose
+    safety margin is a specific number rather than a hope.
+    """
+
+    def test_a_segment_exactly_at_the_floor_is_kept_and_one_hair_below_is_not(self) -> None:
+        spec = [(BASELINE, "me")] * 5 + [(BASELINE, "them")]
+        sims, _, _ = _sims_of(spec)
+        at_floor = sims[5]
+
+        with mock.patch.object(ingest, "FOREIGN_SIMILARITY", at_floor):
+            kept = _scan(spec)
+        # `sim < FOREIGN_SIMILARITY`: the floor itself is not foreign. Audio is
+        # removed only for being BELOW the line, never for being on it.
+        self.assertEqual(kept.dropped, set())
+
+        with mock.patch.object(ingest, "FOREIGN_SIMILARITY",
+                               float(np.nextafter(at_floor, 1.0))):
+            dropped = _scan(spec)
+        self.assertEqual(dropped.dropped, {5})
+
+    def test_a_segment_exactly_at_the_mad_cut_is_not_flagged(self) -> None:
+        """The other comparison, `sim < median - K*mad`, on its own edge."""
+        spec = [(BASELINE, "me")] * 6 + [(BASELINE, "odd")]
+        sims, median, mad = _sims_of(spec)
+        self.assertGreater(mad, 0.0, "a zero spread would make the rule inert")
+        edge_k = (median - sims[6]) / mad          # cut lands exactly on segment 6
+
+        # A millionth looser: the cut sits just below the segment, which is
+        # therefore not unlike the rest and gets no entry at all.
+        with mock.patch.object(ingest, "OUTLIER_MAD_K", edge_k * (1.0 + 1e-6)):
+            outside = _scan(spec)
+        self.assertNotIn(6, [o["i"] for o in outside.payload["per_segment_outliers"]])
+
+        # A millionth tighter: the cut sits just above it, so it is flagged —
+        # and flagged is all it can be, since it is nowhere near the floor.
+        with mock.patch.object(ingest, "OUTLIER_MAD_K", edge_k * (1.0 - 1e-6)):
+            inside = _scan(spec)
+        out = {o["i"]: o for o in inside.payload["per_segment_outliers"]}
+        self.assertEqual(out[6]["action"], "flagged")
+        self.assertEqual(inside.dropped, set())
+
+    def test_the_mad_rule_needs_a_rest_to_be_unlike(self) -> None:
+        """`OUTLIER_MIN_SEGMENTS` is an edge too: with three segments there is no
+        "rest of this speaker" for a fourth to differ from."""
+        self.assertEqual(4, ingest.OUTLIER_MIN_SEGMENTS)
+        spec = [(BASELINE, "me")] * 2 + [(BASELINE, "odd")]
+        self.assertEqual([], _scan(spec).payload["per_segment_outliers"])
+        # One more segment and the same shape is judgeable.
+        spec = [(BASELINE, "me")] * 3 + [(BASELINE, "odd")]
+        self.assertTrue(_scan(spec).payload["per_segment_outliers"])
+
+    def test_the_drop_budget_is_exactly_int_of_the_fraction(self) -> None:
+        # 9 segments, 4 of them somebody else: int(9 * 0.34) = 3 may go, and the
+        # fourth is KEPT with the reason that the measurement is not trusted.
+        spec = [(BASELINE, "me")] * 5 + [(BASELINE, t) for t in
+                                         ("themA", "themB", "themC", "themD")]
+        scan = _scan(spec)
+        budget = int(9 * ingest.MAX_DROP_FRACTION)
+        self.assertEqual(3, budget)
+        self.assertEqual(budget, len(scan.dropped))
+        spared = [o for o in scan.payload["per_segment_outliers"]
+                  if o["action"] == "flagged" and "not trusted" in (o["why"] or "")]
+        self.assertEqual(1, len(spared))
+
+    def test_a_recording_too_small_to_afford_a_drop_drops_nothing(self) -> None:
+        """int(2 * 0.34) = 0. On a two-segment recording the budget is zero, so
+        even two clips that agree about nothing are only ever reported.
+
+        (With exactly two segments the centroid sits between them and they score
+        identically, so "which one is the intruder" is a question this rule
+        cannot answer — one more reason it may not delete either.)"""
+        scan = _scan([(BASELINE, "me"), (BASELINE, "away")])
+        self.assertEqual(scan.dropped, set())
+        out = {o["i"]: o for o in scan.payload["per_segment_outliers"]}
+        self.assertEqual(2, len(out))
+        for o in out.values():
+            self.assertLess(o["similarity"], ingest.FOREIGN_SIMILARITY)
+            self.assertEqual(o["action"], "flagged")
+            self.assertIn("not trusted", o["why"])
+
+    def test_the_wholesale_revert_is_unreachable_while_the_budget_caps_drops(self) -> None:
+        """The belt behind the braces, and an honest note about which is load-bearing.
+
+        `measure_segments` ends with "if the drop set would leave nothing at all,
+        abandon it". That branch cannot fire as shipped: drops stop at
+        `int(n * MAX_DROP_FRACTION)`, which is strictly less than n for every n
+        this code reaches, and the per-emotion guard keeps one clip per emotion
+        on top of that. It is kept as a belt — this test says so out loud so the
+        next reader does not mistake untested for unreachable, and so that
+        loosening either rail is caught by the assertion below rather than by a
+        user losing a whole recording.
+        """
+        for n in range(2, 40):
+            with self.subTest(segments=n):
+                self.assertLess(int(n * ingest.MAX_DROP_FRACTION), n)
+
+    def test_and_when_both_rails_are_loosened_the_revert_fires(self) -> None:
+        """The same branch, exercised — every measurable segment condemned, and
+        the whole drop set abandoned rather than the recording emptied."""
+        # Four emotions, each with one measurable (mutually dissimilar) segment
+        # and two that cannot be embedded — so the per-emotion guard sees three
+        # clips for an emotion whose only usable one is condemned.
+        spec: list[tuple[str, str]] = []
+        for emo, tag in (("baseline", "axis0"), ("happy", "axis1"),
+                         ("sad", "axis2"), ("angry", "axis3")):
+            spec += [(emo, tag), (emo, "broken"), (emo, "broken")]
+        with mock.patch.object(ingest, "FOREIGN_SIMILARITY", 0.9), \
+             mock.patch.object(ingest, "MAX_DROP_FRACTION", 1.0):
+            scan = _scan(spec, fail={"broken"})
+        self.assertEqual(4, scan.payload["segments_measured"])
+        self.assertEqual(set(), scan.dropped)          # abandoned wholesale
+        self.assertEqual(0, scan.payload["dropped"])
+        self.assertEqual(4, scan.payload["flagged"])
+        for o in scan.payload["per_segment_outliers"]:
+            self.assertEqual("flagged", o["action"])
+            self.assertIn("no usable audio", o["why"])
+
+
+class RulePublicationTests(unittest.TestCase):
+    """The rule that removes audio travels with the audio it judged.
+
+    Calibrating the constants (`test_fidelity_calibration.py`) established that
+    the removal floor is safe and that it catches a minority of bystanders. Both
+    halves belong where a user can reach them, not only in a comment — so the
+    payload carries the numbers AND the sentence, on the measured and the
+    unmeasured payload alike.
+    """
+
+    def _rule(self, payload: dict) -> dict:
+        self.assertIn("rule", payload)
+        return payload["rule"]
+
+    def test_the_measured_payload_publishes_the_constants(self) -> None:
+        rule = self._rule(_scan([(BASELINE, "me")] * 4).payload)
+        self.assertEqual(ingest.FOREIGN_SIMILARITY, rule["foreign_similarity"])
+        self.assertEqual(ingest.OUTLIER_MAD_K, rule["outlier_mad_k"])
+        self.assertEqual(ingest.MAX_DROP_FRACTION, rule["max_drop_fraction"])
+
+    def test_the_unmeasured_payload_publishes_the_same_shape(self) -> None:
+        with mock.patch.object(ingest.voiceprint, "unavailable_reason",
+                               lambda: "sherpa-onnx is not installed."):
+            rule = self._rule(ingest.measure_segments(
+                _labels([(BASELINE, "me")] * 4)).payload)
+        self.assertEqual(ingest.FOREIGN_SIMILARITY, rule["foreign_similarity"])
+
+    def test_the_note_states_the_weakness_and_not_only_the_strength(self) -> None:
+        """A disclosure that only carries the flattering half is not one. The
+        note has to say the rule misses bystanders, not merely that it is
+        careful — a user reading it is deciding whether to trust a clone."""
+        note = self._rule(_scan([(BASELINE, "me")] * 4).payload)["calibration"]
+        self.assertIn("real recorded speech", note)
+        self.assertIn("1 in 7", note)
+        self.assertIn("can survive", note)
+
+    def test_the_payload_is_json_safe(self) -> None:
+        json.dumps(_scan([(BASELINE, "me")] * 5 + [(BASELINE, "them")]).payload)
 
 
 # ── the pipeline publishes it ───────────────────────────────────────────────

@@ -1574,10 +1574,7 @@ def baseline_note(plan: BaselinePlan, seconds: float, min_stem: float) -> str | 
 # `service/voiceprint.py` closes that. Every segment gets a speaker embedding,
 # the speaker's own centre of mass is the reference, and a segment sitting far
 # from it is a diarization error or a bystander voice. That is REPORTED always
-# and acted on rarely, for a reason worth writing down: the numbers below are NOT
-# calibrated against a fixture set (that is a later step in the proposal), so the
-# statistical rule does the deciding and the absolute constants only guard the
-# one case a rule cannot see — a segment that is not this person at all.
+# and acted on rarely:
 #
 #   * OUTLIER_MAD_K — flag at K median-absolute-deviations below the median
 #     similarity. Self-calibrating per recording: there is no fixed "good"
@@ -1589,11 +1586,76 @@ def baseline_note(plan: BaselinePlan, seconds: float, min_stem: float) -> str | 
 # Nothing here can empty a stem: the last audio for an emotion is always kept
 # (flagged), and a drop set that would leave no usable segments at all is
 # abandoned wholesale. Every one of those outcomes is named in the payload.
+#
+# WHAT THE CONSTANTS ACTUALLY DO, MEASURED
+# ----------------------------------------
+# These two numbers used to carry a comment saying they were NOT calibrated
+# against a fixture set. They are now, and the fixture set is REAL recorded
+# humans, for the reason diarize.py gives: this is the same embedder that splits
+# ONE synthetic voice into two, so a sweep over TTS clips would produce a worse
+# number wearing the authority of a measurement.
+#
+# The set is sherpa-onnx's two labelled conversations (2 EN speakers, 4 ZH
+# speakers — no account, same release as the models), diarized at the shipped
+# threshold and cut with this module's own chunking. 5 speaker pools; each
+# segment scored against its own speaker's centroid and against every other
+# speaker's. Reproduce with `service/tests/test_fidelity_calibration.py`.
+#
+# ====================  =====================  ==========================
+# population            min / p5 / median      max
+# ====================  =====================  ==========================
+# same speaker (14)     0.728 / 0.757 / 0.830  —
+# other speaker (56)    0.115 / 0.178 / 0.440  0.766
+# ====================  =====================  ==========================
+# (chunking min 1.2 s / max 15 s; at max 4 s the same-speaker worst case falls
+# to 0.613 and the foreign best case rises to 0.794 — shorter clips, noisier
+# embeddings, and the reason a floor tuned on long segments is not safe.)
+#
+# Floor sweep — foreign segments caught / a real speaker's own audio deleted:
+#
+#   0.10  0/56   0/14        0.30  15/56  0/14
+#   0.20  5/56   0/14        0.40  26/56  0/14
+#   0.25  8/56   0/14  <-    0.50  36/56  0/14
+#                             0.60  44/56  0/14
+#
+# So 0.25 is SAFE — nothing a real speaker said came within 0.35 of it — and it
+# is WEAK: it catches about one bystander segment in seven. Both halves are
+# published in the payload (`fidelity["rule"]`) instead of living here, because
+# a user whose audio survived a rule that catches one in seven should be able to
+# learn that, and a user whose audio was dropped should be able to see what
+# decided. The floor is NOT raised: the two populations overlap (a stranger
+# reached 0.766 against a centroid whose owner's own worst clip scored 0.728),
+# so no absolute floor separates them, and the margin at 0.60 is already gone at
+# the 4 s chunking. Raising an audio-destroying threshold on 14 own-voice
+# samples from 5 people would be the same failure as never measuring it.
+#
+# OUTLIER_MAD_K, over 16 contaminated recordings built from those pools at the
+# 4 s chunking (one speaker plus 1-2 segments of another, so the bystander pulls
+# the centroid as it really does) — foreign flagged / the speaker's own flagged:
+#
+#   1.5  9/24  9/64     2.5  6/24  4/64     3.5  3/24  3/64
+#   2.0  6/24  6/64     3.0  4/24  4/64 <-  5.0  1/24  3/64
+#
+# K=2.5 caught two more bystanders at the same false-flag rate, which is 2
+# segments out of 24 — below what a set this size resolves — so 3.0 stays as the
+# conservative end of a shallow curve. The MAD rule only ever flags; nothing
+# here deletes audio except the floor above.
 FIDELITY_VERSION = 1
 OUTLIER_MAD_K = 3.0
 OUTLIER_MIN_SEGMENTS = 4      # below this, "unlike the rest" has no rest to mean
 FOREIGN_SIMILARITY = 0.25
 MAX_DROP_FRACTION = 0.34
+# The provenance of the two numbers above, in one line the product can show. It
+# says what was established (the floor does not delete real audio) AND what was
+# not (it catches a minority of bystanders), because a disclosure that only
+# carries the flattering half is not a disclosure.
+CALIBRATION_NOTE = (
+    "calibrated on real recorded speech (2 conversations, 6 speakers): no real "
+    "speaker's own segment scored within 0.35 of the removal floor, so this "
+    "rule does not delete audio it should keep — but it also caught only about "
+    "1 in 7 genuinely foreign segments on that set, so audio from another voice "
+    "can survive it. Segments that merely sound unlike the rest are flagged, "
+    "never removed.")
 # One fixed line, so a clone's identity number is comparable with the next
 # clone's. Phonetically broad, short enough that synthesizing it costs seconds.
 CALIBRATION_TEXT = ("The quick brown fox jumps over the lazy dog, and she "
@@ -1614,6 +1676,21 @@ class SegmentFidelity(NamedTuple):
     centre: object | None
 
 
+def _rule() -> dict:
+    """The rule that decides what leaves a clone, published with its numbers.
+
+    Every constant that can remove a user's audio, plus what measuring them
+    established and failed to establish (see CALIBRATION_NOTE). It rides on the
+    unmeasured payload too: "which rule would have applied" is answerable
+    whether or not it ran, and a shape that changes between the two would make
+    the absent case harder to render, not easier.
+    """
+    return {"foreign_similarity": FOREIGN_SIMILARITY,
+            "outlier_mad_k": OUTLIER_MAD_K,
+            "max_drop_fraction": MAX_DROP_FRACTION,
+            "calibration": CALIBRATION_NOTE}
+
+
 def _unmeasured(reason: str) -> dict:
     """A fidelity payload for "we did not measure this, and here is why".
 
@@ -1624,7 +1701,7 @@ def _unmeasured(reason: str) -> dict:
             "reference_similarity": None, "segments_measured": 0,
             "segments_failed": [], "per_segment_outliers": [],
             "dropped": 0, "flagged": 0, "stems": {},
-            "measures": _IDENTITY_CAVEAT}
+            "rule": _rule(), "measures": _IDENTITY_CAVEAT}
 
 
 def measure_segments(labels: list[dict], *,
@@ -1731,6 +1808,7 @@ def measure_segments(labels: list[dict], *,
         "dropped": len(dropped),
         "flagged": sum(1 for o in outliers if o["action"] == "flagged"),
         "stems": {},
+        "rule": _rule(),
         "measures": _IDENTITY_CAVEAT,
     }
     return SegmentFidelity(payload, dropped, centre)
