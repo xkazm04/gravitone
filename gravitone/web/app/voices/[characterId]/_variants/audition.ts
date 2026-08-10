@@ -54,8 +54,22 @@ export const AUDITION_CONCURRENCY = 2;
 /** How many times one cell waits out a 429 before it gives up and says so. */
 export const BUSY_RETRIES = 4;
 
-/** One Voice to audition: the slot, and the concrete voice that speaks it. */
-export type AuditionTarget = { emotion: string; label: string; voiceId: string };
+/**
+ * One Voice to audition: the slot, and the concrete voice that speaks it.
+ *
+ * `derivedFrom` carries the slot's ORIGIN into the matrix, and it is not
+ * cosmetic. The audition's claim is that the speaker never drifted, and a
+ * computed take cannot support that claim about anybody — so the target has to
+ * know which it is before a tile can be honest about it. Null (or absent) means
+ * a human performed this take; a string names who the emotion direction came
+ * from, in the rack's own words (`derivedDonorLabel`).
+ */
+export type AuditionTarget = {
+  emotion: string;
+  label: string;
+  voiceId: string;
+  derivedFrom?: string | null;
+};
 
 /**
  * What one tile is doing right now. There is no state that renders as a

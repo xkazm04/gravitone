@@ -18,7 +18,7 @@
 
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { emotionMeta } from "@/lib/emotions";
-import type { Slot } from "@/app/voices/_data/characters";
+import { derivedDonorLabel, type Slot } from "@/app/voices/_data/characters";
 import {
   auditionSummary, useEmotionAudition, type AuditionTarget,
 } from "./audition";
@@ -32,10 +32,19 @@ export default function EmotionAudition({ name, slots }: {
   // re-render the baseline take under another name — eight identical clips
   // presented as a range is the exact overclaim this feature is an argument
   // against — so it is named as missing instead.
+  //
+  // A DERIVED slot is auditioned (it is a real embedding making a real sound,
+  // and hearing it is exactly how a user judges whether to keep it), but it
+  // travels with its origin so no tile can pass a computed take off as a
+  // performance — the line the rack holds one element above.
   const targets: AuditionTarget[] = slots
     .filter((s) => s.voice)
-    .map((s) => ({ emotion: s.emotion, label: s.label, voiceId: s.voice!.voice_id }));
+    .map((s) => ({
+      emotion: s.emotion, label: s.label, voiceId: s.voice!.voice_id,
+      derivedFrom: derivedDonorLabel(s.voice),
+    }));
   const missing = slots.filter((s) => !s.voice);
+  const derivedCount = targets.filter((t) => t.derivedFrom).length;
 
   const { line, editLine, cells, running, playing, playError,
           audition, stopRun, play } = useEmotionAudition(targets);
@@ -81,11 +90,31 @@ export default function EmotionAudition({ name, slots }: {
         </span>
       </div>
 
+      {/* The identity claim is only as wide as the set it is made over. With a
+          computed take in the matrix, "you hear that {name} is still {name} in
+          all of it" is an overclaim — a derived voice is a real embedding
+          making a real sound, but nobody performed it, so it can vouch for the
+          algebra and never for the speaker. The claim narrows to the recordings
+          instead of being dropped: that IS still the check the user came for. */}
       <p className="font-hanken max-w-2xl text-sm leading-relaxed text-white/65">
         Every Voice speaks the <span className="text-white">same line</span>. That is the
         experiment: the text is held still so the only thing that can differ between two
-        takes is the recording behind them — you hear the range, and you hear that {name} is
-        still {name} in all of it. Emotions here are auditioned, not prompted.
+        takes is the {derivedCount > 0 ? "voice" : "recording"} behind them — you hear the
+        range, and{" "}
+        {derivedCount > 0 ? (
+          <>
+            across the <span className="text-white">recorded</span> takes you hear that{" "}
+            {name} is still {name}. {derivedCount}{" "}
+            {derivedCount === 1 ? "tile is" : "tiles are"}{" "}
+            <span className="text-violet-200">derived</span> — computed from a baseline plus
+            a borrowed emotion direction, not performed by {name} — so{" "}
+            {derivedCount === 1 ? "it tells" : "they tell"} you what the algebra sounds
+            like, never that {name} performed it.
+          </>
+        ) : (
+          <>you hear that {name} is still {name} in all of it.</>
+        )}{" "}
+        Emotions here are auditioned, not prompted.
       </p>
 
       <div className="mt-3 flex flex-wrap items-center gap-3">
@@ -100,7 +129,8 @@ export default function EmotionAudition({ name, slots }: {
         <button
           onClick={() => void audition()}
           disabled={running || line.trim().length === 0}
-          title={`Render “${line.trim()}” once in each of ${name}'s ${targets.length} recorded Voices.`}
+          title={`Render “${line.trim()}” once in each of ${name}'s ${targets.length} Voices.`
+            + (derivedCount > 0 ? ` ${derivedCount} of them are derived, not recorded.` : "")}
           className="font-jetbrains cursor-pointer rounded-full border border-cyan-400/30 bg-cyan-400/10 px-4 py-1.5 text-[12px] text-cyan-200 transition hover:bg-cyan-400/20 disabled:opacity-40"
         >
           {running ? "auditioning…" : `▶ audition all ${targets.length}`}

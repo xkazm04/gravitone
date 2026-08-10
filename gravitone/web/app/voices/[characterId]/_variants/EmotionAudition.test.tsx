@@ -7,6 +7,12 @@
 import { act, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+// The matrix now reads a slot's ORIGIN through the shared data layer, whose
+// hooks reach Firebase auth on import — it refuses to initialize without real
+// keys. Rendering is what's under test (same stubs the rack's suite uses).
+vi.mock("@/lib/useAuth", () => ({ useAuth: () => ({ user: null }) }));
+vi.mock("@/lib/voiceVault", () => ({ recordVoiceOwnership: async () => ({ saved: 0, failed: 0 }) }));
+
 import EmotionAudition from "./EmotionAudition";
 import { clearAuditionCache } from "./audition";
 import type { Slot, Voice } from "@/app/voices/_data/characters";
@@ -101,6 +107,65 @@ describe("EmotionAudition", () => {
   it("says so when there is nothing to audition", () => {
     render(<EmotionAudition name="Sarah" slots={[slot("angry", "Angry", false)]} />);
     expect(screen.getByText(/no recorded Voices yet/i)).toBeInTheDocument();
+  });
+
+  // ── a computed take never auditions as a performance ───────────────────────
+  // Everywhere else in this context the derived/recorded line is held to the
+  // letter; the audition was the one surface where a derived tile carried a
+  // recording's weight, under copy claiming the listener hears that the speaker
+  // never drifted — a claim no computed take can support.
+
+  function derivedSlot(emotion: string, label: string, donor = "Mary"): Slot {
+    const v: Voice = {
+      ...voice(emotion), origin: "derived",
+      derived_from: { source: "donor", donor: "mary", donor_name: donor },
+    };
+    return { emotion, label, hue: 200, custom: false, voice: v, voices: [v], demand: 0 };
+  }
+
+  const MIXED = [slot("baseline", "Baseline"), derivedSlot("angry", "Angry")];
+
+  it("marks a derived tile as derived, and leaves the recorded one alone", () => {
+    render(<EmotionAudition name="Sarah" slots={MIXED} />);
+    // One tile carries the rack's own violet derived chip; the recording has none.
+    expect(screen.getByText(/derived · from Mary/)).toBeInTheDocument();
+    expect(screen.getAllByText(/derived · from/)).toHaveLength(1);
+    // …and the distinction is in the accessible NAME too, not only the pixels.
+    expect(screen.getByRole("button", { name: "Play the auditioned derived Angry take" }))
+      .toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Play the auditioned Baseline take" }))
+      .toBeInTheDocument();
+  });
+
+  it("stops claiming the speaker never drifted once a computed take is in the set", () => {
+    render(<EmotionAudition name="Sarah" slots={MIXED} />);
+    const copy = screen.getByText(/That is the experiment/).textContent ?? "";
+    expect(copy).toMatch(/across the recorded takes you hear that Sarah is still Sarah/);
+    expect(copy).not.toMatch(/still Sarah in all of it/);
+    expect(copy).toMatch(/1 tile is derived/);
+    expect(copy).toMatch(/not performed by Sarah/);
+  });
+
+  it("keeps the unqualified claim where every take really is a recording", () => {
+    render(<EmotionAudition name="Sarah" slots={SLOTS} />);
+    const copy = screen.getByText(/That is the experiment/).textContent ?? "";
+    expect(copy).toMatch(/you hear that Sarah is still Sarah in all of it/);
+    expect(copy).not.toMatch(/derived/);
+    expect(screen.queryByText(/derived · from/)).toBeNull();
+  });
+
+  it("auditions the derived take like any other — hearing it is how you judge it", async () => {
+    const bodies: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_u: unknown, init: RequestInit) => {
+      bodies.push(String(init.body));
+      return wav();
+    }));
+    render(<EmotionAudition name="Sarah" slots={MIXED} />);
+    await act(async () => {
+      screen.getByRole("button", { name: /audition all 2/i }).click();
+    });
+    await waitFor(() => expect(screen.getByText("2/2 rendered")).toBeInTheDocument());
+    expect(bodies.map((b) => JSON.parse(b).voiceId).sort()).toEqual(["v_angry", "v_baseline"]);
   });
 
   it("gates a double click — one run, not two", async () => {

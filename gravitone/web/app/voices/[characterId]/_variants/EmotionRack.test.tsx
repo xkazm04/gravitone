@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // The rack pulls in the data layer, whose hooks reach Firebase auth — it
@@ -205,6 +205,13 @@ function derived(id: string, emotion: string, donorName = "Mary"): Voice {
   };
 }
 
+/** The rack's own table. The audition matrix below it renders the derived chip
+ *  as well (deliberately — see EmotionAudition.test.tsx), so every assertion
+ *  about a ROW scopes itself here rather than to the whole document. */
+function rack(): HTMLElement {
+  return screen.getByRole("table");
+}
+
 function renderDerivable(slots: Slot[], deriveVoice = vi.fn(async () => {})) {
   render(
     <EmotionRack
@@ -231,9 +238,11 @@ describe("EmotionRack — a derived slot is never a recording", () => {
       slot("angry", "Angry", [derived("v_derived", "angry")]),
     ]);
 
-    expect(screen.getByText(/derived · from Mary/)).toBeInTheDocument();
-    // Exactly one "recorded" chip on the page: the baseline's.
-    expect(screen.getAllByText("recorded")).toHaveLength(1);
+    // Scoped to the RACK: the audition matrix underneath now marks its derived
+    // tiles too, so an unscoped query would be asserting over both surfaces.
+    expect(within(rack()).getByText(/derived · from Mary/)).toBeInTheDocument();
+    // Exactly one "recorded" chip in the rack: the baseline's.
+    expect(within(rack()).getAllByText("recorded")).toHaveLength(1);
     // …and the header counts it separately from the recordings.
     expect(screen.getByText(/1\/2 recorded/)).toBeInTheDocument();
     expect(screen.getByText(/1 derived/)).toBeInTheDocument();
@@ -271,7 +280,7 @@ describe("EmotionRack — a derived slot is never a recording", () => {
       derived_from: { source: "basis", donor: null, contributors: ["a", "b", "c"] },
     };
     renderDerivable([slot("angry", "Angry", [v])]);
-    expect(screen.getByText(/derived · from 3 voices/)).toBeInTheDocument();
+    expect(within(rack()).getByText(/derived · from 3 voices/)).toBeInTheDocument();
   });
 });
 
@@ -295,9 +304,9 @@ describe("EmotionRack — the transfer measurement, or its plain absence", () =>
     renderDerivable([
       slot("angry", "Angry", [withTransfer(derived("v_d", "angry"), { ...MEASURED })]),
     ]);
-    expect(screen.getByText(/transfer measured · 0\.72/)).toBeInTheDocument();
+    expect(within(rack()).getByText(/transfer measured · 0\.72/)).toBeInTheDocument();
     // The donor chip is untouched — the two facts are separate.
-    expect(screen.getByText(/derived · from Mary/)).toBeInTheDocument();
+    expect(within(rack()).getByText(/derived · from Mary/)).toBeInTheDocument();
     expect(screen.getByTitle(/across 3 speakers, measured 2026-08-01/)).toBeInTheDocument();
   });
 
@@ -306,7 +315,7 @@ describe("EmotionRack — the transfer measurement, or its plain absence", () =>
       slot("angry", "Angry", [withTransfer(derived("v_d", "angry"),
         { ...MEASURED, state: "below-bar", quality: 0.31 })]),
     ]);
-    expect(screen.getByText(/transfer below the bar · 0\.31/)).toBeInTheDocument();
+    expect(within(rack()).getByText(/transfer below the bar · 0\.31/)).toBeInTheDocument();
     expect(screen.getByTitle(/against a bar of 0\.50/)).toBeInTheDocument();
   });
 
@@ -317,7 +326,7 @@ describe("EmotionRack — the transfer measurement, or its plain absence", () =>
         { state: "unmeasured", quality: null, speakers: 0, in_sample: 0,
           min_quality: 0.5, measured: null, version: 1 })]),
     ]);
-    const chip = screen.getByText("transfer unmeasured");
+    const chip = within(rack()).getByText("transfer unmeasured");
     expect(chip).toBeInTheDocument();
     // Neutral, not amber/rose: an unrun harness is not a defect in this voice.
     expect(chip.className).toContain("text-white/55");
@@ -329,14 +338,14 @@ describe("EmotionRack — the transfer measurement, or its plain absence", () =>
 
   it("renders a row that predates the block exactly as it always did", () => {
     renderDerivable([slot("angry", "Angry", [withTransfer(derived("v_d", "angry"), undefined)])]);
-    expect(screen.getByText(/derived · from Mary/)).toBeInTheDocument();
-    expect(screen.queryByText(/transfer/i)).toBeNull();
+    expect(within(rack()).getByText(/derived · from Mary/)).toBeInTheDocument();
+    expect(within(rack()).queryByText(/transfer/i)).toBeNull();
   });
 
   it("says nothing about transfer on a recording", () => {
     renderDerivable([slot("baseline", "Baseline", [voice("v_base", "baseline")])]);
-    expect(screen.getByText("recorded")).toBeInTheDocument();
-    expect(screen.queryByText(/transfer/i)).toBeNull();
+    expect(within(rack()).getByText("recorded")).toBeInTheDocument();
+    expect(within(rack()).queryByText(/transfer/i)).toBeNull();
   });
 });
 

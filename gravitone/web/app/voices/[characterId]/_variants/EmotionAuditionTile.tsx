@@ -42,6 +42,10 @@ export default function EmotionAuditionTile({ target: t, cell, isPlaying, name, 
   const status = cellLine(cell);
   const ready = cell?.kind === "ready";
   const hue = emotionMeta(t.emotion).hue;
+  // A computed take must never audition with a recording's visual weight. The
+  // violet is the rack's own derived accent, not a new one, so the two surfaces
+  // read as one statement about the same voice.
+  const derivedFrom = t.derivedFrom || null;
   return (
     <div
       className={`rounded-lg border p-2.5 transition ${
@@ -65,17 +69,29 @@ export default function EmotionAuditionTile({ target: t, cell, isPlaying, name, 
           // Named for the AUDITION, not just the emotion: the rack row
           // above has its own "Play Baseline", and two controls sharing
           // one accessible name is a real ambiguity for anyone who
-          // navigates by name rather than by position.
-          aria-label={isPlaying
-            ? `Stop the auditioned ${t.label} take`
-            : `Play the auditioned ${t.label} take`}
-          title={ready ? `Play ${name}'s ${t.label} take of this line` : "Audition first"}
+          // navigates by name rather than by position. "derived" is part
+          // of the NAME, not only of the visuals — a listener who
+          // navigates by name is exactly the one who cannot see the chip.
+          aria-label={`${isPlaying ? "Stop" : "Play"} the auditioned `
+            + `${derivedFrom ? "derived " : ""}${t.label} take`}
+          title={ready
+            ? `Play ${name}'s ${t.label} take of this line`
+              + (derivedFrom ? " — computed, not performed" : "")
+            : "Audition first"}
           className="grid h-7 w-7 shrink-0 place-items-center rounded-full text-[11px] text-slate-950 transition hover:brightness-110 disabled:opacity-25"
           style={{ background: `hsl(${hue} 85% 64%)` }}
         >
           {isPlaying ? "⏸" : "▶"}
         </button>
       </div>
+      {derivedFrom && (
+        <p
+          title={`This take was COMPUTED from a baseline plus the emotion direction taken from ${derivedFrom}. Nobody performed it — it can show you what the algebra sounds like, not that ${name} sounds like this.`}
+          className="font-jetbrains mt-2 truncate rounded bg-violet-400/10 px-1.5 py-0.5 text-[10px] text-violet-200"
+        >
+          derived · from {derivedFrom}
+        </p>
+      )}
       {/* Not a live region: eight tiles each announcing themselves
           would shout over each other (and over the page's own status
           region). The run gets ONE announcement, above. */}
