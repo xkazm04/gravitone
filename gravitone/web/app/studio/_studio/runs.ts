@@ -1,0 +1,121 @@
+// The mocked agent runs — r-042 wrapped with one named failure, r-043 still
+// going. The library's commission dock reads the running one.
+
+import type { AgentRun } from "./types";
+
+export const RUNS: AgentRun[] = [
+  {
+    id: "r-042",
+    brief:
+      "Cut a 30-second trailer VO pass for Glass Harbor: narration in Marla's voice from the v4 script, three poster concepts from the pier reference, a tense score, rough mux over take 3.",
+    status: "finished-with-failures",
+    startedAt: "2026-08-09T14:01:00Z",
+    steps: [
+      {
+        id: "s1",
+        title: "Read the script",
+        tool: "ground.document",
+        model: "gemini-2.5-pro",
+        status: "done",
+        detail: "12 pages parsed; leads, setting and the act-two reversal extracted for the writer.",
+        outputAssetIds: [],
+        durationS: 9,
+      },
+      {
+        id: "s2",
+        title: "Cast the voice",
+        tool: "gravitone.list_characters",
+        status: "done",
+        detail: "Marla selected — cloned, consent receipt on file. The consent gate ran before synthesis, not after.",
+        outputAssetIds: [],
+        durationS: 2,
+      },
+      {
+        id: "s3",
+        title: "Write narration lines",
+        tool: "brain.direct",
+        model: "gemini-2.5-pro",
+        status: "done",
+        detail: "Two lines against a 27-second spoken budget; both under budget, nothing silently stretched.",
+        outputAssetIds: [],
+        durationS: 14,
+      },
+      {
+        id: "s4",
+        title: "Speak the takes",
+        tool: "gravitone.synthesize",
+        model: "pocket-tts:marla",
+        status: "done",
+        detail: "Two takes rendered in the Character's own emotion stems.",
+        outputAssetIds: ["aud-1", "aud-2"],
+        durationS: 21,
+      },
+      {
+        id: "s5",
+        title: "Poster concepts",
+        tool: "genmedia.image",
+        model: "imagen-3",
+        status: "done",
+        detail: "Three concepts from the Pier 7 reference; each filed with its prompt.",
+        outputAssetIds: ["img-3", "img-4", "img-5"],
+        durationS: 33,
+      },
+      {
+        id: "s6",
+        title: "Score",
+        tool: "genmedia.music",
+        model: "lyria-3",
+        status: "failed",
+        detail:
+          "Lyria refused the request in this region — no clip was produced. The rest of the run continued; the mux names the missing bed.",
+        outputAssetIds: [],
+        durationS: 6,
+      },
+      {
+        id: "s7",
+        title: "Rough mux",
+        tool: "gravitone.mux",
+        model: "ffmpeg-mux",
+        status: "done",
+        detail: "Takes placed at their marks over take 3. Fit report: both lines verbatim, no atempo.",
+        outputAssetIds: ["vid-3"],
+        durationS: 12,
+      },
+      {
+        id: "s8",
+        title: "Caption & file",
+        tool: "library.caption",
+        model: "gemini-2.5-flash",
+        status: "done",
+        detail: "Six new assets captioned and filed into Trailer v2 with full lineage.",
+        outputAssetIds: [],
+        durationS: 18,
+      },
+    ],
+  },
+  {
+    id: "r-043",
+    brief: "Caption this morning's drone b-roll and file it with the harbor footage.",
+    status: "running",
+    startedAt: "2026-08-10T07:56:00Z",
+    steps: [
+      {
+        id: "s1",
+        title: "Caption the clip",
+        tool: "library.caption",
+        model: "gemini-2.5-flash",
+        status: "running",
+        detail: "Scene pass in flight — 61 seconds of footage, 4 scenes detected so far.",
+        outputAssetIds: [],
+      },
+      {
+        id: "s2",
+        title: "File into collection",
+        tool: "library.file",
+        status: "queued",
+        detail: "Waits on the caption; will propose Glass Harbor / Source.",
+        outputAssetIds: [],
+      },
+    ],
+  },
+];
