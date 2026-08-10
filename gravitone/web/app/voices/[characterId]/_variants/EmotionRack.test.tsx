@@ -8,7 +8,7 @@ vi.mock("@/lib/voiceVault", () => ({ recordVoiceOwnership: async () => ({ saved:
 
 import EmotionRack from "./EmotionRack";
 import { EMOTION_RULE } from "@/lib/slugs";
-import type { Slot, Voice } from "@/app/voices/_data/characters";
+import type { DerivedFrom, Slot, Voice } from "@/app/voices/_data/characters";
 
 // Two harnesses, because the two behaviours under test want opposite fixtures:
 // the slug panel needs a character whose NAME slugs non-trivially and no slots
@@ -272,6 +272,71 @@ describe("EmotionRack — a derived slot is never a recording", () => {
     };
     renderDerivable([slot("angry", "Angry", [v])]);
     expect(screen.getByText(/derived · from 3 voices/)).toBeInTheDocument();
+  });
+});
+
+// ── did anybody ever MEASURE that this emotion travels? ──────────────────────
+// The service emits one shape for it (emotion_basis.transfer_payload) with three
+// named states. The rack must tell them apart — and must keep rendering a row
+// that predates the block exactly as it did before, since that is every derived
+// row written by an older service.
+
+function withTransfer(v: Voice, transfer: NonNullable<DerivedFrom["transfer"]> | undefined): Voice {
+  return { ...v, derived_from: { ...(v.derived_from as DerivedFrom), transfer } };
+}
+
+const MEASURED = {
+  state: "measured", quality: 0.72, speakers: 3, in_sample: 2,
+  min_quality: 0.5, measured: "2026-08-01", version: 1,
+} as const;
+
+describe("EmotionRack — the transfer measurement, or its plain absence", () => {
+  it("states a measured transfer with the number that was measured", () => {
+    renderDerivable([
+      slot("angry", "Angry", [withTransfer(derived("v_d", "angry"), { ...MEASURED })]),
+    ]);
+    expect(screen.getByText(/transfer measured · 0\.72/)).toBeInTheDocument();
+    // The donor chip is untouched — the two facts are separate.
+    expect(screen.getByText(/derived · from Mary/)).toBeInTheDocument();
+    expect(screen.getByTitle(/across 3 speakers, measured 2026-08-01/)).toBeInTheDocument();
+  });
+
+  it("marks a below-the-bar transfer against its bar, as an advisory", () => {
+    renderDerivable([
+      slot("angry", "Angry", [withTransfer(derived("v_d", "angry"),
+        { ...MEASURED, state: "below-bar", quality: 0.31 })]),
+    ]);
+    expect(screen.getByText(/transfer below the bar · 0\.31/)).toBeInTheDocument();
+    expect(screen.getByTitle(/against a bar of 0\.50/)).toBeInTheDocument();
+  });
+
+  it("says nobody measured it — as a fact, not as a fault", () => {
+    // The normal state on every install today: derive_ab has never run.
+    renderDerivable([
+      slot("angry", "Angry", [withTransfer(derived("v_d", "angry"),
+        { state: "unmeasured", quality: null, speakers: 0, in_sample: 0,
+          min_quality: 0.5, measured: null, version: 1 })]),
+    ]);
+    const chip = screen.getByText("transfer unmeasured");
+    expect(chip).toBeInTheDocument();
+    // Neutral, not amber/rose: an unrun harness is not a defect in this voice.
+    expect(chip.className).toContain("text-white/55");
+    expect(chip.className).not.toMatch(/amber|rose/);
+    expect(screen.getByTitle(/not evidence against this voice/)).toBeInTheDocument();
+    // …and no number is invented for a measurement that never happened.
+    expect(screen.queryByText(/0\.00/)).toBeNull();
+  });
+
+  it("renders a row that predates the block exactly as it always did", () => {
+    renderDerivable([slot("angry", "Angry", [withTransfer(derived("v_d", "angry"), undefined)])]);
+    expect(screen.getByText(/derived · from Mary/)).toBeInTheDocument();
+    expect(screen.queryByText(/transfer/i)).toBeNull();
+  });
+
+  it("says nothing about transfer on a recording", () => {
+    renderDerivable([slot("baseline", "Baseline", [voice("v_base", "baseline")])]);
+    expect(screen.getByText("recorded")).toBeInTheDocument();
+    expect(screen.queryByText(/transfer/i)).toBeNull();
   });
 });
 

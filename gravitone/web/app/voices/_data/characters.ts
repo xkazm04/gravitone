@@ -80,7 +80,121 @@ export type DerivedFrom = {
   basis_version?: number | null;
   alpha?: number;
   at?: string;
+  /**
+   * Whether anybody ever MEASURED how well this emotion travels between
+   * speakers. Optional because rows written before the service grew the block
+   * (`emotion_basis.transfer_payload`) simply do not carry it — and a row
+   * without it renders as it always did, never as an error.
+   */
+  transfer?: Transfer;
 };
+
+/**
+ * The three states "how well does this emotion travel?" can be in — the
+ * service's own names (`service/emotion_basis.py::TRANSFER_STATES`), not a
+ * number this app re-derives.
+ *
+ * The number alone cannot carry them: 0.0 means measured and lost, 1.0 means
+ * measured and matched, and "nobody ran the harness" has no honest number at
+ * all. `"unmeasured"` is the NORMAL state on every install where the A/B
+ * harness has never been run, which is every install today.
+ */
+export type TransferState = "measured" | "below-bar" | "unmeasured";
+
+/** `derived_from.transfer` off the wire — the same key set in all three states. */
+export type Transfer = {
+  state: TransferState;
+  /** `null` — and only null — when nothing was measured. Never coerced to 0. */
+  quality: number | null;
+  /** Speakers actually tested. 0 for the unmeasured row: a count, not a guess. */
+  speakers: number;
+  /** How many of those speakers also contributed to the direction. */
+  in_sample: number;
+  /** The product bar the state was decided against. */
+  min_quality: number;
+  /** When the harness ran, or null. */
+  measured: string | null;
+  version: number;
+};
+
+const TRANSFER_STATES: readonly TransferState[] = ["measured", "below-bar", "unmeasured"];
+
+/**
+ * Read the service's transfer block off the wire.
+ *
+ * Anything unrecognisable — a hand-edited registry, a future schema, a fourth
+ * state this UI has no words for — comes back `undefined` and therefore renders
+ * as a row that predates the field, rather than as a state invented here. The
+ * failure mode is to say nothing, never to say the wrong thing about a voice.
+ */
+export function readTransfer(raw: unknown): Transfer | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const o = raw as Record<string, unknown>;
+  const state = o.state;
+  if (typeof state !== "string" || !TRANSFER_STATES.includes(state as TransferState)) {
+    return undefined;
+  }
+  const num = (v: unknown, fallback: number) =>
+    typeof v === "number" && Number.isFinite(v) ? v : fallback;
+  const quality = typeof o.quality === "number" && Number.isFinite(o.quality) ? o.quality : null;
+  // A measured state with no number is the one internally inconsistent payload
+  // this can receive; it is not believed, because the state is only meaningful
+  // as a verdict ON that number.
+  if (state !== "unmeasured" && quality === null) return undefined;
+  return {
+    state: state as TransferState,
+    quality: state === "unmeasured" ? null : quality,
+    speakers: num(o.speakers, 0),
+    in_sample: num(o.in_sample, 0),
+    min_quality: num(o.min_quality, 0.5),
+    measured: typeof o.measured === "string" && o.measured ? o.measured : null,
+    version: num(o.version, 1),
+  };
+}
+
+/** What one measured (or unmeasured) transfer says, ready to render. */
+export type TransferChip = { label: string; title: string; tone: "measured" | "below" | "unknown" };
+
+/**
+ * The rack's words for a derived slot's transfer state, or null when the row
+ * predates the measurement entirely.
+ *
+ * Three states, no fourth, and no number that was not measured. The unmeasured
+ * copy is deliberately FLAT — it is the normal state on every install today,
+ * and the service says it best: absence of a measurement is not evidence of a
+ * bad voice, and not evidence of a good one either.
+ */
+export function transferChip(v: Voice | null | undefined, label = "this emotion"): TransferChip | null {
+  const t = v?.origin === "derived" ? v.derived_from?.transfer : undefined;
+  if (!t) return null;
+  const across = t.speakers === 1 ? "1 speaker" : `${t.speakers} speakers`;
+  const when = t.measured ? `, measured ${t.measured}` : "";
+  if (t.state === "unmeasured") {
+    return {
+      tone: "unknown",
+      label: "transfer unmeasured",
+      title: `Nobody has measured how well ${label} travels between speakers — the A/B `
+        + "harness has never been run here. That is not evidence against this voice, and "
+        + "not evidence for it either: it is simply unknown.",
+    };
+  }
+  if (t.state === "below-bar") {
+    return {
+      tone: "below",
+      label: `transfer below the bar · ${t.quality!.toFixed(2)}`,
+      title: `Measured at ${t.quality!.toFixed(2)} against a bar of ${t.min_quality.toFixed(2)} `
+        + `across ${across}${when}: a derived take of ${label} landed further from the `
+        + "recording it stands in for than the bar allows. Record this slot when you can.",
+    };
+  }
+  return {
+    tone: "measured",
+    label: `transfer measured · ${t.quality!.toFixed(2)}`,
+    title: `Measured at ${t.quality!.toFixed(2)} against a bar of ${t.min_quality.toFixed(2)} `
+      + `across ${across}${when}: a derived take of ${label} lands about as close to the `
+      + "recording it stands in for as that recording's own render does.",
+  };
+}
 
 /** Who to credit for a derived slot, in the rack's own words. Null when the
  *  Voice is a recording (there is nobody to credit — they performed it). */
@@ -334,9 +448,15 @@ export function normalizeCharacter(c: Character): Character {
       // because the UI's job is to refuse to present a computed slot as a
       // performance, not to invent a state it cannot render.
       const origin = v.origin === "derived" ? "derived" : "recorded";
+      const from = origin === "derived" && v.derived_from ? v.derived_from : undefined;
       return {
         ...v, origin,
-        derived_from: origin === "derived" && v.derived_from ? v.derived_from : undefined,
+        // The transfer block rides inside `derived_from` and is normalized at
+        // this ONE boundary, like fidelity: an unreadable block becomes absent
+        // rather than half-believed.
+        derived_from: from
+          ? { ...from, transfer: readTransfer((from as { transfer?: unknown }).transfer) }
+          : undefined,
         fidelity: fidelity ?? undefined,
       };
     }),

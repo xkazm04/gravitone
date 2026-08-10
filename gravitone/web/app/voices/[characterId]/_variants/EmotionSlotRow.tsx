@@ -1,6 +1,6 @@
 "use client";
 
-import { relTime, signalOf, derivedDonorLabel, type Slot, type Voice } from "@/app/voices/_data/characters";
+import { relTime, signalOf, derivedDonorLabel, transferChip, type Slot, type Voice } from "@/app/voices/_data/characters";
 import EmotionIcon from "@/components/ui/EmotionIcon";
 import SignalChip from "@/app/voices/_variants/SignalChip";
 import EmotionSlotActions from "./EmotionSlotActions";
@@ -44,6 +44,10 @@ export default function EmotionSlotRow({
   // string comparison, so there is one place that decides what
   // "derived" looks like.
   const derivedFrom = derivedDonorLabel(s.voice);
+  // Whether anybody ever MEASURED that this emotion travels. Null for a
+  // recording and for a derived row written before the service carried the
+  // block — absent is invisible, exactly like the Signal chip.
+  const transfer = transferChip(s.voice, s.label);
 
   return (
     <tr className={`border-b border-white/5 transition hover:bg-white/[0.03] ${!filled ? "opacity-70" : ""}`}>
@@ -102,6 +106,28 @@ export default function EmotionSlotRow({
                   className="font-jetbrains rounded border border-violet-400/30 bg-violet-400/10 px-1.5 py-0.5 text-[11px] text-violet-200">
                   derived · from {derivedFrom}
                 </span>
+                {transfer && (
+                  // Three states, the service's own (emotion_basis.py), never a
+                  // fourth and never a number nobody measured. Tone is the
+                  // rack's existing grammar, not a new accent: emerald for a
+                  // measured fact that holds, amber for an advisory the user
+                  // can act on — and for "nobody measured this", the SAME
+                  // neutral the empty slot's "→ baseline" chip wears. It is the
+                  // normal state on every install today, so it must read as a
+                  // blank in the record rather than as a defect in this voice.
+                  <span
+                    title={transfer.title}
+                    className={`font-jetbrains rounded px-1.5 py-0.5 text-[11px] ${
+                      transfer.tone === "measured"
+                        ? "bg-emerald-400/10 text-emerald-300"
+                        : transfer.tone === "below"
+                          ? "bg-amber-400/10 text-amber-300"
+                          : "bg-white/5 text-white/55"
+                    }`}
+                  >
+                    {transfer.label}
+                  </span>
+                )}
                 {s.demand > 0 && (
                   // The demand counter stays ALIVE for a derived
                   // slot: the appetite was for this speaker actually
