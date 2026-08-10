@@ -231,10 +231,32 @@ class FidelityTests(unittest.TestCase):
         self.assertEqual([d.kind for d in report.rated_deltas], ["wrong"])
 
     def test_confidence_source_says_when_no_floor_was_applied(self) -> None:
-        # stt.Word carries no probability today; the report must SAY that
-        # rather than imply a floor it never applied.
+        # Words came back carrying no probability: the EAR did not rate them,
+        # and the report must say so rather than imply a floor it never applied.
         report = verify.compare("Hello there.", evenly("hello there"))
         self.assertEqual(report.confidence_source, "unrated")
+
+    def test_nobody_asked_is_a_different_fact_from_could_not_rate(self) -> None:
+        """"unrated" is about the audio; "no-words" is about the request.
+
+        A flat-text comparison never obtained word-level output at all, so
+        there was nothing the model could have rated. Filing that as "unrated"
+        would blame the clip for a decision the caller made.
+        """
+        self.assertEqual(
+            verify.compare("Hello there.", "hello there").confidence_source,
+            "no-words")
+        self.assertEqual(
+            verify.compare("Hello there.", evenly("hello there")).confidence_source,
+            "unrated")
+        self.assertEqual(
+            verify.compare("Hello there.",
+                           scored("hello there", 0.9, 0.9)).confidence_source,
+            "asr")
+        # And the distinction survives to the wire.
+        payload = json.loads(base64.b64decode(verify.deltas_header(
+            verify.compare("Hello there.", "hello there"))).decode("utf-8"))
+        self.assertEqual(payload["confidence_source"], "no-words")
 
     def test_absent_is_not_zero(self) -> None:
         report = verify.compare("", [])
@@ -369,6 +391,7 @@ class _RouteBase(unittest.TestCase):
         appmod.ALIGN_CACHE.clear()
         appmod.ENGINE = fake_engine.FakeEngine(workers=2, delay=0.01)
         self.transcriptions = 0
+        self.decode_kwargs: list[dict] = []
         self.ears = True
         stt.available = lambda: self.ears
         stt.transcribe_pcm = self._transcribe
@@ -376,6 +399,7 @@ class _RouteBase(unittest.TestCase):
 
     def _transcribe(self, pcm, **kwargs):
         self.transcriptions += 1
+        self.decode_kwargs.append(kwargs)
         return transcript(self.HEARD, evenly(self.HEARD))
 
     def tearDown(self) -> None:
@@ -450,6 +474,14 @@ class VerifyQueryTests(_RouteBase):
             base64.b64decode(r.headers["x-fidelity-deltas"]).decode("utf-8"))
         self.assertEqual(payload["deltas"][0]["expected"], "world")
 
+    def test_scoring_buys_the_word_timestamps_that_carry_confidence(self) -> None:
+        """A rated score costs a kwarg, not a second decode (~5% at beam 5,
+        nothing at beam 1 — measured). Asking for the weaker claim for free was
+        the bug."""
+        self._post(verify="true")
+        self.assertTrue(all(k.get("word_timestamps") for k in self.decode_kwargs),
+                        "verification must ask the ear to rate its words")
+
     def test_a_missing_transcriber_is_named_never_a_crash(self) -> None:
         self.ears = False
         r = self._post(verify="true")
@@ -517,12 +549,21 @@ class RatedTimelineTests(_RouteBase):
 
     def _transcribe(self, pcm, **kwargs):
         self.transcriptions += 1
+        self.decode_kwargs.append(kwargs)
         return transcript(self.HEARD, scored(self.HEARD, 0.99, 0.38))
 
     def test_the_timeline_reports_per_word_confidence(self) -> None:
         body = self._post("/with-timestamps").json()
         self.assertEqual([w["confidence"] for w in body["words"]], [0.99, 0.38])
         self.assertEqual(body["fidelity"]["confidence_source"], "asr")
+
+    def test_a_verified_render_is_scored_against_a_rated_transcript(self) -> None:
+        """The whole point of D3: the score is now backed by a confidence floor
+        instead of being structurally unrated because nobody asked."""
+        r = self._post(verify="true")
+        payload = json.loads(
+            base64.b64decode(r.headers["x-fidelity-deltas"]).decode("utf-8"))
+        self.assertEqual(payload["confidence_source"], "asr")
 
 
 class WithTimestampsTests(_RouteBase):

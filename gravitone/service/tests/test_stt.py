@@ -203,6 +203,15 @@ class TranscribeTests(_FakeWhisperCase):
         stt.transcribe_pcm(b"\x00\x00" * 16000)
         self.assertFalse(_FakeModel.calls[-1]["word_timestamps"])
 
+    def test_a_caller_that_needs_rated_words_can_ask_for_them(self) -> None:
+        """Word timestamps are the only route to a per-word probability, so a
+        verifier has to be able to buy them on the PCM path too — without them
+        its score has no confidence floor behind it."""
+        _FakeModel.probabilities = [0.9, 0.9, 0.9]
+        result = stt.transcribe_pcm(b"\x00\x00" * 16000, word_timestamps=True)
+        self.assertTrue(_FakeModel.calls[-1]["word_timestamps"])
+        self.assertEqual([w.confidence for w in result.words], [0.9, 0.9, 0.9])
+
     def test_pcm_becomes_normalized_float(self) -> None:
         pcm = np.array([0, 16384, -32768], dtype="<i2").tobytes()
         out = stt.pcm16_to_float32(pcm)

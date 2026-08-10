@@ -393,7 +393,16 @@ class FidelityReport:
     unrated: int = 0
     reference_words: int = 0
     heard_words: int = 0
-    confidence_source: str = "unrated"   # "asr" | "unrated"
+    # Which of three different things happened to the confidence floor, because
+    # only one of them is a fact about the audio:
+    #   "asr"      — the transcriber rated words and the floor was applied;
+    #   "unrated"  — words came back carrying no probability. The ear could not
+    #                rate them; that IS about this clip;
+    #   "no-words" — the comparison was handed flat text, so there was nothing
+    #                to rate. Nobody asked the model for word-level output. That
+    #                is about the REQUEST, not about the audio, and conflating
+    #                the two makes a weak claim look like a measured one.
+    confidence_source: str = "no-words"
     deltas: list[Delta] = field(default_factory=list)
 
     @property
@@ -574,9 +583,17 @@ def compare(reference_text: str, heard, *,
     ref = normalize(reference_text)
     hyp = heard_tokens(heard)
     confidences = [h.confidence for h in hyp if h.confidence is not None]
+    if confidences:
+        source = "asr"
+    elif isinstance(heard, str):
+        # Flat text: the decode was run without word timestamps, which is the
+        # only way faster-whisper emits per-word probabilities. Nobody asked.
+        source = "no-words"
+    else:
+        source = "unrated"
     report = FidelityReport(
         score=None, reference_words=len(ref), heard_words=len(hyp),
-        confidence_source="asr" if confidences else "unrated")
+        confidence_source=source)
 
     def rated(h: Heard) -> bool:
         return h.confidence is None or h.confidence >= min_confidence

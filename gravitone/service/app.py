@@ -1740,12 +1740,12 @@ async def _ears_available() -> bool:
 def _transcribe_words(pcm: bytes):
     """Transcribe verification audio WITH word timestamps. Blocking.
 
-    ``stt.transcribe_pcm`` is the conversation path and asks for no word
-    timestamps (a turn is waiting on it), so this prefers the kwarg — which is
-    what the module SHOULD grow, see the report hook — and falls back to
-    ``stt.transcribe``, the public entry point that does take it. Both are
-    module-level lookups so the existing test convention (monkeypatching
-    ``stt.transcribe_pcm``) keeps working unchanged.
+    ``stt.transcribe_pcm`` defaults to no word timestamps because the
+    conversation path has a turn waiting on it; this asks for them explicitly.
+    The fallback to ``stt.transcribe`` survives a test stub with a narrower
+    signature — the suites monkeypatch ``stt.transcribe_pcm`` by convention, and
+    a stub that predates the kwarg must degrade rather than 500. Both are
+    module-level lookups so that convention keeps working.
     """
     try:
         return stt.transcribe_pcm(pcm, rate=stt.TARGET_RATE,
@@ -1755,24 +1755,26 @@ def _transcribe_words(pcm: bytes):
     return stt.transcribe(stt.pcm16_to_float32(pcm), word_timestamps=True)
 
 
-def _transcribe_plain(pcm: bytes):
-    """Transcribe for SCORING only — no word timestamps, no second decode pass.
-
-    Fidelity compares words, not times; buying timestamps for a verdict that
-    ignores them would be spending the caller's CPU on nothing.
-    """
-    return stt.transcribe_pcm(pcm, rate=stt.TARGET_RATE)
-
-
-async def _listen(audio: CachedAudio, *, words: bool):
+async def _listen(audio: CachedAudio):
     """Feed finished audio back through the ear. Returns an ``stt.Transcript``.
+
+    ALWAYS with word timestamps. There used to be a cheaper scoring-only decode
+    here, on the reasoning that fidelity compares words and not times — but word
+    timestamps are the only way faster-whisper emits a per-word PROBABILITY, so
+    skipping them did not save a comparison, it silently downgraded every
+    verified render to ``confidence_source: "no-words"``: a score with no
+    confidence floor behind it, unable to tell an ASR stumble from a TTS defect.
+    Measured, that saved ~5% of one decode at beam 5 and nothing at all at beam
+    1 (16 s clip, small/int8/CPU) — there is no second decode involved, the
+    alignment runs off the encoder output already computed. A materially weaker
+    claim is not worth 5%.
 
     Both hops are offloaded: WAV → PCM is a wave parse plus a resample, and the
     decode is seconds of CPU. On the event loop either one stalls every other
     request on the replica (repo law; guarded by test_handler_modes).
     """
     pcm = await _offload(convai.wav_to_pcm, audio.wav_bytes, stt.TARGET_RATE)
-    return await _offload(_transcribe_words if words else _transcribe_plain, pcm)
+    return await _offload(_transcribe_words, pcm)
 
 
 def _heard(transcript) -> object:
@@ -1818,7 +1820,7 @@ async def _verify_rendered(rendered: _Rendered, voice_id: str, req: TTSRequest,
         return rendered, {"X-Fidelity-Score": "unavailable",
                           "X-Fidelity-Unavailable": "stt-model-absent"}
 
-    transcript = await _listen(rendered.audio, words=False)
+    transcript = await _listen(rendered.audio)
     report = verify.compare(req.text, _heard(transcript))
     retries = 0
     if (mode == "strict" and report.score is not None
@@ -1827,7 +1829,7 @@ async def _verify_rendered(rendered: _Rendered, voice_id: str, req: TTSRequest,
         if second is not None:
             retries = 1
             again = verify.compare(req.text, _heard(
-                await _listen(second, words=False)))
+                await _listen(second)))
             if again.score is not None and again.score > report.score:
                 # The retry really is better — serve it, and say so in the
                 # timings: this response now carries audio that was rendered,
@@ -1944,7 +1946,7 @@ async def text_to_speech_with_timestamps(
         return rendered  # backpressure
 
     async def _build() -> _CachedAlignment:
-        transcript = await _listen(rendered.audio, words=True)
+        transcript = await _listen(rendered.audio)
         return _alignment_payload(req.text, transcript, rendered.audio)
 
     if rendered.bypass:

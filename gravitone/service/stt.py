@@ -271,18 +271,26 @@ def _assemble(collected, detected, elapsed: float) -> Transcript:
 
 
 def transcribe_pcm(pcm: bytes, *, rate: int = TARGET_RATE,
-                   language: str | None = None, hotwords: str | None = None) -> Transcript:
+                   language: str | None = None, hotwords: str | None = None,
+                   word_timestamps: bool = False) -> Transcript:
     """Transcribe raw PCM16 mono — the conversation path.
 
-    No word timestamps and no re-encode: the caller already has the samples,
-    and a turn is waiting on this.
+    No re-encode: the caller already has the samples. Word timestamps are OFF
+    by default because a turn is waiting on this one and it has no use for
+    them; ``word_timestamps=True`` is for the callers that do (verification —
+    they are also the only way to get a per-word probability out of the model,
+    so they buy the confidence floor as well as the timing). Measured cost on a
+    16 s clip, small/int8/CPU: ~5% at beam 5, inside the noise at beam 1. There
+    is no second decode — the alignment runs off the encoder output already
+    computed.
     """
     audio = pcm16_to_float32(_at_target_rate(pcm, rate))
     global _FINALS_WAITING
     with _WAITING_LOCK:
         _FINALS_WAITING += 1
     try:
-        return transcribe(audio, language=language, hotwords=hotwords)
+        return transcribe(audio, language=language, hotwords=hotwords,
+                          word_timestamps=word_timestamps)
     finally:
         with _WAITING_LOCK:
             _FINALS_WAITING -= 1
