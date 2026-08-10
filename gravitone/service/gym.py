@@ -50,6 +50,35 @@ reproduce the recording's interruptions instead of manufacturing its own. Set
 test barge-in behaviour on purpose. `compare()` refuses to score latency across
 two different pacings rather than quietly averaging them.
 
+**Why a suite run can flake on a busy box, and what was ruled out**
+(measured 2026-08-10, so the next person does not re-derive it). The gate finds
+turn boundaries from SAMPLE counts, so the audio side is deterministic - but
+whether the SERVER calls a barge-in is not: `convai._on_speech_start` cancels
+the agent's turn whenever the caller's next utterance starts while that turn is
+still pending, which is a wall-clock race. The polite driver is what keeps that
+race from firing, and its three deadlines (`POLITE_MAX_WAIT_S`,
+`POLITE_EAR_WAIT_S`, `OPENING_GRACE_S`) are absolute constants sized for a fast
+box. When one expires the driver resumes feeding ON TOP of the agent, which is
+how a replay MANUFACTURES an interruption the recording never had - surfacing
+as `interruptions_stable`, `agent_text_stable` or `turn_count_stable`, never as
+a latency check. Measured: a timeout only RISKS the barge-in rather than
+guaranteeing it (the feed resumes one frame per expired wait, so the caller's
+next utterance may still land after the reply ended), which is the second half
+of why the flake was intermittent. `gave_up` is the deterministic half, so it
+is the half `compare()` scores.
+
+Ruled out: `comparable_pacing` cannot flake - it compares `wire.pace`, the
+float ARGUMENT passed to `replay()`, and both runs of a suite use the same one.
+Also measured: 20 busy processes on 12 cores (a ~3x wall-clock stretch on the
+suite) did NOT reproduce it - the deadlines still had roughly an order of
+magnitude of headroom. So the fix is not to shorten the odds by weakening a
+check: the driver now RECORDS what politeness cost (`run["politeness"]`:
+longest waits, timeouts, `gave_up`), `compare()` leads with
+`polite_replay_intact` so a starved box is named as a starved box instead of as
+a changed agent, and a shared runner buys margin with `patience` (a multiplier
+on all three deadlines, settable per call, per suite and per case). Nothing
+about the product's own bar moved.
+
 One default pace, everywhere: the library, `POST /v1/convai/replay` and
 `python -m service.gym run` all default to `pace=0.0`, and real time is the
 thing you ask for. They disagreed once - the CLI defaulted to 1.0 - and the
@@ -121,7 +150,7 @@ BASELINE_SCHEMA = "gravitone-gym-baseline/1"
 # or given different arithmetic. A baseline minted under an older check set was
 # recorded to answer a different question, and scoring it silently is how a
 # suite reports "pass" about checks that did not exist yet.
-CHECK_SET = "gravitone-gym-checks/1"
+CHECK_SET = "gravitone-gym-checks/2"
 
 # One frame is 100 ms of audio, which is what a browser client sends.
 FRAME_MS = 100
@@ -152,6 +181,10 @@ POLITE_MAX_WAIT_S = 20.0
 # barge-in the original call never had. A silence that produces no transcript
 # within this window was a false onset (a door, a cough) and the feed resumes.
 POLITE_EAR_WAIT_S = 10.0
+# How long the driver waits for the OPENING to be announced before it starts
+# feeding. See `_drive` for why it exists at all; it is a politeness deadline
+# like the two above, so it scales with `patience` like them.
+OPENING_GRACE_S = 3.0
 # A caller frame counts as sound at this PCM16 amplitude - far above digital
 # silence, far below speech. Only the polite driver reads it, and only to
 # notice "I just finished saying something".
@@ -488,7 +521,7 @@ def replay(source: str | Path, *, agent_id: str | None = None,
            trailing_silence_ms: int = TRAILING_SILENCE_MS,
            quiet_ms: int = QUIET_MS, deadline_s: float = DEADLINE_S,
            polite: bool = True, polite_quiet_ms: int = POLITE_QUIET_MS,
-           override: dict | None = None,
+           patience: float = 1.0, override: dict | None = None,
            work_dir: str | Path | None = None) -> dict:
     """Stream one recorded conversation back through the socket.
 
@@ -517,11 +550,12 @@ def replay(source: str | Path, *, agent_id: str | None = None,
         runs_dir = Path(work_dir) if work_dir else _default_runs_dir()
         runs_dir.mkdir(parents=True, exist_ok=True)
         with _recording_into(runs_dir):
-            wire, wall_s, conversation_id = _drive(
+            wire, wall_s, conversation_id, manners = _drive(
                 app or _default_app(), agent_id, pcm, rate,
                 pace=pace, frame_ms=frame_ms, quiet_ms=quiet_ms,
                 deadline_s=deadline_s, polite=polite,
-                polite_quiet_ms=polite_quiet_ms, override=override)
+                polite_quiet_ms=polite_quiet_ms, patience=patience,
+                override=override)
         recorded = _read_json(runs_dir / conversation_id / "transcript.json") \
             if conversation_id else None
         # Inside the replay lock, and after the artifact has been read back:
@@ -548,6 +582,11 @@ def replay(source: str | Path, *, agent_id: str | None = None,
             "frames": events["frames_sent"],
             "trailing_silence_ms": trailing_silence_ms,
         },
+        # Whether the driver was ABLE to be polite, and by how much margin. A
+        # replay whose politeness ran out of patience talked over the agent,
+        # and every structural number under it is then a fact about this box
+        # rather than about the agent. See the module docstring's flake note.
+        "politeness": manners,
         "timings_source": timings_source,
         "turns": turns,
         "totals": _totals(turns, wall_s, events),
@@ -619,9 +658,15 @@ def _brain_description() -> dict:
 
 def _drive(app: Any, agent_id: str, pcm: bytes, rate: int, *, pace: float,
            frame_ms: int, quiet_ms: int, deadline_s: float, polite: bool,
-           polite_quiet_ms: int,
-           override: dict | None) -> tuple[_Wire, float, str | None]:
-    """Open the socket, stream the audio, wait for the room to go quiet."""
+           polite_quiet_ms: int, patience: float,
+           override: dict | None) -> tuple[_Wire, float, str | None, dict]:
+    """Open the socket, stream the audio, wait for the room to go quiet.
+
+    Also returns what politeness COST: the longest a wait actually blocked and
+    how many waits ran out. Those numbers are the difference between "the agent
+    changed" and "this box could not keep up", and until they were on the
+    artifact the driver knew and nobody else did.
+    """
     from fastapi.testclient import TestClient
 
     from service import convai
@@ -640,6 +685,27 @@ def _drive(app: Any, agent_id: str, pcm: bytes, rate: int, *, pace: float,
     started = time.monotonic()
     conversation_id: str | None = None
     frames = 0
+    # Every politeness deadline scaled by one knob. They are wall-clock
+    # constants sized for a fast box (see the module docstring); a shared CI
+    # runner buys margin by raising `patience` rather than by anybody editing
+    # the constants or loosening a product check.
+    max_wait_s = POLITE_MAX_WAIT_S * patience
+    ear_wait_s = POLITE_EAR_WAIT_S * patience
+    manners: dict = {"polite": bool(polite), "patience": round(patience, 3),
+                     "opening_announced": None, "floor_timeouts": 0,
+                     "ear_timeouts": 0, "reply_timeouts": 0,
+                     "longest_floor_wait_s": 0.0, "longest_ear_wait_s": 0.0,
+                     "deadlines_s": {"floor": round(max_wait_s, 3),
+                                     "ear": round(ear_wait_s, 3),
+                                     "opening": round(
+                                         OPENING_GRACE_S * patience, 3)},
+                     "gave_up": False}
+
+    def _timed(fn, *args) -> Any:
+        """Run a wait, and remember how long it actually blocked."""
+        at = time.monotonic()
+        got = fn(*args)
+        return got, time.monotonic() - at
     with (client if lifespan else contextlib.nullcontext()), \
             client.websocket_connect(url) as ws:
         wire = _Wire(ws, deadline_s, rate)
@@ -669,7 +735,8 @@ def _drive(app: Any, agent_id: str, pcm: bytes, rate: int, *, pace: float,
                 # real traffic, and a grace the announcement can lose to is a
                 # barge-in generator (measured: 1.0s lost the race on this
                 # box, exactly once per replay, always on the opening).
-                wire.wait_for("agent_response", 3.0)
+                manners["opening_announced"] = wire.wait_for(
+                    "agent_response", OPENING_GRACE_S * patience) is not None
             spoke = False       # sound has gone out since the last yield
             quiet_run = 0       # consecutive quiet frames after that sound
             for i in range(0, len(pcm), step):
@@ -681,8 +748,15 @@ def _drive(app: Any, agent_id: str, pcm: bytes, rate: int, *, pace: float,
                     # unchanged and still in order - it only stops an unpaced
                     # replay from talking over a reply the original caller
                     # politely waited out.
-                    wire.wait_for_floor(polite_quiet_ms / 1000.0,
-                                        POLITE_MAX_WAIT_S)
+                    free, waited = _timed(wire.wait_for_floor,
+                                          polite_quiet_ms / 1000.0, max_wait_s)
+                    manners["longest_floor_wait_s"] = max(
+                        manners["longest_floor_wait_s"], waited)
+                    if not free:
+                        # The agent still had the floor when patience ran out,
+                        # so the next frames go out ON TOP of it. That is a
+                        # manufactured barge-in, and it is recorded as one.
+                        manners["floor_timeouts"] += 1
                 chunk = pcm[i:i + step]
                 ws.send_json({"user_audio_chunk": base64.b64encode(
                     chunk).decode("ascii")})
@@ -707,18 +781,39 @@ def _drive(app: Any, agent_id: str, pcm: bytes, rate: int, *, pace: float,
                         spoke, quiet_run = False, 0
                         heard = wire.count("user_transcript")
                         answered = wire.count("agent_response")
-                        if wire.wait_for_count("user_transcript", heard,
-                                               POLITE_EAR_WAIT_S):
+                        confirmed, waited = _timed(
+                            wire.wait_for_count, "user_transcript", heard,
+                            ear_wait_s)
+                        manners["longest_ear_wait_s"] = max(
+                            manners["longest_ear_wait_s"], waited)
+                        if confirmed:
                             # Words confirmed; now the brain owes a reply.
-                            wire.wait_for_count("agent_response", answered,
-                                                POLITE_MAX_WAIT_S)
-                        # else: no words in it (a false onset) - resume.
+                            if not wire.wait_for_count("agent_response",
+                                                       answered, max_wait_s):
+                                manners["reply_timeouts"] += 1
+                        elif not wire.stopped:
+                            # Either a false onset (a door, a cough - fine, and
+                            # the feed resumes) or an ear too slow to answer
+                            # within the deadline. The driver cannot tell them
+                            # apart, so it counts the ambiguity rather than
+                            # assuming the innocent one: a run with ear
+                            # timeouts in it is a run whose turn boundaries may
+                            # have been placed by this box's scheduler.
+                            manners["ear_timeouts"] += 1
             wire.wait_quiet(quiet_ms / 1000.0,
                             max(1.0, deadline_s - (time.monotonic() - started)))
         finally:
             wire.stop()
     wire.frames_sent = frames  # type: ignore[attr-defined]
-    return wire, round(time.monotonic() - started, 3), conversation_id
+    for key in ("longest_floor_wait_s", "longest_ear_wait_s"):
+        manners[key] = round(manners[key], 3)
+    # `ear_timeouts` is deliberately NOT part of this: a silence that produced
+    # no transcript is equally a false onset (a door, a cough), which is normal
+    # in a real recording. A floor or reply timeout has no innocent reading -
+    # the agent had the floor, or owed a reply, and the driver stopped waiting.
+    manners["gave_up"] = bool(manners["floor_timeouts"]
+                              or manners["reply_timeouts"])
+    return wire, round(time.monotonic() - started, 3), conversation_id, manners
 
 
 # ---------------------------------------------------------------------------
@@ -955,6 +1050,16 @@ def compare(run_a: dict, run_b: dict, thresholds: dict | None = None) -> dict:
         _check("comparable_pacing", "the same wire pace in both runs",
                f"a=pace {pace_a[0]}/polite {pace_a[1]} "
                f"b=pace {pace_b[0]}/polite {pace_b[1]}", comparable),
+        # BEFORE the structural checks, because it is the one that says which
+        # of them to believe. A polite replay that ran out of patience fed the
+        # caller over the agent, and the turn count / interruption / agent text
+        # deltas under it are then measurements of THIS BOX, not of the agent.
+        # Named separately so the report leads with "the driver could not stay
+        # polite" instead of "the agent grew an interruption".
+        _check("polite_replay_intact",
+               "neither run ran out of patience waiting for the agent",
+               f"a={_gave_up(run_a)} b={_gave_up(run_b)}",
+               not _gave_up(run_a) and not _gave_up(run_b)),
         _check("turn_count_stable",
                f"|delta| <= {limits['turn_count_delta_max']}", turn_delta,
                abs(turn_delta) <= limits["turn_count_delta_max"]),
@@ -995,6 +1100,16 @@ def compare(run_a: dict, run_b: dict, thresholds: dict | None = None) -> dict:
         "verdict": "pass" if all(c["pass"] for c in checks) else "fail",
     }
     return result
+
+
+def _gave_up(run: dict) -> bool:
+    """Did this run's polite driver stop waiting for the agent?
+
+    Absent means no - artifacts written before the driver counted this carry
+    no `politeness` block, and treating "we did not measure it" as "it
+    happened" would fail every comparison against an older run.
+    """
+    return bool((run.get("politeness") or {}).get("gave_up"))
 
 
 def _pacing(run: dict) -> tuple[Any, Any]:
@@ -1211,6 +1326,7 @@ def evict_runs(runs_dir: Path, limit: int = MAX_RUNS) -> int:
 
 def run_suite(directory: str | Path, *, app: Any = None,
               update_baselines: bool = False, pace: float | None = None,
+              patience: float | None = None,
               work_dir: str | Path | None = None) -> dict:
     """Every case in a suite: replay, assert, and diff against its baseline.
 
@@ -1223,6 +1339,12 @@ def run_suite(directory: str | Path, *, app: Any = None,
     root = Path(suite["root"])
     thresholds = dict(THRESHOLDS, **(suite.get("thresholds") or {}))
     suite_pace = suite.get("pace", 0.0) if pace is None else pace
+    # A suite checked in for CI can declare how patient its driver must be on
+    # the runner it will actually meet - a shared box is slower than the one
+    # the suite was authored on, and buying margin here is honest where
+    # loosening a threshold would not be.
+    suite_patience = (float(suite.get("patience", 1.0)) if patience is None
+                      else float(patience))
     cases: list[dict] = []
     for spec in suite["cases"]:
         name = str(spec.get("name") or spec.get("recording") or "case")
@@ -1231,6 +1353,7 @@ def run_suite(directory: str | Path, *, app: Any = None,
             run = replay(_suite_path(root, spec.get("recording")),
                          agent_id=spec.get("agent_id"), app=app,
                          pace=float(spec.get("pace", suite_pace)),
+                         patience=float(spec.get("patience", suite_patience)),
                          override=spec.get("override"), work_dir=work_dir)
         except (GymError, OSError) as exc:
             entry.update(verdict="error", error=str(exc))
@@ -1319,6 +1442,12 @@ class ReplayRequest(BaseModel):
                                            "the floor, so an unpaced replay does "
                                            "not invent barge-ins the recording "
                                            "never had")
+    patience: float = Field(1.0, ge=0.01, le=20.0,
+                            description="multiplier on the driver's politeness "
+                                        "deadlines. Raise it on a shared or "
+                                        "loaded box, where the agent legitimately "
+                                        "takes longer than the deadlines a fast "
+                                        "box was sized for")
     compare_to: str | None = Field(None, max_length=400,
                                    description="path to an earlier run artifact "
                                                "to score this run against")
@@ -1396,7 +1525,8 @@ def replay_conversation(req: ReplayRequest) -> dict:
             raise HTTPException(404, f"no run artifact at '{req.compare_to}'")
     try:
         run = replay(req.recording, agent_id=req.agent_id, pace=req.pace,
-                     polite=req.polite, override=req.override)
+                     polite=req.polite, patience=req.patience,
+                     override=req.override)
     except GymError as exc:
         raise HTTPException(404, str(exc))
     except OSError as exc:
@@ -1434,6 +1564,15 @@ def _print_run(run: dict) -> None:
         if d["n"]:
             print(f"  {field}: mean {d['mean']}s  p50 {d['p50']}s  "
                   f"max {d['max']}s  (n={d['n']})")
+    manners = run.get("politeness") or {}
+    if manners.get("gave_up"):
+        # Printed above the drift, because it changes what the rest means.
+        print(f"WARNING: the driver ran out of patience "
+              f"({manners.get('floor_timeouts')} floor / "
+              f"{manners.get('reply_timeouts')} reply timeout(s)) - this box "
+              f"was too slow for a polite replay, so the turn structure below "
+              f"is about the box. Re-run with --patience "
+              f"{max(2.0, manners.get('patience', 1.0) * 2):.0f}.")
     drift = run.get("drift_vs_source") or {}
     if drift.get("available"):
         print(f"Drift vs the source transcript: WER {drift['wer']} "
@@ -1463,6 +1602,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                               "the same default the library and POST "
                               "/v1/convai/replay use); 1.0 = real time, which "
                               "is what a latency claim needs")
+    run_cmd.add_argument("--patience", type=float, default=1.0,
+                         help="multiplier on the driver's politeness deadlines "
+                              "- raise it on a shared or loaded box")
     run_cmd.add_argument("--barge-in", action="store_true",
                          help="do not pause the feed while the agent is talking "
                               "(an unpaced replay will then talk over it)")
@@ -1479,13 +1621,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     suite_cmd.add_argument("directory")
     suite_cmd.add_argument("--update-baselines", action="store_true")
     suite_cmd.add_argument("--pace", type=float, default=None)
+    suite_cmd.add_argument("--patience", type=float, default=None,
+                           help="multiplier on the driver's politeness "
+                                "deadlines, overriding the suite's own")
     suite_cmd.add_argument("--out", default=None)
 
     a = ap.parse_args(argv)
     try:
         if a.command == "run":
             run = replay(a.recording, agent_id=a.agent, pace=a.pace,
-                         polite=not a.barge_in)
+                         polite=not a.barge_in, patience=a.patience)
             _print_run(run)
             _write(a.out, run)
             return 0
@@ -1506,7 +1651,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             _write(a.out, result)
             return exit_code(result)
         result = run_suite(a.directory, update_baselines=a.update_baselines,
-                           pace=a.pace)
+                           pace=a.pace, patience=a.patience)
         print("-" * 62)
         print(f"Gravitone gym suite {result['suite']}  "
               f"[{result['verdict'].upper()}]")
