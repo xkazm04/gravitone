@@ -1,0 +1,104 @@
+# .ai/manifest.yaml — the agent-facing contract for this repo.
+# Capabilities are tool-NEUTRAL (a name -> the command that fulfils it), heavy subsystems are
+# referenced by path, and unknown fields MUST be ignored — so this survives tool churn and schema
+# growth. THE CONTRACT SHIPS BESIDE THIS FILE: .ai/SPEC.md defines every key below and what a
+# conformant reader asserts about them, and resolves in a fresh clone with no network.
+schema: ai-manifest
+schemaVersion: 0.1.0
+generatedAt: "2026-09-03"
+generatedFrom: [Dockerfile, requirements.txt, .github/workflows/sealed.yml, .github/workflows/perf-ledger.yml, docs/harness/harness-learnings.md, deploy/helm/gravitone/values.yaml]
+
+repo:
+  name: gravitone
+  purpose: "CPU-only, Arm-native text-to-speech and speech-to-text service with voice cloning, shaped like a hosted TTS API: a bounded pool of model instances behind an admission queue with 429 backpressure, a sealed air-gapped appliance image, and a Helm chart whose autoscaling reads queue depth"
+  languages: [python, typescript, shell]
+  archetype: service
+
+# Capabilities, not tools. Every command below was read out of the workflows, the Dockerfile or
+# docs/harness/harness-learnings.md; nothing here is invented. `verified` is a claim a doctor flips
+# to true once it has actually run the command. There is no pytest in this repo: the suite is
+# unittest, one module per run, and the ship gate is the full per-module loop (a wave is never
+# green on a subset). `service/tests/fake_engine.py` shims the model dependencies on import, so the
+# suite runs without weights or torch.
+capabilities:
+  # One module. Verified 2026-09-03: `python -m unittest service.tests.test_auth` -> 8 tests OK.
+  test-module: { command: "python -m unittest service.tests.<module>", verified: true }
+  # The full loop the harness doc names as the ship gate (subprocess per module).
+  test: { command: "for m in service/tests/test_*.py; do python -m unittest \"service.tests.$(basename ${m%.py})\" || exit 1; done", verified: false }
+  test-web: { command: "cd web && npm test", verified: false }
+  test-mcp: { command: "cd agents/mcp-gravitone && npm test", verified: false }
+  typecheck-web: { command: "cd web && npx tsc --noEmit", verified: false }
+  build-web: { command: "cd web && npm run build", verified: false }
+  lint-web: { command: "cd web && npm run lint", verified: false }
+  # The artifact. BASE_IMAGE is an Arm image; the bake stage fetches every model at build time.
+  build-image: { command: "docker build -t gravitone .", verified: false }
+  # Measure -> plan -> deploy (deploy/README.md). The plan compiler writes the chart overlay.
+  benchmark: { command: "bash benchmark_arm.sh", verified: false }
+  certify: { command: "python -m service.certify", verified: false }
+  plan-helm-values: { command: "python -m service.plan certification.json --emit helm-values", verified: false }
+  chart-render: { command: "helm template gravitone deploy/helm/gravitone", verified: false }
+  # Runs the service locally (needs the model weights; under test the fake engine replaces them).
+  serve: { command: "python -m service.app", verified: false }
+
+# Pointers — these subsystems can change format underneath without breaking this contract.
+paths:
+  spec: .ai/SPEC.md
+  contextMap: context-map.json
+  docs: docs/
+  deploy: deploy/
+  chart: deploy/helm/gravitone/
+  harnessLearnings: docs/harness/harness-learnings.md
+
+boundaries:
+  # Model weights, voices and recordings are assets, not code: never edited by an agent, never
+  # committed as a change. ingest_jobs/ is runtime state the ingest pipeline leaves behind.
+  neverTouch: [piper_voices/, diarization_models/, voices/, recordings/, ingest_jobs/]
+  generatedNotHandEdited: [context-map.json, web/package-lock.json, agents/mcp-gravitone/package-lock.json]
+  secretsFrom: "the root xi-api-key comes from TTS_API_KEY in the environment (chart: apiKey.value or apiKey.existingSecret); issued keys live in the service's key store; the GitHub remote is PUBLIC — never commit a key"
+
+# The control model: where each capability is PRIMARILY enforced. `.github/workflows/sealed.yml`
+# boots the sealed image with no network and proves it can clone, synthesize, transcribe and
+# converse, then asserts that egress FAILS; `perf-ledger.yml` gates on the load-test differ.
+controls:
+  ciHardPass: [build-image, test-mcp]
+  ciAdvisory: [benchmark]
+  localGate: [test]
+  notes:
+    - "sealed.yml needs an aarch64 runner; it is the appliance's proof, not a unit gate."
+    - "perf-ledger.yml compares load-test results against the ledger (service/compare.py)."
+
+registry:
+  remote: github:xkazm04/ai-registry
+  local: ../ai-registry
+  machine: Wolf
+  contributor: xkazm04
+knowledge:
+  domains: [software-engineering]
+
+# Scope - what this project does and deliberately does not do. Read by the registry's
+# scripts/build-fleet-map.mjs to classify subjects this project has NO context for: an
+# absence inside an out-of-scope category or subject is never proposed as a new direction;
+# every other in-domain absence is a `candidate` for the intake direction pass. Keys are
+# `<bundle>/<category>[/<subcategory>]` and `<bundle>/<subject>`. Decisions on proposed
+# directions live in .ai/directions/ledger.jsonl. DRAFT written by the registry on
+# 2026-09-03 at onboarding - the owner edits this block, the registry only reads it.
+scope:
+  does:
+    - serve text-to-speech and speech-to-text over a hosted-API-compatible HTTP surface, on CPU, self-hosted
+    - voice cloning from a short reference clip; characters, packs and an ingest pipeline from recordings
+    - a conversational agent protocol served locally, with recording and replay
+    - capacity as a measured fact - benchmark, certify the box, compile the topology, autoscale on queue depth
+    - ship as a sealed, air-gapped appliance image and a Helm chart
+  does_not:
+    - a hosted multi-tenant SaaS, billing, or per-user accounts beyond API keys
+    - a GPU path or a cloud model API dependency
+    - an end-user product UI beyond the web studio companion
+    - agent fleets, companions, orchestration, recruiting, civic, game or media-generation domains
+  out_of_scope_categories:
+    - software-engineering/llm-agent/companion
+    - software-engineering/llm-agent/orchestration
+    - software-engineering/engineering-assessment
+    - software-engineering/ui-surfaces/input-and-editing
+  out_of_scope_subjects:
+    - software-engineering/plan-entitlements
+  directions_ledger: .ai/directions/ledger.jsonl
