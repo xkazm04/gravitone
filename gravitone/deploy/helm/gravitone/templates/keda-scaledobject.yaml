@@ -3,6 +3,13 @@
 # precedes every 429) is polled straight from the JSON /metrics endpoint —
 # no Prometheus required. Needs KEDA installed: https://keda.sh
 #
+# The value read is `fleet.queued`, NOT `metrics.queued`. The poll goes through
+# the ClusterIP Service, which hands it to ONE pod; `metrics.queued` there is
+# that pod's queue, a sample. `fleet.queued` is summed over every pod the
+# headless peers Service names (service/fleet.py), so every pod answers the
+# same total and KEDA's AverageValue (total / replicas) means what the target
+# says: queued requests per replica.
+#
 # /metrics REQUIRES A CREDENTIAL when TTS_API_KEY is set (it publishes the
 # deployment shape and live latency percentiles). This scaler runs in the KEDA
 # operator pod and reaches the service over cluster DNS, so it is NOT loopback
@@ -37,7 +44,7 @@ spec:
     - type: metrics-api
       metadata:
         url: "http://{{ include "gravitone.fullname" . }}:{{ .Values.service.port }}/metrics"
-        valueLocation: "metrics.queued"
+        valueLocation: "fleet.queued"
         targetValue: {{ .Values.autoscaling.keda.queuedTarget | quote }}
         authMode: "apiKey"
         method: "header"

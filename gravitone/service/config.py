@@ -434,6 +434,11 @@ class Settings:
     # Optional shared secret; if set, requests must send it as `xi-api-key`
     # (ElevenLabs-compatible header). Empty = open (local dev).
     api_key: str = _str("TTS_API_KEY", "")
+    # The headless peers Service (chart: <release>-peers.<ns>.svc). When set, /metrics
+    # carries a `fleet` block summed over every pod, which is what the autoscaler
+    # reads (service/fleet.py). Empty outside a fleet: the block is then absent.
+    fleet_peers: str = _str("TTS_FLEET_PEERS", "")
+    fleet_peer_timeout_s: float = float(_str("TTS_FLEET_PEER_TIMEOUT_S", "1.0"))
     # --- Private surface ---------------------------------------------------
     # Interactive API docs (/docs, /redoc) and the OpenAPI schema
     # (/openapi.json). FastAPI publishes all three by default, which on a

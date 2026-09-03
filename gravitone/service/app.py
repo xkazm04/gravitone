@@ -58,6 +58,7 @@ from service import stt, verify
 from service.cache import CachedAudio, SynthCache
 from service.config import SETTINGS
 from service.demand import record_fallback
+from service import fleet as fleet_module
 from service.emotions import parse_segments, resolve
 from service import engine as engine_module
 from service.engine import (
@@ -3122,8 +3123,18 @@ async def metrics():
     if ENGINE is None:
         raise HTTPException(status_code=503, detail="engine not ready")
     # `cache` is this PROCESS's synthesis cache (per replica, never global).
-    return {"config": ENGINE.config(), "metrics": ENGINE.metrics.snapshot(),
+    body = {"config": ENGINE.config(), "metrics": ENGINE.metrics.snapshot(),
             "cache": SYNTH_CACHE.stats()}
+    if SETTINGS.fleet_peers:
+        # `metrics` above is THIS pod. The scaler must not read it: a ClusterIP hands
+        # each poll to one pod, so that number is a sample. `fleet` is the sum over
+        # every pod the headless peers Service names, read off the request thread
+        # so a slow peer cannot stall this pod's own answer.
+        body["fleet"] = await asyncio.to_thread(
+            fleet_module.snapshot, SETTINGS.fleet_peers, SETTINGS.port,
+            SETTINGS.api_key, SETTINGS.fleet_peer_timeout_s,
+        )
+    return body
 
 
 def main():
