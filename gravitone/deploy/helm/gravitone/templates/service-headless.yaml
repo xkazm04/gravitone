@@ -1,0 +1,21 @@
+# The fleet's own address book. A headless Service resolves to EVERY pod IP,
+# which is what /metrics needs to sum the admission queue across the fleet
+# (`fleet.queued`) instead of reporting the one pod the ClusterIP balancer
+# happened to pick. The scaler reads the fleet number; see values.yaml
+# `autoscaling` for why a single pod's queue was never a fleet signal.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "gravitone.fullname" . }}-peers
+  labels:
+    {{- include "gravitone.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: false
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "gravitone.selectorLabels" . | nindent 4 }}

@@ -40,6 +40,9 @@ capabilities:
   certify: { command: "cd gravitone && python -m service.certify", verified: false }
   plan-helm-values: { command: "cd gravitone && python -m service.plan certification.json --emit helm-values", verified: false }
   chart-render: { command: "helm template gravitone gravitone/deploy/helm/gravitone", verified: false }
+  # Policy over the deployment SHAPE (probes, thread pinning, disruption budget, secret checksum,
+  # the fleet scaling signal, certified values), text-level with a must-fail fixture per policy.
+  chart-policy: { command: "cd gravitone && node scripts/check-chart.mjs && node --test scripts/check-chart.test.mjs", verified: true }
   # Runs the service locally (needs the model weights; under test the fake engine replaces them).
   serve: { command: "cd gravitone && python -m service.app", verified: false }
 
@@ -66,7 +69,7 @@ boundaries:
 # service job (the fake-engine suite under pytest). The sealed-appliance and perf-ledger workflows
 # ship as `.example` files and run nowhere until an aarch64 runner is wired.
 controls:
-  ciHardPass: [typecheck-web, test-web, build-web, test-service-ci]
+  ciHardPass: [typecheck-web, test-web, build-web, test-service-ci, chart-policy]
   ciAdvisory: []
   localGate: [test]
   notes:

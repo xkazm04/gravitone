@@ -1,0 +1,17 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+# Addressed to whoever drains a node: a voluntary disruption may not take the
+# last serving replica. Without this, `kubectl drain` evicts every pod of a
+# small install at once and the outage is silent - the drain succeeds. With it,
+# the drain refuses loudly until a replacement is Ready elsewhere.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "gravitone.fullname" . }}
+  labels:
+    {{- include "gravitone.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "gravitone.selectorLabels" . | nindent 6 }}
+{{- end }}
