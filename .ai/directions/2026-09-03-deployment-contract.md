@@ -5,7 +5,7 @@ raised_by: intake intake-kube-0903
 source: librarian/sources/2026-09-03-kube-rs.md (design record entries E1, A3; peer study points 6, 10-12)
 stage: a text-level policy check over deploy/helm/gravitone/, run beside the service test loop and in a CI job, with one must-fail fixture per policy
 size: 3 files / ~250 lines / M
-status: proposed
+status: accepted
 ---
 
 ## Why the scope implies it

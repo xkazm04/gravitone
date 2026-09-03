@@ -5,7 +5,7 @@ raised_by: intake intake-kube-0903
 source: librarian/sources/2026-09-03-kube-rs.md (design record entry B2 - a replica is correct only under stated properties of its source; peer study point 9)
 stage: the /metrics endpoint service/app.py exposes and the KEDA trigger in deploy/helm/gravitone/templates/keda-scaledobject.yaml
 size: 3 files / ~120 lines / M
-status: proposed
+status: accepted
 ---
 
 ## Why the scope implies it
