@@ -221,3 +221,8 @@ jobs:
       # `gravitone/` so `import service.x` resolves.
       - name: Unit tests
         run: python -m pytest service/tests -q
+
+      # Policy over the chart's shape, with a must-fail fixture per policy. Text-level:
+      # no helm binary, no cluster (scripts/check-chart.mjs).
+      - name: Chart policy gate
+        run: node scripts/check-chart.mjs && node --test scripts/check-chart.test.mjs
