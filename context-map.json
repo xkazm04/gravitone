@@ -1,0 +1,885 @@
+{
+  "contexts": [
+    {
+      "api_surface": "POST /v1/text-to-speech/{voice_id}, GET /v1/voices, GET /health, GET /metrics, xi-api-key header",
+      "business_feature": "Text-to-speech API",
+      "category": "api",
+      "cross_refs": [
+        "synthesis-engine-pool",
+        "admission-and-backpressure"
+      ],
+      "db_tables": [],
+      "description": "The hosted-TTS-shaped HTTP surface: POST /v1/text-to-speech/{voice_id} returning wav/mp3/pcm with timing headers, GET /v1/voices, /health and /metrics, behind one central API-key check and one error voice. Configuration is read once from the environment at boot.",
+      "entry_points": [
+        "service/app.py"
+      ],
+      "file_paths": [
+        "service/app.py",
+        "service/auth.py",
+        "service/errors.py",
+        "service/config.py"
+      ],
+      "group": "Speech synthesis",
+      "group_id": "bc974195-fa3d-46e8-9119-7b987d0cdec4",
+      "id": "b4d2ce8f-e9ea-4993-b773-c90f9d27541e",
+      "keywords": [
+        "tts",
+        "http",
+        "api-key",
+        "health",
+        "metrics",
+        "elevenlabs-compatible",
+        "fastapi"
+      ],
+      "last_written_at": "2026-09-03T00:00:00Z",
+      "name": "tts-http-api",
+      "pinned": false,
+      "tech_stack": [
+        "python"
+      ]
+    },
+    {
+      "api_surface": "",
+      "business_feature": "Synthesis engines",
+      "category": "lib",
+      "cross_refs": [
+        "tts-http-api",
+        "replica-scaling"
+      ],
+      "db_tables": [],
+      "description": "A bounded pool of independent model instances (generation is not thread-safe, the model is GIL-bound, so capacity comes from replicas never from in-process workers) plus the engine plane that says which mouth speaks: the primary CPU model, and a second engine for languages it cannot speak. A one-load stem exporter shares the same loaded model.",
+      "entry_points": [
+        "service/engine.py"
+      ],
+      "file_paths": [
+        "service/engine.py",
+        "service/engines.py",
+        "service/piper.py",
+        "service/export_stems.py"
+      ],
+      "group": "Speech synthesis",
+      "group_id": "bc974195-fa3d-46e8-9119-7b987d0cdec4",
+      "id": "0aa80a32-54b9-4663-898f-974b8f2beed3",
+      "keywords": [
+        "engine",
+        "pool",
+        "worker",
+        "gil",
+        "piper",
+        "multilingual",
+        "stems"
+      ],
+      "last_written_at": "2026-09-03T00:00:00Z",
+      "name": "synthesis-engine-pool",
+      "pinned": false,
+      "tech_stack": [
+        "python"
+      ]
+    },
+    {
+      "api_surface": "",
+      "business_feature": "Prosody and emotion control",
+      "category": "lib",
+      "cross_refs": [
+        "voices-and-characters",
+        "takes-and-review"
+      ],
+      "db_tables": [],
+      "description": "What a recording sounds like (pitch, loudness, pace, colour) and how characters carry an emotion scale: a shared emotion basis of averaged residuals with per-emotion coherence, and the offline tools that derive it, backfill prosody and run A/B derivations.",
+      "entry_points": [
+        "service/emotions.py"
+      ],
+      "file_paths": [
+        "service/prosody.py",
+        "service/emotions.py",
+        "service/emotion_basis.py",
+        "service/tools/emotion_residuals.py",
+        "service/tools/derive_ab.py",
+        "service/tools/derive_autofill.py",
+        "service/tools/prosody_backfill.py"
+      ],
+      "group": "Speech synthesis",
+      "group_id": "bc974195-fa3d-46e8-9119-7b987d0cdec4",
+      "id": "642f12c7-417a-46aa-b4ba-ed64f16f0da4",
+      "keywords": [
+        "prosody",
+        "emotion",
+        "residuals",
+        "pitch",
+        "pace",
+        "basis",
+        "derive"
+      ],
+      "last_written_at": "2026-09-03T00:00:00Z",
+      "name": "prosody-and-emotion",
+      "pinned": false,
+      "tech_stack": [
+        "python"
+      ]
+    },
+    {
+      "api_surface": "shared take and review-set pages",
+      "business_feature": "Takes, review sets and direction",
+      "category": "api",
+      "cross_refs": [
+        "prosody-and-emotion",
+        "speech-to-text"
+      ],
+      "db_tables": [],
+      "description": "Persisted renders behind public review pages, direction telemetry (what humans change when they re-perform a take) and the pure verification half of verified speech: did the audio say the words.",
+      "entry_points": [
+        "service/takes.py"
+      ],
+      "file_paths": [
+        "service/takes.py",
+        "service/direction.py",
+        "service/verify.py"
+      ],
+      "group": "Speech synthesis",
+      "group_id": "bc974195-fa3d-46e8-9119-7b987d0cdec4",
+      "id": "cd6b6f43-b9e8-45a7-a22d-635a80f37a07",
+      "keywords": [
+        "takes",
+        "review",
+        "direction",
+        "verify",
+        "telemetry"
+      ],
+      "last_written_at": "2026-09-03T00:00:00Z",
+      "name": "takes-and-review",
+      "pinned": false,
+      "tech_stack": [
+        "python"
+      ]
+    },
+    {
+      "api_surface": "HTTP 429 backpressure, queue depth in /metrics",
+      "business_feature": "Admission control",
+      "category": "lib",
+      "cross_refs": [
+        "synthesis-engine-pool",
+        "replica-scaling"
+      ],
+      "db_tables": [],
+      "description": "The pre-429 signal: an admission queue in front of the engine pool that answers HTTP 429 when full, per-IP budgets shared by every public compute surface, a bounded single-flight synthesis cache, and the fallback demand telemetry that feeds the coverage loop.",
+      "entry_points": [
+        "service/ratelimit.py"
+      ],
+      "file_paths": [
+        "service/engine.py",
+        "service/ratelimit.py",
+        "service/cache.py",
+        "service/demand.py"
+      ],
+      "group": "Capacity and admission",
+      "group_id": "52aedede-30e8-41a0-98a4-a4f6c8a4958e",
+      "id": "dc631fce-29af-46f6-aed1-4f49b30a0dcd",
+      "keywords": [
+        "admission",
+        "queue",
+        "429",
+        "backpressure",
+        "rate-limit",
+        "single-flight",
+        "cache"
+      ],
+      "last_written_at": "2026-09-03T00:00:00Z",
+      "name": "admission-and-backpressure",
+      "pinned": false,
+      "tech_stack": [
+        "python"
+      ]
+    },
+    {
+      "api_surface": "python -m service.plan certification.json --emit helm-values",
+      "business_feature": "Replica planning",
+      "category": "lib",
+      "cross_refs": [
+        "hardware-certification",
+        "helm-chart-and-autoscaling"
+      ],
+      "db_tables": [],
+      "description": "The scaling story for a GIL-bound model: a replica-native launcher, and the deployment compiler that turns a hardware certificate into a topology (replica count, threads per replica, resources, autoscaling) and emits chart values carrying the certificate hash and hardware fingerprint.",
+      "entry_points": [
+        "service/plan.py"
+      ],
+      "file_paths": [
+        "service/replicas.py",
+        "service/plan.py"
+      ],
+      "group": "Capacity and admission",
+      "group_id": "52aedede-30e8-41a0-98a4-a4f6c8a4958e",
+      "id": "fcb868d8-7d3d-484b-a58a-eb4166830f1e",
+      "keywords": [
+        "replicas",
+        "plan",
+        "topology",
+        "helm-values",
+        "certificate",
+        "threads"
+      ],
+      "last_written_at": "2026-09-03T00:00:00Z",
+      "name": "replica-scaling",
+      "pinned": false,
+      "tech_stack": [
+        "python"
+      ]
+    },
+    {
+      "api_surface": "POST /v1/speech-to-text",
+      "business_feature": "Local speech-to-text",
+      "category": "api",
+      "cross_refs": [
+        "conversational-agent",
+        "diarization-and-voiceprint"
+      ],
+      "db_tables": [],
+      "description": "Local transcription shaped like the hosted STT API, on CPU with int8 weights, with per-request keyword bias, plus the streaming voice-activity gate that decides when the caller started and stopped talking.",
+      "entry_points": [
+        "service/stt.py"
+      ],
+      "file_paths": [
+        "service/stt.py",
+        "service/vad.py"
+      ],
+      "group": "Listening",
+      "group_id": "9ac5e3d7-7727-4fe3-9c0a-a70603177e86",
+      "id": "1efe52e5-bccd-4000-bfbc-c6a123f1a976",
+      "keywords": [
+        "stt",
+        "whisper",
+        "vad",
+        "transcription",
+        "keyword-bias",
+        "streaming"
+      ],
+      "last_written_at": "2026-09-03T00:00:00Z",
+      "name": "speech-to-text",
+      "pinned": false,
+      "tech_stack": [
+        "python"
+      ]
+    },
+    {
+      "api_surface": "",
+      "business_feature": "Who spoke when",
+      "category": "lib",
+      "cross_refs": [
+        "speech-to-text",
+        "character-ingest"
+      ],
+      "db_tables": [],
+      "description": "Speaker diarization without an account (chosen over the hosted-token alternative because an offline service cannot demand one), and a single speaker embedding answering one question: is this the same voice.",
+      "entry_points": [
+        "service/diarize.py"
+      ],
+      "file_paths": [
+        "service/diarize.py",
+        "service/voiceprint.py"
+      ],
+      "group": "Listening",
+      "group_id": "9ac5e3d7-7727-4fe3-9c0a-a70603177e86",
+      "id": "9db010a8-22c0-465f-9efb-68ca410a4598",
+      "keywords": [
+        "diarization",
+        "speaker",
+        "embedding",
+        "voiceprint",
+        "offline",
+        "onnx"
+      ],
+      "last_written_at": "2026-09-03T00:00:00Z",
+      "name": "diarization-and-voiceprint",
+      "pinned": false,
+      "tech_stack": [
+        "python"
+      ]
+    },
+    {
+      "api_surface": "agents WebSocket",
+      "business_feature": "Conversational agents",
+      "category": "api",
+      "cross_refs": [
+        "speech-to-text",
+        "synthesis-engine-pool",
+        "conversation-gym"
+      ],
+      "db_tables": [],
+      "description": "The hosted-agents WebSocket protocol served locally: who the agent is and what it says next, and what a conversation leaves behind (two aligned recordings and a transcript).",
+      "entry_points": [
+        "service/convai.py"
+      ],
+      "file_paths": [
+        "service/convai.py",
+        "service/dialog.py",
+        "service/recording.py"
+      ],
+      "group": "Conversation",
+      "group_id": "7976a553-28fb-452b-bfc1-ece5c48a9a13",
+      "id": "b5c363c5-091f-4958-9582-804c63f9b7bf",
+      "keywords": [
+        "convai",
+        "websocket",
+        "dialog",
+        "agent",
+        "recording",
+        "transcript"
+      ],
+      "last_written_at": "2026-09-03T00:00:00Z",
+      "name": "conversational-agent",
+      "pinned": false,
+      "tech_stack": [
+        "python"
+      ]
+    },
+    {
+      "api_surface": "",
+      "business_feature": "Audible docs",
+      "category": "lib",
+      "cross_refs": [
+        "synthesis-engine-pool"
+      ],
+      "db_tables": [],
+      "description": "Any page becomes a segmented narration plan: the generalised audible-docs planner.",
+      "entry_points": [
+        "service/narrate.py"
+      ],
+      "file_paths": [
+        "service/narrate.py"
+      ],
+      "group": "Conversation",
+      "group_id": "7976a553-28fb-452b-bfc1-ece5c48a9a13",
+      "id": "c8a848d0-8b3a-4b07-97a6-58fe7e9d39d6",
+      "keywords": [
+        "narration",
+        "plan",
+        "segments",
+        "docs"
+      ],
+      "last_written_at": "2026-09-03T00:00:00Z",
+      "name": "narration-plans",
+      "pinned": false,
+      "tech_stack": [
+        "python"
+      ]
+    },
+    {
+      "api_surface": "",
+      "business_feature": "Conversation replay harness",
+      "category": "test",
+      "cross_refs": [
+        "conversational-agent",
+        "hardware-certification"
+      ],
+      "db_tables": [],
+      "description": "A recorded call replayed as a deterministic test, and the traffic shapes (when requests arrive and what they say) the load harness drives with.",
+      "entry_points": [
+        "service/gym.py"
+      ],
+      "file_paths": [
+        "service/gym.py",
+        "service/workload.py"
+      ],
+      "group": "Conversation",
+      "group_id": "7976a553-28fb-452b-bfc1-ece5c48a9a13",
+      "id": "6e1ac115-44e7-4921-b3dc-916938f6e235",
+      "keywords": [
+        "gym",
+        "replay",
+        "deterministic",
+        "workload",
+        "traffic-shape"
+      ],
+      "last_written_at": "2026-09-03T00:00:00Z",
+      "name": "conversation-gym",
+      "pinned": false,
+      "tech_stack": [
+        "python"
+      ]
+    },
+    {
+      "api_surface": "GET /v1/voices and character routes, key management routes",
+      "business_feature": "Voice and character management",
+      "category": "api",
+      "cross_refs": [
+        "character-packs-and-buildstore",
+        "prosody-and-emotion"
+      ],
+      "db_tables": [],
+      "description": "Voice and character CRUD, and API-key issue/rotate/revoke with copy-once secrets.",
+      "entry_points": [
+        "service/voices.py"
+      ],
+      "file_paths": [
+        "service/voices.py",
+        "service/keys.py"
+      ],
+      "group": "Voices and characters",
+      "group_id": "ef03c601-30ca-4eda-9558-d7fd485153d8",
+      "id": "28b6ba9b-5f20-42e3-bb2b-d42d15dbb799",
+      "keywords": [
+        "voices",
+        "characters",
+        "api-keys",
+        "rotate",
+        "revoke"
+      ],
+      "last_written_at": "2026-09-03T00:00:00Z",
+      "name": "voices-and-characters",
+      "pinned": false,
+      "tech_stack": [
+        "python"
+      ]
+    },
+    {
+      "api_surface": "",
+      "business_feature": "Character packs and the build store",
+      "category": "data",
+      "cross_refs": [
+        "voices-and-characters"
+      ],
+      "db_tables": [],
+      "description": "Portable integrity-checked character bundles, speech as a build artifact (the identity function and the durable store), and atomic file writes underneath both.",
+      "entry_points": [
+        "service/packs.py"
+      ],
+      "file_paths": [
+        "service/packs.py",
+        "service/buildstore.py",
+        "service/atomicio.py"
+      ],
+      "group": "Voices and characters",
+      "group_id": "ef03c601-30ca-4eda-9558-d7fd485153d8",
+      "id": "34dd7fd2-3f27-4921-b56e-3995690331aa",
+      "keywords": [
+        "packs",
+        "bundle",
+        "integrity",
+        "buildstore",
+        "artifact",
+        "atomic-write"
+      ],
+      "last_written_at": "2026-09-03T00:00:00Z",
+      "name": "character-packs-and-buildstore",
+      "pinned": false,
+      "tech_stack": [
+        "python"
+      ]
+    },
+    {
+      "api_surface": "ingest routes",
+      "business_feature": "Character from recording",
+      "category": "api",
+      "cross_refs": [
+        "diarization-and-voiceprint",
+        "voices-and-characters"
+      ],
+      "db_tables": [],
+      "description": "The scan, review, commit pipeline that turns a recording into a character, with speaker selection over the diarization output, and the on-disk ingest jobs it leaves behind.",
+      "entry_points": [
+        "service/ingest_api.py"
+      ],
+      "file_paths": [
+        "service/ingest.py",
+        "service/ingest_api.py",
+        "ingest_jobs"
+      ],
+      "group": "Voices and characters",
+      "group_id": "ef03c601-30ca-4eda-9558-d7fd485153d8",
+      "id": "f4444b5e-4a78-4037-8eef-1457574f3ced",
+      "keywords": [
+        "ingest",
+        "scan",
+        "review",
+        "commit",
+        "speaker-selection",
+        "jobs"
+      ],
+      "last_written_at": "2026-09-03T00:00:00Z",
+      "name": "character-ingest",
+      "pinned": false,
+      "tech_stack": [
+        "python"
+      ]
+    },
+    {
+      "api_surface": "bash benchmark_arm.sh && python -m service.certify",
+      "business_feature": "Certify your box",
+      "category": "lib",
+      "cross_refs": [
+        "replica-scaling",
+        "conversation-gym"
+      ],
+      "db_tables": [],
+      "description": "The measure half of measure-plan-deploy: the ramp load-tester that finds the concurrency cap before critical degradation, the certification kit for the self-hosted tier, the result differ the performance ledger gates on, and the benchmark scripts for the reference instances.",
+      "entry_points": [
+        "service/certify.py"
+      ],
+      "file_paths": [
+        "service/certify.py",
+        "service/compare.py",
+        "service/loadtest.py",
+        "benchmark_arm.sh",
+        "benchmark_arm_ab.sh",
+        "benchmark_t4g.sh",
+        "aws/run_benchmark.sh",
+        ".github/workflows/perf-ledger.yml"
+      ],
+      "group": "Certification and deployment",
+      "group_id": "eaa83a86-71ec-4ff5-a89a-55d932d15ddc",
+      "id": "c9058d8c-26e2-407f-8fc6-9c2635f7b39c",
+      "keywords": [
+        "benchmark",
+        "certify",
+        "loadtest",
+        "knee",
+        "rtf",
+        "perf-ledger",
+        "compare"
+      ],
+      "last_written_at": "2026-09-03T00:00:00Z",
+      "name": "hardware-certification",
+      "pinned": false,
+      "tech_stack": [
+        "python"
+      ]
+    },
+    {
+      "api_surface": "",
+      "business_feature": "The sealed appliance",
+      "category": "config",
+      "cross_refs": [
+        "helm-chart-and-autoscaling",
+        "cloud-bootstrap"
+      ],
+      "db_tables": [],
+      "description": "What the artifact is, as a checkable fact: a multi-stage image whose bake stage fetches every model at build time so the runtime can run with no network (offline hub mode fails loudly on a missing bake), a build-time import gate over every capability module, an air-gap installer, and the CI workflow that boots the image with no network and proves it can clone, synthesize, transcribe and converse.",
+      "entry_points": [
+        "Dockerfile"
+      ],
+      "file_paths": [
+        "service/appliance.py",
+        "Dockerfile",
+        "scripts/airgap-install.sh",
+        "scripts/gravitone-build.mjs",
+        "scripts/gravitone-build.test.mjs",
+        ".github/workflows/sealed.yml",
+        "requirements.txt"
+      ],
+      "group": "Certification and deployment",
+      "group_id": "eaa83a86-71ec-4ff5-a89a-55d932d15ddc",
+      "id": "528bfff4-5b1e-4008-b608-4cfce01f5b93",
+      "keywords": [
+        "docker",
+        "sealed",
+        "offline",
+        "air-gap",
+        "bake",
+        "models",
+        "arm64",
+        "ci"
+      ],
+      "last_written_at": "2026-09-03T00:00:00Z",
+      "name": "sealed-appliance-image",
+      "pinned": false,
+      "tech_stack": [
+        "python"
+      ]
+    },
+    {
+      "api_surface": "helm install gravitone deploy/helm/gravitone -f gravitone-values.yaml",
+      "business_feature": "Helm chart",
+      "category": "config",
+      "cross_refs": [
+        "replica-scaling",
+        "sealed-appliance-image"
+      ],
+      "db_tables": [],
+      "description": "The fleet chart: one deployment per measured topology, a persistent volume for voices, a secret for the root key, a horizontal autoscaler and an event-driven scaler whose metric is queue depth (the pre-429 signal). Its defaults are one box's numbers; the plan compiler writes the overlay for other silicon.",
+      "entry_points": [
+        "deploy/helm/gravitone/values.yaml"
+      ],
+      "file_paths": [
+        "deploy/helm/gravitone/Chart.yaml",
+        "deploy/helm/gravitone/values.yaml",
+        "deploy/helm/gravitone/README.md",
+        "deploy/helm/gravitone/templates/deployment.yaml",
+        "deploy/helm/gravitone/templates/hpa.yaml",
+        "deploy/helm/gravitone/templates/keda-scaledobject.yaml",
+        "deploy/helm/gravitone/templates/pvc.yaml",
+        "deploy/helm/gravitone/templates/secret.yaml",
+        "deploy/helm/gravitone/templates/service.yaml",
+        "deploy/helm/gravitone/templates/_helpers.tpl",
+        "deploy/helm/gravitone/templates/NOTES.txt"
+      ],
+      "group": "Certification and deployment",
+      "group_id": "eaa83a86-71ec-4ff5-a89a-55d932d15ddc",
+      "id": "e1bbaf71-e970-4080-821a-3f60158663a6",
+      "keywords": [
+        "helm",
+        "kubernetes",
+        "hpa",
+        "keda",
+        "scaledobject",
+        "autoscaling",
+        "queue-depth",
+        "pvc",
+        "probes"
+      ],
+      "last_written_at": "2026-09-03T00:00:00Z",
+      "name": "helm-chart-and-autoscaling",
+      "pinned": false,
+      "tech_stack": [
+        "helm",
+        "kubernetes"
+      ]
+    },
+    {
+      "api_surface": "deploy/aws-oneclick.sh up|stop",
+      "business_feature": "One-command cloud deploy",
+      "category": "config",
+      "cross_refs": [
+        "sealed-appliance-image"
+      ],
+      "db_tables": [],
+      "description": "The other two ways to a running endpoint: a one-command cloud-CLI script, a stack template, an instance bootstrap and a systemd unit, with the least-privilege policy they need.",
+      "entry_points": [
+        "deploy/aws-oneclick.sh"
+      ],
+      "file_paths": [
+        "deploy/aws-oneclick.sh",
+        "deploy/bootstrap.sh",
+        "deploy/cloudformation.yaml",
+        "deploy/gravitone-unit.sh",
+        "deploy/README.md",
+        "aws/iam-policy.json",
+        "aws/README.md"
+      ],
+      "group": "Certification and deployment",
+      "group_id": "eaa83a86-71ec-4ff5-a89a-55d932d15ddc",
+      "id": "09c03767-8dde-4dac-80da-6eed41534d55",
+      "keywords": [
+        "aws",
+        "cloudformation",
+        "bootstrap",
+        "systemd",
+        "iam",
+        "one-click"
+      ],
+      "last_written_at": "2026-09-03T00:00:00Z",
+      "name": "cloud-bootstrap",
+      "pinned": false,
+      "tech_stack": [
+        "shell",
+        "cloudformation"
+      ]
+    },
+    {
+      "api_surface": "MCP stdio server",
+      "business_feature": "MCP tools",
+      "category": "api",
+      "cross_refs": [
+        "tts-http-api"
+      ],
+      "db_tables": [],
+      "description": "The tool server that exposes the service to agent hosts: a manifest of tools, a call bridge over the HTTP API, and its own node test suite.",
+      "entry_points": [
+        "agents/mcp-gravitone/server.mjs"
+      ],
+      "file_paths": [
+        "agents/mcp-gravitone/server.mjs",
+        "agents/mcp-gravitone/lib/call.mjs",
+        "agents/mcp-gravitone/lib/config.mjs",
+        "agents/mcp-gravitone/lib/manifest.mjs",
+        "agents/mcp-gravitone/lib/rpc.mjs",
+        "agents/mcp-gravitone/test/call.test.mjs",
+        "agents/mcp-gravitone/test/manifest.test.mjs",
+        "agents/mcp-gravitone/package.json"
+      ],
+      "group": "Integrations",
+      "group_id": "53db4c2d-1e7f-4a7f-afb7-0e0d977f1814",
+      "id": "5cee1ff5-e2f7-40e8-8e43-5fc7e7be63b6",
+      "keywords": [
+        "mcp",
+        "tools",
+        "manifest",
+        "rpc",
+        "agent-host"
+      ],
+      "last_written_at": "2026-09-03T00:00:00Z",
+      "name": "mcp-server",
+      "pinned": false,
+      "tech_stack": [
+        "node"
+      ]
+    },
+    {
+      "api_surface": "Next.js app",
+      "business_feature": "Web studio",
+      "category": "ui",
+      "cross_refs": [
+        "tts-http-api",
+        "takes-and-review"
+      ],
+      "db_tables": [],
+      "description": "The web companion: playground, voices, keys, benchmarks and profile pages, shared take and review pages, and its narration bake script.",
+      "entry_points": [
+        "web/app/page.tsx"
+      ],
+      "file_paths": [
+        "web/app",
+        "web/components",
+        "web/lib",
+        "web/scripts",
+        "web/package.json"
+      ],
+      "group": "Integrations",
+      "group_id": "53db4c2d-1e7f-4a7f-afb7-0e0d977f1814",
+      "id": "2aeb25c5-dd61-43c7-8762-9d1e93bb5f89",
+      "keywords": [
+        "web",
+        "studio",
+        "playground",
+        "benchmarks",
+        "keys",
+        "react"
+      ],
+      "last_written_at": "2026-09-03T00:00:00Z",
+      "name": "web-studio",
+      "pinned": false,
+      "tech_stack": [
+        "typescript",
+        "nextjs"
+      ]
+    },
+    {
+      "api_surface": "python -m unittest service.tests.<module>",
+      "business_feature": "Service test harness",
+      "category": "test",
+      "cross_refs": [
+        "synthesis-engine-pool"
+      ],
+      "db_tables": [],
+      "description": "Seventy-odd unittest modules over the service, made runnable without model weights by a fake engine that installs dependency shims on import and an engine conformance suite every mouth must pass. The ship gate is the full per-module loop; a wave is never green on a subset.",
+      "entry_points": [
+        "service/tests/fake_engine.py"
+      ],
+      "file_paths": [
+        "service/tests/fake_engine.py",
+        "service/tests/engine_conformance.py",
+        "service/tests/fixtures",
+        "docs/harness/harness-learnings.md"
+      ],
+      "group": "Quality harness",
+      "group_id": "bfb1ca2e-d9a3-4467-9fb3-07a86847b1fe",
+      "id": "2ab7f2b1-9264-4839-8b27-fde7345e174c",
+      "keywords": [
+        "unittest",
+        "fake-engine",
+        "shims",
+        "conformance",
+        "ship-gate"
+      ],
+      "last_written_at": "2026-09-03T00:00:00Z",
+      "name": "service-test-harness",
+      "pinned": false,
+      "tech_stack": [
+        "python"
+      ]
+    }
+  ],
+  "generated_at": "2026-09-03T00:00:00Z",
+  "generator": "registry onboarding (intake-kube-0903)",
+  "groups": [
+    {
+      "id": "bc974195-fa3d-46e8-9119-7b987d0cdec4",
+      "name": "Speech synthesis",
+      "domain": "feature",
+      "color": "amber",
+      "context_count": 4
+    },
+    {
+      "id": "52aedede-30e8-41a0-98a4-a4f6c8a4958e",
+      "name": "Capacity and admission",
+      "domain": "infrastructure",
+      "color": "red",
+      "context_count": 2
+    },
+    {
+      "id": "9ac5e3d7-7727-4fe3-9c0a-a70603177e86",
+      "name": "Listening",
+      "domain": "feature",
+      "color": "blue",
+      "context_count": 2
+    },
+    {
+      "id": "7976a553-28fb-452b-bfc1-ece5c48a9a13",
+      "name": "Conversation",
+      "domain": "feature",
+      "color": "violet",
+      "context_count": 3
+    },
+    {
+      "id": "ef03c601-30ca-4eda-9558-d7fd485153d8",
+      "name": "Voices and characters",
+      "domain": "data",
+      "color": "green",
+      "context_count": 3
+    },
+    {
+      "id": "eaa83a86-71ec-4ff5-a89a-55d932d15ddc",
+      "name": "Certification and deployment",
+      "domain": "infrastructure",
+      "color": "slate",
+      "context_count": 4
+    },
+    {
+      "id": "53db4c2d-1e7f-4a7f-afb7-0e0d977f1814",
+      "name": "Integrations",
+      "domain": "integration",
+      "color": "teal",
+      "context_count": 2
+    },
+    {
+      "id": "bfb1ca2e-d9a3-4467-9fb3-07a86847b1fe",
+      "name": "Quality harness",
+      "domain": "shared",
+      "color": "gray",
+      "context_count": 1
+    }
+  ],
+  "project": {
+    "id": "c8a1bbd0-c103-41bb-9c6d-fd17457d3188",
+    "name": "gravitone",
+    "root": "."
+  },
+  "provenance": {
+    "git_commit": "a3e94cfa9d79086003667ae73495d8a8745bc24a",
+    "git_commit_count": 314
+  },
+  "stats": {
+    "contexts": 21,
+    "files": 92,
+    "groups": 8,
+    "use_cases": 0
+  },
+  "taxonomy": {
+    "context_categories": [
+      "ui",
+      "api",
+      "lib",
+      "data",
+      "test",
+      "config"
+    ],
+    "group_domains": [
+      "feature",
+      "infrastructure",
+      "shared",
+      "integration",
+      "data"
+    ]
+  },
+  "use_cases": [],
+  "version": 2
+}
