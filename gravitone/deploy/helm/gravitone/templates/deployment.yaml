@@ -15,6 +15,16 @@ spec:
     metadata:
       labels:
         {{- include "gravitone.selectorLabels" . | nindent 8 }}
+      {{- if not .Values.apiKey.existingSecret }}
+      annotations:
+        # A rotated root key must reach running pods. The key arrives through
+        # envFrom, which never changes the pod template, so without this a
+        # `helm upgrade --set apiKey.value=...` rolled nothing and every pod
+        # kept the old key. The checksum changes when the secret does, and the
+        # changed template rolls the pods. Skipped for existingSecret: the chart
+        # does not render that secret and cannot fingerprint it.
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+      {{- end }}
     spec:
       {{- with .Values.nodeSelector }}
       nodeSelector:
@@ -44,6 +54,10 @@ spec:
               value: {{ .Values.tts.language | quote }}
             - name: TTS_HOST
               value: "0.0.0.0"
+            # Where the fleet lives: the headless peers Service, so /metrics can
+            # sum the admission queue over every pod for the scaler.
+            - name: TTS_FLEET_PEERS
+              value: {{ printf "%s-peers.%s.svc" (include "gravitone.fullname" .) .Release.Namespace | quote }}
           envFrom:
             - secretRef:
                 name: {{ include "gravitone.secretName" . }}

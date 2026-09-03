@@ -50,6 +50,19 @@ service:
   type: LoadBalancer
   port: 8080
 
+# Voluntary disruptions (node drains, upgrades) may not take the last serving
+# replica; the drain refuses loudly instead of succeeding silently.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# THESE DEFAULTS ARE ONE BOX'S NUMBERS (see the header). A values overlay written
+# by `python -m service.plan` carries a `certificate:` header naming the
+# certification sha and the hardware fingerprint it was compiled from. Installing
+# without one is allowed only when you say so here - the chart policy gate
+# (scripts/check-chart.mjs) refuses a values file that has neither.
+allowUncertified: true
+
 # Shared voices store. Multi-replica writes (cloning on one replica, serving
 # on another) need a ReadWriteMany storage class (EFS/Filestore); with
 # persistence off each replica keeps its own built-in voices only.
@@ -66,10 +79,13 @@ autoscaling:
   #          scaler polling /metrics (requires KEDA installed in the cluster)
   #
   # KEDA CAVEAT — this is where the choice is made, so this is where it is
-  # stated. The scaler reads `metrics.queued` from ONE /metrics response. In a
-  # k8s Deployment each pod is its own process behind a Service, so that is a
-  # real per-pod queue and keda mode is sound. It is NOT sound when several
-  # replicas share a port: `python -m service.replicas` on Linux uses
+  # stated. The scaler reads ONE /metrics response, and the ClusterIP hands
+  # that poll to one arbitrary pod. Each pod's `metrics.queued` is real, and it
+  # is a sample: a fleet of eight with one hot pod scaled on a coin flip. So
+  # the scaler reads `fleet.queued` instead — the sum over every pod named by
+  # the headless peers Service (templates/service-headless.yaml, service/fleet.py)
+  # — and the same number comes back whichever pod answered. It is NOT sound
+  # when several replicas share a port: `python -m service.replicas` on Linux uses
   # SO_REUSEPORT, and its aggregated /metrics is explicitly a
   # `single_replica_sample` with `totals: null` — scaling on it would size the
   # fleet from one arbitrary replica's queue. `python -m service.plan` applies
@@ -81,5 +97,5 @@ autoscaling:
   maxReplicas: 12
   cpuTargetPercent: 70
   keda:
-    queuedTarget: "4"      # scale out when avg queued requests per replica exceeds this
+    queuedTarget: "4"      # scale out when fleet.queued / replicas exceeds this (AverageValue)
     pollingInterval: 15
