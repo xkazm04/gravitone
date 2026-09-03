@@ -6,7 +6,7 @@
 schema: ai-manifest
 schemaVersion: 0.1.0
 generatedAt: "2026-09-03"
-generatedFrom: [Dockerfile, requirements.txt, .github/workflows/sealed.yml, .github/workflows/perf-ledger.yml, docs/harness/harness-learnings.md, deploy/helm/gravitone/values.yaml]
+generatedFrom: [gravitone/Dockerfile, gravitone/requirements.txt, .github/workflows/ci.yml, gravitone/docs/harness/harness-learnings.md, gravitone/deploy/helm/gravitone/values.yaml]
 
 repo:
   name: gravitone
@@ -19,53 +19,59 @@ repo:
 # to true once it has actually run the command. There is no pytest in this repo: the suite is
 # unittest, one module per run, and the ship gate is the full per-module loop (a wave is never
 # green on a subset). `service/tests/fake_engine.py` shims the model dependencies on import, so the
-# suite runs without weights or torch.
+# suite runs without weights or torch. Since upstream commit a0374e1 the app lives under
+# `gravitone/`; every command below runs from that directory.
 capabilities:
   # One module. Verified 2026-09-03: `python -m unittest service.tests.test_auth` -> 8 tests OK.
-  test-module: { command: "python -m unittest service.tests.<module>", verified: true }
+  test-module: { command: "cd gravitone && python -m unittest service.tests.<module>", verified: true }
   # The full loop the harness doc names as the ship gate (subprocess per module).
-  test: { command: "for m in service/tests/test_*.py; do python -m unittest \"service.tests.$(basename ${m%.py})\" || exit 1; done", verified: false }
-  test-web: { command: "cd web && npm test", verified: false }
-  test-mcp: { command: "cd agents/mcp-gravitone && npm test", verified: false }
-  typecheck-web: { command: "cd web && npx tsc --noEmit", verified: false }
-  build-web: { command: "cd web && npm run build", verified: false }
-  lint-web: { command: "cd web && npm run lint", verified: false }
+  test: { command: "cd gravitone && for m in service/tests/test_*.py; do python -m unittest \"service.tests.$(basename ${m%.py})\" || exit 1; done", verified: false }
+  # What CI runs for the service (ci.yml installs pytest; it is not a local dependency).
+  test-service-ci: { command: "cd gravitone && python -m pytest service/tests -q", verified: false }
+  test-web: { command: "cd gravitone/web && npm test", verified: false }
+  test-mcp: { command: "cd gravitone/agents/mcp-gravitone && npm test", verified: false }
+  typecheck-web: { command: "cd gravitone/web && npx tsc --noEmit", verified: false }
+  build-web: { command: "cd gravitone/web && npm run build", verified: false }
+  lint-web: { command: "cd gravitone/web && npm run lint", verified: false }
   # The artifact. BASE_IMAGE is an Arm image; the bake stage fetches every model at build time.
-  build-image: { command: "docker build -t gravitone .", verified: false }
+  build-image: { command: "cd gravitone && docker build -t gravitone .", verified: false }
   # Measure -> plan -> deploy (deploy/README.md). The plan compiler writes the chart overlay.
-  benchmark: { command: "bash benchmark_arm.sh", verified: false }
-  certify: { command: "python -m service.certify", verified: false }
-  plan-helm-values: { command: "python -m service.plan certification.json --emit helm-values", verified: false }
-  chart-render: { command: "helm template gravitone deploy/helm/gravitone", verified: false }
+  benchmark: { command: "cd gravitone && bash benchmark_arm.sh", verified: false }
+  certify: { command: "cd gravitone && python -m service.certify", verified: false }
+  plan-helm-values: { command: "cd gravitone && python -m service.plan certification.json --emit helm-values", verified: false }
+  chart-render: { command: "helm template gravitone gravitone/deploy/helm/gravitone", verified: false }
   # Runs the service locally (needs the model weights; under test the fake engine replaces them).
-  serve: { command: "python -m service.app", verified: false }
+  serve: { command: "cd gravitone && python -m service.app", verified: false }
 
 # Pointers — these subsystems can change format underneath without breaking this contract.
 paths:
   spec: .ai/SPEC.md
+  # The owner's generator writes this map (nested groups shape); the registry map is built from it.
   contextMap: context-map.json
-  docs: docs/
-  deploy: deploy/
-  chart: deploy/helm/gravitone/
-  harnessLearnings: docs/harness/harness-learnings.md
+  app: gravitone/
+  docs: gravitone/docs/
+  deploy: gravitone/deploy/
+  chart: gravitone/deploy/helm/gravitone/
+  harnessLearnings: gravitone/docs/harness/harness-learnings.md
 
 boundaries:
   # Model weights, voices and recordings are assets, not code: never edited by an agent, never
   # committed as a change. ingest_jobs/ is runtime state the ingest pipeline leaves behind.
-  neverTouch: [piper_voices/, diarization_models/, voices/, recordings/, ingest_jobs/]
-  generatedNotHandEdited: [context-map.json, web/package-lock.json, agents/mcp-gravitone/package-lock.json]
+  neverTouch: [piper_voices/, diarization_models/, gravitone/voices/, recordings/, ingest_jobs/]
+  generatedNotHandEdited: [context-map.json, gravitone/web/package-lock.json, gravitone/agents/mcp-gravitone/package-lock.json]
   secretsFrom: "the root xi-api-key comes from TTS_API_KEY in the environment (chart: apiKey.value or apiKey.existingSecret); issued keys live in the service's key store; the GitHub remote is PUBLIC — never commit a key"
 
-# The control model: where each capability is PRIMARILY enforced. `.github/workflows/sealed.yml`
-# boots the sealed image with no network and proves it can clone, synthesize, transcribe and
-# converse, then asserts that egress FAILS; `perf-ledger.yml` gates on the load-test differ.
+# The control model: where each capability is PRIMARILY enforced. `.github/workflows/ci.yml` is the
+# authority: a studio job (typecheck, unit tests, production build under gravitone/web) and a
+# service job (the fake-engine suite under pytest). The sealed-appliance and perf-ledger workflows
+# ship as `.example` files and run nowhere until an aarch64 runner is wired.
 controls:
-  ciHardPass: [build-image, test-mcp]
-  ciAdvisory: [benchmark]
+  ciHardPass: [typecheck-web, test-web, build-web, test-service-ci]
+  ciAdvisory: []
   localGate: [test]
   notes:
-    - "sealed.yml needs an aarch64 runner; it is the appliance's proof, not a unit gate."
-    - "perf-ledger.yml compares load-test results against the ledger (service/compare.py)."
+    - "sealed.yml.example needs an aarch64 runner; it is the appliance's proof, not a unit gate."
+    - "perf-ledger.yml.example compares load-test results against the ledger (service/compare.py)."
 
 registry:
   remote: github:xkazm04/ai-registry

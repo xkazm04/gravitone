@@ -3,7 +3,7 @@ subject: software-engineering/deployment-contract
 project: gravitone
 raised_by: intake intake-kube-0903
 source: librarian/sources/2026-09-03-kube-rs.md (peer study points 7, 8; the same finding kp measured this run)
-stage: deploy/helm/gravitone/templates - a PodDisruptionBudget and a secret checksum annotation on the pod template
+stage: (paths under gravitone/ since upstream a0374e1) deploy/helm/gravitone/templates - a PodDisruptionBudget and a secret checksum annotation on the pod template
 size: 2 files / ~40 lines / S
 status: accepted
 ---
