@@ -1,0 +1,69 @@
+{
+  "name": "gravitone-web",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "bake:narration": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/bake-narration.ts",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@sentry/nextjs": "^10.69.0",
+    "firebase": "^12.16.0",
+    "framer-motion": "^12.38.0",
+    "lucide-react": "^1.29.0",
+    "next": "^15.5.4",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.1.13",
+    "@testing-library/dom": "^10.4.1",
+    "@testing-library/jest-dom": "^7.0.0",
+    "@testing-library/react": "^16.3.2",
+    "@types/node": "^22.10.2",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^6.0.4",
+    "jsdom": "^29.1.1",
+    "postcss": "^8.5.23",
+    "tailwindcss": "^4.1.13",
+    "typescript": "^5.7.2",
+    "vitest": "^3.2.7"
+  },
+  "//overrides": [
+    "`npm audit` reported 3 high / 0 critical and offered `npm audit fix`. Run",
+    "plainly, that fix changed NOTHING but the lockfile's next line (15.5.4 ->",
+    "15.5.22) and left all three standing, because next@15.5.x pins postcss and",
+    "sharp EXACTLY (8.4.31 / 0.34.5) — a nested pin is out of reach of a range",
+    "bump. npm's own next suggestion was `--force`, i.e. next@16.3.0: a major",
+    "upgrade, which is not a decision an audit run is allowed to make.",
+    "",
+    "These two overrides are the fix that does not need one. After them the tree",
+    "reports 0 vulnerabilities, with next still on 15.5.22.",
+    "",
+    "postcss is pinned to THIS package's own devDependency ($postcss, ^8.5.23),",
+    "which is already what tailwind, vite and vitest all resolve to — so the",
+    "override DEDUPES the tree rather than adding a version, and next stops",
+    "carrying a private 8.4.31. Closes GHSA-qx2v-qp2m-jg93 (</style> XSS in the",
+    "stringifier) and the three sourceMappingURL arbitrary-.map-read advisories.",
+    "",
+    "sharp ^0.35.0 is a 0.x MINOR, which for sharp is where libvips moves (to",
+    "8.18) — the one of the two carrying real, if small, risk. It is the version",
+    "next@16 itself depends on, it is used here only by image optimization, and",
+    "the full test suite and a production `next build` were both run against it",
+    "before this landed. Closes the four inherited libvips CVEs (GHSA-f88m-g3jw",
+    "-g9cj).",
+    "",
+    "If next moves past its own pins, delete this block and re-audit rather than",
+    "letting a stale override quietly hold a dependency back."
+  ],
+  "overrides": {
+    "postcss": "$postcss",
+    "sharp": "^0.35.0"
+  }
+}

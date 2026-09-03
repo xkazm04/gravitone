@@ -1,0 +1,40 @@
+.venv/
+__pycache__/
+*.pyc
+logs/
+results/
+samples/
+voices/*.safetensors
+*.wav
+*.mp3
+service/loadtest_result.json
+.research-cache/
+.env
+# deploy/aws-oneclick.sh mints the deployment's ROOT API key into the directory
+# it is run from — which the README tells you is the repo. Untracked-but-not-
+# ignored, it was one `git add -A` away from being published.
+.gravitone-deploy-key
+api_keys.json
+emotion_demand.json
+# Anchored: these are the runtime take/review stores at this directory's root.
+# Unanchored they also swallow web/app/api/takes and web/app/api/reviews, which
+# are tracked source.
+/takes/
+/reviews/
+# Same anchoring, same reason: the runtime call-recording store (and the gym's
+# replay artifacts next to it) live at this root; unanchored `recordings/` also
+# swallowed web/app/api/gym/recordings, which is tracked source.
+/recordings/
+/gym-runs/
+.worktrees/
+ingest_jobs/
+# The video pipeline's own job workdirs, same shape as ingest_jobs/: a fetched
+# video, its frames, a narration track and the muxed result. Megabytes per job,
+# reclaimed by their own GC — never source.
+voiceover_jobs/
+revoice_jobs/
+# Demo renders written by hand while verifying those two pipelines end to end.
+*_demo.mp4
+piper_voices/
+diarization_models/
+build_store/

@@ -1,0 +1,284 @@
+# PARKED — the `.example` suffix means GitHub does not run this file. It was an
+# active workflow until 2026-08-05, when it was parked because it had failed
+# 100% of its runs, dying in setup after 13–18 seconds: it builds an
+# aarch64-only image (armswdev/pytorch-arm-neoverse) and no Arm runner is
+# attached to this repository. To run it for real you need an **aarch64 Arm
+# runner with Docker** (self-hosted Graviton, or a GitHub-hosted `ubuntu-*-arm`
+# runner); cross-building under QEMU would invalidate the very timings the
+# sealed tier claims, so emulation is not a substitute. Restore it by renaming
+# back to `sealed.yml` once that runner exists. The header below is unchanged.
+#
+# Sealed Appliance gate — does the artifact actually work with the cable pulled?
+#
+# ############################################################################
+# # AUTHORED, NEVER RUN. Every step below was written against the repo and    #
+# # reviewed structurally; NOT ONE OF THEM HAS EXECUTED. This image is        #
+# # aarch64-only (armswdev/pytorch-arm-neoverse) and the box this was written #
+# # on is Windows x86 with no docker, so the build could not be attempted.    #
+# # Treat the first real run as a debugging session, not a verification:      #
+# # expect to fix runner labels, the pocket-tts/piper download entry points,  #
+# # and per-step timeouts. Until it has gone green once, the ONLY thing this  #
+# # file proves is intent.                                                    #
+# ############################################################################
+#
+# What it is for: the capability gate is the entire credibility of the sealed
+# tier. The claim is not "we removed the network calls" (unfalsifiable by
+# reading) but "the whole product runs under `docker run --network none`":
+# clone -> synthesize -> /v1/speech-to-text -> a scripted convai turn, with no
+# route to anywhere. An egress attempt cannot succeed in that namespace, so a
+# weight that was not baked surfaces as a FAILED STEP rather than as a customer
+# discovering it on first boot.
+#
+# LEGAL TODO (listed, deliberately NOT resolved here — packaging-deployment.md
+# M1 "Risks"): redistribution of model weights inside a shipped image needs a
+# licence review. Piper itself is MIT; the Whisper/CTranslate2 conversion
+# (Systran/faster-whisper-*) and the sherpa-onnx model releases
+# (pyannote-segmentation-3.0, WeSpeaker CAM++) each need confirming before this
+# artifact is handed to a third party. service/appliance.py carries the same
+# note in-band as `license_review`, so nobody can ship the image and believe the
+# question was settled.
+
+name: sealed-appliance
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      # Repo root is arm/; the application root is gravitone/. Path filters are
+      # workspace-relative; the `run:` steps get the prefix from
+      # defaults.working-directory below (which also makes `docker build .`
+      # use gravitone/ as its build context).
+      - "gravitone/Dockerfile"
+      - "gravitone/requirements.txt"
+      - "gravitone/service/**"
+      - "gravitone/scripts/airgap-install.sh"
+      - ".github/workflows/sealed.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  sealed:
+    # An Arm64 runner is REQUIRED, not a preference: the base image has no
+    # x86 variant, and QEMU emulation of a torch build is slow enough to be a
+    # different thing. GitHub-hosted `ubuntu-24.04-arm` or a self-hosted
+    # Graviton box both work; the label is the first thing to fix on a real run.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+
+    defaults:
+      run:
+        # Repo root is arm/; `docker build ... .` must see the application root.
+        working-directory: gravitone
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sanity — this must be an aarch64 runner
+        run: |
+          set -eu
+          arch="$(uname -m)"
+          echo "runner arch: $arch"
+          [ "$arch" = "aarch64" ] || { echo "!! sealed builds need an Arm64 runner"; exit 1; }
+
+      - name: Build the sealed image
+        run: |
+          set -eu
+          docker build -t gravitone:sealed-ci .
+
+      # The image says what it is before anything is asked of it. --check exits
+      # non-zero on an unsealed tree, so a bake that half-failed dies here with
+      # the missing component named, not three steps later as a mystery 503.
+      - name: Manifest — the image must report itself sealed
+        run: |
+          set -eu
+          docker run --rm --network none gravitone:sealed-ci \
+            python -m service.appliance --check | tee appliance.json
+
+      - name: Start the appliance with NO network at all
+        run: |
+          set -eu
+          # --network none is the whole test. Not a firewall rule, not an egress
+          # proxy: the container has a loopback interface and nothing else, so
+          # any DNS lookup or HTTPS fetch fails at the syscall.
+          docker run -d --name sealed --network none \
+            -e TTS_WORKERS=1 -e TTS_TORCH_THREADS=4 \
+            gravitone:sealed-ci
+          # No curl is assumed inside the image; python is always there.
+          probe='import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:8080/health", timeout=3).read().decode())'
+          for _ in $(seq 1 60); do
+            docker exec sealed python -c "$probe" && break
+            sleep 5
+          done
+          docker exec sealed python -c "$probe"
+
+      # The capability script is written here and copied IN rather than baked
+      # into the image: it is a test, and a test that ships to customers is a
+      # support surface. It lives in this file (not .github/scripts/) so the
+      # whole gate is one reviewable unit.
+      - name: Capability gate — clone, synthesize, transcribe, converse
+        run: |
+          set -eu
+          cat > check.py <<'PY'
+          import asyncio, io, json, math, struct, sys, urllib.request, wave
+
+          BASE = "http://127.0.0.1:8080"
+
+
+          def get(path):
+              with urllib.request.urlopen(BASE + path, timeout=120) as r:
+                  return json.loads(r.read().decode())
+
+
+          def fail(msg):
+              print("!! " + msg)
+              sys.exit(1)
+
+
+          def tone_wav(seconds=3.0, rate=16000, freq=180.0):
+              """A synthetic clip. Not speech — the clone path is being tested for
+              REACHABILITY offline (does it run without fetching anything?), not
+              for voice quality, which has its own suites."""
+              frames = b"".join(
+                  struct.pack("<h", int(12000 * math.sin(2 * math.pi * freq * i / rate)))
+                  for i in range(int(rate * seconds)))
+              buf = io.BytesIO()
+              with wave.open(buf, "wb") as w:
+                  w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate)
+                  w.writeframes(frames)
+              return buf.getvalue()
+
+
+          def post_multipart(path, fields, filename=None, blob=None, field="file"):
+              boundary = "----gravitone-sealed-gate"
+              body = b""
+              for key, value in fields.items():
+                  body += (f"--{boundary}\r\nContent-Disposition: form-data; "
+                           f'name="{key}"\r\n\r\n{value}\r\n').encode()
+              if blob is not None:
+                  body += (f"--{boundary}\r\nContent-Disposition: form-data; "
+                           f'name="{field}"; filename="{filename}"\r\n'
+                           "Content-Type: audio/wav\r\n\r\n").encode() + blob + b"\r\n"
+              body += f"--{boundary}--\r\n".encode()
+              req = urllib.request.Request(
+                  BASE + path, data=body,
+                  headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+              with urllib.request.urlopen(req, timeout=600) as r:
+                  return json.loads(r.read().decode())
+
+
+          # 0. the manifest agrees it is sealed and complete
+          manifest = get("/v1/appliance")
+          if manifest["seal"] != "sealed":
+              fail(f"manifest says {manifest['seal']}: {manifest['missing']}")
+          for capability in ("synthesize", "clone", "speech_to_text", "converse"):
+              if not manifest["capabilities"].get(capability):
+                  fail(f"capability '{capability}' is absent in a sealed image")
+          if not manifest["offline_enforced"]:
+              fail("HF_HUB_OFFLINE is not set — a missing weight would silently download")
+          print("0/4 manifest: sealed,",
+                f"{manifest['model_bytes'] / 2**20:.0f} MiB of baked models")
+
+          # 1. clone — the attestation fields are required by service/voices.py
+          voice = post_multipart(
+              "/v1/voices",
+              {"character": "Sealed Gate", "emotion": "neutral", "attested": "true",
+               "statement": "CI-owned synthetic clip, cloned inside a sealed image."},
+              filename="sample.wav", blob=tone_wav())
+          voice_id = (voice.get("voices") or [voice])[0].get("voice_id") or voice.get("voice_id")
+          print("1/4 clone:", voice_id)
+
+          # 2. synthesize with the cloned voice
+          req = urllib.request.Request(
+              f"{BASE}/v1/text-to-speech/{voice_id}",
+              data=json.dumps({"text": "The cable is unplugged and I am still talking."}).encode(),
+              headers={"Content-Type": "application/json"})
+          with urllib.request.urlopen(req, timeout=600) as r:
+              audio = r.read()
+          if len(audio) < 1000:
+              fail(f"synthesis returned {len(audio)} bytes")
+          print(f"2/4 synthesize: {len(audio)} bytes of audio")
+
+          # 3. transcribe it back — the ears the old image did not have at all
+          stt = post_multipart("/v1/speech-to-text", {"model_id": "whisper-1"},
+                               filename="say.wav", blob=audio)
+          if "text" not in stt:
+              fail(f"speech-to-text returned no transcript: {stt}")
+          print("3/4 speech-to-text:", repr(stt["text"])[:80])
+
+          # 4. one scripted convai turn over the WebSocket. The scripted brain is
+          # the default (CONVAI_LLM=scripted) precisely so this needs no model
+          # server — the assertion is that the duplex session opens, announces
+          # itself and produces an agent turn, entirely inside this namespace.
+          async def one_turn():
+              import websockets
+              agents = get("/v1/convai/agents")
+              agent_id = (agents.get("agents") or agents)[0]["agent_id"]
+              url = f"ws://127.0.0.1:8080/v1/convai/conversation?agent_id={agent_id}"
+              async with websockets.connect(url, open_timeout=30) as ws:
+                  first = json.loads(await asyncio.wait_for(ws.recv(), 30))
+                  if first.get("type") != "conversation_initiation_metadata":
+                      fail(f"unexpected first frame: {first}")
+                  for _ in range(40):
+                      frame = json.loads(await asyncio.wait_for(ws.recv(), 60))
+                      if frame.get("type") in ("agent_response", "audio"):
+                          return frame["type"]
+              fail("no agent turn arrived")
+
+          print("4/4 convai:", asyncio.run(one_turn()))
+          print("SEALED: the whole product ran with no network.")
+          PY
+          docker cp check.py sealed:/tmp/check.py
+          docker exec sealed python /tmp/check.py
+
+      # Belt and braces: prove the namespace really is sealed, so a future
+      # runner change that quietly grants the container a network turns this
+      # job red instead of making every assertion above meaningless.
+      - name: Egress attempt must FAIL
+        run: |
+          set -eu
+          egress='import socket; socket.setdefaulttimeout(5); socket.create_connection(("huggingface.co", 443)); print("REACHED THE INTERNET")'
+          if docker exec sealed python -c "$egress"; then
+            echo "!! the sealed container reached the network — this gate proves nothing"
+            exit 1
+          fi
+          echo "egress blocked, as required"
+
+      - name: Slim variant still builds and reports UNSEALED honestly
+        run: |
+          set -eu
+          docker build --build-arg MODELS_STAGE=nobake --build-arg HF_HUB_OFFLINE=0 \
+            -t gravitone:slim-ci .
+          # Exit code 1 is the CORRECT outcome here: the slim image must not
+          # claim to be sealed. A zero would mean the seal means nothing.
+          if docker run --rm --network none gravitone:slim-ci \
+               python -m service.appliance --check; then
+            echo "!! the slim image reported itself sealed"
+            exit 1
+          fi
+
+      - name: Air-gap delivery — save, checksum, and the handover manifest
+        run: |
+          set -eu
+          bash scripts/airgap-install.sh save gravitone:sealed-ci gravitone-ci.tar
+          sha256sum -c gravitone-ci.tar.sha256
+          test -s gravitone-ci.manifest.json
+
+      - name: Collect the manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: appliance-manifest
+          # Workspace-relative; upload-artifact ignores defaults.working-directory.
+          path: |
+            gravitone/appliance.json
+            gravitone/gravitone-ci.manifest.json
+          if-no-files-found: warn
+
+      - name: Logs on failure
+        if: failure()
+        run: docker logs sealed || true
+
+      - name: Tear down
+        if: always()
+        run: docker rm -f sealed || true

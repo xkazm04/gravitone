@@ -1,0 +1,417 @@
+"""Re-voice jobs — the stateless door and the phase thread.
+
+The door takes the source URL and the LINES (character_id, text, start, end)
+rather than an ingest job id, deliberately:
+
+  * the studio already holds the scene (GET /v1/ingest/{job}/scene hands it
+    over, with timing since the sovereign-transcription work), and the user
+    EDITS it there — the edited script is the real input, not the job;
+  * ingest jobs are replica-affine and TTL'd; a re-voice should not die
+    because the scan that produced its Characters aged out an hour ago.
+
+Same job discipline as voiceover_api (def handlers, one phase thread, 429
+admission, TTL GC, authored failures), and since the copies of that discipline
+had started drifting apart it is now literally the same code: `service/jobs.py`
+holds the bookkeeping, this module holds its own state and its own phases. The
+LIFECYCLES stay separate because they genuinely are — a narration is one
+render, a re-voice may be re-run line by line as the user punches in — so
+`_run_job` and the door are this module's alone.
+
+Steps: fetch → direct → speak → mux. `direct` is the brain assigning one
+emotion per line from the Character's real stems (skippable, `direct:false`);
+`speak` runs every line through revoice.fit_line's ladder and the fit report
+is the product as much as the mp4 is.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import threading
+import time
+from pathlib import Path
+
+from fastapi import APIRouter
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+from service import brain as brain_mod
+from service import errors, frames, ingest_url, jobs, revoice, voiceover
+from service.config import REPO_ROOT, _int, _str
+from service.emotions import resolve
+from service.voiceover_api import _engine_speak
+from service.voices import emotion_map, prosody_map
+
+logger = logging.getLogger("gravitone.revoice")
+
+router = APIRouter()
+RV = "/v1/revoice"
+
+WORK_DIR = Path(_str("REVOICE_WORK_DIR", str(REPO_ROOT / "revoice_jobs")))
+MAX_ACTIVE = _int("REVOICE_MAX_JOBS", 1)
+MAX_LINES = _int("REVOICE_MAX_LINES", 200)
+MAX_SECONDS = float(_str("REVOICE_MAX_SECONDS", "") or 900)
+
+_TTL_S = 30 * 60
+_RUNNING_TTL_S = 120 * 60
+#: A work dir is NEVER deleted the instant its job dies: a `FileResponse` for
+#: revoiced.mp4 / track.wav may still be streaming out of it. Every deletion is
+#: deferred by this grace and performed by `_gc` — one reclamation path, so no
+#: door has to reason about who might be reading.
+_REAP_GRACE_S = 60
+
+JOBS: dict[str, dict] = {}
+_LOCK = threading.Lock()
+#: (deadline, work_dir) — the ONLY place a work dir is removed from disk.
+_REAP: list[tuple[float, str]] = []
+
+#: Admission is a HELD PERMIT, not a count derived from job status — the same
+#: discipline `engine.py` runs on. A count says "the door is free" the moment a
+#: worker stops writing `running`, which a worker killed by process exit or a
+#: BaseException never gets to do: the old `_active()` left MAX_ACTIVE=1 shut
+#: for the whole _RUNNING_TTL_S window. `_run_job` releases in a `finally`, so
+#: every exit path — return, exception, BaseException, cancel — frees it.
+_ADMIT = threading.BoundedSemaphore(max(MAX_ACTIVE, 0))
+
+STEPS = (("fetch", "fetching the video"),
+         ("direct", "composing the emotional read"),
+         ("speak", "re-performing every line"),
+         ("mux", "assembling the re-voiced video"))
+
+_PUBLIC_KEYS = ("id", "status", "step", "steps", "partial", "error", "source",
+                "brain", "result", "limits", "options")
+
+#: Stated on every job: what this pipeline does NOT preserve.
+_LIMIT_BED = ("the original background (music, ambience) is not carried over "
+              "— the output holds the new speech only; recovering the bed "
+              "needs source separation, which this box does not do")
+
+
+# ── registry plumbing ─────────────────────────────────────────────────────────
+# This used to be ~90 lines copied from voiceover_api, under a comment arguing
+# that sharing a base "would couple two lifecycles for ~60 lines of dict
+# bookkeeping". That was honest when it was written and it has since inverted:
+# TEN methods were character-for-character identical except for the module
+# global they closed over, and the last two rounds exist partly because a defect
+# fixed on one side survived untouched in its twin and had to be ported by hand,
+# twice. The seam moved to where the copies actually were — `service/jobs.py`
+# takes the BOOKKEEPING (which knows nothing about either pipeline), and the
+# lifecycles stay uncoupled where they genuinely differ: `_run_job` is NOT
+# shared (four steps against six, a fit ladder against a cloud vision pass), and
+# neither are the doors. The state below stays in this module on purpose — it is
+# what a deployment repoints and what a test patches.
+
+_REGISTRY = jobs.JobRegistry(__name__)
+
+_get = _REGISTRY.get
+_public = _REGISTRY.public
+_update = _REGISTRY.update
+_step = _REGISTRY.step
+_partial = _REGISTRY.partial
+_finish = _REGISTRY.finish
+_schedule_reap = _REGISTRY.schedule_reap
+_gc = _REGISTRY.gc
+_acquire_admission = _REGISTRY.acquire_admission
+_release_admission = _REGISTRY.release_admission
+_abandon_at_the_door = _REGISTRY.abandon_at_the_door
+
+
+def _new_job(source: dict, lines: list[dict], options: dict,
+             *, permit: bool = False) -> dict:
+    return _REGISTRY.new_job(permit=permit, source=source, lines=lines,
+                             options=options, limits=[_LIMIT_BED])
+
+
+# ── the phase thread ──────────────────────────────────────────────────────────
+
+_AUTHORED = (revoice.RevoiceError, voiceover.VoiceoverError,
+             frames.FramesError, brain_mod.BrainError,
+             ingest_url.LinkRefusal, errors.UserFacing)
+
+
+def _run_job(job: dict) -> None:
+    wd = Path(job["work_dir"])
+    cancelled = lambda: bool(job.get("cancel"))  # noqa: E731
+    lines = job["lines"]
+    try:
+        # ── fetch ─────────────────────────────────────────────────────────
+        _step(job, "fetch", "active")
+        video = ingest_url.download_video(job["source"]["url"], wd)
+        meta = frames.probe_video(video)
+        video_seconds = min(float(meta["duration"]), MAX_SECONDS)
+        _partial(job, {"video": {"seconds": meta["duration"],
+                                 "width": meta["width"],
+                                 "height": meta["height"]}})
+        _step(job, "fetch", "done")
+        if cancelled():
+            raise _Cancelled()
+
+        # ── direct ────────────────────────────────────────────────────────
+        _step(job, "direct", "active")
+        emaps = {cid: emotion_map(cid)
+                 for cid in {l["character_id"] for l in lines}}
+        by_char = {cid: sorted(m) for cid, m in emaps.items()}
+        mind = None
+        if job["options"]["direct"] or job["options"]["rewrite"]:
+            mind = brain_mod.make_brain()
+            _update(job, brain=mind.describe())
+        if job["options"]["direct"] and mind is not None:
+            plan = mind.complete_json(
+                revoice.direction_prompt(lines, by_char))
+            revoice.apply_direction(lines, plan, by_char)
+        else:
+            for l in lines:
+                l.setdefault("emotion", "baseline")
+                l["emotion_requested"] = None
+        _partial(job, {"directed": sum(1 for l in lines
+                                       if l["emotion"] != "baseline")})
+        _step(job, "direct", "done")
+        if cancelled():
+            raise _Cancelled()
+
+        # ── speak (the fit ladder, per line) ─────────────────────────────
+        _step(job, "speak", "active")
+        pmaps = {cid: prosody_map(cid) for cid in emaps}
+        fit_report: list[dict] = []
+        for n, l in enumerate(lines):
+            if cancelled():
+                raise _Cancelled()
+            _partial(job, {"spoken_done": n, "spoken_total": len(lines)})
+            emap = emaps[l["character_id"]]
+            voice_id, used, fell_back = resolve(l["emotion"], emap,
+                                                prosody=pmaps[l["character_id"]])
+            budget = float(l["end"]) - float(l["start"])
+            rewriter = None
+            if job["options"]["rewrite"] and mind is not None:
+                rewriter = (lambda text, max_words, _m=mind:
+                            _m.complete(revoice.rewrite_prompt(text, max_words),
+                                        temperature=0.3))
+            try:
+                fitted = revoice.fit_line(
+                    l["text"], budget,
+                    speak=lambda t, _v=voice_id: _engine_speak(_v, t),
+                    rewrite=rewriter)
+            except Exception as exc:  # noqa: BLE001 - one line must not cost the video
+                logger.warning("revoice line %s failed: %r", l["i"], exc)
+                fit_report.append({"i": l["i"], "character_id": l["character_id"],
+                                   "error": "this line could not be re-performed",
+                                   "method": None, "budget_seconds": round(budget, 2)})
+                continue
+            l["wav"] = fitted["wav"]
+            l["seconds"] = fitted["seconds"]
+            fit_report.append({
+                "i": l["i"], "character_id": l["character_id"],
+                "emotion": used, "stem_fallback": bool(fell_back),
+                "emotion_requested": l.get("emotion_requested"),
+                "budget_seconds": round(budget, 2),
+                "seconds": fitted["seconds"], "method": fitted["method"],
+                "atempo": fitted["atempo"],
+                "rewritten_text": fitted["rewritten_text"],
+                "spill_seconds": fitted["spill_seconds"], "error": None})
+        if fit_report and all(f.get("error") for f in fit_report):
+            # Every single line refused. Muxing here would hand the user a
+            # `done` video with a silent track — the expensive lie. Name it.
+            raise errors.UserFacing(
+                "not one line could be re-performed, so the re-voiced video "
+                "would be silent — the service log says why each line failed")
+        _step(job, "speak", "done")
+
+        # ── mux ───────────────────────────────────────────────────────────
+        _step(job, "mux", "active")
+        placements = [{"i": l["i"], "start": float(l["start"]),
+                       "end": float(l["end"])} for l in lines]
+        track_lines = [{"scene": l["i"], "text": l["text"],
+                        "emotion": l.get("emotion", "baseline"),
+                        "wav": l.get("wav"), "seconds": l.get("seconds")}
+                       for l in lines]
+        track, placed = voiceover.build_track(track_lines, placements,
+                                              video_seconds=video_seconds)
+        _merge_track_truth(fit_report, placed)
+        (wd / "track.wav").write_bytes(track)
+        (wd / "fit.json").write_text(json.dumps(fit_report), "utf-8")
+        voiceover.mux(video, wd / "track.wav", wd / "revoiced.mp4")
+        _step(job, "mux", "done")
+        methods = [f.get("method") for f in fit_report]
+        _finish(job, "done", result={
+            "fit": fit_report,
+            "summary": {
+                "lines": len(fit_report),
+                "verbatim": methods.count("verbatim"),
+                "atempo": methods.count("atempo"),
+                "rewritten": (methods.count("rewrite")
+                              + methods.count("rewrite+atempo")),
+                # `spilling` stays the ladder's ESTIMATE (unchanged meaning);
+                # the two below are measured against what is in the file.
+                "spilling": sum(1 for f in fit_report
+                                if f.get("spill_seconds")),
+                "spilling_in_track": sum(1 for f in fit_report
+                                         if f.get("track_spill_seconds")),
+                "clipped": sum(1 for f in fit_report
+                               if f.get("track_clipped_seconds")),
+                "silent_in_track": sum(1 for f in fit_report
+                                       if not f.get("in_track")),
+                "failed": sum(1 for f in fit_report if f.get("error")),
+            }})
+    except _Cancelled:
+        logger.info("revoice job %s: abandoned (cancelled)", job["id"])
+        _finish(job, "cancelled")
+    except _AUTHORED as exc:
+        _finish(job, "error", error=str(exc))
+    except Exception as exc:  # noqa: BLE001 - the boundary; sanitize and log
+        logger.exception("revoice job %s failed", job["id"])
+        _finish(job, "error",
+                error=errors.sanitize_detail("re-voicing this video", exc))
+    finally:
+        # The permit is released HERE and only here for a started job: a
+        # BaseException (or a worker torn down mid-flight) skips every `except`
+        # above but never this.
+        _release_admission(job)
+
+
+def _merge_track_truth(fit_report: list[dict], placed: list[dict]) -> None:
+    """Fold `build_track`'s accounting into the per-line fit report.
+
+    `fit_line`'s `spill_seconds` is an ESTIMATE: spoken seconds minus the slot,
+    computed for one line in isolation before anything is placed. `build_track`
+    measures what actually landed in track.wav — against the real video length
+    and the neighbouring slots — so a line truncated at the end of the video
+    spills less than the estimate claimed and loses seconds the estimate never
+    mentioned. Both numbers survive, named apart: `spill_seconds` is what the
+    ladder decided, `track_*` is what is in the mp4 the user downloads.
+    """
+    by_i = {p.get("scene"): p for p in placed}
+    for f in fit_report:
+        p = by_i.get(f["i"]) or {}
+        f["track_spill_seconds"] = round(float(p.get("spill_seconds") or 0.0), 2)
+        f["track_clipped_seconds"] = round(
+            float(p.get("clipped_seconds") or 0.0), 2)
+        # Some audio for this line is actually audible in the track.
+        f["in_track"] = bool(
+            (p.get("seconds") or 0.0) > (p.get("clipped_seconds") or 0.0))
+
+
+class _Cancelled(Exception):
+    pass
+
+
+# ── the door ──────────────────────────────────────────────────────────────────
+
+class RevoiceLine(BaseModel):
+    character_id: str
+    text: str = Field(..., min_length=1, max_length=2000)
+    start: float = Field(..., ge=0)
+    end: float = Field(..., gt=0)
+    emotion: str | None = None  # honoured when direct:false
+
+
+class RevoiceReq(BaseModel):
+    url: str
+    lines: list[RevoiceLine] = Field(..., min_length=1, max_length=200)
+    #: brain assigns one emotion per line (the composed emotional scale)
+    direct: bool = True
+    #: brain may shorten lines that cannot fit their slot (reported per line)
+    rewrite: bool = True
+
+
+@router.post(RV)
+def start(req: RevoiceReq):
+    """Re-voice a video from its (possibly edited) scene lines."""
+    _gc()
+    bad = [l for l in req.lines if l.end <= l.start]
+    if bad:
+        return JSONResponse(status_code=422, content={"detail": (
+            "every line needs end > start — re-voicing places lines by "
+            "their absolute timing (scan the video again if the scene "
+            "carried none)")})
+    missing = sorted({l.character_id for l in req.lines
+                      if not emotion_map(l.character_id)})
+    if missing:
+        return JSONResponse(status_code=404, content={"detail": (
+            f"unknown character(s): {', '.join(missing)}")})
+    if req.direct or req.rewrite:
+        try:
+            brain_mod.make_brain()
+        except brain_mod.BrainError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+    try:
+        url = ingest_url.guard_link(req.url)
+        info = ingest_url.probe(url)
+    except ingest_url.LinkRefusal as exc:
+        return JSONResponse(status_code=exc.status,
+                            content={"detail": exc.message})
+    if info.duration is not None and info.duration > MAX_SECONDS:
+        last = max(l.end for l in req.lines)
+        if last > MAX_SECONDS:
+            return JSONResponse(status_code=422, content={"detail": (
+                f"lines reach {last:.0f}s but this box re-voices at most "
+                f"the first {MAX_SECONDS:.0f} seconds of a video")})
+    if not _acquire_admission():
+        return JSONResponse(status_code=429, headers={"Retry-After": "60"},
+                            content={"detail": (
+                                "this box is already re-voicing a video — "
+                                "try again when it finishes")})
+    lines = [{"i": i, "character_id": l.character_id, "text": l.text.strip(),
+              "start": l.start, "end": l.end,
+              "emotion": (l.emotion or "baseline")}
+             for i, l in enumerate(req.lines)]
+    job = None
+    try:
+        job = _new_job({"kind": "url", "url": url, "title": info.title},
+                       lines, {"direct": req.direct, "rewrite": req.rewrite},
+                       permit=True)
+        threading.Thread(target=_run_job, args=(job,),
+                         name=f"revoice-{job['id']}", daemon=True).start()
+    except BaseException:
+        # No `_run_job` will ever run its `finally` for this job — the door is
+        # the only one left who can hand the permit back.
+        _abandon_at_the_door(job)
+        raise
+    return {"job_id": job["id"], "source": job["source"],
+            "lines": len(lines)}
+
+
+# ── reading a job ─────────────────────────────────────────────────────────────
+
+@router.get(RV + "/{job_id}")
+def status(job_id: str):
+    job = _get(job_id)
+    if job is None:
+        return errors.job_expired()
+    return _public(job)
+
+
+_artifact = _REGISTRY.artifact
+
+
+@router.get(RV + "/{job_id}/video")
+def video(job_id: str):
+    return _artifact(job_id, "revoiced.mp4", "video/mp4",
+                     "the re-voiced video is not finished")
+
+
+@router.get(RV + "/{job_id}/track")
+def track(job_id: str):
+    return _artifact(job_id, "track.wav", "audio/wav",
+                     "the re-voiced track is not finished")
+
+
+@router.delete(RV + "/{job_id}")
+def cancel(job_id: str):
+    job = _get(job_id)
+    if job is None:
+        return errors.job_expired()
+    with _LOCK:
+        job["cancel"] = True
+        job["touched"] = time.time()
+        if job["status"] == "running":
+            # The phase thread sees the flag at its next boundary and stops. It
+            # keeps its admission permit until it actually does — the box IS
+            # still busy until then — and its work dir is reclaimed by `_gc`,
+            # never yanked from under it.
+            job["status"] = "cancelled"
+        else:
+            # Terminal already: the artifacts may be mid-download. Drop the job
+            # from the registry (so the next poll is an honest 404) but let the
+            # reap grace expire before the bytes go.
+            JOBS.pop(job_id, None)
+            _schedule_reap(job["work_dir"])
+    return {"status": "cancelled"}

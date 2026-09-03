@@ -1,0 +1,23 @@
+Gravitone
+Copyright (c) 2026 kazii
+
+This product includes software developed by Kyutai.
+
+  Kyutai Pocket TTS — MIT License
+  https://github.com/kyutai-labs/pocket-tts
+
+Gravitone builds on Pocket TTS as a dependency (installed via pip); it is
+not vendored into this repository. Its license terms are unchanged and
+apply to that component.
+
+Voice assets carry PER-VOICE licenses — see
+https://huggingface.co/kyutai/tts-voices. Only ship voices you have the
+right to, and only clone a voice with the speaker's consent (see the Pocket
+TTS "Prohibited use" section).
+
+Why this text is here and not in LICENSE: GitHub detects a repository's
+license by matching LICENSE against known license bodies. An attribution
+paragraph inserted into the MIT text drops the match below the detection
+threshold, and the repository then reports no license at all — which is
+exactly what happened before this file existed. LICENSE stays verbatim MIT;
+attribution lives here and in README.md.

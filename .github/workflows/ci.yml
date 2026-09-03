@@ -1,0 +1,223 @@
+# ci — the one gate in this repository that actually runs, and is expected to be green.
+#
+# Everything else under .github/workflows/ carries a `.example` suffix and is
+# therefore invisible to GitHub: `perf-ledger.yml.example` and
+# `sealed.yml.example` both need an aarch64 Arm runner that this repository does
+# not have, and `audio-drift.yml.example` needs a deployed Gravitone URL and an
+# API key. They are design artifacts. THIS file is the opposite: every command
+# below was executed locally, from a clean `git worktree` checkout of HEAD with
+# a fresh `npm ci` and a fresh virtualenv, before it was committed — so the
+# first run is a confirmation, not a debugging session.
+#
+# It deliberately carries NO `paths:` filter. The parked workflows all filtered
+# on `gravitone/service/**`, which is why `gravitone/web/` — the studio, ~1100
+# tests of it — had never once been touched by CI. Every push to main and every
+# pull request runs both jobs.
+#
+# ---------------------------------------------------------------------------
+# WHAT IS NOT GATED HERE, AND WHY (read before "fixing" an omission)
+# ---------------------------------------------------------------------------
+#
+# 1. `npm run lint` is NOT run. It is a phantom script: `package.json` defines
+#    it as `next lint`, but the repository contains no ESLint configuration and
+#    no `eslint` / `eslint-config-next` dependency. Running it prints the
+#    Next.js 16 deprecation notice and then drops into the INTERACTIVE prompt
+#    "? How would you like to configure ESLint?" — which in CI hangs until the
+#    job times out, or exits non-zero against a closed stdin. Measured, it exits
+#    1 with no files linted.
+#
+#    This was measured rather than guessed. In a throwaway checkout, adding
+#    `eslint` + `eslint-config-next` and an `.eslintrc.json` extending
+#    `next/core-web-vitals` lints the studio in ~40s and reports 1 error and 4
+#    warnings across 3 files — and the single "error" is not a code defect but a
+#    stale inline suppression referencing `@typescript-eslint/no-explicit-any`,
+#    a rule that config does not load. So the studio is very nearly lint-clean
+#    and lint IS worth gating; the missing piece is a dependency + config change
+#    in `gravitone/web/`, not a workflow change. Do that first, in its own
+#    commit, then add the step here. Note `next lint` is removed in Next.js 16,
+#    so the migration target is the ESLint CLI, not `next lint`.
+#
+#    `next build` still type-checks, and `npx tsc --noEmit` runs below, so the
+#    absence of lint costs style enforcement — not correctness.
+#
+# 2. The service job installs a NARROW dependency set, not
+#    `gravitone/requirements.txt`. This is not a shortcut around a failure; it
+#    is what the test suite is designed for. `service/tests/__init__.py` and
+#    `service/tests/fake_engine.py` inject lightweight stand-ins for `torch`,
+#    `scipy` and `pocket_tts` into `sys.modules` before `service.app` is
+#    imported, precisely so that unit tests never load a real model. Installing
+#    torch / faster-whisper / sherpa-onnx / piper-tts in CI would add hundreds of
+#    megabytes and minutes of wheel downloads to exercise code paths that the
+#    fakes replace anyway. The full suite was verified locally against exactly
+#    the packages listed below, on a machine with no torch and no scipy
+#    installed at all.
+#
+#    The consequence, stated plainly: this job proves the service's HTTP surface,
+#    routing, accounting, auth, error handling and orchestration logic. It does
+#    NOT prove real synthesis, real transcription or real diarization — those
+#    need model weights and, for the performance claims, Arm hardware. That is
+#    what `sealed.yml.example` and `perf-ledger.yml.example` are for.
+#
+# 3. There is no deploy job and no `environment:` — nothing is deployed from CI.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push to the same ref supersedes an in-flight run; main is never
+# cancelled, so the branch always ends with a real verdict against its tip.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  web:
+    name: studio (next 15 / react 19)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: gravitone/web
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Node 22, not 20: the lockfile's strictest transitive engine constraint
+      # is `^20.19.0 || ^22.13.0 || >=24.0.0` (jsdom 29 and friends), and Next
+      # 15.5 wants 20+. 22.x clears both with room to spare.
+      - uses: actions/setup-node@v4
+        with:
+          # 24, not 22, and the difference is not cosmetic. On Node 22 this
+          # suite fails 33 tests that pass on 24 — starting with
+          # `expected Blob { size: 44 } to be an instance of Blob`, a dual-realm
+          # identity mismatch between jsdom's `Blob` and the one Node exposes
+          # globally. The suite is developed and verified on 24; pinning the
+          # gate to anything else tests a runtime nobody runs.
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: gravitone/web/package-lock.json
+
+      # `npm install`, not `npm ci`, and that is a deliberate trade.
+      #
+      # `npm ci` refuses this lockfile on Linux: it was generated on Windows,
+      # where npm prunes the transitive dependencies of optional
+      # platform-specific packages it will never install. `@img/sharp-wasm32`
+      # declares `@emnapi/runtime` and `@tailwindcss/oxide-wasm32-wasi`
+      # declares `@emnapi/core`, and neither lands in the tree at the version a
+      # Linux resolve hoists — so `npm ci` exits EUSAGE on "Missing:
+      # @emnapi/runtime@1.11.3 from lock file" before running a single test.
+      # Regenerating the lockfile on Windows does not fix it (verified: pristine
+      # resolves, and `--os=linux --cpu=x64`, both still nest `@emnapi/core`);
+      # producing a Linux-correct lockfile requires a Linux machine.
+      #
+      # What this costs: dependency versions are resolved fresh rather than
+      # pinned byte-for-byte, so an upstream release inside an existing semver
+      # range can turn this gate red without a commit. What it buys: the gate
+      # runs at all. FOLLOW-UP — regenerate `package-lock.json` on Linux (or in
+      # this container) and restore `npm ci`, which is strictly better.
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      # Type check before tests: a type error is the cheapest failure to read.
+      - name: Type check
+        run: npx tsc --noEmit
+
+      # Vitest, jsdom environment. 86 files / 1200 tests at time of writing.
+      - name: Unit tests
+        run: npm run test
+
+      # Known flake risk, recorded rather than hidden: `app/layout.tsx` uses
+      # `next/font/google`, so the build fetches font files from Google at build
+      # time. Locally this logged "Retrying 1/3..." several times before
+      # succeeding. If this step ever fails with a font fetch error, that is a
+      # network flake, not a code regression — but the durable fix is to
+      # self-host the fonts in `gravitone/web/`, not to relax this gate.
+      - name: Production build
+        run: npm run build
+        # SCOPED TO THIS STEP ON PURPOSE — do not promote to job level.
+        #
+        # `next build` PRERENDERS /keys, which initializes Firebase Auth at
+        # module scope; unset, the build dies with `FirebaseError:
+        # auth/invalid-api-key` and "Export encountered an error on
+        # /keys/page". But a present NEXT_PUBLIC_FIREBASE_PROJECT_ID is also
+        # exactly how the studio decides it is in `firebase` auth mode rather
+        # than `single-user` (app/api/keys/identity.ts). Job-level, these
+        # placeholders put the TEST run in firebase mode, /api/keys answered
+        # 401 to everything, and 21 tests written against single-user mode
+        # failed with `expected 401 to be 400`. Tests must run in the posture a
+        # plain `git clone && npm test` gets.
+        #
+        # These are PLACEHOLDERS. Not anyone's project, not secrets, and never
+        # to be replaced with live values: Firebase web config is public by
+        # design, but pasting a real project's config here would silently point
+        # CI builds at a real Firebase project. Nothing here calls Firebase —
+        # the values need only be well-shaped enough for `initializeApp`.
+        env:
+          NEXT_PUBLIC_FIREBASE_API_KEY: AIzaSyDUMMY-ci-placeholder-not-a-real-key
+          NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN: gravitone-ci-placeholder.firebaseapp.com
+          NEXT_PUBLIC_FIREBASE_PROJECT_ID: gravitone-ci-placeholder
+          NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET: gravitone-ci-placeholder.appspot.com
+          NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID: "000000000000"
+          NEXT_PUBLIC_FIREBASE_APP_ID: "1:000000000000:web:0000000000000000000000"
+
+  service:
+    name: service (fastapi, fake-engine suite)
+    runs-on: ubuntu-latest
+    # The suite took 610s locally (1991 passed / 5 skipped / 233 subtests). A
+    # 2-core hosted runner may be slower, and a timeout here would read as a
+    # code failure, so the budget is generous on purpose.
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: gravitone
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 3.14 is the version the suite was verified on, and README.md declares
+      # the service supports 3.10–3.14.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      # NOT `-r requirements.txt` — see the header. pytest is deliberately
+      # absent from requirements.txt (that file is the runtime image's
+      # dependency set), so it is named explicitly here. numpy is the only one
+      # of these the tests import directly; the rest are what `service.app`
+      # needs to import at all.
+      #
+      # sentry-sdk is the one addition that is NOT needed to import the app:
+      # service/observability.py imports it lazily and only when SENTRY_DSN is
+      # set, so the suite would pass without it — by SKIPPING every test that
+      # proves the reporting posture (no PII, no request bodies, tracing off,
+      # the ingest spend ledger's shape). A gate that skips the tests it exists
+      # to run is not a gate, so it is installed here on purpose. The
+      # no-DSN tests, which are the ones that matter most, run either way and
+      # never touch the network.
+      # ffmpeg is a real runtime dependency, not a test convenience: the service
+      # shells out to it to transcode synthesis output (`mp3_44100_128` and the
+      # other non-WAV `output_format`s) and to normalise ingest audio to 24 kHz
+      # mono. The fake engine replaces the MODEL, not the encoder, so these
+      # paths run for real. GitHub's ubuntu image does not ship it — without
+      # this step two tests fail on `FileNotFoundError: 'ffmpeg'`.
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -version | head -1
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest fastapi "numpy>=2" httpx python-multipart psutil sentry-sdk
+
+      # The suite is large (~2000 tests) and takes several minutes. Run it from
+      # `gravitone/` so `import service.x` resolves.
+      - name: Unit tests
+        run: python -m pytest service/tests -q

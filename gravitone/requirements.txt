@@ -1,0 +1,54 @@
+# THIS FILE IS THE IMAGE'S DEPENDENCY SET. The Dockerfile installs from it
+# (`pip install -c <pinned-torch> -r requirements.txt`) instead of the inline
+# hand-list it used to carry, which had drifted and shipped an image with no
+# faster-whisper, no sherpa-onnx and no piper-tts — a container that could not
+# listen, diarize or speak a non-English language. Adding a dependency here is
+# now enough; a build-time import gate fails the build if a capability module
+# stops importing.
+#
+# "Fetched on first use" below describes a bare pip install. In the SEALED
+# image every one of those fetches happens at BUILD time in the Dockerfile's
+# `bake` stage, into /opt/gravitone/models, and the runtime sets
+# HF_HUB_OFFLINE=1 so a missing bake fails loudly instead of phoning home.
+#
+# torch is pulled in by pocket-tts. On aarch64 Linux, pip installs the
+# manylinux ARM wheel with oneDNN + Arm Compute Library kernels. In the image
+# torch comes from the Arm base image and is PINNED as a pip constraint so it
+# is never replaced by a generic wheel.
+pocket-tts>=2.1.0
+# Local speech-to-text (service/stt.py) and therefore the ears of the
+# conversational agent. CTranslate2 int8 on CPU — no GPU, no API key, and the
+# same "runs on the box you already have" claim the TTS side makes. Weights are
+# fetched on first use, not at install time.
+faster-whisper>=1.1
+# Speaker diarization (service/diarize.py). Chosen over pyannote.audio because
+# its pretrained pipelines require a HuggingFace account + token, which a service
+# that claims to run offline on your own box cannot demand. sherpa-onnx links its
+# own ONNX runtime, so this adds no torch dependency. Models are fetched by
+# `python -m service.diarize --download` (~34 MB), not at install time.
+sherpa-onnx>=1.13
+# Piper voices (service/piper.py) — the second synthesis engine, for the
+# languages Pocket TTS does not speak. Voice files are downloaded separately.
+piper-tts>=1.3
+fastapi>=0.100
+uvicorn[standard]>=0.20
+scipy>=1.10
+numpy>=2
+psutil>=5.9
+python-multipart>=0.0.9
+httpx>=0.27
+# Error reporting (service/observability.py). Present in the image so that
+# turning it on is one environment variable rather than a rebuild — but it is
+# never imported unless SENTRY_DSN is set, and `init()` survives its absence,
+# so a slimmed-down image that drops it still runs. Errors only: no tracing, no
+# profiling, no PII, and request bodies are explicitly never captured.
+sentry-sdk>=2.0
+# Link ingest (service/ingest_url.py): a pasted YouTube URL becomes the same
+# audio file a drop would have been. Invoked as `python -m yt_dlp` with NO
+# postprocessors — one audio-only itag, written as-is — so it adds no decoder
+# and never calls ffmpeg on our behalf (the pipeline's own ffmpeg pass is
+# unchanged). PINNED, not floored: yt-dlp tracks a site that changes weekly, so
+# a floating version is a service whose behaviour changes without a deploy. The
+# flip side is that a pin ages out — when links start failing, bump this line
+# first (see deploy/README.md, "Link ingest is brittle by design").
+yt-dlp==2026.7.4
