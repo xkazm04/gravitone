@@ -15,7 +15,8 @@ vi.mock("next/navigation", () => ({
 // The waveform needs a real AudioContext; nothing here is asserting decoration.
 vi.mock("@/lib/peaks", () => ({ computePeaks: vi.fn(async () => ({ peaks: [], duration: 1 })) }));
 
-import ReviewPage, { generateMetadata, loadReview } from "./page";
+import ReviewPage, { generateMetadata } from "./page";
+import { loadReview } from "./loadReview";
 import type { Review } from "./ReviewPicker";
 
 const REVIEW: Review = {
