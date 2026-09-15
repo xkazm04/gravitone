@@ -279,6 +279,26 @@ class VideoTierTests(unittest.TestCase):
             self.assertIn("voice can still be cloned", ctx.exception.message)
 
 
+def _all_routes(router) -> list:
+    """Every route FastAPI will actually dispatch to, unwrapped.
+
+    Newer FastAPI (>=0.140-ish) stores an `include_router()`'d sub-router as
+    an internal `_IncludedRouter` wrapper on the parent's `.routes` instead
+    of flattening its routes into that list — the wrapper carries no `.path`
+    of its own, so a plain scan of `app.routes` silently finds nothing for
+    ANY route added through `include_router`, which is every route this
+    service has except the handful defined directly on `app`.
+    `original_router` is FastAPI's own way back to the real APIRouter; older
+    FastAPI has no such attribute, so this recurses only where it exists and
+    is a no-op flatten on the versions that already flatten.
+    """
+    out = []
+    for r in router.routes:
+        nested = getattr(r, "original_router", None)
+        out.extend(_all_routes(nested) if nested is not None else [r])
+    return out
+
+
 class ScanUrlRouteTests(unittest.TestCase):
     def setUp(self) -> None:
         self._dir = TemporaryDirectory()
@@ -379,7 +399,7 @@ class ScanUrlRouteTests(unittest.TestCase):
 
     def test_it_shares_the_scan_budget_rather_than_minting_a_second_one(self) -> None:
         deps = [d.dependency for d in
-                next(r for r in appmod.app.routes
+                next(r for r in _all_routes(appmod.app)
                      if getattr(r, "path", "") == "/v1/ingest/scan-url").dependencies]
         self.assertTrue(deps, "scan-url must carry a per-IP budget")
 
